@@ -10,9 +10,12 @@ import {
   RadioTower,
   RefreshCw,
 } from "lucide-react";
-import type { Capabilities, Capability, Project } from "./models";
+import type { AnalysisProviderConfiguration, Capabilities, Capability, Project } from "./models";
+import { listAnalysisProviders } from "./analysisProviderApi";
+import { AnalysisProviderSettings } from "./AnalysisProviderSettings";
 import { DepthCapturePanel } from "./DepthCapturePanel";
 import { LocalPreprocessingPanel } from "./LocalPreprocessingPanel";
+import { SemanticAnalysisPanel } from "./SemanticAnalysisPanel";
 import { ReferenceMediaPanel } from "./ReferenceMediaPanel";
 import { uploadReferenceMedia } from "./referenceMediaApi";
 
@@ -78,6 +81,19 @@ function StatusLine({ icon: Icon, label, capability }: { icon: typeof RadioTower
   );
 }
 
+function selectedAnalysisProvider(providers: AnalysisProviderConfiguration[]) {
+  return providers.find((provider) => provider.selectedProvider === provider.provider) ?? null;
+}
+
+function analysisServiceCapability(capability: Capability, providers: AnalysisProviderConfiguration[]): Capability {
+  const provider = selectedAnalysisProvider(providers);
+  if (!provider) return capability;
+  return {
+    state: provider.credentialState === "configured" ? "configured" : "unconfigured",
+    label: `${provider.provider === "bailian" ? "百炼" : "本地兼容服务"} · ${provider.model ?? "未配置模型"}`,
+  };
+}
+
 function ProjectMark() {
   return (
     <div className="project-mark" aria-hidden="true">
@@ -90,6 +106,9 @@ function ProjectMark() {
 export function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [capabilities, setCapabilities] = useState<Capabilities>(defaultCapabilities);
+  const [analysisProviders, setAnalysisProviders] = useState<AnalysisProviderConfiguration[]>([]);
+  const [analysisSettingsOpen, setAnalysisSettingsOpen] = useState(false);
+  const [isLoadingAnalysisProviders, setIsLoadingAnalysisProviders] = useState(false);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [projectName, setProjectName] = useState("");
@@ -120,6 +139,17 @@ export function App() {
       setCapabilities(unavailableCapabilities);
     }
     setIsLoading(false);
+  }
+
+  async function openAnalysisSettings() {
+    setAnalysisSettingsOpen(true);
+    if (analysisProviders.length > 0 || isLoadingAnalysisProviders) return;
+    setIsLoadingAnalysisProviders(true);
+    try {
+      setAnalysisProviders(await listAnalysisProviders());
+    } finally {
+      setIsLoadingAnalysisProviders(false);
+    }
   }
 
   async function refreshCapabilities() {
@@ -190,7 +220,7 @@ export function App() {
             <span>AI Video Reverse Engineer</span>
           </button>
           <div className="topbar-status" aria-label="环境状态">
-            <StatusLine icon={RadioTower} label="分析服务" capability={capabilities.analysisService} />
+            <StatusLine icon={RadioTower} label="分析服务" capability={analysisServiceCapability(capabilities.analysisService, analysisProviders)} />
             <StatusLine icon={MonitorCog} label="本地 ComfyUI" capability={capabilities.localComfyui} />
             {capabilities.analysisService.state === "unavailable" && (
               <button className="capability-retry" type="button" onClick={() => void refreshCapabilities()}><RefreshCw size={15} aria-hidden="true" />重新检测</button>
@@ -222,6 +252,9 @@ export function App() {
             hasPreprocessingResult={selectedProject.localPreprocessing !== null}
           />
           <LocalPreprocessingPanel project={selectedProject} onProjectUpdated={updateProject} />
+          {!analysisSettingsOpen && <button className="secondary-action analysis-settings-entry" type="button" onClick={() => void openAnalysisSettings()}>分析服务设置</button>}
+          {analysisSettingsOpen && <AnalysisProviderSettings providers={analysisProviders} onProvidersChanged={setAnalysisProviders} />}
+          <SemanticAnalysisPanel project={selectedProject} provider={selectedAnalysisProvider(analysisProviders)} onProjectUpdated={updateProject} />
           <DepthCapturePanel project={selectedProject} onProjectUpdated={updateProject} onMutationPendingChange={setDepthMutationPending} />
         </section>
       </main>
@@ -238,7 +271,7 @@ export function App() {
           <strong>AI 视频复刻分析器</strong>
         </div>
         <div className="topbar-status" aria-label="环境状态">
-          <StatusLine icon={RadioTower} label="分析服务" capability={capabilities.analysisService} />
+          <StatusLine icon={RadioTower} label="分析服务" capability={analysisServiceCapability(capabilities.analysisService, analysisProviders)} />
           <StatusLine icon={MonitorCog} label="本地 ComfyUI" capability={capabilities.localComfyui} />
           {capabilities.analysisService.state === "unavailable" && (
             <button className="capability-retry" type="button" onClick={() => void refreshCapabilities()}><RefreshCw size={15} aria-hidden="true" />重新检测</button>

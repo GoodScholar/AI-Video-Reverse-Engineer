@@ -174,6 +174,16 @@ export type SemanticAnalysis = {
   error: SemanticAnalysisError | null;
 };
 
+export type AnalysisProviderId = "bailian" | "local_openai_compatible";
+
+export type AnalysisProviderConfiguration = {
+  provider: AnalysisProviderId;
+  model: string | null;
+  baseUrl: string | null;
+  credentialState: "configured" | "unconfigured";
+  selectedProvider: AnalysisProviderId | null;
+};
+
 export type DepthCaptureStageName =
   | "preparing"
   | "estimatingDepth"
@@ -285,7 +295,7 @@ export type Project = {
 };
 
 export type Capability = {
-  state: "checking" | "unavailable" | "unconfigured" | "disconnected";
+  state: "checking" | "unavailable" | "unconfigured" | "disconnected" | "configured";
   label: string;
 };
 
