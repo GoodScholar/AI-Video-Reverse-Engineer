@@ -312,3 +312,40 @@ def test_bailian_total_deadline_interrupts_when_only_partial_response_headers_ar
 
     assert error.value.failure.code == "timeout"
     assert elapsed < 0.25
+
+
+def test_bailian_total_deadline_cancels_tls_handshake_after_connect_budget_is_consumed(monkeypatch):
+    client_hello_received = threading.Event()
+
+    class ClientHelloOnlyHandler(BaseHTTPRequestHandler):
+        def handle(self):
+            self.connection.recv(16 * 1024)
+            client_hello_received.set()
+            time.sleep(0.4)
+
+        def log_message(self, *args):
+            pass
+
+    original_connect_tcp = openai_chat._CancellableNetworkBackend.connect_tcp
+
+    def delayed_connect_tcp(self, *args, **kwargs):
+        stream = original_connect_tcp(self, *args, **kwargs)
+        time.sleep(0.15)
+        return stream
+
+    monkeypatch.setattr(openai_chat._CancellableNetworkBackend, "connect_tcp", delayed_connect_tcp)
+    monkeypatch.setattr(openai_chat, "TOTAL_PROVIDER_DEADLINE_SECONDS", 0.2)
+    with _LoopbackProviderServer(ClientHelloOnlyHandler) as server, openai_chat.new_cancellable_client(timeout=1.0) as client:
+        started = time.monotonic()
+        with pytest.raises(ProviderAnalysisError) as error:
+            openai_chat.post_chat_completion(
+                client,
+                "https://127.0.0.1:%d/chat/completions" % server._server.server_port,
+                "test-credential",
+                _core_request(),
+            )
+        elapsed = time.monotonic() - started
+
+    assert client_hello_received.is_set()
+    assert error.value.failure.code == "timeout"
+    assert elapsed < 0.3
