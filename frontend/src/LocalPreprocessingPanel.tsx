@@ -3,21 +3,39 @@ import {
   Check, CircleAlert, Clock3, LoaderCircle, Play, RefreshCw, RotateCcw,
 } from "lucide-react";
 
-import type { LocalPreprocessing, PreprocessingStageName, Project } from "./models";
+import type {
+  ImageLocalPreprocessing,
+  ImagePreprocessingStageName,
+  LocalPreprocessing,
+  PreprocessingStageName,
+  Project,
+  ReferenceImage,
+  ReferenceMedia,
+  VideoLocalPreprocessing,
+  VideoPreprocessingStageName,
+} from "./models";
 import { getProject, startLocalPreprocessing } from "./localPreprocessingApi";
 
 const DESKTOP_QUERY = "(min-width: 1024px)";
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
 
-const stageLabels = {
+const videoStageLabels = {
   decoding: "解码",
   sceneDetection: "镜头检测",
   keyframeExtraction: "关键帧提取",
   motionAnalysis: "运动分析",
   reproducibilityAssessment: "初步可复刻性判断",
-} satisfies Record<PreprocessingStageName, string>;
+} satisfies Record<VideoPreprocessingStageName, string>;
 
-const stageOrder = Object.keys(stageLabels) as PreprocessingStageName[];
+const imageStageLabels = {
+  imageDecoding: "图像解码",
+  imageNormalization: "方向与色彩标准化",
+  proxyGeneration: "分析代理生成",
+  reproducibilityAssessment: "初步可复刻性判断",
+} satisfies Record<ImagePreprocessingStageName, string>;
+
+const videoStageOrder = Object.keys(videoStageLabels) as VideoPreprocessingStageName[];
+const imageStageOrder = Object.keys(imageStageLabels) as ImagePreprocessingStageName[];
 
 type Props = {
   project: Project;
@@ -71,14 +89,14 @@ function StageIcon({ status }: { status: LocalPreprocessing["stages"][number]["s
   return <Clock3 aria-hidden="true" size={16} />;
 }
 
-function motionText(summary: NonNullable<LocalPreprocessing["proxySummary"]>) {
+function motionText(summary: NonNullable<VideoLocalPreprocessing["proxySummary"]>) {
   if (summary.motionLevel === "unavailable") return "运动强度无法独立评估";
   const level = { light: "低", moderate: "中度", high: "高" }[summary.motionLevel];
   const p90 = summary.motionP90 === null ? "无法读取" : summary.motionP90.toFixed(3);
   return `${level}运动 · P90 ${p90}`;
 }
 
-function Conclusion({ task }: { task: LocalPreprocessing }) {
+function VideoPreprocessingConclusion({ task }: { task: VideoLocalPreprocessing }) {
   const summary = task.proxySummary;
   const assessment = task.reproducibilityAssessment;
   if (!summary || !assessment) return null;
@@ -106,6 +124,38 @@ function Conclusion({ task }: { task: LocalPreprocessing }) {
   );
 }
 
+function imageProxyDimensions(image: ReferenceImage) {
+  const longEdge = Math.max(image.width, image.height);
+  if (longEdge <= 2048) return `${image.width}×${image.height}`;
+  const scale = 2048 / longEdge;
+  return `${Math.round(image.width * scale)}×${Math.round(image.height * scale)}`;
+}
+
+function ImagePreprocessingConclusion({ task, image }: { task: ImageLocalPreprocessing; image: ReferenceImage | null }) {
+  if (!task.proxySummary || !task.reproducibilityAssessment) return null;
+
+  return (
+    <div className="local-preprocessing-conclusion local-preprocessing-conclusion--image">
+      <h3>本地预处理摘要</h3>
+      <ul className="local-preprocessing-summary" aria-label="本地预处理摘要">
+        {image && <li>代理尺寸：{imageProxyDimensions(image)}</li>}
+        <li>分析代理仅用于后续语义分析，不上传原始参考图片。</li>
+        {image?.hasTransparency && <li>透明区域已使用白色背景处理。</li>}
+      </ul>
+      <div className="local-preprocessing-assessment" aria-label="初步结论：待语义分析确认">
+        <h3>待语义分析确认</h3>
+        <p className="local-preprocessing-image-note">本地预处理未执行主体或交互的语义判断。</p>
+      </div>
+    </div>
+  );
+}
+
+function stageLabel(name: PreprocessingStageName) {
+  return name in imageStageLabels
+    ? imageStageLabels[name as ImagePreprocessingStageName]
+    : videoStageLabels[name as VideoPreprocessingStageName];
+}
+
 export function LocalPreprocessingPanel({
   project,
   onProjectUpdated,
@@ -117,6 +167,8 @@ export function LocalPreprocessingPanel({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState("");
   const [refreshError, setRefreshError] = useState("");
+  const task = project.localPreprocessing;
+  const canPoll = task?.status === "queued" || task?.status === "running";
   const mountedRef = useRef(false);
   const requestGenerationRef = useRef(0);
   const currentProjectIdRef = useRef(project.id);
@@ -124,12 +176,11 @@ export function LocalPreprocessingPanel({
   const manualRefreshRef = useRef<(() => void) | null>(null);
   const statusHeadingRef = useRef<HTMLHeadingElement>(null);
   const startButtonRef = useRef<HTMLButtonElement>(null);
+  const retryButtonRef = useRef<HTMLButtonElement>(null);
   const focusStatusForProjectRef = useRef<string | null>(null);
+  const previousTaskStatusRef = useRef<LocalPreprocessing["status"] | null>(task?.status ?? null);
   currentProjectIdRef.current = project.id;
   callbackRef.current = onProjectUpdated;
-
-  const task = project.localPreprocessing;
-  const canPoll = task?.status === "queued" || task?.status === "running";
 
   useEffect(() => {
     mountedRef.current = true;
@@ -156,6 +207,13 @@ export function LocalPreprocessingPanel({
   useEffect(() => {
     if (submitError) startButtonRef.current?.focus();
   }, [submitError]);
+
+  useEffect(() => {
+    if (task?.status === "failed" && previousTaskStatusRef.current !== "failed" && isDesktop) {
+      retryButtonRef.current?.focus();
+    }
+    previousTaskStatusRef.current = task?.status ?? null;
+  }, [isDesktop, task?.status]);
 
   useEffect(() => {
     if (!canPoll) return undefined;
@@ -215,7 +273,7 @@ export function LocalPreprocessingPanel({
   }, [canPoll, load, pollIntervalMs, project.id, task?.status]);
 
   async function submit() {
-    if (!isDesktop || project.referenceMedia?.type !== "video" || isSubmitting) return;
+    if (!isDesktop || !project.referenceMedia || isSubmitting) return;
     const generation = ++requestGenerationRef.current;
     const projectId = project.id;
     const isCurrent = () => (
@@ -249,32 +307,30 @@ export function LocalPreprocessingPanel({
       <h2 id="local-preprocessing-title">本地预处理</h2>
       {!task && isDesktop && (
         <div className="local-preprocessing-not-started">
-          {project.referenceMedia?.type === "video" ? (
+          {project.referenceMedia ? (
             <>
-              <p>此步骤只在本机处理，尚不会发送分析代理。</p>
+              <p>{project.referenceMedia.type === "image"
+                ? "此步骤只在本机处理，将生成方向与色彩标准化后的分析代理。"
+                : "此步骤只在本机处理，尚不会发送分析代理。"}</p>
               <button ref={startButtonRef} className="primary-action" type="button" disabled={isSubmitting} onClick={() => void submit()}>
                 <Play aria-hidden="true" size={17} />{isSubmitting ? "正在启动本地预处理…" : "开始本地预处理"}
               </button>
             </>
-          ) : project.referenceMedia?.type === "image"
-            ? <p>参考图片的本地预处理将在后续版本提供；当前不会启动请求。</p>
-            : <p>请先添加并校验参考素材，再开始本地预处理。</p>}
-        </div>
+          ) : <p>请先添加并校验参考素材，再开始本地预处理。</p>}
+      </div>
       )}
-      {!task && !isDesktop && <p>{project.referenceMedia?.type === "video"
+      {!task && !isDesktop && <p>{project.referenceMedia
         ? "请在宽度至少 1024px 的桌面设备开始或重试本地预处理"
-        : project.referenceMedia?.type === "image"
-          ? "参考图片的本地预处理将在后续版本提供。"
-          : "请先添加并校验参考素材，再开始本地预处理。"}</p>}
-      {task && <TaskContent task={task} headingRef={statusHeadingRef} />}
+        : "请先添加并校验参考素材，再开始本地预处理。"}</p>}
+      {task && <TaskContent task={task} referenceMedia={project.referenceMedia} headingRef={statusHeadingRef} />}
       {task?.status === "failed" && task.error && (
         <div className="local-preprocessing-error" role="alert">
           <CircleAlert aria-hidden="true" size={17} />
-          <span><strong>{stageLabels[task.error.stage]}失败</strong>{task.error.message}</span>
+          <span><strong>{stageLabel(task.error.stage)}失败</strong>{task.error.message}</span>
         </div>
       )}
       {task?.status === "failed" && isDesktop && (
-        <button ref={startButtonRef} className="secondary-action" type="button" disabled={isSubmitting} onClick={() => void submit()}>
+        <button ref={retryButtonRef} className="secondary-action" type="button" disabled={isSubmitting} onClick={() => void submit()}>
           <RotateCcw aria-hidden="true" size={17} />{isSubmitting ? "正在重新启动…" : "从失败阶段重试"}
         </button>
       )}
@@ -289,7 +345,7 @@ export function LocalPreprocessingPanel({
   );
 }
 
-function TaskContent({ task, headingRef }: { task: LocalPreprocessing; headingRef: React.RefObject<HTMLHeadingElement> }) {
+function TaskContent({ task, referenceMedia, headingRef }: { task: LocalPreprocessing; referenceMedia: ReferenceMedia | null; headingRef: React.RefObject<HTMLHeadingElement> }) {
   const states = new Map(task.stages.map((stage) => [stage.name, stage]));
   const statusText = task.status === "completed"
     ? `本地预处理已完成；初步结论：${task.reproducibilityAssessment?.status === "out_of_scope" ? "超出当前可复刻范围" : "待语义分析确认"}`
@@ -299,18 +355,21 @@ function TaskContent({ task, headingRef }: { task: LocalPreprocessing; headingRe
     <div className={`local-preprocessing-task local-preprocessing-task--${task.status}`} role="status" aria-live="polite" aria-label={statusText}>
       <h3 ref={headingRef} tabIndex={-1}>{taskTitle(task)}</h3>
       <ol className="local-preprocessing-stages" aria-label="本地预处理阶段">
-        {stageOrder.map((name) => {
+        {(task.mediaType === "image" ? imageStageOrder : videoStageOrder).map((name) => {
           const stage = states.get(name) ?? { name, status: "pending" as const, startedAt: null, completedAt: null };
           return (
             <li key={name} className={`local-preprocessing-stage local-preprocessing-stage--${stage.status}`}>
               <StageIcon status={stage.status} />
-              <span>{stageLabels[name]}</span>
+              <span>{stageLabel(name)}</span>
               <span>{stageStateText(stage.status)}</span>
             </li>
           );
         })}
       </ol>
-      {task.status === "completed" && <Conclusion task={task} />}
+      {task.status === "completed" && task.mediaType === "image" && (
+        <ImagePreprocessingConclusion task={task} image={referenceMedia?.type === "image" ? referenceMedia : null} />
+      )}
+      {task.status === "completed" && task.mediaType === "video" && <VideoPreprocessingConclusion task={task} />}
     </div>
   );
 }

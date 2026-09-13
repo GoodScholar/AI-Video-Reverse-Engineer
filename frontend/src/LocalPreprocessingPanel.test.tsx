@@ -2,7 +2,14 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, expect, it, vi } from "vitest";
 
-import type { LocalPreprocessing, PreprocessingStageName, Project } from "./models";
+import type {
+  ImageLocalPreprocessing,
+  ImagePreprocessingStageName,
+  LocalPreprocessing,
+  Project,
+  VideoLocalPreprocessing,
+  VideoPreprocessingStageName,
+} from "./models";
 import { LocalPreprocessingPanel } from "./LocalPreprocessingPanel";
 
 function stubDesktop(matches = true) {
@@ -29,11 +36,14 @@ function stubDesktop(matches = true) {
   };
 }
 
-const stageNames: PreprocessingStageName[] = [
+const stageNames: VideoPreprocessingStageName[] = [
   "decoding", "sceneDetection", "keyframeExtraction", "motionAnalysis", "reproducibilityAssessment",
 ];
+const imageStageNames: ImagePreprocessingStageName[] = [
+  "imageDecoding", "imageNormalization", "proxyGeneration", "reproducibilityAssessment",
+];
 
-function preprocessing(overrides: Partial<LocalPreprocessing> = {}): LocalPreprocessing {
+function preprocessing(overrides: Partial<VideoLocalPreprocessing> = {}): VideoLocalPreprocessing {
   return {
     id: "preprocessing-001",
     sourceReferenceMediaId: "video-001", mediaType: "video",
@@ -64,17 +74,54 @@ function project(localPreprocessing: LocalPreprocessing | null = null): Project 
   };
 }
 
-function completedTask(overrides: Partial<LocalPreprocessing> = {}) {
+function completedTask(overrides: Partial<VideoLocalPreprocessing> = {}) {
   return preprocessing({
     status: "completed", currentStage: null, completedAt: "2026-09-11T10:01:00+00:00",
     stages: stageNames.map((name) => ({ name, status: "completed", startedAt: "2026-09-11T10:00:00+00:00", completedAt: "2026-09-11T10:01:00+00:00" })),
-    proxySummary: { keyframeCount: 8, contactSheetCount: 1, sceneChangeCount: 0, motionP50: 1.2, motionP90: 3.2, motionPeak: 4.1, motionLevel: "moderate" },
+    proxySummary: { mediaType: "video", keyframeCount: 8, contactSheetCount: 1, sceneChangeCount: 0, motionP50: 1.2, motionP90: 3.2, motionPeak: 4.1, motionLevel: "moderate" },
     reproducibilityAssessment: {
       status: "pending_semantic_confirmation",
       checks: [{ criterion: "primary_subject_count", status: "pending", message: "待语义分析确认", evidence: "主要主体数量和复杂交互仍待确认。" }],
     },
     ...overrides,
   });
+}
+
+function completedImageTask(): ImageLocalPreprocessing {
+  return {
+    id: "image-preprocessing-001",
+    sourceReferenceMediaId: "image-001",
+    mediaType: "image",
+    algorithmVersion: 1,
+    status: "completed",
+    currentStage: null,
+    stages: imageStageNames.map((name) => ({
+      name,
+      status: "completed",
+      startedAt: "2026-09-11T10:00:00+00:00",
+      completedAt: "2026-09-11T10:01:00+00:00",
+    })),
+    queuedAt: "2026-09-11T10:00:00+00:00",
+    startedAt: "2026-09-11T10:00:00+00:00",
+    updatedAt: "2026-09-11T10:01:00+00:00",
+    completedAt: "2026-09-11T10:01:00+00:00",
+    proxySummary: { mediaType: "image" },
+    reproducibilityAssessment: {
+      status: "pending_semantic_confirmation",
+      checks: [],
+    },
+    error: null,
+  };
+}
+
+function imageProject(localPreprocessing: LocalPreprocessing | null = null): Project {
+  return {
+    ...project(localPreprocessing),
+    referenceMedia: {
+      type: "image", id: "image-001", originalName: "hero.png", format: "png", sizeBytes: 11,
+      width: 5760, height: 3840, hasTransparency: true,
+    },
+  };
 }
 
 function deferred<T>() {
@@ -99,20 +146,20 @@ it("有视频时等待用户手动开始", () => {
   expect(start).not.toHaveBeenCalled();
 });
 
-it("参考图片准确说明后续预处理阶段且不发起请求", () => {
+it("图片也等待用户手动启动本地预处理", async () => {
   stubDesktop();
-  const start = vi.fn();
+  const start = vi.fn().mockResolvedValue(imageProject(completedImageTask()));
   render(
     <LocalPreprocessingPanel
-      project={{ ...project(), referenceMedia: { type: "image", id: "image-001", originalName: "hero.png", format: "png", sizeBytes: 11, width: 1200, height: 1600, hasTransparency: true } }}
+      project={imageProject()}
       onProjectUpdated={vi.fn()}
       start={start}
     />,
   );
 
-  expect(screen.getByText("参考图片的本地预处理将在后续版本提供；当前不会启动请求。")).toBeVisible();
-  expect(screen.queryByRole("button", { name: "开始本地预处理" })).not.toBeInTheDocument();
-  expect(start).not.toHaveBeenCalled();
+  expect(screen.getByText("此步骤只在本机处理，将生成方向与色彩标准化后的分析代理。")).toBeVisible();
+  await userEvent.click(screen.getByRole("button", { name: "开始本地预处理" }));
+  expect(start).toHaveBeenCalledWith("project-001");
 });
 
 it("没有参考素材时说明前置条件且不提供启动按钮", () => {
@@ -179,10 +226,53 @@ it("完成后展示本地摘要和待语义分析结论", () => {
   expect(screen.getByRole("status")).toHaveAccessibleName(expect.stringContaining("初步结论"));
 });
 
+it("完成图片任务显示四个图片阶段和专属摘要，不混入视频结论", () => {
+  stubDesktop();
+  render(<LocalPreprocessingPanel project={imageProject(completedImageTask())} onProjectUpdated={vi.fn()} />);
+
+  for (const label of ["图像解码", "方向与色彩标准化", "分析代理生成", "初步可复刻性判断"]) {
+    expect(screen.getByText(label)).toBeInTheDocument();
+  }
+  expect(screen.getByText("代理尺寸：2048×1365")).toBeVisible();
+  expect(screen.getByText("透明区域已使用白色背景处理。")).toBeVisible();
+  expect(screen.getByText("待语义分析确认")).toBeVisible();
+  expect(screen.queryByText(/镜头/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/运动强度/)).not.toBeInTheDocument();
+});
+
+it("图片任务失败时把焦点移到桌面端重试按钮", () => {
+  stubDesktop();
+  const running: ImageLocalPreprocessing = {
+    ...completedImageTask(),
+    status: "running",
+    currentStage: "proxyGeneration",
+    completedAt: null,
+    proxySummary: null,
+    reproducibilityAssessment: null,
+    stages: imageStageNames.map((name) => ({
+      name,
+      status: name === "imageDecoding" || name === "imageNormalization" ? "completed" : name === "proxyGeneration" ? "running" : "pending",
+      startedAt: null,
+      completedAt: null,
+    })),
+  };
+  const view = render(<LocalPreprocessingPanel project={imageProject(running)} onProjectUpdated={vi.fn()} />);
+  const failed: ImageLocalPreprocessing = {
+    ...running,
+    status: "failed",
+    error: { code: "proxy_generation_failed", message: "分析代理无法压缩到安全上限。", stage: "proxyGeneration", retryable: true },
+    stages: running.stages.map((stage) => ({ ...stage, status: stage.name === "proxyGeneration" ? "failed" : stage.status })),
+  };
+
+  view.rerender(<LocalPreprocessingPanel project={imageProject(failed)} onProjectUpdated={vi.fn()} />);
+
+  expect(screen.getByRole("button", { name: "从失败阶段重试" })).toHaveFocus();
+});
+
 it("超出范围时完整展示失败检查，且不可用运动不伪称低运动", () => {
   stubDesktop();
   const task = completedTask({
-    proxySummary: { keyframeCount: 2, contactSheetCount: 1, sceneChangeCount: 2, motionP50: null, motionP90: null, motionPeak: null, motionLevel: "unavailable" },
+    proxySummary: { mediaType: "video", keyframeCount: 2, contactSheetCount: 1, sceneChangeCount: 2, motionP50: null, motionP90: null, motionPeak: null, motionLevel: "unavailable" },
     reproducibilityAssessment: {
       status: "out_of_scope",
       checks: [{ criterion: "single_shot", status: "failed", message: "检测到多个镜头", evidence: "检测到 2 次镜头切换。" }],
@@ -284,6 +374,14 @@ it("窄屏保留后台失败详情，但不提供提交重试", () => {
   expect(screen.getByRole("alert")).toHaveTextContent("运动分析失败");
   expect(screen.getByRole("alert")).toHaveTextContent("无法读取运动向量");
   expect(screen.queryByRole("button", { name: "从失败阶段重试" })).not.toBeInTheDocument();
+});
+
+it("窄屏图片任务只读，不显示启动操作", () => {
+  stubDesktop(false);
+  render(<LocalPreprocessingPanel project={imageProject()} onProjectUpdated={vi.fn()} />);
+
+  expect(screen.getByText("请在宽度至少 1024px 的桌面设备开始或重试本地预处理")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "开始本地预处理" })).not.toBeInTheDocument();
 });
 
 it("窄屏保留刷新错误并可重新读取状态", async () => {

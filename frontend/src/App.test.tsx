@@ -99,12 +99,35 @@ describe("项目首页", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("图片本地预处理排队时锁定参考素材替换", async () => {
+    vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    const readyProject = {
+      id: "project-001", name: "图片复刻", createdAt: "2026-09-10T10:00:00+00:00", updatedAt: "2026-09-10T10:00:00+00:00",
+      referenceMedia: { type: "image" as const, id: "image-001", originalName: "hero.png", format: "png" as const, sizeBytes: 11, width: 1200, height: 1600, hasTransparency: true },
+      localPreprocessing: {
+        id: "preprocessing-001", sourceReferenceMediaId: "image-001", mediaType: "image" as const, algorithmVersion: 1, status: "queued" as const,
+        currentStage: "imageDecoding" as const, stages: [], queuedAt: "2026-09-10T10:00:00+00:00", startedAt: null,
+        updatedAt: "2026-09-10T10:00:00+00:00", completedAt: null, proxySummary: null, reproducibilityAssessment: null, error: null,
+      },
+    };
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValueOnce(response([readyProject]));
+    fetchMock.mockResolvedValueOnce(response(capabilities));
+
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: /图片复刻/ }));
+
+    expect(screen.getByText("本地预处理或深度捕捉运行时不能更换参考素材")).toBeVisible();
+    expect(screen.getByLabelText("参考素材文件")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "更换参考素材" })).toBeDisabled();
+  });
+
   it("重新打开完成项目直接显示摘要且不会自动 POST", async () => {
     const completed = {
       id: "preprocessing-001", sourceReferenceMediaId: "video-001", mediaType: "video", algorithmVersion: 1, status: "completed" as const,
       currentStage: null, queuedAt: "2026-09-10T10:00:00+00:00", startedAt: "2026-09-10T10:00:00+00:00", updatedAt: "2026-09-10T10:01:00+00:00", completedAt: "2026-09-10T10:01:00+00:00",
       stages: ["decoding", "sceneDetection", "keyframeExtraction", "motionAnalysis", "reproducibilityAssessment"].map((name) => ({ name: name as "decoding" | "sceneDetection" | "keyframeExtraction" | "motionAnalysis" | "reproducibilityAssessment", status: "completed" as const, startedAt: null, completedAt: null })),
-      proxySummary: { keyframeCount: 8, contactSheetCount: 1 as const, sceneChangeCount: 0, motionP50: 1, motionP90: 2, motionPeak: 3, motionLevel: "light" as const },
+      proxySummary: { mediaType: "video" as const, keyframeCount: 8, contactSheetCount: 1 as const, sceneChangeCount: 0, motionP50: 1, motionP90: 2, motionPeak: 3, motionLevel: "light" as const },
       reproducibilityAssessment: { status: "pending_semantic_confirmation" as const, checks: [] }, error: null,
     };
     const readyProject = {

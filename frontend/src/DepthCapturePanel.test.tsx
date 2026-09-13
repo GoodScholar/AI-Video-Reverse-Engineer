@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { DepthCapturePanel } from "./DepthCapturePanel";
-import type { DepthCapture, DepthCaptureStageName, Project } from "./models";
+import type { DepthCapture, DepthCaptureStageName, Project, VideoLocalPreprocessing } from "./models";
 
 function stubDesktop(matches = true) {
   const listeners = new Set<(event: MediaQueryListEvent) => void>();
@@ -202,7 +202,7 @@ it("参考素材变化后解除提交锁并忽略旧的深度启动响应", asyn
   const view = render(<DepthCapturePanel project={initial} onProjectUpdated={onProjectUpdated} start={vi.fn().mockReturnValue(pending.promise)} onMutationPendingChange={onMutationPendingChange} />);
   await userEvent.click(screen.getByRole("button", { name: "开始本地深度捕捉" }));
   expect(onMutationPendingChange).toHaveBeenCalledWith(true);
-  const changedReference = { ...initial, referenceMedia: { ...initial.referenceMedia!, id: "video-002", originalName: "replacement.mp4" }, localPreprocessing: { ...initial.localPreprocessing!, sourceReferenceMediaId: "video-002", mediaType: "video" as const } };
+  const changedReference = { ...initial, referenceMedia: { ...initial.referenceMedia!, id: "video-002", originalName: "replacement.mp4" }, localPreprocessing: { ...initial.localPreprocessing!, sourceReferenceMediaId: "video-002", mediaType: "video" as const } as VideoLocalPreprocessing };
   view.rerender(<DepthCapturePanel project={changedReference} onProjectUpdated={onProjectUpdated} start={vi.fn().mockReturnValue(pending.promise)} onMutationPendingChange={onMutationPendingChange} />);
   await act(async () => { pending.resolve(project()); await pending.promise; });
   expect(onProjectUpdated).not.toHaveBeenCalled();

@@ -23,19 +23,30 @@ export type ReferenceImage = {
 
 export type ReferenceMedia = ReferenceImage | ReferenceVideo;
 
-export type PreprocessingStageName =
+export type VideoPreprocessingStageName =
   | "decoding"
   | "sceneDetection"
   | "keyframeExtraction"
   | "motionAnalysis"
   | "reproducibilityAssessment";
 
-export type PreprocessingStageState = {
-  name: PreprocessingStageName;
+export type ImagePreprocessingStageName =
+  | "imageDecoding"
+  | "imageNormalization"
+  | "proxyGeneration"
+  | "reproducibilityAssessment";
+
+export type PreprocessingStageName = VideoPreprocessingStageName | ImagePreprocessingStageName;
+
+export type PreprocessingStageState<Name extends PreprocessingStageName = PreprocessingStageName> = {
+  name: Name;
   status: "pending" | "running" | "completed" | "failed";
   startedAt: string | null;
   completedAt: string | null;
 };
+
+export type VideoPreprocessingStageState = PreprocessingStageState<VideoPreprocessingStageName>;
+export type ImagePreprocessingStageState = PreprocessingStageState<ImagePreprocessingStageName>;
 
 export type LocalPreprocessingError = {
   code: string;
@@ -55,33 +66,52 @@ export type ReproducibilityCheck = {
   evidence: string;
 };
 
-export type LocalPreprocessing = {
+export type VideoProxySummary = {
+  mediaType: "video";
+  keyframeCount: number;
+  contactSheetCount: 1;
+  sceneChangeCount: number;
+  motionP50: number | null;
+  motionP90: number | null;
+  motionPeak: number | null;
+  motionLevel: "light" | "moderate" | "high" | "unavailable";
+};
+
+export type ImageProxySummary = {
+  mediaType: "image";
+};
+
+type LocalPreprocessingBase = {
   id: string;
   sourceReferenceMediaId: string;
-  mediaType: "image" | "video";
   algorithmVersion: 1;
   status: "queued" | "running" | "completed" | "failed";
-  currentStage: PreprocessingStageName | null;
-  stages: PreprocessingStageState[];
   queuedAt: string;
   startedAt: string | null;
   updatedAt: string;
   completedAt: string | null;
-  proxySummary: {
-    keyframeCount: number;
-    contactSheetCount: 1;
-    sceneChangeCount: number;
-    motionP50: number | null;
-    motionP90: number | null;
-    motionPeak: number | null;
-    motionLevel: "light" | "moderate" | "high" | "unavailable";
-  } | null;
   reproducibilityAssessment: {
     status: "out_of_scope" | "pending_semantic_confirmation";
     checks: ReproducibilityCheck[];
   } | null;
   error: LocalPreprocessingError | null;
 };
+
+export type VideoLocalPreprocessing = LocalPreprocessingBase & {
+  mediaType: "video";
+  currentStage: VideoPreprocessingStageName | null;
+  stages: VideoPreprocessingStageState[];
+  proxySummary: VideoProxySummary | null;
+};
+
+export type ImageLocalPreprocessing = LocalPreprocessingBase & {
+  mediaType: "image";
+  currentStage: ImagePreprocessingStageName | null;
+  stages: ImagePreprocessingStageState[];
+  proxySummary: ImageProxySummary | null;
+};
+
+export type LocalPreprocessing = VideoLocalPreprocessing | ImageLocalPreprocessing;
 
 export type DepthCaptureStageName =
   | "preparing"

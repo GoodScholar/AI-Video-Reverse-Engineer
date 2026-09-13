@@ -144,12 +144,14 @@ h1 { max-width: 700px; margin-bottom: 15px; font-size: clamp(30px, 4vw, 48px); l
 .local-preprocessing-stage, .preprocessing-stage { min-height: 48px; display: grid; grid-template-columns: 24px 1fr auto; align-items: center; gap: 10px; border-bottom: 1px solid #c7c6bc; }
 .local-preprocessing-stage > :last-child { color: var(--metadata-text); font-size: 12px; line-height: 1.4; letter-spacing: .08em; }
 .local-preprocessing-conclusion { margin-top: 28px; }
+.local-preprocessing-conclusion--image .local-preprocessing-summary { grid-template-columns: 1fr; }
 .local-preprocessing-summary, .preprocessing-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 0 0 22px; padding: 0; list-style: none; border-top: 1px solid #c7c6bc; }
 .local-preprocessing-summary li { min-width: 0; padding: 15px 12px 15px 0; border-bottom: 1px solid #c7c6bc; color: #202427; }
 .local-preprocessing-assessment { padding: 18px 0 0; border-top: 1px solid #c7c6bc; }
 .local-preprocessing-check { margin-bottom: 14px; color: #4c5454; }
 .local-preprocessing-check strong, .local-preprocessing-check span { display: block; }
 .local-preprocessing-check span { margin-top: 4px; color: var(--metadata-text); }
+.local-preprocessing-image-note { margin-bottom: 0; color: #4c5454; line-height: 1.6; }
 .preprocessing-assessment--out-of-scope, .local-preprocessing-conclusion--out-of-scope .local-preprocessing-assessment { border-top: 1px solid var(--primary-button); padding-top: 14px; }
 .local-preprocessing-error { margin: 20px 0; padding: 12px 0 0; display: flex; align-items: flex-start; gap: 9px; border-top: 1px solid var(--primary-button); color: #8a2c17; line-height: 1.5; }
 .local-preprocessing-error strong { display: block; margin-bottom: 2px; }
