@@ -1,9 +1,7 @@
-from datetime import datetime, timezone
-
 import pytest
 from pydantic import ValidationError
 
-from app.semantic_analysis import SemanticAnalysis, StructuredVisualAnalysis, validate_analysis_for_media
+from app.semantic_analysis import StructuredVisualAnalysis, validate_analysis_for_media
 
 
 def valid_image_result():
@@ -72,19 +70,10 @@ def test_analysis_rejects_unknown_media_type():
         validate_analysis_for_media(valid_image_result(), "audio")
 
 
-def test_semantic_analysis_defaults_first_result_version_to_one():
-    analysis = SemanticAnalysis(
-        id="analysis-001",
-        sourceReferenceMediaId="media-001",
-        sourcePreprocessingId="preprocessing-001",
-        provider="bailian",
-        model="qwen3.7-flash",
-        promptVersion=1,
-        schemaVersion=1,
-        status="queued",
-        createdAt=datetime(2026, 9, 13, tzinfo=timezone.utc).isoformat(),
-        updatedAt=datetime(2026, 9, 13, tzinfo=timezone.utc).isoformat(),
-    )
+def test_structured_visual_analysis_defaults_result_version_to_one():
+    payload = valid_image_result()
+    payload.pop("version")
 
-    assert analysis.result is None
-    assert analysis.schemaVersion == 1
+    analysis = StructuredVisualAnalysis.model_validate(payload)
+
+    assert analysis.version == 1

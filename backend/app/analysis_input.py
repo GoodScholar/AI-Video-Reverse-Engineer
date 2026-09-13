@@ -46,8 +46,16 @@ class VideoMotion(_StrictInput):
     level: Literal["light", "moderate", "high", "unavailable"]
 
 
+class VideoSource(_StrictInput):
+    durationSeconds: float = Field(gt=0)
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    frameRate: float = Field(gt=0)
+
+
 class VideoProxy(_StrictInput):
     schemaVersion: Literal[1]
+    source: VideoSource
     keyframes: list[VideoKeyframe] = Field(min_length=1)
     scene: VideoScene
     motion: VideoMotion
