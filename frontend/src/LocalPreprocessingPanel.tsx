@@ -178,7 +178,10 @@ export function LocalPreprocessingPanel({
   const startButtonRef = useRef<HTMLButtonElement>(null);
   const retryButtonRef = useRef<HTMLButtonElement>(null);
   const focusStatusForProjectRef = useRef<string | null>(null);
-  const previousTaskStatusRef = useRef<LocalPreprocessing["status"] | null>(task?.status ?? null);
+  const previousTaskRef = useRef<{ projectId: string; status: LocalPreprocessing["status"] | null }>({
+    projectId: project.id,
+    status: task?.status ?? null,
+  });
   currentProjectIdRef.current = project.id;
   callbackRef.current = onProjectUpdated;
 
@@ -209,11 +212,18 @@ export function LocalPreprocessingPanel({
   }, [submitError]);
 
   useEffect(() => {
-    if (task?.status === "failed" && previousTaskStatusRef.current !== "failed" && isDesktop) {
+    const previousTask = previousTaskRef.current;
+    const sameProject = previousTask.projectId === project.id;
+    const completedFromActiveTask = sameProject
+      && (previousTask.status === "queued" || previousTask.status === "running")
+      && task?.status === "completed";
+    if (completedFromActiveTask) {
+      statusHeadingRef.current?.focus();
+    } else if (sameProject && task?.status === "failed" && previousTask.status !== "failed" && isDesktop) {
       retryButtonRef.current?.focus();
     }
-    previousTaskStatusRef.current = task?.status ?? null;
-  }, [isDesktop, task?.status]);
+    previousTaskRef.current = { projectId: project.id, status: task?.status ?? null };
+  }, [isDesktop, project.id, task?.status]);
 
   useEffect(() => {
     if (!canPoll) return undefined;

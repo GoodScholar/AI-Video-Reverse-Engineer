@@ -42,3 +42,27 @@ tsc -b && vite build 成功
 ```
 
 工作树内没有 `.venv/bin/pytest`，因此后端验证使用仓库共享的 `../../.venv/bin/pytest`；其余命令与任务简报一致。
+
+## Fix round 1：完成态焦点
+
+### RED
+
+先为初始 `queued` 和 `running` 的项目添加轮询完成后的焦点测试，并确认普通初始完成态不会抢占焦点：
+
+```sh
+npm --prefix frontend test -- LocalPreprocessingPanel.test.tsx App.test.tsx
+```
+
+结果：`41 passed, 2 failed`。两个失败均为预期行为：轮询返回 completed 后，焦点仍留在“其他控件”，未移动到“本地预处理已完成”标题。
+
+### GREEN
+
+状态引用现在同时记录项目 ID 与上一次状态；仅在同一项目从 `queued` 或 `running` 转为 `completed` 时聚焦状态标题。初始完成态、项目切换、卸载和被既有请求代次防护丢弃的旧响应均不触发该焦点转移；失败态原有的重试按钮焦点保持不变。
+
+```text
+npm --prefix frontend test -- LocalPreprocessingPanel.test.tsx App.test.tsx
+43 passed
+
+npm --prefix frontend run build
+tsc -b && vite build 成功
+```

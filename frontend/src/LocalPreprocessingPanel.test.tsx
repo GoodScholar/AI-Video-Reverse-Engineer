@@ -319,6 +319,46 @@ it("运行中每秒读取一次，未完成请求不重叠且完成后停止", a
   expect(load).toHaveBeenCalledTimes(1);
 });
 
+for (const initialStatus of ["queued", "running"] as const) {
+  it(`${initialStatus} 任务轮询完成后把焦点移到状态标题`, async () => {
+    vi.useFakeTimers();
+    stubDesktop();
+    const initial = project(preprocessing({
+      status: initialStatus,
+      currentStage: initialStatus === "running" ? "decoding" : null,
+    }));
+    const completed = project(completedTask());
+    const load = vi.fn().mockResolvedValue(completed);
+    const onProjectUpdated = vi.fn();
+    let view: ReturnType<typeof render>;
+    const panel = (current: Project) => <>
+      <button type="button">其他控件</button>
+      <LocalPreprocessingPanel project={current} onProjectUpdated={onProjectUpdated} load={load} />
+    </>;
+    onProjectUpdated.mockImplementation((next: Project) => view.rerender(panel(next)));
+    view = render(panel(initial));
+    const otherControl = screen.getByRole("button", { name: "其他控件" });
+    otherControl.focus();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+
+    expect(screen.getByRole("heading", { name: "本地预处理已完成" })).toHaveFocus();
+  });
+}
+
+it("初始已完成任务不抢占当前焦点", () => {
+  stubDesktop();
+  render(<>
+    <button type="button">其他控件</button>
+    <LocalPreprocessingPanel project={project(completedTask())} onProjectUpdated={vi.fn()} />
+  </>);
+  const otherControl = screen.getByRole("button", { name: "其他控件" });
+  otherControl.focus();
+
+  expect(screen.getByRole("heading", { name: "本地预处理已完成" })).not.toHaveFocus();
+  expect(otherControl).toHaveFocus();
+});
+
 it("刷新失败保留最后状态并可手动重新读取", async () => {
   vi.useFakeTimers();
   stubDesktop();
