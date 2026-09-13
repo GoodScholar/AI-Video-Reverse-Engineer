@@ -31,10 +31,13 @@ def _migrate_local_preprocessing(project: dict) -> None:
     if not isinstance(preprocessing, dict):
         return
 
-    if "sourceReferenceMediaId" in preprocessing:
-        return
-    legacy_source_id = preprocessing.pop("sourceReferenceVideoId", None)
-    if legacy_source_id is not None:
-        preprocessing["sourceReferenceMediaId"] = legacy_source_id
-        if "mediaType" not in preprocessing:
-            preprocessing["mediaType"] = "video"
+    if "sourceReferenceMediaId" not in preprocessing:
+        legacy_source_id = preprocessing.pop("sourceReferenceVideoId", None)
+        if legacy_source_id is not None:
+            preprocessing["sourceReferenceMediaId"] = legacy_source_id
+            if "mediaType" not in preprocessing:
+                preprocessing["mediaType"] = "video"
+
+    proxy_summary = preprocessing.get("proxySummary")
+    if preprocessing.get("mediaType") == "video" and isinstance(proxy_summary, dict):
+        proxy_summary.setdefault("mediaType", "video")

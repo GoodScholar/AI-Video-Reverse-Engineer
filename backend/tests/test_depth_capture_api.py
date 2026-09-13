@@ -90,7 +90,10 @@ def _completed_project(tmp_path, *, assessment="pending_semantic_confirmation"):
     for name in ("decode.json", "scene-changes.json", "motion.json", "analysis-proxy.json"):
         (directory / name).write_text('{"done":true}', encoding="utf-8")
     (directory / "manifest.json").write_text(json.dumps({
-        "schemaVersion": 1, "algorithmVersion": 1, "sourceReferenceVideoId": "video-001",
+        "schemaVersion": 1,
+        "algorithmVersion": 1,
+        "mediaType": "video",
+        "sourceReferenceMediaId": "video-001",
     }), encoding="utf-8")
     (directory / "contact-sheet.jpg").write_bytes(b"sheet")
     frames = directory / "keyframes"
@@ -211,10 +214,13 @@ def test_start_rejects_each_completed_preprocessing_precondition(tmp_path, mutat
     payload = json.loads((tmp_path / "projects.json").read_text(encoding="utf-8"))
     preprocessing = payload[0]["localPreprocessing"]
     if mutation == "source":
-        preprocessing["sourceReferenceVideoId"] = "video-other"
+        preprocessing["sourceReferenceMediaId"] = "video-other"
         manifest = tmp_path / "project-files/project-001/local-preprocessing/preprocess-001/manifest.json"
         manifest.write_text(json.dumps({
-            "schemaVersion": 1, "algorithmVersion": 1, "sourceReferenceVideoId": "video-other",
+            "schemaVersion": 1,
+            "algorithmVersion": 1,
+            "mediaType": "video",
+            "sourceReferenceMediaId": "video-other",
         }), encoding="utf-8")
     elif mutation == "out_of_scope":
         preprocessing["reproducibilityAssessment"]["status"] = "out_of_scope"

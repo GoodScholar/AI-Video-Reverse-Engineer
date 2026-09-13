@@ -189,7 +189,10 @@ def test_five_legacy_project_json_fixtures_migrate_and_next_write_uses_only_new_
         assert preprocessing["currentStage"] == expected["currentStage"]
         assert preprocessing["stages"] == expected["stages"]
         assert preprocessing["error"] == expected["error"]
-        assert preprocessing["proxySummary"] == expected["proxySummary"]
+        expected_proxy_summary = expected["proxySummary"]
+        if expected_proxy_summary is not None:
+            expected_proxy_summary = {**expected_proxy_summary, "mediaType": "video"}
+        assert preprocessing["proxySummary"] == expected_proxy_summary
         assert preprocessing["reproducibilityAssessment"] == expected["reproducibilityAssessment"]
         assert preprocessing["sourceReferenceMediaId"] == "video-001"
         assert preprocessing["mediaType"] == "video"

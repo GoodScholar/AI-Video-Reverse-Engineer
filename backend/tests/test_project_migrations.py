@@ -59,6 +59,27 @@ def test_migrates_legacy_preprocessing_source_to_typed_reference_media_source():
     assert payload["localPreprocessing"] == {"sourceReferenceVideoId": "video-001"}
 
 
+def test_migrates_legacy_video_proxy_summary_to_discriminated_union_idempotently():
+    preprocessing = _legacy_preprocessing("completed")
+    preprocessing["proxySummary"] = {
+        "keyframeCount": 4,
+        "contactSheetCount": 1,
+        "sceneChangeCount": 0,
+        "motionP50": 1.0,
+        "motionP90": 2.0,
+        "motionPeak": 3.0,
+        "motionLevel": "light",
+    }
+    payload = _legacy_project(local_preprocessing=preprocessing)
+
+    migrated = migrate_project_payload(payload)
+
+    assert migrated["localPreprocessing"]["proxySummary"]["mediaType"] == "video"
+    assert Project.model_validate(migrated).localPreprocessing.proxySummary.mediaType == "video"
+    assert migrate_project_payload(migrated) == migrated
+    assert "mediaType" not in payload["localPreprocessing"]["proxySummary"]
+
+
 def test_current_fields_win_while_input_remains_unchanged_and_result_is_idempotent():
     payload = {
         "referenceVideo": {"id": "video-legacy"},

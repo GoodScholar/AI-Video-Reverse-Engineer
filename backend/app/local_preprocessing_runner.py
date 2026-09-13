@@ -192,7 +192,8 @@ def run_decoding_stage(
     write_stage_json(output_directory, "decode.json", {
         "schemaVersion": 1,
         "algorithmVersion": ALGORITHM_VERSION,
-        "sourceReferenceVideoId": reference.id,
+        "mediaType": "video",
+        "sourceReferenceMediaId": reference.id,
         "expectedFrameCount": round(reference.durationSeconds * reference.frameRate),
         "completedAt": _timestamp(),
         "ffmpegVersion": _ffmpeg_version(ffmpeg_path, run),
@@ -321,7 +322,8 @@ def run_assessment_stage(
     manifest = {
         "schemaVersion": 1,
         "algorithmVersion": ALGORITHM_VERSION,
-        "sourceReferenceVideoId": reference.id,
+        "mediaType": "video",
+        "sourceReferenceMediaId": reference.id,
         "generatedAt": _timestamp(),
         "parameters": _fixed_parameters(),
         "keyframes": proxy["keyframes"],

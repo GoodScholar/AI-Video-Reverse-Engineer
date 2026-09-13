@@ -107,7 +107,8 @@ def write_completed_project_with_artifacts(tmp_path, *, first_invalid_stage):
             (directory / "manifest.json").write_text(json.dumps({
                 "schemaVersion": 1,
                 "algorithmVersion": 1,
-                "sourceReferenceVideoId": "video-001",
+                "mediaType": "video",
+                "sourceReferenceMediaId": "video-001",
             }), encoding="utf-8")
     return project, (tmp_path / "projects.json").read_bytes()
 
@@ -298,7 +299,8 @@ def test_completed_task_is_idempotent_and_is_not_dispatched_again(tmp_path):
         (output / "manifest.json").write_text(json.dumps({
             "schemaVersion": 1,
             "algorithmVersion": 1,
-            "sourceReferenceVideoId": kwargs["reference"].id,
+            "mediaType": "video",
+            "sourceReferenceMediaId": kwargs["reference"].id,
         }), encoding="utf-8")
         return PreprocessingRunResult(
             proxy_summary=AnalysisProxySummary(

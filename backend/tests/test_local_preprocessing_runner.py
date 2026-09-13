@@ -230,7 +230,11 @@ def test_full_run_writes_only_proxy_contract_and_not_source_metadata(tmp_path):
         "durationSeconds": 2.5, "width": 854, "height": 480, "frameRate": 24.0,
     }
     assert json.loads((output / "decode.json").read_text(encoding="utf-8"))["ffmpegVersion"] == "8.1.1"
-    assert json.loads((output / "manifest.json").read_text(encoding="utf-8"))["parameters"] == {
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["mediaType"] == "video"
+    assert manifest["sourceReferenceMediaId"] == "video-001"
+    assert "sourceReferenceVideoId" not in manifest
+    assert manifest["parameters"] == {
         "analysisSampleRate": ANALYSIS_SAMPLE_RATE,
         "analysisLongEdge": ANALYSIS_LONG_EDGE,
         "keyframeLongEdge": KEYFRAME_LONG_EDGE,
