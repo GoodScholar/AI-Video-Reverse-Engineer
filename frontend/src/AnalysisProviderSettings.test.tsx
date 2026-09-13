@@ -11,6 +11,11 @@ const providers: AnalysisProviderConfiguration[] = [
   { provider: "local_openai_compatible" as const, model: "vision-local", baseUrl: "http://127.0.0.1:8080", credentialState: "unconfigured" as const, selectedProvider: "bailian" as const },
 ];
 
+const providersWithUnimplementedCloud = [
+  ...providers,
+  { provider: "openai" as const, model: null, baseUrl: null, credentialState: "unconfigured" as const, selectedProvider: "openai" as const },
+];
+
 it("保存密钥后立即清空密码输入且只显示配置状态", async () => {
   vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
   const user = userEvent.setup();
@@ -58,4 +63,14 @@ it("保存无密钥的本地兼容服务后标为已配置且已选择", async (
   expect(save).toHaveBeenCalledWith("local_openai_compatible", { model: "vision-local", baseUrl: "http://127.0.0.1:8080" });
   expect(localProviderCard).toHaveAttribute("aria-pressed", "true");
   expect(within(localProviderCard).getByText("已配置")).toBeVisible();
+});
+
+it("只允许配置已实现的百炼和本地服务，不把未实现云端显示为本地表单", () => {
+  vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  render(<AnalysisProviderSettings providers={providersWithUnimplementedCloud} save={vi.fn()} testConnection={vi.fn()} />);
+
+  expect(screen.getByRole("button", { name: /阿里云百炼/ })).toBeVisible();
+  expect(screen.getAllByRole("button", { name: /本地 OpenAI 兼容服务/ })).toHaveLength(1);
+  expect(screen.getByRole("heading", { name: "阿里云百炼" })).toBeVisible();
+  expect(screen.queryByText("本地服务 API Key（可选）")).not.toBeInTheDocument();
 });

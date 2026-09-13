@@ -1,6 +1,7 @@
 import pytest
 
-from app.provider_models import MODEL_CATALOG, models_for, model_is_allowed
+from app.analysis_provider_catalog import CATALOG
+from app.provider_models import MODEL_CATALOG, PROVIDER_IDS, models_for, model_is_allowed, provider_for
 
 
 @pytest.mark.parametrize(
@@ -38,3 +39,15 @@ def test_model_catalog_cannot_be_mutated_after_import():
     finally:
         if isinstance(MODEL_CATALOG, dict):
             MODEL_CATALOG["openai"] = original
+
+
+def test_legacy_catalog_is_a_compatibility_projection_of_the_unified_directory():
+    assert tuple(CATALOG.providers) == PROVIDER_IDS
+    for provider_id in PROVIDER_IDS:
+        source = provider_for(provider_id)
+        legacy = CATALOG.providers[provider_id]
+        assert legacy.label == source.label
+        if legacy.availability == "verified":
+            assert [model.modelId for model in legacy.models] == [model.id for model in source.models]
+        else:
+            assert legacy.models == ()

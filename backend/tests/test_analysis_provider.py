@@ -70,8 +70,10 @@ def catalog_with_verified_doubao(endpoint_bindings):
     return ProviderCatalog(version=1, providers=providers)
 
 
-def test_catalog_exposes_only_the_first_wave_and_verified_bailian_model():
-    assert set(CATALOG.providers) == {"bailian", "openai", "gemini", "doubao", "claude"}
+def test_catalog_exposes_all_unified_provider_ids_and_verified_bailian_model():
+    assert set(CATALOG.providers) == {
+        "bailian", "local_openai_compatible", "openai", "doubao", "gemini", "grok", "claude",
+    }
 
     bailian = CATALOG.providers["bailian"]
     assert bailian.availability == "verified"

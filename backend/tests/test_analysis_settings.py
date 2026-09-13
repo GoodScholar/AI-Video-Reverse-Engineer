@@ -266,21 +266,23 @@ def test_failed_credential_write_preserves_the_previous_non_sensitive_configurat
         credential_store=credentials,
         analysis_settings=settings,
     ))
-    initial = client.put("/api/analysis-providers/bailian/configuration", json={
+    initial = client.put("/api/analysis-providers/local_openai_compatible/configuration", json={
         "apiKey": "first-secret",
-        "model": "qwen3.7-flash",
+        "model": "vision-local-first",
+        "baseUrl": "http://localhost:1234/v1",
     })
     assert initial.status_code == 200
     credentials.fail_writes = True
 
-    response = client.put("/api/analysis-providers/bailian/configuration", json={
+    response = client.put("/api/analysis-providers/local_openai_compatible/configuration", json={
         "apiKey": "replacement-secret",
-        "model": "qwen3.7-flash",
+        "model": "vision-local-replacement",
+        "baseUrl": "http://localhost:1234/v1",
     })
 
     assert response.status_code == 503
-    assert settings.get("bailian").model == "qwen3.7-flash"
-    assert credentials.get("bailian") == "first-secret"
+    assert settings.get("local_openai_compatible").model == "vision-local-first"
+    assert credentials.get("local_openai_compatible") == "first-secret"
     assert "replacement-secret" not in response.text
 
 
@@ -330,10 +332,10 @@ def test_unknown_provider_is_rejected_before_any_credential_store_access(tmp_pat
 def test_credential_read_failure_without_an_api_key_preserves_existing_configuration(tmp_path):
     settings = AnalysisSettings(tmp_path / "analysis-providers.json")
     settings.save(
-        provider="bailian",
-        model="qwen3.7-flash",
-        base_url=None,
-        selected_provider="bailian",
+        provider="local_openai_compatible",
+        model="vision-local-first",
+        base_url="http://localhost:1234/v1",
+        selected_provider="local_openai_compatible",
     )
     client = TestClient(create_app(
         data_dir=tmp_path,
@@ -341,12 +343,13 @@ def test_credential_read_failure_without_an_api_key_preserves_existing_configura
         analysis_settings=settings,
     ))
 
-    response = client.put("/api/analysis-providers/bailian/configuration", json={
-        "model": "qwen3.7-flash",
+    response = client.put("/api/analysis-providers/local_openai_compatible/configuration", json={
+        "model": "vision-local-replacement",
+        "baseUrl": "http://localhost:1234/v1",
     })
 
     assert response.status_code == 503
-    assert settings.get("bailian").model == "qwen3.7-flash"
+    assert settings.get("local_openai_compatible").model == "vision-local-first"
 
 
 def test_invalid_local_url_never_attempts_a_credential_rollback(tmp_path):

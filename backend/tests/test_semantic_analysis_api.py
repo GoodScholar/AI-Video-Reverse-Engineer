@@ -330,8 +330,15 @@ def test_analysis_rejects_a_model_outside_the_provider_catalog(tmp_path):
         credential_store=InMemoryCredentials(),
         analysis_settings=AnalysisSettings(tmp_path / "analysis-providers.json"),
     ))
-    response = client.put("/api/analysis-providers/bailian/configuration", json={
+    configured = client.put("/api/analysis-providers/bailian/configuration", json={
+        "model": "qwen3.7-flash",
+    })
+    assert configured.status_code == 200
+    project_id = ready_project(client, tmp_path)
+    response = client.post(f"/api/projects/{project_id}/semantic-analysis", json={
+        "provider": "bailian",
         "model": "not-a-bailian-vision-model",
+        "disclosureAccepted": True,
     })
 
     assert response.status_code == 400

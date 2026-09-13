@@ -1,4 +1,4 @@
-import { type FormEvent, useEffect, useState } from "react";
+import { type FormEvent, useEffect, useMemo, useState } from "react";
 import { Check, CircleAlert, PlugZap, Save } from "lucide-react";
 
 import type { AnalysisProviderConfiguration, AnalysisProviderId } from "./models";
@@ -10,6 +10,7 @@ import {
 
 const DESKTOP_QUERY = "(min-width: 1024px)";
 const BAILIAN_MODEL = "qwen3.7-flash";
+const IMPLEMENTED_PROVIDER_IDS = new Set<AnalysisProviderId>(["bailian", "local_openai_compatible"]);
 
 type Props = {
   providers: AnalysisProviderConfiguration[];
@@ -45,6 +46,10 @@ function initialProvider(providers: AnalysisProviderConfiguration[]): AnalysisPr
     ?? null;
 }
 
+function implementedProviders(providers: AnalysisProviderConfiguration[]) {
+  return providers.filter((provider) => IMPLEMENTED_PROVIDER_IDS.has(provider.provider));
+}
+
 function isConfigured(provider: AnalysisProviderConfiguration) {
   return provider.credentialState === "configured"
     || (provider.provider === "local_openai_compatible"
@@ -63,8 +68,9 @@ export function AnalysisProviderSettings({
   testConnection = testAnalysisProviderConnection,
 }: Props) {
   const isDesktop = useDesktop();
-  const [selectedProvider, setSelectedProvider] = useState<AnalysisProviderId | null>(() => initialProvider(providers));
-  const selected = providers.find((provider) => provider.provider === selectedProvider) ?? null;
+  const availableProviders = useMemo(() => implementedProviders(providers), [providers]);
+  const [selectedProvider, setSelectedProvider] = useState<AnalysisProviderId | null>(() => initialProvider(implementedProviders(providers)));
+  const selected = availableProviders.find((provider) => provider.provider === selectedProvider) ?? null;
   const [model, setModel] = useState(selected?.model ?? "");
   const [baseUrl, setBaseUrl] = useState(selected?.baseUrl ?? "");
   const [apiKey, setApiKey] = useState("");
@@ -74,18 +80,18 @@ export function AnalysisProviderSettings({
   const [connectionStatus, setConnectionStatus] = useState("");
 
   useEffect(() => {
-    const next = initialProvider(providers);
-    setSelectedProvider((current) => providers.some((provider) => provider.provider === current) ? current : next);
-  }, [providers]);
+    const next = initialProvider(availableProviders);
+    setSelectedProvider((current) => availableProviders.some((provider) => provider.provider === current) ? current : next);
+  }, [availableProviders]);
 
   useEffect(() => {
-    const next = providers.find((provider) => provider.provider === selectedProvider);
+    const next = availableProviders.find((provider) => provider.provider === selectedProvider);
     setModel(next?.model ?? (selectedProvider === "bailian" ? BAILIAN_MODEL : ""));
     setBaseUrl(next?.baseUrl ?? "");
     setApiKey("");
     setError("");
     setConnectionStatus("");
-  }, [providers, selectedProvider]);
+  }, [availableProviders, selectedProvider]);
 
   function choose(provider: AnalysisProviderId) {
     if (!isDesktop) return;
@@ -142,11 +148,11 @@ export function AnalysisProviderSettings({
         </div>
         {!isDesktop && <p className="analysis-readonly">窄屏仅查看配置状态</p>}
       </div>
-      {providers.length === 0 ? <p className="analysis-provider-empty">暂时无法读取可用分析服务。</p> : (
+      {availableProviders.length === 0 ? <p className="analysis-provider-empty">暂时无法读取可用分析服务。</p> : (
         <>
           <fieldset className="analysis-provider-choice" disabled={!isDesktop || isSaving || isTesting}>
             <legend>选择分析服务</legend>
-            {providers.map((provider) => (
+            {availableProviders.map((provider) => (
               <button key={provider.provider} className={provider.provider === selectedProvider ? "analysis-provider-option analysis-provider-option--selected" : "analysis-provider-option"} type="button" aria-pressed={provider.provider === selectedProvider} onClick={() => choose(provider.provider)}>
                 <span>{providerLabel(provider.provider)}</span>
                 <span>{isConfigured(provider) ? "已配置" : "尚未配置"}</span>

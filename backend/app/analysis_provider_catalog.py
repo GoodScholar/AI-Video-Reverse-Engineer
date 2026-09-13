@@ -1,52 +1,33 @@
-from .analysis_provider import (
-    ProviderCatalog,
-    ProviderConfigurationError,
-    ProviderDefinition,
-    ProviderModel,
-)
+from .analysis_provider import ProviderCatalog, ProviderConfigurationError, ProviderDefinition, ProviderModel
+from .provider_models import PROVIDER_IDS, provider_for
 
 
-# Verification evidence is intentionally limited to the Task 3 brief.  The
-# remaining providers stay visible but model-free until Task 9 real smoke tests.
+def _compatibility_provider(provider_id: str) -> ProviderDefinition:
+    source = provider_for(provider_id)
+    models = ()
+    if source.compatibilityAvailability == "verified":
+        models = tuple(
+            ProviderModel(
+                modelId=model.id,
+                label=model.label,
+                recommended=index == 0,
+                vision=True,
+                structuredOutput=True,
+                regions=source.compatibilityRegions,
+            )
+            for index, model in enumerate(source.models)
+        )
+    return ProviderDefinition(
+        providerId=source.id,
+        label=source.label,
+        availability=source.compatibilityAvailability,
+        models=models,
+    )
+
+
 CATALOG = ProviderCatalog(
     version=1,
-    providers={
-        "bailian": ProviderDefinition(
-            providerId="bailian",
-            label="阿里云百炼",
-            availability="verified",
-            models=(
-                ProviderModel(
-                    modelId="qwen3.7-flash",
-                    label="Qwen3.7 Flash",
-                    recommended=True,
-                    vision=True,
-                    structuredOutput=True,
-                    regions=("cn",),
-                ),
-            ),
-        ),
-        "openai": ProviderDefinition(
-            providerId="openai",
-            label="OpenAI",
-            availability="unverified",
-        ),
-        "gemini": ProviderDefinition(
-            providerId="gemini",
-            label="Google Gemini",
-            availability="unverified",
-        ),
-        "doubao": ProviderDefinition(
-            providerId="doubao",
-            label="火山方舟豆包",
-            availability="unverified",
-        ),
-        "claude": ProviderDefinition(
-            providerId="claude",
-            label="Anthropic Claude",
-            availability="unverified",
-        ),
-    },
+    providers={provider_id: _compatibility_provider(provider_id) for provider_id in PROVIDER_IDS},
 )
 
 

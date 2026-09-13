@@ -7,11 +7,10 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_serializer, field_validator, model_serializer, model_validator
 
 from .analysis_models import StructuredAnalysis
+from .provider_models import PROVIDER_IDS
 
 
-FIRST_WAVE_PROVIDER_IDS = frozenset({
-    "bailian", "openai", "gemini", "doubao", "claude",
-})
+FIRST_WAVE_PROVIDER_IDS = frozenset(PROVIDER_IDS)
 _SENSITIVE_KEY_PARTS = (
     "auth", "credential", "secret", "password", "token", "privatekey", "apikey",
 )
