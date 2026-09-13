@@ -62,6 +62,29 @@ def test_image_runner_commits_valid_artifacts_before_marking_each_stage_complete
     assert "project-001" not in encoded
 
 
+def test_image_runner_persists_actual_sizes_transparency_and_applicability_facts(tmp_path):
+    source = tmp_path / "private-reference.png"
+    Image.new("RGBA", (4096, 2049), (12, 34, 56, 0)).save(source, format="PNG")
+    output = preprocessing_directory(tmp_path, "project-001", "prep-001")
+
+    result = run_image_preprocessing(
+        source_path=source, reference=reference(), preprocessing=preprocessing(),
+        output_directory=output, on_stage_started=lambda _: None,
+        on_stage_completed=lambda _: None,
+    )
+
+    assert result.proxy_summary.model_dump() == {
+        "mediaType": "image",
+        "originalDisplaySize": {"width": 4096, "height": 2049},
+        "normalizedSize": {"width": 4096, "height": 2049},
+        "proxySize": {"width": 2048, "height": 1024},
+        "transparencyFlattened": True,
+        "applicabilityStatus": "pending_semantic_confirmation",
+    }
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["proxySummary"] == result.proxy_summary.model_dump()
+
+
 def test_image_runner_rewinds_from_first_invalid_completed_artifact(tmp_path):
     source = source_image(tmp_path / "private-reference.png")
     output = preprocessing_directory(tmp_path, "project-001", "prep-001")

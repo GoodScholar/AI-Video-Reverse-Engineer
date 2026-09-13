@@ -7,13 +7,15 @@ from pathlib import Path
 from typing import Any, Optional
 
 from PIL import Image, UnidentifiedImageError
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from .image_preprocessing import ANALYSIS_PROXY_LONG_EDGE, MAX_ANALYSIS_PROXY_BYTES
 from .local_preprocessing import (
     ALGORITHM_VERSION,
+    ImageProxySummary,
     LocalPreprocessing,
     MediaType,
+    ReproducibilityAssessment,
     StageName,
     stage_order_for,
 )
@@ -159,10 +161,7 @@ def stage_artifacts_are_valid(
         return (
             _stage_files_are_valid(directory, stage_files)
             and manifest is not None
-            and manifest.get("schemaVersion") == 1
-            and manifest.get("algorithmVersion") == ALGORITHM_VERSION
-            and manifest.get("mediaType") == preprocessing.mediaType
-            and manifest.get("sourceReferenceMediaId") == preprocessing.sourceReferenceMediaId
+            and _manifest_is_valid(manifest, directory, preprocessing)
         )
     return _stage_files_are_valid(directory, stage_files)
 
@@ -272,6 +271,66 @@ def _image_artifact_is_valid(path: Path, image_format: str) -> bool:
             return True
     except (OSError, UnidentifiedImageError, ValueError, SyntaxError):
         return False
+
+
+def _manifest_is_valid(
+    manifest: dict[str, Any], directory: Path, preprocessing: LocalPreprocessing,
+) -> bool:
+    if (
+        manifest.get("schemaVersion") != 1
+        or manifest.get("algorithmVersion") != ALGORITHM_VERSION
+    ):
+        return False
+    if _current_manifest_matches_task(manifest, preprocessing):
+        return (
+            _image_manifest_summary_matches_artifacts(manifest, directory)
+            if preprocessing.mediaType == "image" else True
+        )
+    return _legacy_video_manifest_matches_task(manifest, preprocessing)
+
+
+def _current_manifest_matches_task(
+    manifest: dict[str, Any], preprocessing: LocalPreprocessing,
+) -> bool:
+    return (
+        manifest.get("mediaType") == preprocessing.mediaType
+        and manifest.get("sourceReferenceMediaId") == preprocessing.sourceReferenceMediaId
+    )
+
+
+def _legacy_video_manifest_matches_task(
+    manifest: dict[str, Any], preprocessing: LocalPreprocessing,
+) -> bool:
+    return (
+        preprocessing.mediaType == "video"
+        and "mediaType" not in manifest
+        and "sourceReferenceMediaId" not in manifest
+        and manifest.get("sourceReferenceVideoId") == preprocessing.sourceReferenceMediaId
+    )
+
+
+def _image_manifest_summary_matches_artifacts(manifest: dict[str, Any], directory: Path) -> bool:
+    try:
+        summary = ImageProxySummary(**manifest["proxySummary"])
+        assessment = ReproducibilityAssessment(**manifest["reproducibilityAssessment"])
+        normalized_size = _image_artifact_size(directory / "normalized.png", "PNG")
+        proxy_size = _image_artifact_size(directory / "analysis-proxy.jpg", "JPEG")
+    except (KeyError, TypeError, ValidationError, OSError, UnidentifiedImageError, ValueError, SyntaxError):
+        return False
+    return (
+        summary.originalDisplaySize == summary.normalizedSize
+        and summary.normalizedSize.model_dump() == normalized_size
+        and summary.proxySize.model_dump() == proxy_size
+        and summary.applicabilityStatus == assessment.status
+    )
+
+
+def _image_artifact_size(path: Path, image_format: str) -> dict[str, int]:
+    if not _image_artifact_is_valid(path, image_format):
+        raise ValueError("图片产物无效")
+    with Image.open(path) as image:
+        image.load()
+        return {"width": image.width, "height": image.height}
 
 
 def _discard_stage_artifacts(

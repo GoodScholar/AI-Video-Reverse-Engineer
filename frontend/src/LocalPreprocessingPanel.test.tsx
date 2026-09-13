@@ -105,7 +105,14 @@ function completedImageTask(): ImageLocalPreprocessing {
     startedAt: "2026-09-11T10:00:00+00:00",
     updatedAt: "2026-09-11T10:01:00+00:00",
     completedAt: "2026-09-11T10:01:00+00:00",
-    proxySummary: { mediaType: "image" },
+    proxySummary: {
+      mediaType: "image",
+      originalDisplaySize: { width: 5760, height: 3840 },
+      normalizedSize: { width: 5760, height: 3840 },
+      proxySize: { width: 2048, height: 1365 },
+      transparencyFlattened: true,
+      applicabilityStatus: "pending_semantic_confirmation",
+    },
     reproducibilityAssessment: {
       status: "pending_semantic_confirmation",
       checks: [],
@@ -238,6 +245,26 @@ it("完成图片任务显示四个图片阶段和专属摘要，不混入视频�
   expect(screen.getByText("待语义分析确认")).toBeVisible();
   expect(screen.queryByText(/镜头/)).not.toBeInTheDocument();
   expect(screen.queryByText(/运动强度/)).not.toBeInTheDocument();
+});
+
+it("图片摘要使用后端保存的 Pillow 代理尺寸而非前端重算", () => {
+  stubDesktop();
+  const image = {
+    ...completedImageTask(),
+    proxySummary: {
+      mediaType: "image" as const,
+      originalDisplaySize: { width: 4096, height: 2049 },
+      normalizedSize: { width: 4096, height: 2049 },
+      proxySize: { width: 2048, height: 1024 },
+      transparencyFlattened: true,
+      applicabilityStatus: "pending_semantic_confirmation" as const,
+    },
+  };
+  render(<LocalPreprocessingPanel project={imageProject(image)} onProjectUpdated={vi.fn()} />);
+
+  expect(screen.getByText("代理尺寸：2048×1024")).toBeVisible();
+  expect(screen.queryByText("代理尺寸：2048×1025")).not.toBeInTheDocument();
+  expect(screen.getByText("透明区域已使用白色背景处理。")).toBeVisible();
 });
 
 it("图片任务失败时把焦点移到桌面端重试按钮", () => {

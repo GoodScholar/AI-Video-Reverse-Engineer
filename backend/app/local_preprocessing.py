@@ -84,8 +84,18 @@ class VideoProxySummary(BaseModel):
     motionLevel: Literal["light", "moderate", "high", "unavailable"]
 
 
+class ImageSize(BaseModel):
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+
+
 class ImageProxySummary(BaseModel):
     mediaType: Literal["image"] = "image"
+    originalDisplaySize: ImageSize
+    normalizedSize: ImageSize
+    proxySize: ImageSize
+    transparencyFlattened: bool
+    applicabilityStatus: Literal["out_of_scope", "pending_semantic_confirmation"]
 
 
 ProxySummary = Annotated[

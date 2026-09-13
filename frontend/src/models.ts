@@ -79,6 +79,11 @@ export type VideoProxySummary = {
 
 export type ImageProxySummary = {
   mediaType: "image";
+  originalDisplaySize: { width: number; height: number };
+  normalizedSize: { width: number; height: number };
+  proxySize: { width: number; height: number };
+  transparencyFlattened: boolean;
+  applicabilityStatus: "out_of_scope" | "pending_semantic_confirmation";
 };
 
 type LocalPreprocessingBase = {

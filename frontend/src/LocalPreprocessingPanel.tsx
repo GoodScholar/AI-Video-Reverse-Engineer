@@ -9,8 +9,6 @@ import type {
   LocalPreprocessing,
   PreprocessingStageName,
   Project,
-  ReferenceImage,
-  ReferenceMedia,
   VideoLocalPreprocessing,
   VideoPreprocessingStageName,
 } from "./models";
@@ -124,23 +122,17 @@ function VideoPreprocessingConclusion({ task }: { task: VideoLocalPreprocessing 
   );
 }
 
-function imageProxyDimensions(image: ReferenceImage) {
-  const longEdge = Math.max(image.width, image.height);
-  if (longEdge <= 2048) return `${image.width}×${image.height}`;
-  const scale = 2048 / longEdge;
-  return `${Math.round(image.width * scale)}×${Math.round(image.height * scale)}`;
-}
-
-function ImagePreprocessingConclusion({ task, image }: { task: ImageLocalPreprocessing; image: ReferenceImage | null }) {
+function ImagePreprocessingConclusion({ task }: { task: ImageLocalPreprocessing }) {
   if (!task.proxySummary || !task.reproducibilityAssessment) return null;
+  const summary = task.proxySummary;
 
   return (
     <div className="local-preprocessing-conclusion local-preprocessing-conclusion--image">
       <h3>本地预处理摘要</h3>
       <ul className="local-preprocessing-summary" aria-label="本地预处理摘要">
-        {image && <li>代理尺寸：{imageProxyDimensions(image)}</li>}
+        <li>代理尺寸：{summary.proxySize.width}×{summary.proxySize.height}</li>
         <li>分析代理仅用于后续语义分析，不上传原始参考图片。</li>
-        {image?.hasTransparency && <li>透明区域已使用白色背景处理。</li>}
+        {summary.transparencyFlattened && <li>透明区域已使用白色背景处理。</li>}
       </ul>
       <div className="local-preprocessing-assessment" aria-label="初步结论：待语义分析确认">
         <h3>待语义分析确认</h3>
@@ -332,7 +324,7 @@ export function LocalPreprocessingPanel({
       {!task && !isDesktop && <p>{project.referenceMedia
         ? "请在宽度至少 1024px 的桌面设备开始或重试本地预处理"
         : "请先添加并校验参考素材，再开始本地预处理。"}</p>}
-      {task && <TaskContent task={task} referenceMedia={project.referenceMedia} headingRef={statusHeadingRef} />}
+      {task && <TaskContent task={task} headingRef={statusHeadingRef} />}
       {task?.status === "failed" && task.error && (
         <div className="local-preprocessing-error" role="alert">
           <CircleAlert aria-hidden="true" size={17} />
@@ -355,7 +347,7 @@ export function LocalPreprocessingPanel({
   );
 }
 
-function TaskContent({ task, referenceMedia, headingRef }: { task: LocalPreprocessing; referenceMedia: ReferenceMedia | null; headingRef: React.RefObject<HTMLHeadingElement> }) {
+function TaskContent({ task, headingRef }: { task: LocalPreprocessing; headingRef: React.RefObject<HTMLHeadingElement> }) {
   const states = new Map(task.stages.map((stage) => [stage.name, stage]));
   const statusText = task.status === "completed"
     ? `本地预处理已完成；初步结论：${task.reproducibilityAssessment?.status === "out_of_scope" ? "超出当前可复刻范围" : "待语义分析确认"}`
@@ -377,7 +369,7 @@ function TaskContent({ task, referenceMedia, headingRef }: { task: LocalPreproce
         })}
       </ol>
       {task.status === "completed" && task.mediaType === "image" && (
-        <ImagePreprocessingConclusion task={task} image={referenceMedia?.type === "image" ? referenceMedia : null} />
+        <ImagePreprocessingConclusion task={task} />
       )}
       {task.status === "completed" && task.mediaType === "video" && <VideoPreprocessingConclusion task={task} />}
     </div>

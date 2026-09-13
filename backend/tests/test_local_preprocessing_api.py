@@ -246,6 +246,47 @@ def test_opening_project_returns_a_valid_completed_preprocessing_unchanged(tmp_p
     assert preprocessing_file_snapshot(directory) == artifacts_before
 
 
+def test_get_preserves_completed_video_task_with_unambiguous_legacy_manifest(tmp_path):
+    project, persisted = write_completed_project_with_artifacts(tmp_path, first_invalid_stage=None)
+    directory = tmp_path / "project-files/project-001/local-preprocessing/preprocessing-001"
+    manifest_path = directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("mediaType")
+    manifest["sourceReferenceVideoId"] = manifest.pop("sourceReferenceMediaId")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    persisted = (tmp_path / "projects.json").read_bytes()
+    artifacts_before = preprocessing_file_snapshot(directory)
+    client = TestClient(create_app(data_dir=tmp_path, preprocessing_queue_factory=ManualQueue))
+
+    opened = client.get(f"/api/projects/{project['id']}")
+
+    assert opened.status_code == 200
+    assert opened.json()["localPreprocessing"]["status"] == "completed"
+    assert (tmp_path / "projects.json").read_bytes() == persisted
+    assert preprocessing_file_snapshot(directory) == artifacts_before
+
+
+def test_post_returns_existing_completed_video_task_with_unambiguous_legacy_manifest(tmp_path):
+    project, _ = write_completed_project_with_artifacts(tmp_path, first_invalid_stage=None)
+    directory = tmp_path / "project-files/project-001/local-preprocessing/preprocessing-001"
+    manifest_path = directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("mediaType")
+    manifest["sourceReferenceVideoId"] = manifest.pop("sourceReferenceMediaId")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    queue = ManualQueue(lambda _: None)
+    client = TestClient(create_app(
+        data_dir=tmp_path, preprocessing_queue_factory=lambda _: queue,
+    ))
+
+    repeated = client.post(f"/api/projects/{project['id']}/local-preprocessing")
+
+    assert repeated.status_code == 200
+    assert repeated.json()["localPreprocessing"]["id"] == "preprocessing-001"
+    assert repeated.json()["localPreprocessing"]["status"] == "completed"
+    assert queue.pending == []
+
+
 def test_reading_invalid_completed_preprocessing_hides_preprocessing_directory_os_error(tmp_path, monkeypatch):
     project, _ = write_completed_project_with_artifacts(tmp_path, first_invalid_stage="decoding")
     client = TestClient(create_app(data_dir=tmp_path), raise_server_exceptions=False)

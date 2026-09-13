@@ -56,6 +56,15 @@ def write_image_manifest(directory, source_reference_media_id):
         "algorithmVersion": 1,
         "mediaType": "image",
         "sourceReferenceMediaId": source_reference_media_id,
+        "proxySummary": {
+            "mediaType": "image",
+            "originalDisplaySize": {"width": 256, "height": 256},
+            "normalizedSize": {"width": 256, "height": 256},
+            "proxySize": {"width": 256, "height": 256},
+            "transparencyFlattened": False,
+            "applicabilityStatus": "pending_semantic_confirmation",
+        },
+        "reproducibilityAssessment": {"status": "pending_semantic_confirmation", "checks": []},
     })
 
 
@@ -300,6 +309,34 @@ def test_image_manifest_requires_matching_media_algorithm_and_source(
     }
     manifest.update(manifest_update)
     write_stage_json(directory, "manifest.json", manifest)
+
+    valid = validate_completed_stages(image_preprocessing, directory)
+
+    assert valid.firstInvalidStage == "reproducibilityAssessment"
+
+
+def test_image_manifest_summary_must_match_real_normalized_and_proxy_artifacts(
+    tmp_path, image_preprocessing,
+):
+    directory = preprocessing_directory(tmp_path, "project-001", image_preprocessing.id)
+    directory.mkdir(parents=True)
+    Image.new("RGB", (4096, 2049), (12, 34, 56)).save(directory / "normalized.png", format="PNG")
+    Image.new("RGB", (2048, 1024), (12, 34, 56)).save(directory / "analysis-proxy.jpg", format="JPEG")
+    write_stage_json(directory, "manifest.json", {
+        "schemaVersion": 1,
+        "algorithmVersion": 1,
+        "mediaType": "image",
+        "sourceReferenceMediaId": image_preprocessing.sourceReferenceMediaId,
+        "proxySummary": {
+            "mediaType": "image",
+            "originalDisplaySize": {"width": 4096, "height": 2049},
+            "normalizedSize": {"width": 4096, "height": 2049},
+            "proxySize": {"width": 2048, "height": 1025},
+            "transparencyFlattened": False,
+            "applicabilityStatus": "pending_semantic_confirmation",
+        },
+        "reproducibilityAssessment": {"status": "pending_semantic_confirmation", "checks": []},
+    })
 
     valid = validate_completed_stages(image_preprocessing, directory)
 

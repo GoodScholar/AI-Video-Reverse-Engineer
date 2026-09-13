@@ -7,7 +7,10 @@ from typing import Callable
 from pydantic import ValidationError
 
 from .image_preprocessing import (
+    DecodedImageFacts,
     ImagePreprocessingFailure,
+    NormalizedImageFacts,
+    ProxyImageFacts,
     assess_image_reproducibility,
     inspect_image,
     normalize_image,
@@ -15,6 +18,7 @@ from .image_preprocessing import (
 )
 from .local_preprocessing import (
     ALGORITHM_VERSION,
+    ImageSize,
     ImageProxySummary,
     LocalPreprocessing,
     MediaType,
@@ -53,21 +57,25 @@ def run_image_preprocessing(
             "preprocessing_unexpected_error", "本地预处理阶段状态无效，请重试。", "imageDecoding",
         )
     assessment: ReproducibilityAssessment | None = None
+    summary: ImageProxySummary | None = None
+    decoded_facts: DecodedImageFacts | None = None
+    normalized_facts: NormalizedImageFacts | None = None
+    proxy_facts: ProxyImageFacts | None = None
     for stage in order:
         if states[stage].status == "completed":
             continue
         on_stage_started(stage)
         try:
             if stage == "imageDecoding":
-                inspect_image(source_path)
+                decoded_facts = inspect_image(source_path)
             elif stage == "imageNormalization":
-                _commit_image_artifact(
+                normalized_facts = _commit_image_artifact(
                     output_directory / "normalized.png",
                     lambda target: normalize_image(source_path, target),
                     inspect_image,
                 )
             elif stage == "proxyGeneration":
-                _commit_image_artifact(
+                proxy_facts = _commit_image_artifact(
                     output_directory / "analysis-proxy.jpg",
                     lambda target: write_analysis_proxy(output_directory / "normalized.png", target),
                     inspect_image,
@@ -76,7 +84,11 @@ def run_image_preprocessing(
                 assessment = assess_image_reproducibility(
                     output_directory / "normalized.png", output_directory / "analysis-proxy.jpg",
                 )
-                _write_manifest(output_directory, reference, assessment)
+                decoded_facts = decoded_facts or inspect_image(source_path)
+                normalized_facts = normalized_facts or _normalized_facts(output_directory)
+                proxy_facts = proxy_facts or _proxy_facts(output_directory)
+                summary = _image_summary(decoded_facts, normalized_facts, proxy_facts, assessment)
+                _write_manifest(output_directory, reference, assessment, summary)
             if not stage_artifacts_are_valid(stage, output_directory, validated):
                 raise ValueError("阶段产物无效")
         except ImagePreprocessingFailure as error:
@@ -91,16 +103,16 @@ def run_image_preprocessing(
             _reset_after_failure(output_directory, stage, preprocessing.mediaType)
             raise LocalPreprocessingFailure(_failure_code_for(stage), _failure_message_for(stage), stage) from error
         on_stage_completed(stage)
-    if assessment is None:
-        assessment = _load_assessment(output_directory)
-    return PreprocessingRunResult(proxy_summary=ImageProxySummary(), assessment=assessment)
+    if assessment is None or summary is None:
+        return _load_result(output_directory)
+    return PreprocessingRunResult(proxy_summary=summary, assessment=assessment)
 
 
 def _commit_image_artifact(
     destination: Path,
     writer: Callable[[Path], object],
     validator: Callable[[Path], object],
-) -> None:
+) -> object:
     destination.parent.mkdir(parents=True, exist_ok=True)
     descriptor, raw_path = tempfile.mkstemp(
         dir=destination.parent, prefix=f".{destination.name}-", suffix=".part",
@@ -108,9 +120,10 @@ def _commit_image_artifact(
     temporary = Path(raw_path)
     os.close(descriptor)
     try:
-        writer(temporary)
+        facts = writer(temporary)
         validator(temporary)
         os.replace(temporary, destination)
+        return facts
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
@@ -120,6 +133,7 @@ def _write_manifest(
     output_directory: Path,
     reference: ReferenceImage,
     assessment: ReproducibilityAssessment,
+    summary: ImageProxySummary,
 ) -> None:
     write_stage_json(output_directory, "manifest.json", {
         "schemaVersion": 1,
@@ -129,16 +143,53 @@ def _write_manifest(
         "artifacts": {
             "normalized": "normalized.png", "analysisProxy": "analysis-proxy.jpg",
         },
-        "proxySummary": ImageProxySummary().model_dump(),
+        "proxySummary": summary.model_dump(),
         "reproducibilityAssessment": assessment.model_dump(),
     })
 
 
-def _load_assessment(output_directory: Path) -> ReproducibilityAssessment:
+def _normalized_facts(output_directory: Path) -> NormalizedImageFacts:
+    facts = inspect_image(output_directory / "normalized.png")
+    return NormalizedImageFacts(displaySize=facts.displaySize, transparencyFlattened=False)
+
+
+def _proxy_facts(output_directory: Path) -> ProxyImageFacts:
+    path = output_directory / "analysis-proxy.jpg"
+    facts = inspect_image(path)
+    return ProxyImageFacts(displaySize=facts.displaySize, byteSize=path.stat().st_size)
+
+
+def _image_summary(
+    decoded: DecodedImageFacts,
+    normalized: NormalizedImageFacts,
+    proxy: ProxyImageFacts,
+    assessment: ReproducibilityAssessment,
+) -> ImageProxySummary:
+    return ImageProxySummary(
+        originalDisplaySize=ImageSize(width=decoded.displaySize[0], height=decoded.displaySize[1]),
+        normalizedSize=ImageSize(width=normalized.displaySize[0], height=normalized.displaySize[1]),
+        proxySize=ImageSize(width=proxy.displaySize[0], height=proxy.displaySize[1]),
+        transparencyFlattened=normalized.transparencyFlattened or decoded.hasTransparency,
+        applicabilityStatus=assessment.status,
+    )
+
+
+def _load_result(output_directory: Path) -> PreprocessingRunResult:
     try:
         with (output_directory / "manifest.json").open(encoding="utf-8") as file:
             manifest = json.load(file)
-        return ReproducibilityAssessment(**manifest["reproducibilityAssessment"])
+        assessment = ReproducibilityAssessment(**manifest["reproducibilityAssessment"])
+        summary = ImageProxySummary(**manifest["proxySummary"])
+        normalized = _normalized_facts(output_directory)
+        proxy = _proxy_facts(output_directory)
+        if (
+            summary.originalDisplaySize != summary.normalizedSize
+            or summary.normalizedSize != ImageSize(width=normalized.displaySize[0], height=normalized.displaySize[1])
+            or summary.proxySize != ImageSize(width=proxy.displaySize[0], height=proxy.displaySize[1])
+            or summary.applicabilityStatus != assessment.status
+        ):
+            raise ValueError("图片预处理汇总不一致")
+        return PreprocessingRunResult(proxy_summary=summary, assessment=assessment)
     except OSError as error:
         raise LocalPreprocessingFailure(
             "preprocessing_storage_unavailable", "本地预处理结果无法读取，请检查数据目录后重试。", "reproducibilityAssessment",

@@ -121,11 +121,20 @@ def test_image_proxy_summary_is_selected_by_media_type():
 
     parsed = LocalPreprocessing.model_validate({
         **task.model_dump(),
-        "proxySummary": {"mediaType": "image"},
+        "proxySummary": {
+            "mediaType": "image",
+            "originalDisplaySize": {"width": 4096, "height": 2049},
+            "normalizedSize": {"width": 4096, "height": 2049},
+            "proxySize": {"width": 2048, "height": 1024},
+            "transparencyFlattened": True,
+            "applicabilityStatus": "pending_semantic_confirmation",
+        },
     })
 
     assert parsed.proxySummary is not None
     assert parsed.proxySummary.mediaType == "image"
+    assert parsed.proxySummary.proxySize.width == 2048
+    assert parsed.proxySummary.proxySize.height == 1024
 
 
 @pytest.mark.parametrize(
