@@ -68,3 +68,39 @@ it("披露冻结本次素材与预处理身份，并在身份失效时不提交"
   expect(screen.queryByRole("button", { name: "确认并开始语义分析" })).not.toBeInTheDocument();
   expect(start).not.toHaveBeenCalled();
 });
+
+it("素材替换并完成新预处理后可重新确认并提交新身份", async () => {
+  vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  const user = userEvent.setup();
+  const start = vi.fn();
+  const initial = { ...project(), semanticAnalysis: null };
+  const completedImagePreprocessing = initial.localPreprocessing;
+  if (completedImagePreprocessing?.mediaType !== "image") throw new Error("测试素材应为图片预处理");
+  const replacementWithoutPreprocessing = {
+    ...initial,
+    referenceMedia: { ...initial.referenceMedia!, id: "image-002", originalName: "replacement.png" },
+    localPreprocessing: null,
+  };
+  const replacementReady: Project = {
+    ...replacementWithoutPreprocessing,
+    localPreprocessing: {
+      ...completedImagePreprocessing,
+      id: "pre-002",
+      sourceReferenceMediaId: "image-002",
+      proxySummary: { ...completedImagePreprocessing.proxySummary!, proxySize: { width: 800, height: 1200 } },
+    },
+  };
+  start.mockResolvedValue(replacementReady);
+  const view = render(<SemanticAnalysisPanel project={initial} provider={{ provider: "bailian", model: "qwen3.7-flash", baseUrl: null, credentialState: "configured", selectedProvider: "bailian" }} onProjectUpdated={vi.fn()} start={start} />);
+
+  await user.click(screen.getByRole("button", { name: "开始语义分析" }));
+  view.rerender(<SemanticAnalysisPanel project={replacementWithoutPreprocessing} provider={{ provider: "bailian", model: "qwen3.7-flash", baseUrl: null, credentialState: "configured", selectedProvider: "bailian" }} onProjectUpdated={vi.fn()} start={start} />);
+  expect(screen.getByRole("alert")).toHaveTextContent("参考素材或本地预处理已变化");
+
+  view.rerender(<SemanticAnalysisPanel project={replacementReady} provider={{ provider: "bailian", model: "qwen3.7-flash", baseUrl: null, credentialState: "configured", selectedProvider: "bailian" }} onProjectUpdated={vi.fn()} start={start} />);
+  await user.click(screen.getByRole("button", { name: "开始语义分析" }));
+  expect(screen.getByText("analysis-proxy.jpg（800×1200，比例 800:1200）")).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "确认并开始语义分析" }));
+
+  expect(start).toHaveBeenCalledWith("project-001", "bailian", "qwen3.7-flash");
+});

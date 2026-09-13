@@ -159,6 +159,12 @@ export function SemanticAnalysisPanel({
   }, [disclosure, disclosureIsCurrent]);
 
   useEffect(() => {
+    if (!disclosure || disclosureIsCurrent) return;
+    setDisclosure(null);
+    setSubmitError("参考素材或本地预处理已变化，请重新确认发送内容。");
+  }, [disclosure, disclosureIsCurrent]);
+
+  useEffect(() => {
     previousStatusRef.current = task?.status ?? null;
   }, [project.id]);
 
