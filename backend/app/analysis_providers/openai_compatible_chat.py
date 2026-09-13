@@ -1,5 +1,6 @@
 import base64
 import json
+import time
 from typing import Any, Optional, Union
 
 import httpx
@@ -10,6 +11,7 @@ from .base import ProviderAnalysisError, ProviderFailure, ProviderRequest, Provi
 
 
 MAX_PROVIDER_RESPONSE_BYTES = 256_000
+TOTAL_PROVIDER_DEADLINE_SECONDS = 120.0
 
 
 def image_data_url(value: Union[ImageAnalysisInput, VideoAnalysisInput]) -> str:
@@ -47,29 +49,38 @@ def post_chat_completion(
     headers = {"Content-Type": "application/json"}
     if credential is not None and credential.strip():
         headers["Authorization"] = "Bearer " + credential
+    started_at = time.monotonic()
     try:
-        response = client.post(
-            url,
-            headers=headers,
-            json=build_chat_payload(request),
-            follow_redirects=False,
-        )
+        with client.stream(
+            "POST", url, headers=headers, json=build_chat_payload(request), follow_redirects=False,
+        ) as response:
+            if time.monotonic() - started_at > TOTAL_PROVIDER_DEADLINE_SECONDS:
+                raise httpx.TimeoutException("total provider deadline exceeded")
+            if response.status_code >= 300:
+                raise ProviderAnalysisError(failure_for_status(response.status_code))
+            response_bytes = bytearray()
+            for chunk in response.iter_bytes():
+                if time.monotonic() - started_at > TOTAL_PROVIDER_DEADLINE_SECONDS:
+                    raise httpx.TimeoutException("total provider deadline exceeded")
+                if len(response_bytes) + len(chunk) > MAX_PROVIDER_RESPONSE_BYTES:
+                    raise ValueError("响应超过安全边界")
+                response_bytes.extend(chunk)
+            request_id = response.headers.get("x-request-id")
     except httpx.TimeoutException:
         raise ProviderAnalysisError(ProviderFailure.for_code("timeout")) from None
     except httpx.RequestError:
         raise ProviderAnalysisError(ProviderFailure.for_code("network_error")) from None
-    if response.status_code >= 300:
-        raise ProviderAnalysisError(failure_for_status(response.status_code))
+    except ProviderAnalysisError:
+        raise
+    except (TypeError, ValueError):
+        raise ProviderAnalysisError(ProviderFailure.for_code("invalid_analysis_response")) from None
     try:
-        if len(response.content) > MAX_PROVIDER_RESPONSE_BYTES:
-            raise ValueError("响应超过安全边界")
-        payload = response.json()
+        payload = json.loads(response_bytes.decode("utf-8"))
         raw_text = payload["choices"][0]["message"]["content"]
-    except (ValueError, TypeError, KeyError, IndexError, RecursionError):
+    except (UnicodeDecodeError, ValueError, TypeError, KeyError, IndexError, RecursionError):
         raise ProviderAnalysisError(ProviderFailure.for_code("invalid_analysis_response")) from None
     if not isinstance(raw_text, str):
         raise ProviderAnalysisError(ProviderFailure.for_code("invalid_analysis_response"))
-    request_id = response.headers.get("x-request-id")
     return ProviderResult(rawText=raw_text, providerRequestId=request_id)
 
 

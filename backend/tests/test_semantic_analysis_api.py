@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 import pytest
 
+from app import main
 from app.analysis_settings import AnalysisSettings
 from app.image_preprocessing_runner import run_image_preprocessing
 from app.local_preprocessing import new_local_preprocessing
@@ -459,7 +460,11 @@ def test_connection_test_uses_configured_provider_without_reading_project_media(
         "model": "qwen3.7-flash",
     }).status_code == 200
 
-    response = client.post("/api/analysis-providers/bailian/test-connection")
+    response = client.post(
+        "/api/analysis-providers/bailian/test-connection",
+        content="{}",
+        headers=_sensitive_headers(),
+    )
 
     assert response.status_code == 200
     assert response.json() == {"provider": "bailian", "model": "qwen3.7-flash", "status": "connected"}
@@ -558,16 +563,17 @@ def test_matching_completed_analysis_is_idempotent(tmp_path):
     assert holder["queue"].pending == []
 
     completed = response.json()["semanticAnalysis"]
-    semantic_analysis_checkpoint_path(tmp_path, project_id, completed["id"]).write_text(
-        '{"not":"a semantic checkpoint"}', encoding="utf-8",
-    )
+    checkpoint_path = semantic_analysis_checkpoint_path(tmp_path, project_id, completed["id"])
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    checkpoint["model"] = "untrusted-model"
+    checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
     retried = client.post(f"/api/projects/{project_id}/semantic-analysis", json=request)
 
     assert retried.status_code == 202
     assert retried.json()["semanticAnalysis"]["id"] != completed["id"]
 
 
-def test_replacing_reference_media_clears_existing_semantic_analysis(tmp_path):
+def test_replacing_reference_media_rejects_active_semantic_analysis(tmp_path):
     holder = {}
 
     def queue_factory(handler):
@@ -596,5 +602,192 @@ def test_replacing_reference_media_clears_existing_semantic_analysis(tmp_path):
         files={"file": ("replacement.png", payload.getvalue(), "image/png")},
     )
 
-    assert response.status_code == 200
-    assert response.json()["semanticAnalysis"] is None
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "semantic_analysis_in_progress"
+
+
+def _sensitive_headers(*, origin=None):
+    headers = {
+        "Content-Type": "application/json",
+        "X-AIVRE-Intent": "semantic-analysis",
+    }
+    if origin is not None:
+        headers["Origin"] = origin
+    return headers
+
+
+def test_sensitive_mutations_reject_cross_origin_and_simple_form_before_reading_credentials(tmp_path):
+    credentials = InMemoryCredentials()
+    reads = 0
+
+    def read(provider):
+        nonlocal reads
+        reads += 1
+        return credentials.values.get(provider)
+
+    credentials.get = read
+    client = TestClient(create_app(
+        data_dir=tmp_path,
+        credential_store=credentials,
+        analysis_settings=AnalysisSettings(tmp_path / "analysis-providers.json"),
+    ))
+
+    response = client.post(
+        "/api/analysis-providers/bailian/test-connection",
+        content="provider=bailian",
+        headers={
+            "Origin": "https://attacker.invalid",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "request_origin_rejected"
+    assert reads == 0
+
+
+def test_sensitive_mutations_accept_allowed_browser_origin_and_explicit_local_client_contract(tmp_path):
+    credentials = InMemoryCredentials()
+    client = TestClient(create_app(
+        data_dir=tmp_path,
+        credential_store=credentials,
+        analysis_settings=AnalysisSettings(tmp_path / "analysis-providers.json"),
+    ))
+    payload = {"model": "qwen3.7-flash"}
+
+    browser = client.put(
+        "/api/analysis-providers/bailian/configuration",
+        content=json.dumps(payload),
+        headers=_sensitive_headers(origin="http://127.0.0.1:5173"),
+    )
+    local_client = client.put(
+        "/api/analysis-providers/bailian/configuration",
+        content=json.dumps(payload),
+        headers=_sensitive_headers(),
+    )
+
+    assert browser.status_code == 200
+    assert local_client.status_code == 200
+
+
+@pytest.mark.parametrize("status", ["queued", "running"])
+def test_reference_media_upload_rejects_active_semantic_analysis_before_reading_upload(tmp_path, status):
+    client = TestClient(create_app(data_dir=tmp_path))
+    project_id = ready_project(client, tmp_path)
+    projects = json.loads((tmp_path / "projects.json").read_text(encoding="utf-8"))
+    task = new_semantic_analysis(
+        reference_media_id="image-001", preprocessing_id="preprocessing-001",
+        provider="bailian", model="qwen3.7-flash", now=datetime.now(timezone.utc),
+    )
+    task.status = status
+    if status == "running":
+        task.startedAt = datetime.now(timezone.utc).isoformat()
+    projects[0]["semanticAnalysis"] = task.model_dump(mode="json")
+    (tmp_path / "projects.json").write_text(json.dumps(projects), encoding="utf-8")
+    source = Image.new("RGB", (256, 256), (1, 2, 3))
+    body = BytesIO()
+    source.save(body, format="PNG")
+
+    response = client.put(
+        f"/api/projects/{project_id}/reference-media",
+        files={"file": ("replacement.png", body.getvalue(), "image/png")},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "semantic_analysis_in_progress"
+
+
+def test_reference_media_upload_rechecks_semantic_analysis_while_staging(tmp_path, monkeypatch):
+    client = TestClient(create_app(data_dir=tmp_path))
+    project_id = ready_project(client, tmp_path)
+    real_stage = main.stage_reference_media
+
+    def start_analysis_during_upload(*args, **kwargs):
+        staged = real_stage(*args, **kwargs)
+        projects = json.loads((tmp_path / "projects.json").read_text(encoding="utf-8"))
+        task = new_semantic_analysis(
+            reference_media_id="image-001", preprocessing_id="preprocessing-001",
+            provider="bailian", model="qwen3.7-flash", now=datetime.now(timezone.utc),
+        )
+        projects[0]["semanticAnalysis"] = task.model_dump(mode="json")
+        (tmp_path / "projects.json").write_text(json.dumps(projects), encoding="utf-8")
+        return staged
+
+    monkeypatch.setattr(main, "stage_reference_media", start_analysis_during_upload)
+    image = Image.new("RGB", (256, 256), (1, 2, 3))
+    body = BytesIO()
+    image.save(body, format="PNG")
+
+    response = client.put(
+        f"/api/projects/{project_id}/reference-media",
+        files={"file": ("replacement.png", body.getvalue(), "image/png")},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "semantic_analysis_in_progress"
+
+
+def test_retry_after_finalize_write_failure_recovers_validated_checkpoint_without_provider_call(tmp_path, monkeypatch):
+    holder = {}
+
+    def queue_factory(handler):
+        holder["queue"] = ManualQueue(handler)
+        return holder["queue"]
+
+    calls = 0
+
+    def runner(**kwargs):
+        nonlocal calls
+        calls += 1
+        return StructuredVisualAnalysis.model_validate({
+            "version": 42,
+            "observedFacts": {"staticVisual": {
+                "subject": "人物", "scene": "室内", "composition": "中景", "viewpoint": "平视",
+                "lighting": "柔光", "color": "暖色", "visualStyle": "写实",
+            }, "temporal": None},
+            "generationSuggestions": {
+                "subjectMotion": "轻微动作", "environmentalMotion": "无", "cameraMotion": "固定",
+                "rhythm": "平稳", "suggestedDuration": 3.0, "audio": "环境声",
+            },
+        })
+
+    real_write = main._write_projects
+    remaining_finalize_failures = 1
+
+    def fail_only_completed(data_dir, projects):
+        nonlocal remaining_finalize_failures
+        task = projects[0].semanticAnalysis
+        if task is not None and task.status == "completed" and remaining_finalize_failures:
+            remaining_finalize_failures -= 1
+            raise OSError("finalize failed")
+        return real_write(data_dir, projects)
+
+    monkeypatch.setattr(main, "_write_projects", fail_only_completed)
+    settings = AnalysisSettings(tmp_path / "analysis-providers.json")
+    client = TestClient(create_app(
+        data_dir=tmp_path, credential_store=InMemoryCredentials(), analysis_settings=settings,
+        semantic_analysis_queue_factory=queue_factory, semantic_analysis_runner=runner,
+    ))
+    project_id = ready_project(client, tmp_path)
+    assert client.put("/api/analysis-providers/bailian/configuration", json={"model": "qwen3.7-flash"}).status_code == 200
+    request = {"provider": "bailian", "model": "qwen3.7-flash", "disclosureAccepted": True}
+    assert client.post(f"/api/projects/{project_id}/semantic-analysis", json=request).status_code == 202
+    holder["queue"].run_next()
+    failed = client.get(f"/api/projects/{project_id}").json()["semanticAnalysis"]
+
+    def restarted_queue_factory(handler):
+        holder["restarted"] = ManualQueue(handler)
+        return holder["restarted"]
+
+    client = TestClient(create_app(
+        data_dir=tmp_path, credential_store=InMemoryCredentials(), analysis_settings=settings,
+        semantic_analysis_queue_factory=restarted_queue_factory, semantic_analysis_runner=runner,
+    ))
+
+    recovered = client.post(f"/api/projects/{project_id}/semantic-analysis", json=request)
+
+    assert failed["status"] == "failed"
+    assert recovered.status_code == 200
+    assert recovered.json()["semanticAnalysis"]["status"] == "completed"
+    assert recovered.json()["semanticAnalysis"]["result"]["version"] == 1
+    assert calls == 1

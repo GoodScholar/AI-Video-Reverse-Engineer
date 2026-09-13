@@ -85,6 +85,7 @@ from app.semantic_analysis_storage import (
     completed_checkpoint_matches,
     discard_semantic_analysis_checkpoint,
     interrupted_semantic_analysis,
+    load_completed_checkpoint_for_recovery,
     new_semantic_analysis,
     write_semantic_analysis_checkpoint,
 )
@@ -147,6 +148,11 @@ _MEDIA_CHUNK_BYTES = 64 * 1024
 _MEDIA_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 _MEDIA_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW
 _MEDIA_NOT_FOUND_ERRNOS = {errno.ENOENT, errno.ENOTDIR, errno.ELOOP}
+_ALLOWED_ANALYSIS_MUTATION_ORIGINS = frozenset({
+    "http://127.0.0.1:5173", "http://localhost:5173",
+    "http://127.0.0.1:4173", "http://localhost:4173",
+})
+_ANALYSIS_REQUEST_INTENT = "semantic-analysis"
 
 
 def _stage_label(stage: StageName) -> str:
@@ -921,7 +927,7 @@ def create_app(
     def default_analysis_provider(
         *, provider: str, credential: Optional[str], base_url: Optional[str], model: str,
     ):
-        client = httpx.Client(timeout=30.0)
+        client = httpx.Client(timeout=30.0, trust_env=False, follow_redirects=False)
         if provider == "bailian":
             return BailianAnalysisProvider(client, credential)
         if provider == "local_openai_compatible" and base_url is not None:
@@ -1030,7 +1036,7 @@ def create_app(
                 current.status = "completed"
                 current.updatedAt = now
                 current.completedAt = now
-                current.result = result
+                current.result = result.model_copy(update={"version": 1})
                 current.error = None
                 return current
             persist_semantic_analysis_change(project_id, task, complete)
@@ -1110,6 +1116,34 @@ def create_app(
             or reference_media_path_pattern.fullmatch(request.url.path) is not None
         )
 
+    def is_sensitive_analysis_mutation(request: Request) -> bool:
+        path = request.url.path
+        return (
+            request.method == "PUT" and bool(re.fullmatch(r"/api/analysis-providers/[^/]+/configuration", path))
+        ) or (
+            request.method == "POST" and (
+                bool(re.fullmatch(r"/api/analysis-providers/[^/]+/(?:test-connection|connection-test)", path))
+                or bool(re.fullmatch(r"/api/projects/[^/]+/semantic-analysis", path))
+            )
+        )
+
+    def sensitive_mutation_rejection(request: Request) -> Optional[JSONResponse]:
+        origin = request.headers.get("origin")
+        content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if origin is not None and origin not in _ALLOWED_ANALYSIS_MUTATION_ORIGINS:
+            return JSONResponse(status_code=403, content={"detail": {
+                "code": "request_origin_rejected", "message": "请求来源不被本地分析服务允许。",
+            }})
+        if content_type != "application/json":
+            return JSONResponse(status_code=403, content={"detail": {
+                "code": "request_intent_rejected", "message": "敏感分析请求必须使用 JSON。",
+            }})
+        if origin is not None and request.headers.get("x-aivre-intent") != _ANALYSIS_REQUEST_INTENT:
+            return JSONResponse(status_code=403, content={"detail": {
+                "code": "request_intent_rejected", "message": "敏感分析请求缺少明确意图。",
+            }})
+        return None
+
     def invalid_multipart_response() -> JSONResponse:
         return JSONResponse(
             status_code=400,
@@ -1155,6 +1189,10 @@ def create_app(
 
     @app.middleware("http")
     async def reject_invalid_reference_video_request(request, call_next):
+        if is_sensitive_analysis_mutation(request):
+            rejection = sensitive_mutation_rejection(request)
+            if rejection is not None:
+                return rejection
         if not is_reference_media_request(request):
             return await call_next(request)
 
@@ -1178,6 +1216,15 @@ def create_app(
                 content={"detail": {
                     "code": "depth_capture_in_progress",
                     "message": "深度捕捉正在排队或运行，请完成后再更换参考视频。",
+                }},
+            )
+        semantic = project.semanticAnalysis
+        if semantic is not None and semantic.status in {"queued", "running"}:
+            return JSONResponse(
+                status_code=409,
+                content={"detail": {
+                    "code": "semantic_analysis_in_progress",
+                    "message": "语义分析正在排队或运行，请完成后再更换参考素材。",
                 }},
             )
 
@@ -1241,6 +1288,15 @@ def create_app(
                     detail={
                         "code": "depth_capture_in_progress",
                         "message": "深度捕捉正在排队或运行，请完成后再更换参考视频。",
+                    },
+                )
+            semantic = previous_project.semanticAnalysis
+            if semantic is not None and semantic.status in {"queued", "running"}:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "semantic_analysis_in_progress",
+                        "message": "语义分析正在排队或运行，请完成后再更换参考素材。",
                     },
                 )
             old_path = (
@@ -1545,6 +1601,23 @@ def create_app(
                         "message": "语义分析正在排队或运行，请稍后再试。",
                     },
                 )
+            if (
+                existing is not None
+                and existing.status == "failed"
+                and existing.sourceReferenceMediaId == reference.id
+                and existing.sourcePreprocessingId == preprocessing.id
+                and existing.provider == payload.provider
+                and existing.model == payload.model
+                and existing.promptVersion == PROMPT_VERSION
+                and existing.schemaVersion == SCHEMA_VERSION
+            ):
+                checkpoint = load_completed_checkpoint_for_recovery(data_dir, project.id, existing)
+                if checkpoint is not None:
+                    idempotent = True
+                    return project.model_copy(update={
+                        "semanticAnalysis": checkpoint,
+                        "updatedAt": checkpoint.updatedAt,
+                    })
             try:
                 setting = configured_analysis_settings.get(payload.provider)
                 has_credential = credentials().get(payload.provider) is not None

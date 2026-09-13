@@ -1,6 +1,7 @@
 import httpx
 import pytest
 
+import app.analysis_providers.openai_compatible_chat as openai_chat
 from app.analysis_input import ImageAnalysisInput
 from app.analysis_prompt import build_analysis_prompt
 from app.analysis_provider import BailianProviderConfig, ProviderRequest as LegacyProviderRequest
@@ -155,3 +156,60 @@ def test_bailian_rejects_oversized_provider_response_before_exposing_raw_text():
         provider.analyze(_core_request())
 
     assert error.value.failure.code == "invalid_analysis_response"
+
+
+class _StreamingResponse:
+    status_code = 200
+    headers = {}
+
+    def __init__(self, chunks):
+        self._chunks = iter(chunks)
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.closed = True
+
+    def iter_bytes(self):
+        yield from self._chunks
+
+
+class _StreamingClient:
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    def stream(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        return self.response
+
+
+def test_bailian_stops_streaming_response_as_soon_as_byte_limit_is_exceeded():
+    def chunks():
+        yield b"{" + b"x" * 256_000
+        pytest.fail("超过响应上限后不得读取后续流块")
+
+    response = _StreamingResponse(chunks())
+    client = _StreamingClient(response)
+
+    with pytest.raises(ProviderAnalysisError) as error:
+        openai_chat.post_chat_completion(client, "https://provider.invalid", "test-credential", _core_request())
+
+    assert error.value.failure.code == "invalid_analysis_response"
+    assert response.closed is True
+    assert len(client.calls) == 1
+
+
+def test_bailian_streaming_response_enforces_one_total_deadline(monkeypatch):
+    response = _StreamingResponse([b'{"choices":[{"message":{"content":"{}"}}]}'])
+    client = _StreamingClient(response)
+    ticks = iter([0.0, 0.0, 121.0])
+    monkeypatch.setattr(openai_chat.time, "monotonic", lambda: next(ticks))
+
+    with pytest.raises(ProviderAnalysisError) as error:
+        openai_chat.post_chat_completion(client, "https://provider.invalid", "test-credential", _core_request())
+
+    assert error.value.failure.code == "timeout"
+    assert response.closed is True

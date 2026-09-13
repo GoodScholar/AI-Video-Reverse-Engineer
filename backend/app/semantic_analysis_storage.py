@@ -3,6 +3,7 @@ import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 from uuid import uuid4
 
 from .analysis_prompt import PROMPT_VERSION
@@ -66,6 +67,27 @@ def completed_checkpoint_matches(
     except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
         return False
     return checkpoint.model_dump(mode="json") == task.model_dump(mode="json")
+
+
+def load_completed_checkpoint_for_recovery(
+    data_dir: Path, project_id: str, task: SemanticAnalysis,
+) -> Optional[SemanticAnalysis]:
+    """Load a completed checkpoint only when it still names this exact task."""
+
+    path = semantic_analysis_checkpoint_path(data_dir, project_id, task.id)
+    try:
+        checkpoint = SemanticAnalysis.model_validate(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return None
+    if checkpoint.status != "completed" or checkpoint.result is None:
+        return None
+    identity = (
+        "id", "sourceReferenceMediaId", "sourcePreprocessingId", "provider", "model",
+        "promptVersion", "schemaVersion",
+    )
+    if any(getattr(checkpoint, field) != getattr(task, field) for field in identity):
+        return None
+    return checkpoint
 
 
 def discard_semantic_analysis_checkpoint(

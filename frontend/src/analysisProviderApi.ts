@@ -2,6 +2,10 @@ import type { AnalysisProviderConfiguration, AnalysisProviderId, Project } from 
 import { readApiError } from "./referenceMediaApi";
 
 const CONNECTION_ERROR = "无法连接本地服务，请确认应用服务正在运行后重试。";
+const ANALYSIS_INTENT_HEADERS = {
+  "Content-Type": "application/json",
+  "X-AIVRE-Intent": "semantic-analysis",
+};
 
 export type AnalysisProviderConfigurationInput = {
   apiKey?: string;
@@ -30,7 +34,7 @@ export function saveAnalysisProviderConfiguration(
 ): Promise<AnalysisProviderConfiguration> {
   return request(
     `/api/analysis-providers/${encodeURIComponent(provider)}/configuration`,
-    { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(configuration) },
+    { method: "PUT", headers: ANALYSIS_INTENT_HEADERS, body: JSON.stringify(configuration) },
     "无法保存分析服务设置，请重试。",
   );
 }
@@ -38,7 +42,7 @@ export function saveAnalysisProviderConfiguration(
 export function testAnalysisProviderConnection(provider: AnalysisProviderId): Promise<{ provider: AnalysisProviderId; model: string; status: "connected" }> {
   return request(
     `/api/analysis-providers/${encodeURIComponent(provider)}/test-connection`,
-    { method: "POST" },
+    { method: "POST", headers: ANALYSIS_INTENT_HEADERS, body: "{}" },
     "无法测试分析服务连接，请重试。",
   );
 }
@@ -46,7 +50,7 @@ export function testAnalysisProviderConnection(provider: AnalysisProviderId): Pr
 export function startSemanticAnalysis(projectId: string, provider: AnalysisProviderId, model: string): Promise<Project> {
   return request(
     `/api/projects/${encodeURIComponent(projectId)}/semantic-analysis`,
-    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider, model, disclosureAccepted: true }) },
+    { method: "POST", headers: ANALYSIS_INTENT_HEADERS, body: JSON.stringify({ provider, model, disclosureAccepted: true }) },
     "无法启动语义分析，请重试。",
   );
 }
