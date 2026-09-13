@@ -15,7 +15,7 @@
 | Task 1 | 七供应商统一目录、凭据与配置契约 | 04c | 已完成 |
 | Task 1.5 | 共享强化 HTTP 传输边界 | Task 1 | 已完成 |
 | Task 2 | OpenAI、Grok Responses 适配器 | Task 1、1.5 | 已完成 |
-| Task 3 | Claude Messages 适配器 | Task 1、1.5 | 待实现 |
+| Task 3 | Claude Messages 适配器 | Task 1、1.5 | 已完成 |
 | Task 4 | Gemini generateContent 适配器 | Task 1、1.5 | 待实现 |
 | Task 5 | 豆包 Ark Responses 适配器 | Task 1、1.5 | 待实现 |
 | Task 6 | 工厂注册、CAS 验证状态、前端、冒烟入口、文档 | Task 2～5 | 待实现 |
@@ -41,6 +41,7 @@
 - 2026-09-13：Task 1.5 定向回归 `PYTHONPATH=backend /Users/shen/SZG/AI Agent/AI Video Reverse Engineer/.venv/bin/pytest -q backend/tests/analysis_providers/test_bailian.py backend/tests/analysis_providers/test_local_openai_compatible.py backend/tests/test_semantic_analysis_api.py` → `45 passed`；供应商与网络边界回归 `PYTHONPATH=backend /Users/shen/SZG/AI Agent/AI Video Reverse Engineer/.venv/bin/pytest -q backend/tests/analysis_providers backend/tests/test_analysis_provider.py` → `115 passed`；完整后端 `PYTHONPATH=backend /Users/shen/SZG/AI Agent/AI Video Reverse Engineer/.venv/bin/pytest -q backend/tests` → `773 passed, 8 skipped`；`git diff --check` → PASS。
 - 2026-09-13：Task 2 RED：新增 OpenAI/Grok 测试后，`PYTHONPATH=backend /Users/shen/SZG/AI Agent/AI Video Reverse Engineer/.venv/bin/pytest -q backend/tests/analysis_providers/test_openai.py backend/tests/analysis_providers/test_grok.py` 因缺少 `app.analysis_providers.grok` 失败。探针提示契约测试随后以旧 `{"ok":true}` 提示对完整分析提示的偏差稳定失败。GREEN：适配器与共享契约回归 `125 passed`；完整后端 `797 passed, 8 skipped`；`compileall -q backend/app` 与 `git diff --check` 均通过。未使用真实密钥，因此云端验证状态仍为 `unverified`。
 - 2026-09-13：Task 2 审查修复 RED：Responses wire schema 的根 `version` 不在 `required`，且 `message.status: incomplete` 仍被提取为文本；新增图片、视频、repair 递归 schema 与未完成 message 回归后为 `4 failed`。GREEN：在不修改领域/共享 schema 的前提下，出站 Responses schema 深拷贝后递归将每个 `properties` 集合精确写入 `required`；非 `completed` 的显式 message 状态被拒绝。定向 `129 passed`，完整后端 `801 passed, 8 skipped`，`compileall` 和 `git diff --check` 通过。
+- 2026-09-13：Task 3 RED：新增 Claude 核心适配器测试后，因构造器尚无凭据注入而为 `20 failed`；旧三参数契约测试随后按预期以 `TypeError` 暴露尚未迁移到显式 `analyze_legacy` 的调用点。GREEN：Claude、共享和遗留供应商契约回归 `99 passed`；完整后端 `822 passed, 8 skipped`；`PYTHONPATH=backend /Users/shen/SZG/AI Agent/AI Video Reverse Engineer/.venv/bin/python -m compileall -q backend/app` 与 `git diff --check` 通过。未使用真实密钥，云端验证状态保持 `unverified`。
 
 ## 执行记录
 
@@ -50,3 +51,4 @@
 - 2026-09-13：Task 1.5 将 04c 的 socket 级取消、120 秒总期限、禁代理/禁重定向和 256,000-byte 流式限制抽取为 `http_transport`。新边界对成功和 HTTP 错误统一返回受限 `ProviderHTTPResult`，仅传输失败抛出类型化错误；百炼和本地兼容服务继续通过聊天适配器保留既有 payload、解析与稳定错误映射。TDD 先以缺失共享模块的契约测试记录 RED，再完成最小实现并回归。
 - 2026-09-13：Task 1.5 审查修复：JSON 解析改为严格从受限响应 bytes 解码，诊断用 `body_text` 仍可替换解码；非法 UTF-8 与深嵌套 `RecursionError` 均只令 `json_body=None`。新增回归证明 HTTP 200 的深嵌套体稳定映射 `invalid_analysis_response`、HTTP 401 仍优先映射 `authentication_failed`，以及替换解码后看似有效的 JSON 仍被拒绝。RED：`3 failed`；GREEN：同一集 `3 passed`，计划定向 `48 passed`，完整后端 `776 passed, 8 skipped`，`git diff --check` 与 `compileall` 通过。
 - 2026-09-13：Task 2 完成 OpenAI `gpt-5.6-luna` 与 Grok `grok-4.6` 固定 Responses 适配器：端点、Bearer、严格目录、`store:false`、真实 MIME data URL、`input_text`/`input_image`、`text.format` JSON Schema 和 `message/output_text` 遍历均固定在适配器/协议层；空、拒绝、未完成或非结构化响应使用核心 `invalid_analysis_response`。OpenAI 旧三参数契约改由显式 `analyze_legacy` 保留，既有遗留契约测试随之调用该入口。两家探针都走 `connection_test_request(model)` 与既有 `validate_or_repair` 单次修复/严格结构校验路径；共享探针已改用完整图片分析提示。
+- 2026-09-13：Task 3 完成 Claude `claude-sonnet-5` 固定 Messages 适配器：核心 `analyze(ProviderRequest)` 复用强化 HTTP 边界，使用 `x-api-key`、`anthropic-version`、`output_config.format` 和真实 PNG/JPEG base64 image source；repair 仅发送完整文本。Claude wire schema 深拷贝后移除官方不支持的约束、补足每个对象的 `additionalProperties:false`，不改领域 schema。响应仅拼接 `text` 内容块，跳过 thinking/signature 等非文本块，并拒绝拒绝、截断、空文本和畸形响应。探针发送固定 PNG，并经 `validate_or_repair` 的一次文本修复和严格结构校验；未注册主工厂。遗留三参数入口显式重命名为 `analyze_legacy`。
