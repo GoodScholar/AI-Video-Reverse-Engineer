@@ -51,6 +51,40 @@ def test_bailian_core_adapter_maps_http_and_parse_failures_without_sensitive_det
     assert "secret-value" not in str(error.value)
 
 
+@pytest.mark.parametrize(
+    ("status_code", "expected_code"),
+    [(200, "invalid_analysis_response"), (401, "authentication_failed")],
+)
+def test_bailian_maps_deeply_nested_json_by_http_status(status_code, expected_code):
+    deeply_nested_json = b"[" * 1_200 + b"0" + b"]" * 1_200
+    provider = BailianAnalysisProvider(
+        httpx.Client(transport=httpx.MockTransport(
+            lambda request: httpx.Response(status_code, content=deeply_nested_json),
+        )),
+        credential="test-credential",
+    )
+
+    with pytest.raises(ProviderAnalysisError) as error:
+        provider.analyze(_core_request())
+
+    assert error.value.failure.code == expected_code
+
+
+def test_bailian_rejects_invalid_utf8_even_when_replacement_would_form_json():
+    response_bytes = b'{"choices":[{"message":{"content":"{}"}}],"diagnostic":"\xff"}'
+    provider = BailianAnalysisProvider(
+        httpx.Client(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=response_bytes),
+        )),
+        credential="test-credential",
+    )
+
+    with pytest.raises(ProviderAnalysisError) as error:
+        provider.analyze(_core_request())
+
+    assert error.value.failure.code == "invalid_analysis_response"
+
+
 def test_connection_probe_is_a_code_generated_fixed_rgb_png():
     probe = connection_test_image()
 

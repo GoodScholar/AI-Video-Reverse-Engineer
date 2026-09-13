@@ -46,3 +46,4 @@
 - 2026-09-13：Task 1 审查修复：设置页在 Task 6 前只显示并操作百炼与本地服务，统一目录增加供应商标签与旧目录兼容投影，恢复语义 POST 非法型号回归，并以不同本地模型覆盖失败回滚。
 - 2026-09-13：gpt-6 Astra/medium 完成计划审计；修正目录双来源、提前工厂注册、旧三参数适配器入口、共享 HTTP 边界、错误码、结构化输出、连接验证与前端范围。
 - 2026-09-13：Task 1.5 将 04c 的 socket 级取消、120 秒总期限、禁代理/禁重定向和 256,000-byte 流式限制抽取为 `http_transport`。新边界对成功和 HTTP 错误统一返回受限 `ProviderHTTPResult`，仅传输失败抛出类型化错误；百炼和本地兼容服务继续通过聊天适配器保留既有 payload、解析与稳定错误映射。TDD 先以缺失共享模块的契约测试记录 RED，再完成最小实现并回归。
+- 2026-09-13：Task 1.5 审查修复：JSON 解析改为严格从受限响应 bytes 解码，诊断用 `body_text` 仍可替换解码；非法 UTF-8 与深嵌套 `RecursionError` 均只令 `json_body=None`。新增回归证明 HTTP 200 的深嵌套体稳定映射 `invalid_analysis_response`、HTTP 401 仍优先映射 `authentication_failed`，以及替换解码后看似有效的 JSON 仍被拒绝。RED：`3 failed`；GREEN：同一集 `3 passed`，计划定向 `48 passed`，完整后端 `776 passed, 8 skipped`，`git diff --check` 与 `compileall` 通过。

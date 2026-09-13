@@ -273,10 +273,11 @@ def post_provider_json(
         if registry is not None:
             registry.disarm()
 
-    body_text = bytes(response_bytes).decode("utf-8", errors="replace")
+    response_body = bytes(response_bytes)
+    body_text = response_body.decode("utf-8", errors="replace")
     try:
-        json_body = json.loads(body_text)
-    except (TypeError, ValueError, json.JSONDecodeError):
+        json_body = json.loads(response_body.decode("utf-8"))
+    except (TypeError, UnicodeDecodeError, ValueError, json.JSONDecodeError, RecursionError):
         json_body = None
     return ProviderHTTPResult(
         status_code=status_code,
