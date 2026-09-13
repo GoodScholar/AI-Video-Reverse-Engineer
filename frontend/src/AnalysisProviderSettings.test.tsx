@@ -26,3 +26,14 @@ it("保存密钥后立即清空密码输入且只显示配置状态", async () =
   expect(screen.getAllByText("密钥已配置").length).toBeGreaterThan(0);
   expect(screen.queryByText("one-shot-secret")).not.toBeInTheDocument();
 });
+
+it("在连接测试前后都说明固定探针不会上传项目素材", async () => {
+  vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  const user = userEvent.setup();
+  render(<AnalysisProviderSettings providers={providers} save={vi.fn()} testConnection={vi.fn().mockRejectedValue(new Error("服务未响应"))} />);
+
+  expect(screen.getByText("连接测试只发送固定探针，不上传项目素材。")).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "测试连接" }));
+  expect(screen.getByText("连接测试只发送固定探针，不上传项目素材。")).toBeVisible();
+  expect(screen.getByRole("alert")).toHaveTextContent("服务未响应");
+});

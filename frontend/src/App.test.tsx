@@ -28,6 +28,35 @@ describe("项目首页", () => {
     vi.unstubAllGlobals();
   });
 
+  it("独立读取供应商目录，失败可重试且恢复选中服务", async () => {
+    vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    const readyProject = {
+      id: "project-001", name: "雨夜人像复刻", createdAt: "2026-09-10T10:00:00+00:00", updatedAt: "2026-09-10T10:01:00+00:00",
+      referenceMedia: { type: "image" as const, id: "image-001", originalName: "rain.png", format: "png" as const, sizeBytes: 11, width: 1200, height: 1600, hasTransparency: false },
+      localPreprocessing: { id: "pre-001", sourceReferenceMediaId: "image-001", mediaType: "image" as const, algorithmVersion: 1, status: "completed" as const, currentStage: null, stages: [], queuedAt: "2026-09-10T10:00:00+00:00", startedAt: null, updatedAt: "2026-09-10T10:01:00+00:00", completedAt: "2026-09-10T10:01:00+00:00", proxySummary: null, reproducibilityAssessment: { status: "pending_semantic_confirmation" as const, checks: [] }, error: null },
+    };
+    let providerAttempts = 0;
+    vi.mocked(fetch).mockImplementation((url) => {
+      if (url === "/api/projects") return Promise.resolve(response([readyProject]));
+      if (url === "/api/capabilities") return Promise.resolve(response(capabilities));
+      if (url === "/api/analysis-providers") {
+        providerAttempts += 1;
+        return providerAttempts === 1
+          ? Promise.reject(new TypeError("offline"))
+          : Promise.resolve(response([{ provider: "bailian", model: "qwen3.7-flash", baseUrl: null, credentialState: "configured", selectedProvider: "bailian" }]));
+      }
+      return Promise.reject(new Error(`unexpected ${String(url)}`));
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法读取分析服务设置");
+    await userEvent.click(screen.getByRole("button", { name: "重新读取分析服务设置" }));
+    expect(await screen.findByText("百炼 · qwen3.7-flash")).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: /雨夜人像复刻/ }));
+    expect(screen.getByRole("button", { name: "开始语义分析" })).toBeEnabled();
+  });
+
   it("接入深度审查面板，并在任一深度任务运行时锁定参考素材替换", async () => {
     vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
     const runningDepth = {
@@ -48,6 +77,7 @@ describe("项目首页", () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValueOnce(response([readyProject]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
+    fetchMock.mockResolvedValueOnce(response([]));
 
     render(<App />);
     await userEvent.click(await screen.findByRole("button", { name: /雨夜人像复刻/ }));
@@ -70,6 +100,7 @@ describe("项目首页", () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValueOnce(response([readyProject]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
+    fetchMock.mockResolvedValueOnce(response([]));
     fetchMock.mockReturnValueOnce(pending.promise);
     render(<App />);
     await userEvent.click(await screen.findByRole("button", { name: /雨夜人像复刻/ }));
@@ -90,13 +121,14 @@ describe("项目首页", () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValueOnce(response([readyProject]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
+    fetchMock.mockResolvedValueOnce(response([]));
 
     render(<App />);
     await userEvent.click(await screen.findByRole("button", { name: /雨夜人像复刻/ }));
 
     expect(screen.getByRole("heading", { name: "本地预处理" })).toBeVisible();
     expect(screen.getByRole("button", { name: "开始本地预处理" })).toBeVisible();
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it("图片本地预处理排队时锁定参考素材替换", async () => {
@@ -113,6 +145,7 @@ describe("项目首页", () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValueOnce(response([readyProject]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
+    fetchMock.mockResolvedValueOnce(response([]));
 
     render(<App />);
     await userEvent.click(await screen.findByRole("button", { name: /图片复刻/ }));
@@ -137,12 +170,13 @@ describe("项目首页", () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValueOnce(response([readyProject]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
+    fetchMock.mockResolvedValueOnce(response([]));
 
     render(<App />);
     await userEvent.click(await screen.findByRole("button", { name: /雨夜人像复刻/ }));
 
     expect(screen.getByText("8 张关键帧")).toBeVisible();
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it("轮询返回新项目时同步当前页与首页集合", async () => {
@@ -161,6 +195,7 @@ describe("项目首页", () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValueOnce(response([projectA, projectB]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
+    fetchMock.mockResolvedValueOnce(response([]));
     fetchMock.mockResolvedValueOnce(response(completed));
 
     render(<App />);
@@ -189,6 +224,7 @@ describe("项目首页", () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValueOnce(response([projectA, projectB]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
+    fetchMock.mockResolvedValueOnce(response([]));
     fetchMock.mockReturnValueOnce(pending.promise);
 
     render(<App />);
@@ -208,6 +244,7 @@ describe("项目首页", () => {
     fetchMock.mockResolvedValueOnce(
       response(capabilities),
     );
+    fetchMock.mockResolvedValueOnce(response([]));
     fetchMock.mockResolvedValueOnce(
       response({
         id: "project-001",
@@ -234,6 +271,7 @@ describe("项目首页", () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValueOnce(response([]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
+    fetchMock.mockResolvedValueOnce(response([]));
 
     render(<App />);
     await userEvent.click(await screen.findByRole("button", { name: "新建复刻项目" }));
@@ -246,6 +284,7 @@ describe("项目首页", () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValueOnce(response([]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
+    fetchMock.mockResolvedValueOnce(response([]));
 
     render(<App />);
 
@@ -268,6 +307,7 @@ describe("项目首页", () => {
       ]),
     );
     fetchMock.mockResolvedValueOnce(response(capabilities));
+    fetchMock.mockResolvedValueOnce(response([]));
 
     render(<App />);
     await userEvent.click(await screen.findByRole("button", { name: /雨夜人像复刻/ }));
@@ -300,6 +340,7 @@ describe("项目首页", () => {
       }]),
     );
     fetchMock.mockResolvedValueOnce(response(capabilities));
+    fetchMock.mockResolvedValueOnce(response([]));
 
     render(<App />);
     await userEvent.click(await screen.findByRole("button", { name: /雨夜人像复刻/ }));
@@ -334,6 +375,7 @@ describe("项目首页", () => {
       },
     ]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
+    fetchMock.mockResolvedValueOnce(response([]));
     fetchMock.mockResolvedValueOnce(response({
       id: "project-001",
       name: "雨夜人像复刻",
@@ -377,6 +419,7 @@ describe("项目首页", () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValueOnce(response([original, other]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
+    fetchMock.mockResolvedValueOnce(response([]));
     fetchMock.mockReturnValueOnce(pending.promise);
 
     render(<App />);
@@ -401,6 +444,7 @@ describe("项目首页", () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValueOnce(response([original, other]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
+    fetchMock.mockResolvedValueOnce(response([]));
     fetchMock.mockReturnValueOnce(pending.promise);
 
     render(<App />);
@@ -418,6 +462,7 @@ describe("项目首页", () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValueOnce(response({ detail: "本地项目存储不可用" }, 503));
     fetchMock.mockResolvedValueOnce(response(capabilities));
+    fetchMock.mockResolvedValueOnce(response([]));
     fetchMock.mockResolvedValueOnce(
       response([
         {
@@ -443,6 +488,7 @@ describe("项目首页", () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValueOnce(response([]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
+    fetchMock.mockResolvedValueOnce(response([]));
     fetchMock.mockResolvedValueOnce(
       response({
         id: "project-003",
@@ -473,6 +519,7 @@ describe("项目首页", () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValueOnce(response([]));
     fetchMock.mockRejectedValueOnce(new Error("服务未启动"));
+    fetchMock.mockResolvedValueOnce(response([]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
     fetchMock.mockResolvedValueOnce(
       response({
@@ -502,6 +549,7 @@ describe("项目首页", () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValueOnce(response({ detail: "本地项目数据已损坏，请从备份恢复 projects.json，或将损坏文件移到其他位置后重新读取。" }, 503));
     fetchMock.mockResolvedValueOnce(response(capabilities));
+    fetchMock.mockResolvedValueOnce(response([]));
 
     render(<App />);
 
@@ -512,6 +560,7 @@ describe("项目首页", () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValueOnce(response([]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
+    fetchMock.mockResolvedValueOnce(response([]));
     const user = userEvent.setup();
 
     render(<App />);

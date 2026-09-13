@@ -160,6 +160,7 @@ export function AnalysisProviderSettings({
               <label htmlFor="analysis-api-key">{selected.provider === "bailian" ? "百炼 API Key" : "本地服务 API Key（可选）"}</label>
               <input id="analysis-api-key" type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} autoComplete="new-password" disabled={!isDesktop} />
               <p className="analysis-provider-key-state">{selected.credentialState === "configured" ? "密钥已配置" : selected.provider === "bailian" ? "需要 API Key 后才能开始分析" : "本地服务允许不填写 API Key"}</p>
+              <p className="analysis-provider-probe-note">连接测试只发送固定探针，不上传项目素材。</p>
               {error && <p className="analysis-provider-error" role="alert"><CircleAlert aria-hidden="true" size={17} />{error}</p>}
               {connectionStatus && <p className="analysis-provider-success" role="status"><Check aria-hidden="true" size={17} />{connectionStatus}</p>}
               {isDesktop && <div className="analysis-provider-actions">

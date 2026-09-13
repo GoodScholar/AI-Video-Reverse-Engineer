@@ -17,6 +17,16 @@ type Props = {
   pollIntervalMs?: number;
 };
 
+type DisclosureIdentity = {
+  referenceMediaId: string;
+  preprocessingId: string;
+  preprocessingSourceReferenceMediaId: string;
+  preprocessingMediaType: "image" | "video";
+  preprocessingAlgorithmVersion: number;
+  mediaType: "image" | "video";
+  proxySize: { width: number; height: number } | null;
+};
+
 function useDesktop() {
   const [isDesktop, setIsDesktop] = useState(() => (
     typeof window !== "undefined" && typeof window.matchMedia === "function"
@@ -74,15 +84,12 @@ function Result({ task, mediaType, resultHeadingRef }: { task: SemanticAnalysis;
   </div>;
 }
 
-function Disclosure({ project, provider, onCancel, onConfirm, isSubmitting }: { project: Project; provider: AnalysisProviderConfiguration; onCancel: () => void; onConfirm: () => void; isSubmitting: boolean }) {
-  const preprocessing = project.localPreprocessing!;
-  const isImage = project.referenceMedia?.type === "image";
-  const dimensions = preprocessing.proxySummary?.mediaType === "image"
-    ? preprocessing.proxySummary.proxySize
-    : null;
+function Disclosure({ identity, provider, headingRef, onCancel, onConfirm, isSubmitting }: { identity: DisclosureIdentity; provider: AnalysisProviderConfiguration; headingRef: RefObject<HTMLHeadingElement>; onCancel: () => void; onConfirm: () => void; isSubmitting: boolean }) {
+  const isImage = identity.mediaType === "image";
+  const dimensions = identity.proxySize;
   const ratio = dimensions ? `${dimensions.width}:${dimensions.height}` : "由本地预处理记录";
   return <div className="semantic-analysis-disclosure" aria-labelledby="semantic-disclosure-title">
-    <h3 id="semantic-disclosure-title">确认发送分析代理</h3>
+    <h3 ref={headingRef} id="semantic-disclosure-title" tabIndex={-1}>确认发送分析代理</h3>
     <p>将使用 {providerLabel(provider.provider)} 的 {provider.model} 进行本次语义分析。</p>
     <dl>
       <div><dt>实际发送内容</dt><dd>{isImage ? `analysis-proxy.jpg（${dimensions?.width ?? "未知"}×${dimensions?.height ?? "未知"}，比例 ${ratio}）` : "contact-sheet.jpg 与 analysis-proxy.json"}</dd></div>
@@ -108,7 +115,7 @@ export function SemanticAnalysisPanel({
   const task = project.semanticAnalysis ?? null;
   const canPoll = task?.status === "queued" || task?.status === "running";
   const canStart = Boolean(project.referenceMedia && project.localPreprocessing?.status === "completed" && provider?.model && (provider.credentialState === "configured" || provider.provider === "local_openai_compatible"));
-  const [showDisclosure, setShowDisclosure] = useState(false);
+  const [disclosure, setDisclosure] = useState<DisclosureIdentity | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState("");
   const [refreshError, setRefreshError] = useState("");
@@ -120,6 +127,7 @@ export function SemanticAnalysisPanel({
   const resultHeadingRef = useRef<HTMLHeadingElement>(null);
   const startButtonRef = useRef<HTMLButtonElement>(null);
   const retryButtonRef = useRef<HTMLButtonElement>(null);
+  const disclosureHeadingRef = useRef<HTMLHeadingElement>(null);
   const disclosureOriginRef = useRef<"start" | "retry">("start");
   const previousStatusRef = useRef<SemanticAnalysis["status"] | null>(task?.status ?? null);
   currentProjectIdRef.current = project.id;
@@ -132,11 +140,23 @@ export function SemanticAnalysisPanel({
 
   useEffect(() => {
     requestGenerationRef.current += 1;
-    setShowDisclosure(false);
+    setDisclosure(null);
     setIsSubmitting(false);
     setSubmitError("");
     setRefreshError("");
   }, [project.id]);
+
+  const disclosureIsCurrent = disclosure !== null
+    && disclosure.referenceMediaId === project.referenceMedia?.id
+    && disclosure.preprocessingId === project.localPreprocessing?.id
+    && disclosure.preprocessingSourceReferenceMediaId === project.localPreprocessing?.sourceReferenceMediaId
+    && disclosure.preprocessingMediaType === project.localPreprocessing?.mediaType
+    && disclosure.preprocessingAlgorithmVersion === project.localPreprocessing?.algorithmVersion
+    && project.localPreprocessing?.status === "completed";
+
+  useEffect(() => {
+    if (disclosure && disclosureIsCurrent) disclosureHeadingRef.current?.focus();
+  }, [disclosure, disclosureIsCurrent]);
 
   useEffect(() => {
     previousStatusRef.current = task?.status ?? null;
@@ -185,19 +205,33 @@ export function SemanticAnalysisPanel({
   }, [canPoll, load, pollIntervalMs, project.id, task?.status]);
 
   function openDisclosure(origin: "start" | "retry") {
-    if (!isDesktop || !canStart || isSubmitting) return;
+    if (!isDesktop || !canStart || isSubmitting || !project.referenceMedia || !project.localPreprocessing) return;
     setSubmitError("");
     disclosureOriginRef.current = origin;
-    setShowDisclosure(true);
+    const proxySize = project.localPreprocessing.proxySummary?.mediaType === "image"
+      ? project.localPreprocessing.proxySummary.proxySize
+      : null;
+    setDisclosure({
+      referenceMediaId: project.referenceMedia.id,
+      preprocessingId: project.localPreprocessing.id,
+      preprocessingSourceReferenceMediaId: project.localPreprocessing.sourceReferenceMediaId,
+      preprocessingMediaType: project.localPreprocessing.mediaType,
+      preprocessingAlgorithmVersion: project.localPreprocessing.algorithmVersion,
+      mediaType: project.referenceMedia.type,
+      proxySize,
+    });
   }
 
   function cancelDisclosure() {
-    setShowDisclosure(false);
+    setDisclosure(null);
     setShouldRestoreDisclosureFocus(true);
   }
 
   async function confirm() {
-    if (!isDesktop || !provider || !provider.model || isSubmitting) return;
+    if (!isDesktop || !provider || !provider.model || isSubmitting || !disclosureIsCurrent) {
+      if (!disclosureIsCurrent) setSubmitError("参考素材或本地预处理已变化，请重新确认发送内容。");
+      return;
+    }
     const generation = ++requestGenerationRef.current;
     const projectId = project.id;
     const isCurrent = () => mountedRef.current && requestGenerationRef.current === generation && currentProjectIdRef.current === projectId;
@@ -206,7 +240,7 @@ export function SemanticAnalysisPanel({
     try {
       const updated = await start(projectId, provider.provider, provider.model);
       if (!isCurrent()) return;
-      setShowDisclosure(false);
+      setDisclosure(null);
       callbackRef.current(updated);
     } catch (error) {
       if (isCurrent()) setSubmitError(messageFor(error, "无法启动语义分析，请重试。"));
@@ -215,9 +249,10 @@ export function SemanticAnalysisPanel({
 
   return <section className={`semantic-analysis-panel${isDesktop ? "" : " semantic-analysis-panel--readonly"}`} aria-labelledby="semantic-analysis-title">
     <div className="semantic-analysis-heading"><div><h2 id="semantic-analysis-title">语义分析</h2><p>基于本地生成的分析代理，不上传原始参考素材。</p></div>{!isDesktop && <p className="analysis-readonly">窄屏仅查看任务与结果</p>}</div>
-    {(!task || task.status === "completed") && !showDisclosure && isDesktop && <div className="semantic-analysis-start"><p>{canStart ? "确认发送内容后，才会向所选服务提交本次分析。" : "请先完成本地预处理，并在上方保存当前分析服务配置。"}</p><button ref={startButtonRef} className="primary-action" type="button" disabled={!canStart} onClick={() => openDisclosure("start")}><Play aria-hidden="true" size={17} />开始语义分析</button></div>}
-    {task?.status === "failed" && isDesktop && !showDisclosure && <button ref={retryButtonRef} className="secondary-action semantic-analysis-retry" type="button" disabled={!canStart} onClick={() => openDisclosure("retry")}><RotateCcw aria-hidden="true" size={17} />只重试语义分析</button>}
-    {showDisclosure && provider && <Disclosure project={project} provider={provider} isSubmitting={isSubmitting} onCancel={cancelDisclosure} onConfirm={() => void confirm()} />}
+    {(!task || task.status === "completed") && !disclosure && isDesktop && <div className="semantic-analysis-start"><p>{canStart ? "确认发送内容后，才会向所选服务提交本次分析。" : "请先完成本地预处理，并在上方保存当前分析服务配置。"}</p><button ref={startButtonRef} className="primary-action" type="button" disabled={!canStart} onClick={() => openDisclosure("start")}><Play aria-hidden="true" size={17} />开始语义分析</button></div>}
+    {task?.status === "failed" && isDesktop && !disclosure && <button ref={retryButtonRef} className="secondary-action semantic-analysis-retry" type="button" disabled={!canStart} onClick={() => openDisclosure("retry")}><RotateCcw aria-hidden="true" size={17} />只重试语义分析</button>}
+    {disclosure && disclosureIsCurrent && provider && <Disclosure identity={disclosure} provider={provider} headingRef={disclosureHeadingRef} isSubmitting={isSubmitting} onCancel={cancelDisclosure} onConfirm={() => void confirm()} />}
+    {disclosure && !disclosureIsCurrent && <p className="semantic-analysis-error" role="alert">参考素材或本地预处理已变化，请重新确认发送内容。</p>}
     {task && <div className={`semantic-analysis-task semantic-analysis-task--${task.status}`} role="status" aria-live="polite" aria-label={taskTitle(task)}><div><h3>{taskTitle(task)}</h3><p>{providerLabel(task.provider)} · {task.model}</p></div>{task.status === "completed" ? <Check aria-hidden="true" size={20} /> : task.status === "failed" ? <CircleAlert aria-hidden="true" size={20} /> : task.status === "running" ? <LoaderCircle aria-hidden="true" size={20} /> : <Clock3 aria-hidden="true" size={20} />}</div>}
     {task?.status === "failed" && task.error && <p className="semantic-analysis-error" role="alert"><CircleAlert aria-hidden="true" size={17} />{task.error.message}</p>}
     {submitError && <p className="semantic-analysis-error" role="alert"><CircleAlert aria-hidden="true" size={17} />{submitError}</p>}

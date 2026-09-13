@@ -53,3 +53,18 @@ it("取消披露后把焦点交还给开始按钮", async () => {
 
   expect(screen.getByRole("button", { name: "开始语义分析" })).toHaveFocus();
 });
+
+it("披露冻结本次素材与预处理身份，并在身份失效时不提交", async () => {
+  vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  const user = userEvent.setup();
+  const start = vi.fn();
+  const view = render(<SemanticAnalysisPanel project={{ ...project(), semanticAnalysis: null }} provider={{ provider: "bailian", model: "qwen3.7-flash", baseUrl: null, credentialState: "configured", selectedProvider: "bailian" }} onProjectUpdated={vi.fn()} start={start} />);
+
+  await user.click(screen.getByRole("button", { name: "开始语义分析" }));
+  expect(screen.getByRole("heading", { name: "确认发送分析代理" })).toHaveFocus();
+  view.rerender(<SemanticAnalysisPanel project={{ ...project(), referenceMedia: { ...project().referenceMedia!, id: "image-002", originalName: "replacement.png" }, localPreprocessing: null, semanticAnalysis: null }} provider={{ provider: "bailian", model: "qwen3.7-flash", baseUrl: null, credentialState: "configured", selectedProvider: "bailian" }} onProjectUpdated={vi.fn()} start={start} />);
+
+  expect(screen.getByText("参考素材或本地预处理已变化，请重新确认发送内容。")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "确认并开始语义分析" })).not.toBeInTheDocument();
+  expect(start).not.toHaveBeenCalled();
+});

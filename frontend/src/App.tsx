@@ -109,6 +109,7 @@ export function App() {
   const [analysisProviders, setAnalysisProviders] = useState<AnalysisProviderConfiguration[]>([]);
   const [analysisSettingsOpen, setAnalysisSettingsOpen] = useState(false);
   const [isLoadingAnalysisProviders, setIsLoadingAnalysisProviders] = useState(false);
+  const [analysisProviderError, setAnalysisProviderError] = useState("");
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [projectName, setProjectName] = useState("");
@@ -141,15 +142,22 @@ export function App() {
     setIsLoading(false);
   }
 
-  async function openAnalysisSettings() {
-    setAnalysisSettingsOpen(true);
-    if (analysisProviders.length > 0 || isLoadingAnalysisProviders) return;
+  async function loadAnalysisProviders() {
+    if (isLoadingAnalysisProviders) return;
     setIsLoadingAnalysisProviders(true);
+    setAnalysisProviderError("");
     try {
       setAnalysisProviders(await listAnalysisProviders());
+    } catch {
+      setAnalysisProviderError("无法读取分析服务设置，请重试。");
     } finally {
       setIsLoadingAnalysisProviders(false);
     }
+  }
+
+  function openAnalysisSettings() {
+    setAnalysisSettingsOpen(true);
+    if (analysisProviders.length === 0 && !isLoadingAnalysisProviders && !analysisProviderError) void loadAnalysisProviders();
   }
 
   async function refreshCapabilities() {
@@ -181,6 +189,7 @@ export function App() {
 
   useEffect(() => {
     void loadHome();
+    void loadAnalysisProviders();
   }, []);
 
   useEffect(() => {
@@ -227,6 +236,8 @@ export function App() {
             )}
           </div>
         </header>
+
+        {analysisProviderError && <div className="analysis-provider-load-error inline-error" role="alert"><CircleAlert aria-hidden="true" size={18} /><span>{analysisProviderError}</span><button type="button" onClick={() => void loadAnalysisProviders()}><RefreshCw size={15} aria-hidden="true" />重新读取分析服务设置</button></div>}
 
         <section className="project-intro" aria-labelledby="project-title">
           <button className="back-link" type="button" onClick={() => setSelectedProject(null)}>
@@ -278,6 +289,8 @@ export function App() {
           )}
         </div>
       </header>
+
+      {analysisProviderError && <div className="analysis-provider-load-error inline-error" role="alert"><CircleAlert aria-hidden="true" size={18} /><span>{analysisProviderError}</span><button type="button" onClick={() => void loadAnalysisProviders()}><RefreshCw size={15} aria-hidden="true" />重新读取分析服务设置</button></div>}
 
       <section className="home-hero" aria-labelledby="home-title">
         <div>
