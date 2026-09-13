@@ -4,6 +4,7 @@ import pytest
 
 from app.local_preprocessing import (
     FrameMetric,
+    LocalPreprocessing,
     MotionSummary,
     SceneChange,
     assess_reproducibility,
@@ -99,6 +100,32 @@ def test_new_task_has_all_five_ordered_pending_stages():
         "reproducibilityAssessment",
     ]
     assert {stage.status for stage in task.stages} == {"pending"}
+
+
+def test_image_preprocessing_uses_only_image_stages():
+    task = new_local_preprocessing(
+        "prep-1", "image-1", "image", datetime(2026, 9, 11, tzinfo=timezone.utc),
+    )
+
+    assert [stage.name for stage in task.stages] == [
+        "imageDecoding", "imageNormalization",
+        "proxyGeneration", "reproducibilityAssessment",
+    ]
+    assert task.mediaType == "image"
+
+
+def test_image_proxy_summary_is_selected_by_media_type():
+    task = new_local_preprocessing(
+        "prep-1", "image-1", "image", datetime(2026, 9, 11, tzinfo=timezone.utc),
+    )
+
+    parsed = LocalPreprocessing.model_validate({
+        **task.model_dump(),
+        "proxySummary": {"mediaType": "image"},
+    })
+
+    assert parsed.proxySummary is not None
+    assert parsed.proxySummary.mediaType == "image"
 
 
 @pytest.mark.parametrize(

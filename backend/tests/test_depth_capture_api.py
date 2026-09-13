@@ -65,7 +65,7 @@ def _completed_project(tmp_path, *, assessment="pending_semantic_confirmation"):
         id="video-001", originalName="clip.mp4", format="mp4", sizeBytes=1,
         durationSeconds=2, width=640, height=360, frameRate=24,
     )
-    preprocessing = new_local_preprocessing("preprocess-001", reference.id, datetime.now(timezone.utc))
+    preprocessing = new_local_preprocessing("preprocess-001", reference.id, "video", datetime.now(timezone.utc))
     for stage in preprocessing.stages:
         stage.status = "completed"
         stage.startedAt = now

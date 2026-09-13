@@ -489,7 +489,11 @@ def create_app(
 
     def interrupted_preprocessing(project: Project, preprocessing: LocalPreprocessing) -> LocalPreprocessing:
         stage = first_unfinished_stage(preprocessing)
-        reset_stage_artifacts(preprocessing_directory(data_dir, project.id, preprocessing.id), stage)
+        reset_stage_artifacts(
+            preprocessing_directory(data_dir, project.id, preprocessing.id),
+            stage,
+            preprocessing.mediaType,
+        )
         task = preprocessing.model_copy(deep=True)
         reset_stages_from(task, stage)
         task.status = "failed"
@@ -1121,7 +1125,7 @@ def create_app(
                 restart_stage = retry.currentStage or first_unfinished_stage(retry)
                 if all(state.status == "completed" for state in retry.stages):
                     restart_stage = STAGE_ORDER[0]
-                reset_stage_artifacts(directory, restart_stage)
+                reset_stage_artifacts(directory, restart_stage, retry.mediaType)
                 reset_stages_from(retry, restart_stage)
                 retry.status = "queued"
                 retry.currentStage = None
@@ -1134,7 +1138,9 @@ def create_app(
                 retry.error = None
                 task = retry
             else:
-                task = new_local_preprocessing(str(uuid4()), project.referenceVideo.id, now)
+                task = new_local_preprocessing(
+                    str(uuid4()), project.referenceVideo.id, "video", now,
+                )
             dispatching_project_ids.add(project.id)
             dispatching = True
             return project.model_copy(update={

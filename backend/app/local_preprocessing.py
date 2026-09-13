@@ -1,7 +1,7 @@
 import math
 import re
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -24,14 +24,26 @@ LIGHT_MOTION_P90_MAX = 2.5
 MODERATE_MOTION_P90_MAX = 8.0
 FFMPEG_TIMEOUT_SECONDS = 120.0
 
+MediaType = Literal["image", "video"]
 StageName = Literal[
     "decoding", "sceneDetection", "keyframeExtraction",
     "motionAnalysis", "reproducibilityAssessment",
+    "imageDecoding", "imageNormalization", "proxyGeneration",
 ]
-STAGE_ORDER: tuple[StageName, StageName, StageName, StageName, StageName] = (
+VIDEO_STAGE_ORDER: tuple[StageName, ...] = (
     "decoding", "sceneDetection", "keyframeExtraction",
     "motionAnalysis", "reproducibilityAssessment",
 )
+IMAGE_STAGE_ORDER: tuple[StageName, ...] = (
+    "imageDecoding", "imageNormalization",
+    "proxyGeneration", "reproducibilityAssessment",
+)
+# 视频处理链路的临时兼容别名；新通用逻辑必须使用 stage_order_for()。
+STAGE_ORDER = VIDEO_STAGE_ORDER
+
+
+def stage_order_for(media_type: MediaType) -> tuple[StageName, ...]:
+    return IMAGE_STAGE_ORDER if media_type == "image" else VIDEO_STAGE_ORDER
 
 
 class FrameMetric(BaseModel):
@@ -61,7 +73,8 @@ class MotionSummary(BaseModel):
     excludedTimesSeconds: list[float] = Field(default_factory=list)
 
 
-class AnalysisProxySummary(BaseModel):
+class VideoProxySummary(BaseModel):
+    mediaType: Literal["video"] = "video"
     keyframeCount: int = Field(ge=MIN_KEYFRAMES, le=MAX_KEYFRAMES)
     contactSheetCount: Literal[1] = 1
     sceneChangeCount: int = Field(ge=0)
@@ -69,6 +82,17 @@ class AnalysisProxySummary(BaseModel):
     motionP90: Optional[float]
     motionPeak: Optional[float]
     motionLevel: Literal["light", "moderate", "high", "unavailable"]
+
+
+class ImageProxySummary(BaseModel):
+    mediaType: Literal["image"] = "image"
+
+
+ProxySummary = Annotated[
+    Union[ImageProxySummary, VideoProxySummary], Field(discriminator="mediaType"),
+]
+# 视频处理链路的临时兼容别名；新代码应使用 VideoProxySummary。
+AnalysisProxySummary = VideoProxySummary
 
 
 class ReproducibilityCheck(BaseModel):
@@ -108,7 +132,7 @@ class LocalPreprocessingError(BaseModel):
 class LocalPreprocessing(BaseModel):
     id: str
     sourceReferenceMediaId: str
-    mediaType: Literal["image", "video"]
+    mediaType: MediaType
     algorithmVersion: Literal[1] = ALGORITHM_VERSION
     status: Literal["queued", "running", "completed", "failed"]
     currentStage: Optional[StageName] = None
@@ -117,7 +141,7 @@ class LocalPreprocessing(BaseModel):
     startedAt: Optional[str] = None
     updatedAt: str
     completedAt: Optional[str] = None
-    proxySummary: Optional[AnalysisProxySummary] = None
+    proxySummary: Optional[ProxySummary] = None
     reproducibilityAssessment: Optional[ReproducibilityAssessment] = None
     error: Optional[LocalPreprocessingError] = None
 
@@ -350,11 +374,11 @@ def assess_reproducibility(
 def new_local_preprocessing(
     preprocessing_id: str,
     reference_media_id: str,
+    media_type: MediaType,
     now: datetime,
-    media_type: Literal["image", "video"] = "video",
 ) -> LocalPreprocessing:
     timestamp = now.isoformat()
-    stages = [PreprocessingStageState(name=name) for name in STAGE_ORDER]
+    stages = [PreprocessingStageState(name=name) for name in stage_order_for(media_type)]
     return LocalPreprocessing(
         id=preprocessing_id,
         sourceReferenceMediaId=reference_media_id,

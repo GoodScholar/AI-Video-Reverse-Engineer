@@ -61,7 +61,7 @@ def client_with_video_and_queue(tmp_path):
 
 def write_completed_project_with_artifacts(tmp_path, *, first_invalid_stage):
     now = datetime.now(timezone.utc)
-    preprocessing = new_local_preprocessing("preprocessing-001", "video-001", now)
+    preprocessing = new_local_preprocessing("preprocessing-001", "video-001", "video", now)
     for state in preprocessing.stages:
         state.status = "completed"
         state.startedAt = now.isoformat()
@@ -247,7 +247,7 @@ def test_start_requires_a_reference_video(tmp_path):
 
 def test_restart_marks_queued_preprocessing_as_retryable_failure(tmp_path):
     now = datetime.now(timezone.utc)
-    preprocessing = new_local_preprocessing("preprocessing-001", "video-001", now)
+    preprocessing = new_local_preprocessing("preprocessing-001", "video-001", "video", now)
     (tmp_path / "projects.json").write_text(__import__("json").dumps([{
         "id": "project-001", "name": "旧项目", "createdAt": now.isoformat(),
         "updatedAt": now.isoformat(), "referenceMedia": {"type": "video",
@@ -513,7 +513,7 @@ def test_queue_rejection_marks_persisted_task_as_retryable_failure(tmp_path):
 
 def test_restart_ignores_completed_current_stage_and_resumes_first_unfinished_stage(tmp_path):
     now = datetime.now(timezone.utc)
-    preprocessing = new_local_preprocessing("preprocessing-001", "video-001", now)
+    preprocessing = new_local_preprocessing("preprocessing-001", "video-001", "video", now)
     for state in preprocessing.stages[:2]:
         state.status = "completed"
         state.startedAt = now.isoformat()
@@ -706,7 +706,7 @@ def test_initial_queued_write_failure_does_not_submit_a_job(tmp_path, monkeypatc
 def test_algorithm_version_change_creates_a_new_preprocessing_id(tmp_path, monkeypatch):
     client, project, queue = client_with_video_and_queue(tmp_path)
     current = client.get(f"/api/projects/{project['id']}").json()
-    previous = new_local_preprocessing("preprocessing-001", current["referenceMedia"]["id"], datetime.now(timezone.utc))
+    previous = new_local_preprocessing("preprocessing-001", current["referenceMedia"]["id"], "video", datetime.now(timezone.utc))
     previous.status = "failed"
     (tmp_path / "projects.json").write_text(json.dumps([{
         **current, "localPreprocessing": previous.model_dump(),
@@ -723,7 +723,7 @@ def test_algorithm_version_change_creates_a_new_preprocessing_id(tmp_path, monke
 def test_retry_rewinds_to_the_first_missing_completed_stage_artifact(tmp_path):
     client, project, queue = client_with_video_and_queue(tmp_path)
     current = client.get(f"/api/projects/{project['id']}").json()
-    preprocessing = new_local_preprocessing("preprocessing-001", current["referenceMedia"]["id"], datetime.now(timezone.utc))
+    preprocessing = new_local_preprocessing("preprocessing-001", current["referenceMedia"]["id"], "video", datetime.now(timezone.utc))
     preprocessing.status = "failed"
     preprocessing.currentStage = "sceneDetection"
     preprocessing.stages[0].status = "completed"

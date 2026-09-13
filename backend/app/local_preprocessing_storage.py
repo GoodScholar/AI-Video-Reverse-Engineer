@@ -8,16 +8,28 @@ from typing import Any, Optional
 
 from pydantic import BaseModel
 
-from .local_preprocessing import ALGORITHM_VERSION, LocalPreprocessing, STAGE_ORDER, StageName
+from .local_preprocessing import (
+    ALGORITHM_VERSION,
+    LocalPreprocessing,
+    MediaType,
+    StageName,
+    stage_order_for,
+)
 from .reference_video import validate_storage_id
 
 
-STAGE_FILES = {
+VIDEO_STAGE_FILES = {
     "decoding": ("decode.json",),
     "sceneDetection": ("scene-changes.json",),
     "keyframeExtraction": ("contact-sheet.jpg", "keyframes"),
     "motionAnalysis": ("motion.json",),
     "reproducibilityAssessment": ("analysis-proxy.json", "manifest.json"),
+}
+IMAGE_STAGE_FILES = {
+    "imageDecoding": (),
+    "imageNormalization": ("normalized.png",),
+    "proxyGeneration": ("analysis-proxy.jpg",),
+    "reproducibilityAssessment": ("manifest.json",),
 }
 _STAGE_JSON_FILES = frozenset({
     "decode.json",
@@ -32,6 +44,10 @@ _FRAME_NAME = re.compile(r"frame-\d{4}\.jpg\Z")
 class StageValidation(BaseModel):
     preprocessing: LocalPreprocessing
     firstInvalidStage: Optional[StageName]
+
+
+def _stage_files_for(media_type: MediaType) -> dict[StageName, tuple[str, ...]]:
+    return IMAGE_STAGE_FILES if media_type == "image" else VIDEO_STAGE_FILES
 
 
 def preprocessing_directory(data_dir: Path, project_id: str, preprocessing_id: str) -> Path:
@@ -79,11 +95,11 @@ def commit_keyframe_stage(workspace: Path, destination: Path, frame_names: list[
     destination.mkdir(parents=True, exist_ok=True)
     try:
         _validate_keyframe_workspace(workspace, frame_names)
-        _discard_stage_artifacts(destination, "keyframeExtraction")
+        _discard_stage_artifacts(destination, "keyframeExtraction", "video")
         os.replace(workspace / "keyframes", destination / "keyframes")
         os.replace(workspace / "contact-sheet.jpg", destination / "contact-sheet.jpg")
     except BaseException:
-        _discard_stage_artifacts(destination, "keyframeExtraction")
+        _discard_stage_artifacts(destination, "keyframeExtraction", "video")
         raise
 
 
@@ -101,7 +117,7 @@ def inspect_completed_stages(
             first_invalid = state.name
             break
     if first_invalid is not None:
-        start = STAGE_ORDER.index(first_invalid)
+        start = stage_order_for(updated.mediaType).index(first_invalid)
         for state in updated.stages[start:]:
             state.status = "pending"
             state.startedAt = None
@@ -115,7 +131,9 @@ def validate_completed_stages(
 ) -> StageValidation:
     validated = inspect_completed_stages(preprocessing, directory)
     if validated.firstInvalidStage is not None:
-        reset_stage_artifacts(directory, validated.firstInvalidStage)
+        reset_stage_artifacts(
+            directory, validated.firstInvalidStage, preprocessing.mediaType,
+        )
     return validated
 
 
@@ -125,26 +143,32 @@ def stage_artifacts_are_valid(
     preprocessing: LocalPreprocessing,
 ) -> bool:
     directory = _safe_preprocessing_directory(directory)
+    stage_files = _stage_files_for(preprocessing.mediaType).get(stage)
+    if stage_files is None:
+        return False
     if stage == "keyframeExtraction":
         return _keyframe_artifacts_are_valid(directory)
     if stage == "reproducibilityAssessment":
-        proxy = _read_json_object(directory, "analysis-proxy.json")
         manifest = _read_json_object(directory, "manifest.json")
         return (
-            proxy is not None
+            _stage_files_are_valid(directory, stage_files)
             and manifest is not None
             and manifest.get("schemaVersion") == 1
             and manifest.get("algorithmVersion") == ALGORITHM_VERSION
-            and manifest.get("sourceReferenceVideoId") == preprocessing.sourceReferenceVideoId
+            and manifest.get("mediaType") == preprocessing.mediaType
+            and manifest.get("sourceReferenceMediaId") == preprocessing.sourceReferenceMediaId
         )
-    return all(_read_json_object(directory, filename) is not None for filename in STAGE_FILES[stage])
+    return _stage_files_are_valid(directory, stage_files)
 
 
-def reset_stage_artifacts(directory: Path, from_stage: StageName) -> None:
+def reset_stage_artifacts(
+    directory: Path, from_stage: StageName, media_type: MediaType,
+) -> None:
     directory = _safe_preprocessing_directory(directory)
-    start = STAGE_ORDER.index(from_stage)
-    for stage in STAGE_ORDER[start:]:
-        _discard_stage_artifacts(directory, stage)
+    stages = stage_order_for(media_type)
+    start = stages.index(from_stage)
+    for stage in stages[start:]:
+        _discard_stage_artifacts(directory, stage, media_type)
 
 
 def discard_preprocessing(data_dir: Path, project_id: str, preprocessing_id: str) -> None:
@@ -213,9 +237,21 @@ def _read_json_object(directory: Path, filename: str) -> Optional[dict[str, Any]
     return payload if isinstance(payload, dict) and payload else None
 
 
-def _discard_stage_artifacts(directory: Path, stage: StageName) -> None:
+def _stage_files_are_valid(directory: Path, files: tuple[str, ...]) -> bool:
+    return all(
+        _read_json_object(directory, filename) is not None
+        if filename in _STAGE_JSON_FILES
+        else _path_is_inside(directory, directory / filename)
+        and _nonempty_regular_file(directory / filename)
+        for filename in files
+    )
+
+
+def _discard_stage_artifacts(
+    directory: Path, stage: StageName, media_type: MediaType,
+) -> None:
     directory = _safe_preprocessing_directory(directory)
-    for relative in STAGE_FILES[stage]:
+    for relative in _stage_files_for(media_type).get(stage, ()):
         path = directory / relative
         if path.is_symlink() or _path_is_inside(directory, path):
             discard_path(path)

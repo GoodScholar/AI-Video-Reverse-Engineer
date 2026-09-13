@@ -160,19 +160,19 @@ def run_local_preprocessing(
             handlers[state.name]()
         except LocalPreprocessingFailure:
             try:
-                reset_stage_artifacts(output_directory, state.name)
+                reset_stage_artifacts(output_directory, state.name, preprocessing.mediaType)
             except OSError as error:
                 raise storage_failure_for(state.name) from error
             raise
         except OSError as error:
             try:
-                reset_stage_artifacts(output_directory, state.name)
+                reset_stage_artifacts(output_directory, state.name, preprocessing.mediaType)
             except OSError:
                 pass
             raise storage_failure_for(state.name) from error
         except (ValueError, ValidationError) as error:
             try:
-                reset_stage_artifacts(output_directory, state.name)
+                reset_stage_artifacts(output_directory, state.name, preprocessing.mediaType)
             except OSError as cleanup_error:
                 raise storage_failure_for(state.name) from cleanup_error
             raise stage_failure_for(state.name) from error

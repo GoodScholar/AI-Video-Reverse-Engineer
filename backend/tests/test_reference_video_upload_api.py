@@ -370,7 +370,7 @@ def test_successful_replacement_clears_and_removes_old_preprocessing(tmp_path, m
     client = TestClient(create_app(data_dir=tmp_path, max_reference_video_bytes=32))
     project = create_project(client)
     old_reference = upload(client, project["id"], "old.mp4", b"old-video").json()["referenceMedia"]
-    preprocessing = new_local_preprocessing("preprocessing-001", old_reference["id"], datetime.now(timezone.utc))
+    preprocessing = new_local_preprocessing("preprocessing-001", old_reference["id"], "video", datetime.now(timezone.utc))
     preprocessing.status = "failed"
     current = client.get(f"/api/projects/{project['id']}").json()
     (tmp_path / "projects.json").write_text(json.dumps([{
@@ -392,7 +392,7 @@ def test_replacement_metadata_failure_preserves_old_preprocessing_and_artifacts(
     client = TestClient(create_app(data_dir=tmp_path, max_reference_video_bytes=32), raise_server_exceptions=False)
     project = create_project(client)
     old_reference = upload(client, project["id"], "old.mp4", b"old-video").json()["referenceMedia"]
-    preprocessing = new_local_preprocessing("preprocessing-001", old_reference["id"], datetime.now(timezone.utc))
+    preprocessing = new_local_preprocessing("preprocessing-001", old_reference["id"], "video", datetime.now(timezone.utc))
     preprocessing.status = "failed"
     current = client.get(f"/api/projects/{project['id']}").json()
     (tmp_path / "projects.json").write_text(json.dumps([{
@@ -417,7 +417,7 @@ def test_preprocessing_cleanup_failure_does_not_rollback_new_reference(tmp_path,
     client = TestClient(create_app(data_dir=tmp_path, max_reference_video_bytes=32))
     project = create_project(client)
     old_reference = upload(client, project["id"], "old.mp4", b"old-video").json()["referenceMedia"]
-    preprocessing = new_local_preprocessing("preprocessing-001", old_reference["id"], datetime.now(timezone.utc))
+    preprocessing = new_local_preprocessing("preprocessing-001", old_reference["id"], "video", datetime.now(timezone.utc))
     preprocessing.status = "failed"
     current = client.get(f"/api/projects/{project['id']}").json()
     (tmp_path / "projects.json").write_text(json.dumps([{

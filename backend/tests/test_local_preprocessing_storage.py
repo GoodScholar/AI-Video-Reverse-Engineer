@@ -28,6 +28,18 @@ def preprocessing():
     return task
 
 
+@pytest.fixture
+def image_preprocessing():
+    task = new_local_preprocessing(
+        preprocessing_id="prep-image-001",
+        reference_media_id="image-001", media_type="image",
+        now=datetime(2026, 9, 11, tzinfo=timezone.utc),
+    )
+    for stage in task.stages:
+        stage.status = "completed"
+    return task
+
+
 def storage_directory(tmp_path):
     return preprocessing_directory(tmp_path, "project-001", "prep-001")
 
@@ -117,7 +129,7 @@ def test_reset_stage_artifacts_removes_current_stage_and_followers(tmp_path):
     (directory / "contact-sheet.jpg").write_bytes(b"sheet")
     (directory / "keyframes").mkdir()
 
-    reset_stage_artifacts(directory, "keyframeExtraction")
+    reset_stage_artifacts(directory, "keyframeExtraction", "video")
 
     assert not (directory / "contact-sheet.jpg").exists()
     assert not (directory / "keyframes").exists()
@@ -199,7 +211,8 @@ def test_invalid_manifest_algorithm_version_resets_final_stage(tmp_path, preproc
     write_stage_json(directory, "manifest.json", {
         "schemaVersion": 1,
         "algorithmVersion": 999,
-        "sourceReferenceVideoId": preprocessing.sourceReferenceVideoId,
+        "mediaType": "video",
+        "sourceReferenceMediaId": preprocessing.sourceReferenceMediaId,
     })
 
     valid = validate_completed_stages(preprocessing, directory)
@@ -208,6 +221,53 @@ def test_invalid_manifest_algorithm_version_resets_final_stage(tmp_path, preproc
     assert valid.preprocessing.stages[-1].status == "pending"
     assert not (directory / "analysis-proxy.json").exists()
     assert not (directory / "manifest.json").exists()
+
+
+def test_image_completed_stages_require_media_specific_artifacts_and_manifest(tmp_path, image_preprocessing):
+    directory = preprocessing_directory(tmp_path, "project-001", image_preprocessing.id)
+    directory.mkdir(parents=True)
+    (directory / "normalized.png").write_bytes(b"png")
+    (directory / "analysis-proxy.jpg").write_bytes(b"jpeg")
+    write_stage_json(directory, "manifest.json", {
+        "schemaVersion": 1,
+        "algorithmVersion": 1,
+        "mediaType": "image",
+        "sourceReferenceMediaId": image_preprocessing.sourceReferenceMediaId,
+    })
+
+    valid = validate_completed_stages(image_preprocessing, directory)
+
+    assert valid.firstInvalidStage is None
+    assert [stage.status for stage in valid.preprocessing.stages] == ["completed"] * 4
+
+
+@pytest.mark.parametrize(
+    "manifest_update",
+    [
+        {"algorithmVersion": 999},
+        {"mediaType": "video"},
+        {"sourceReferenceMediaId": "image-other"},
+    ],
+)
+def test_image_manifest_requires_matching_media_algorithm_and_source(
+    tmp_path, image_preprocessing, manifest_update,
+):
+    directory = preprocessing_directory(tmp_path, "project-001", image_preprocessing.id)
+    directory.mkdir(parents=True)
+    (directory / "normalized.png").write_bytes(b"png")
+    (directory / "analysis-proxy.jpg").write_bytes(b"jpeg")
+    manifest = {
+        "schemaVersion": 1,
+        "algorithmVersion": 1,
+        "mediaType": "image",
+        "sourceReferenceMediaId": image_preprocessing.sourceReferenceMediaId,
+    }
+    manifest.update(manifest_update)
+    write_stage_json(directory, "manifest.json", manifest)
+
+    valid = validate_completed_stages(image_preprocessing, directory)
+
+    assert valid.firstInvalidStage == "reproducibilityAssessment"
 
 
 def test_discard_preprocessing_rejects_unsafe_id_without_deleting_sentinel(tmp_path):
@@ -235,7 +295,7 @@ def test_reset_rejects_replaced_parent_symlink_without_deleting_external_sentine
     project_files.symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(OSError, match="本地预处理路径超出数据目录"):
-        reset_stage_artifacts(directory, "motionAnalysis")
+        reset_stage_artifacts(directory, "motionAnalysis", "video")
 
     assert sentinel.read_text(encoding="utf-8") == "keep"
 
