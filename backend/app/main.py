@@ -77,6 +77,9 @@ from app.depth_capture_runner import DepthCaptureFailure, DepthCaptureRequest, r
 from app.depth_capture_storage import inspect_depth_artifacts
 from app.depth_capture_storage import DepthPreviewUnavailableError, open_validated_depth_preview
 from app.semantic_analysis import SemanticAnalysis
+from app.analysis_service_secrets import SecureStorageUnavailable
+from app.analysis_settings import AnalysisProviderConfiguration, AnalysisSettings, validate_loopback_base_url
+from app.credential_store import CredentialStore
 
 
 class CreateProjectInput(BaseModel):
@@ -278,12 +281,45 @@ def create_app(
     depth_checkpoint: Path = Path("backend/depth_worker/checkpoints/video_depth_anything_vits.pth"),
     depth_upstream_root: Path = Path("backend/depth_worker/vendor/Video-Depth-Anything"),
     depth_device_probe: Optional[Callable[[], tuple[bool, bool]]] = None,
+    credential_store=None,
+    analysis_settings: Optional[AnalysisSettings] = None,
 ) -> FastAPI:
     app = FastAPI(title="AI 视频复刻分析器")
     project_write_lock = Lock()
     dispatching_project_ids: set[str] = set()
     reference_media_path_pattern = re.compile(r"^/api/projects/[^/]+/reference-media$")
     reference_video_path_pattern = re.compile(r"^/api/projects/[^/]+/reference-video$")
+    configured_credentials = credential_store
+    configured_analysis_settings = analysis_settings or AnalysisSettings(data_dir / "analysis-providers.json")
+
+    def credentials():
+        nonlocal configured_credentials
+        if configured_credentials is None:
+            configured_credentials = CredentialStore()
+        return configured_credentials
+
+    def secure_storage_unavailable() -> HTTPException:
+        return HTTPException(
+            status_code=503,
+            detail={
+                "code": "secure_storage_unavailable",
+                "message": "系统安全存储不可用。",
+            },
+        )
+
+    def analysis_provider_configuration(provider: str) -> AnalysisProviderConfiguration:
+        setting = configured_analysis_settings.get(provider)
+        try:
+            configured = credentials().get(provider) is not None
+        except SecureStorageUnavailable as error:
+            raise secure_storage_unavailable() from error
+        return AnalysisProviderConfiguration(
+            provider=provider,
+            model=setting.model if setting is not None else None,
+            baseUrl=setting.baseUrl if setting is not None else None,
+            credentialState="configured" if configured else "unconfigured",
+            selectedProvider=configured_analysis_settings.selected_provider(),
+        )
 
     def storage_error(error: OSError) -> HTTPException:
         detail = CORRUPT_PROJECT_DATA_MESSAGE if isinstance(error, CorruptProjectDataError) else STORAGE_UNAVAILABLE_MESSAGE
@@ -1030,6 +1066,104 @@ def create_app(
             "analysisService": {"state": "unconfigured", "label": "未配置"},
             "localComfyui": {"state": "disconnected", "label": "未连接"},
         }
+
+    @app.get("/api/analysis-providers", response_model=list[AnalysisProviderConfiguration])
+    def get_analysis_provider_configurations() -> list[AnalysisProviderConfiguration]:
+        try:
+            return [
+                analysis_provider_configuration(provider)
+                for provider in ("bailian", "local_openai_compatible")
+            ]
+        except (OSError, ValueError) as error:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "analysis_settings_unavailable",
+                    "message": "分析供应商设置不可用。",
+                },
+            ) from error
+
+    @app.put(
+        "/api/analysis-providers/{provider}/configuration",
+        response_model=AnalysisProviderConfiguration,
+    )
+    async def put_analysis_provider_configuration(
+        provider: str,
+        request: Request,
+    ) -> AnalysisProviderConfiguration:
+        try:
+            payload = await request.json()
+        except (UnicodeDecodeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
+            ) from None
+        if not isinstance(payload, dict) or set(payload) - {"apiKey", "baseUrl", "model"}:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
+            )
+        model = payload.get("model")
+        api_key = payload.get("apiKey")
+        base_url = payload.get("baseUrl")
+        if (
+            not isinstance(model, str)
+            or not model.strip()
+            or api_key is not None and (not isinstance(api_key, str) or not api_key.strip())
+            or base_url is not None and not isinstance(base_url, str)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
+            )
+        if provider == "local_openai_compatible" and base_url is None:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_analysis_provider_configuration", "message": "本地分析服务地址必须使用回环主机。"},
+            )
+        previous_credential = None
+        credential_store_for_update = None
+        try:
+            if api_key is not None:
+                credential_store_for_update = credentials()
+                previous_credential = credential_store_for_update.get(provider)
+                credential_store_for_update.set(provider, api_key)
+            configured_analysis_settings.save(
+                provider=provider,
+                model=model,
+                base_url=(
+                    validate_loopback_base_url(base_url)
+                    if provider == "local_openai_compatible" else base_url
+                ),
+                selected_provider=provider,
+            )
+            return analysis_provider_configuration(provider)
+        except SecureStorageUnavailable as error:
+            raise secure_storage_unavailable() from error
+        except (OSError, ValueError) as error:
+            if credential_store_for_update is not None:
+                try:
+                    if previous_credential is None:
+                        credential_store_for_update.delete(provider)
+                    else:
+                        credential_store_for_update.set(provider, previous_credential)
+                except SecureStorageUnavailable:
+                    logging.getLogger(__name__).warning("无法回退分析供应商凭据：%s", provider)
+            if isinstance(error, OSError):
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "analysis_settings_unavailable", "message": "分析供应商设置不可用。"},
+                ) from error
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
+            ) from error
 
     @app.post("/api/projects", status_code=201)
     def create_project(payload: CreateProjectInput) -> Project:
