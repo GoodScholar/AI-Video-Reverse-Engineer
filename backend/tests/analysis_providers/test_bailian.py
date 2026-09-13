@@ -5,7 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import httpx
 import pytest
 
-import app.analysis_providers.openai_compatible_chat as openai_chat
+import app.analysis_providers.http_transport as provider_http
 from app.analysis_input import ImageAnalysisInput
 from app.analysis_prompt import build_analysis_prompt
 from app.analysis_provider import BailianProviderConfig, ProviderRequest as LegacyProviderRequest
@@ -162,6 +162,30 @@ def test_bailian_rejects_oversized_provider_response_before_exposing_raw_text():
     assert error.value.failure.code == "invalid_analysis_response"
 
 
+def test_shared_transport_returns_one_bounded_result_for_success_and_http_error_statuses():
+    def handler(request):
+        if request.url.path == "/success":
+            return httpx.Response(200, headers={"x-request-id": "request-success"}, json={"ok": True})
+        return httpx.Response(418, headers={"x-request-id": "request-error"}, json={"error": "teapot"})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        success = provider_http.post_provider_json(
+            client, "https://provider.invalid/success", headers={}, payload={},
+        )
+        error = provider_http.post_provider_json(
+            client, "https://provider.invalid/error", headers={}, payload={},
+        )
+
+    assert success.status_code == 200
+    assert success.json_body == {"ok": True}
+    assert success.body_text == '{"ok":true}'
+    assert success.request_id == "request-success"
+    assert error.status_code == 418
+    assert error.json_body == {"error": "teapot"}
+    assert error.body_text == '{"error":"teapot"}'
+    assert error.request_id == "request-error"
+
+
 class _StreamingResponse:
     status_code = 200
     headers = {}
@@ -218,10 +242,10 @@ def test_bailian_stops_streaming_response_as_soon_as_byte_limit_is_exceeded():
     response = _StreamingResponse(chunks())
     client = _StreamingClient(response)
 
-    with pytest.raises(ProviderAnalysisError) as error:
-        openai_chat.post_chat_completion(client, "https://provider.invalid", "test-credential", _core_request())
+    with pytest.raises(provider_http.ProviderHTTPTransportError) as error:
+        provider_http.post_provider_json(client, "https://provider.invalid", headers={}, payload={})
 
-    assert error.value.failure.code == "invalid_analysis_response"
+    assert error.value.failure_code == "invalid_analysis_response"
     assert response.closed is True
     assert len(client.calls) == 1
 
@@ -230,12 +254,12 @@ def test_bailian_streaming_response_enforces_one_total_deadline(monkeypatch):
     response = _StreamingResponse([b'{"choices":[{"message":{"content":"{}"}}]}'])
     client = _StreamingClient(response)
     ticks = iter([0.0, 0.0, 121.0])
-    monkeypatch.setattr(openai_chat.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(provider_http.time, "monotonic", lambda: next(ticks))
 
-    with pytest.raises(ProviderAnalysisError) as error:
-        openai_chat.post_chat_completion(client, "https://provider.invalid", "test-credential", _core_request())
+    with pytest.raises(provider_http.ProviderHTTPTransportError) as error:
+        provider_http.post_provider_json(client, "https://provider.invalid", headers={}, payload={})
 
-    assert error.value.failure.code == "timeout"
+    assert error.value.failure_code == "timeout"
     assert response.closed is True
 
 
@@ -254,14 +278,14 @@ def test_bailian_total_deadline_interrupts_a_real_loopback_server_before_first_r
         def log_message(self, *args):
             pass
 
-    monkeypatch.setattr(openai_chat, "TOTAL_PROVIDER_DEADLINE_SECONDS", 0.1)
-    with _LoopbackProviderServer(DelayedFirstByteHandler) as server, openai_chat.new_cancellable_client(timeout=1.0) as client:
+    monkeypatch.setattr(provider_http, "TOTAL_PROVIDER_DEADLINE_SECONDS", 0.1)
+    with _LoopbackProviderServer(DelayedFirstByteHandler) as server, provider_http.new_provider_http_client(timeout=1.0) as client:
         started = time.monotonic()
-        with pytest.raises(ProviderAnalysisError) as error:
-            openai_chat.post_chat_completion(client, server.url, "test-credential", _core_request())
+        with pytest.raises(provider_http.ProviderHTTPTransportError) as error:
+            provider_http.post_provider_json(client, server.url, headers={}, payload={})
         elapsed = time.monotonic() - started
 
-    assert error.value.failure.code == "timeout"
+    assert error.value.failure_code == "timeout"
     assert elapsed < 0.25
 
 
@@ -282,14 +306,14 @@ def test_bailian_total_deadline_interrupts_a_real_slow_drip_stream(monkeypatch):
         def log_message(self, *args):
             pass
 
-    monkeypatch.setattr(openai_chat, "TOTAL_PROVIDER_DEADLINE_SECONDS", 0.1)
-    with _LoopbackProviderServer(SlowDripHandler) as server, openai_chat.new_cancellable_client(timeout=1.0) as client:
+    monkeypatch.setattr(provider_http, "TOTAL_PROVIDER_DEADLINE_SECONDS", 0.1)
+    with _LoopbackProviderServer(SlowDripHandler) as server, provider_http.new_provider_http_client(timeout=1.0) as client:
         started = time.monotonic()
-        with pytest.raises(ProviderAnalysisError) as error:
-            openai_chat.post_chat_completion(client, server.url, "test-credential", _core_request())
+        with pytest.raises(provider_http.ProviderHTTPTransportError) as error:
+            provider_http.post_provider_json(client, server.url, headers={}, payload={})
         elapsed = time.monotonic() - started
 
-    assert error.value.failure.code == "timeout"
+    assert error.value.failure_code == "timeout"
     assert elapsed < 0.25
 
 
@@ -303,14 +327,14 @@ def test_bailian_total_deadline_interrupts_when_only_partial_response_headers_ar
         def log_message(self, *args):
             pass
 
-    monkeypatch.setattr(openai_chat, "TOTAL_PROVIDER_DEADLINE_SECONDS", 0.1)
-    with _LoopbackProviderServer(PartialHeadersHandler) as server, openai_chat.new_cancellable_client(timeout=1.0) as client:
+    monkeypatch.setattr(provider_http, "TOTAL_PROVIDER_DEADLINE_SECONDS", 0.1)
+    with _LoopbackProviderServer(PartialHeadersHandler) as server, provider_http.new_provider_http_client(timeout=1.0) as client:
         started = time.monotonic()
-        with pytest.raises(ProviderAnalysisError) as error:
-            openai_chat.post_chat_completion(client, server.url, "test-credential", _core_request())
+        with pytest.raises(provider_http.ProviderHTTPTransportError) as error:
+            provider_http.post_provider_json(client, server.url, headers={}, payload={})
         elapsed = time.monotonic() - started
 
-    assert error.value.failure.code == "timeout"
+    assert error.value.failure_code == "timeout"
     assert elapsed < 0.25
 
 
@@ -326,26 +350,24 @@ def test_bailian_total_deadline_cancels_tls_handshake_after_connect_budget_is_co
         def log_message(self, *args):
             pass
 
-    original_connect_tcp = openai_chat._CancellableNetworkBackend.connect_tcp
+    original_connect_tcp = provider_http._CancellableNetworkBackend.connect_tcp
 
     def delayed_connect_tcp(self, *args, **kwargs):
         stream = original_connect_tcp(self, *args, **kwargs)
         time.sleep(0.15)
         return stream
 
-    monkeypatch.setattr(openai_chat._CancellableNetworkBackend, "connect_tcp", delayed_connect_tcp)
-    monkeypatch.setattr(openai_chat, "TOTAL_PROVIDER_DEADLINE_SECONDS", 0.2)
-    with _LoopbackProviderServer(ClientHelloOnlyHandler) as server, openai_chat.new_cancellable_client(timeout=1.0) as client:
+    monkeypatch.setattr(provider_http._CancellableNetworkBackend, "connect_tcp", delayed_connect_tcp)
+    monkeypatch.setattr(provider_http, "TOTAL_PROVIDER_DEADLINE_SECONDS", 0.2)
+    with _LoopbackProviderServer(ClientHelloOnlyHandler) as server, provider_http.new_provider_http_client(timeout=1.0) as client:
         started = time.monotonic()
-        with pytest.raises(ProviderAnalysisError) as error:
-            openai_chat.post_chat_completion(
-                client,
-                "https://127.0.0.1:%d/chat/completions" % server._server.server_port,
-                "test-credential",
-                _core_request(),
+        with pytest.raises(provider_http.ProviderHTTPTransportError) as error:
+            provider_http.post_provider_json(
+                client, "https://127.0.0.1:%d/chat/completions" % server._server.server_port,
+                headers={}, payload={},
             )
         elapsed = time.monotonic() - started
 
     assert client_hello_received.is_set()
-    assert error.value.failure.code == "timeout"
+    assert error.value.failure_code == "timeout"
     assert elapsed < 0.3
