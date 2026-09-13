@@ -8,6 +8,8 @@
 
 **任务归属：** 计划 04a～04d 完成 Ticket 04；计划 04e 在 Ticket 05～07 前置完成后扩展 Ticket 08～10，避免形成 Ticket 04 → 05 → 06 → 07 → 04 的循环依赖。
 
+**当前交付：** 04c 已完成图片/视频统一语义分析、显式发送披露、安全凭据存储、检查点恢复与失败不切换供应商；仅提供百炼 `qwen3.7-flash` 和回环本地 OpenAI 兼容服务。OpenAI、豆包、Gemini、Grok、Claude 等云端适配器仍由 04d 交付。
+
 ## 执行顺序
 
 1. `04a-unify-reference-media-implementation-plan.md`
@@ -15,7 +17,7 @@
 2. `04b-image-local-preprocessing-implementation-plan.md`
    - 交付图片标准化、分析代理、可恢复阶段任务和前端状态。
 3. `04c-semantic-analysis-core-implementation-plan.md`
-   - 交付统一分析协议、安全配置、百炼/本地兼容基准适配器和分析界面。
+   - 已交付统一分析协议、安全配置、百炼/本地兼容基准适配器和分析界面。
 4. `04d-cloud-analysis-providers-implementation-plan.md`
    - 交付 OpenAI、豆包、Gemini、Grok、Claude 适配器及契约验证。
 5. `04e-i2v-strategy-and-workflows-implementation-plan.md`

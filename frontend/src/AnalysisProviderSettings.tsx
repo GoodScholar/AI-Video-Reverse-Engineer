@@ -45,6 +45,13 @@ function initialProvider(providers: AnalysisProviderConfiguration[]): AnalysisPr
     ?? null;
 }
 
+function isConfigured(provider: AnalysisProviderConfiguration) {
+  return provider.credentialState === "configured"
+    || (provider.provider === "local_openai_compatible"
+      && provider.selectedProvider === provider.provider
+      && Boolean(provider.model?.trim() && provider.baseUrl?.trim()));
+}
+
 function messageFor(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
 }
@@ -142,7 +149,7 @@ export function AnalysisProviderSettings({
             {providers.map((provider) => (
               <button key={provider.provider} className={provider.provider === selectedProvider ? "analysis-provider-option analysis-provider-option--selected" : "analysis-provider-option"} type="button" aria-pressed={provider.provider === selectedProvider} onClick={() => choose(provider.provider)}>
                 <span>{providerLabel(provider.provider)}</span>
-                <span>{provider.credentialState === "configured" ? "密钥已配置" : "尚未配置"}</span>
+                <span>{isConfigured(provider) ? "已配置" : "尚未配置"}</span>
               </button>
             ))}
           </fieldset>

@@ -48,19 +48,25 @@ npm run dev
 
 原始参考素材字节会复制到 `<data_dir>/project-files/<project-id>/reference-media/`。从旧版项目迁移而来的参考视频仍可从旧 `reference-videos/` 目录读取，以保证已有项目可继续打开。`projects.json` 仅保存参考素材元数据，不记录来源路径。
 
-通过 `PUT /api/projects/{project_id}/reference-media` 上传一个 `file`，可首次添加或替换图片、视频。服务端在一次项目写入中提交校验后的素材；替换失败时保留旧素材与现有状态。成功替换会清空当前 `localPreprocessing`、清除 `activeDepthCaptureId`，并清理旧参考素材及旧本地预处理产物；历史 `depthCaptures` 记录仍保留。只要本地预处理或深度捕捉处于排队或运行中，即禁止替换。通过 `GET /api/projects/{project_id}/reference-media/content` 读取当前参考素材内容；旧 `GET /api/projects/{project_id}/reference-video/content` 仅为旧视频客户端兼容保留。完整参考素材当前不会发送到外部服务；本 Ticket 不执行外部语义分析，也不为图片生成视频预处理、深度素材或 ComfyUI Workflow。
+通过 `PUT /api/projects/{project_id}/reference-media` 上传一个 `file`，可首次添加或替换图片、视频。服务端在一次项目写入中提交校验后的素材；替换失败时保留旧素材与现有状态。成功替换会清空当前 `localPreprocessing`、清除 `activeDepthCaptureId`，并清理旧参考素材及旧本地预处理产物；历史 `depthCaptures` 记录仍保留。只要本地预处理、深度捕捉或语义分析处于排队或运行中，即禁止替换。通过 `GET /api/projects/{project_id}/reference-media/content` 读取当前参考素材内容；旧 `GET /api/projects/{project_id}/reference-video/content` 仅为旧视频客户端兼容保留。完整参考素材不会发送到外部服务。
 
 ## 本地预处理与分析代理
 
-参考素材上传成功后不会自动处理。在宽度至少 1024px 的项目页点击“开始本地预处理”：视频依次完成解码、镜头检测、关键帧提取、运动分析和初步可复刻性判断；图片则依次完成图像解码、方向与色彩标准化、分析代理生成和初步可复刻性判断。图片处理会写入去除来源元数据的 `normalized.png` 与 `analysis-proxy.jpg`，并在存在实际透明区域时合成白色背景。图片代理的尺寸和白底处理结果来自本地实际处理产物；主体、交互等语义分析、深度捕捉和可执行工作流生成仍是后续独立能力。
+参考素材上传成功后不会自动处理。在宽度至少 1024px 的项目页点击“开始本地预处理”：视频依次完成解码、镜头检测、关键帧提取、运动分析和初步可复刻性判断；图片则依次完成图像解码、方向与色彩标准化、分析代理生成和初步可复刻性判断。图片处理会写入去除来源元数据的 `normalized.png` 与 `analysis-proxy.jpg`，并在存在实际透明区域时合成白色背景。图片代理的尺寸和白底处理结果来自本地实际处理产物；图片深度素材和可执行工作流生成仍是后续独立能力。
 
 当前 FFmpeg 构建必须包含 `scdet`、`scale`、`metadata`、`drawtext` 和 `tile` 滤镜。可以运行 `ffmpeg -filters` 检查。
 
 macOS 使用 Homebrew 时，可安装 `brew install ffmpeg-full`。它是独立安装的完整构建；在启动后端或运行后端测试的同一终端中，先执行 `export PATH="$(brew --prefix ffmpeg-full)/bin:$PATH"`，再检查 `ffmpeg -version`、`ffprobe -version` 和上述滤镜。
 
-版本化视频产物保存在 `<data_dir>/project-files/<project-id>/local-preprocessing/<preprocessing-id>/`。可发送给后续语义分析的分析代理只有 `contact-sheet.jpg` 和 `analysis-proxy.json`；完整参考视频、独立关键帧和本地路径不会进入分析代理。
+版本化视频产物保存在 `<data_dir>/project-files/<project-id>/local-preprocessing/<preprocessing-id>/`。视频语义分析只发送 `contact-sheet.jpg` 和 `analysis-proxy.json`；图片只发送去元数据的 `analysis-proxy.jpg` 与基础尺寸信息。完整参考素材、独立关键帧和本地路径不会进入分析代理。
 
-本地阶段只判断多镜头和运动强度。显示“待语义分析确认”不代表已经处于可复刻范围；主要主体数量和复杂交互需要后续语义分析确认。
+本地阶段只判断多镜头和运动强度。显示“待语义分析确认”不代表已经处于可复刻范围；主要主体数量和复杂交互由语义分析确认。
+
+## 语义分析
+
+04c 已支持图片和视频的统一、可恢复语义分析。当前仅支持阿里云百炼 `qwen3.7-flash` 与用户配置的回环地址本地 OpenAI 兼容服务；OpenAI、Gemini、豆包、Grok 等云端供应商属于 04d 后续范围。
+
+用户在宽度至少 1024px 的项目页先查看接收方、将发送的代理内容和明确不发送内容，再确认提交。凭据仅由本地服务的系统安全存储管理，前端、项目数据和日志不保存或回显密钥。任务会保存检查点以便重新打开后恢复状态；失败保留本地预处理结果，且不会自动切换供应商或模型。窄屏仅可查看配置、任务和结果。
 
 ## 生产预览
 
