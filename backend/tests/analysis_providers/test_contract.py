@@ -172,6 +172,7 @@ def test_connection_test_has_no_project_data():
     assert request.analysisInput.aspectRatio == 1.0
     assert request.model == "gpt-5.6-luna"
     assert request.isRepair is False
+    assert request.prompt == build_analysis_prompt(request.analysisInput)
 
 
 def test_validate_or_repair_rejects_a_repair_request_as_an_initial_request():

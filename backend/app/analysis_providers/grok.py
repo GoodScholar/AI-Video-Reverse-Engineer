@@ -1,29 +1,18 @@
-from typing import Any, Optional
+from typing import Optional
 
 import httpx
 
-from ..analysis_models import StructuredAnalysis
-from ..analysis_provider import OpenAIProviderConfig, ProviderConfig, ProviderRequest as LegacyProviderRequest
 from ..provider_models import model_is_allowed, models_for
-from . import (
-    image_data_url as legacy_image_data_url,
-    instructions,
-    post_json,
-    request_context,
-    response_schema,
-    validate_configuration,
-    validate_structured_analysis,
-)
 from .base import ProviderAnalysisError, ProviderFailure, ProviderRequest, ProviderResult, failure_for_status
 from .http_transport import ProviderHTTPTransportError, post_provider_json
 from .responses_api import build_responses_payload, result_from_responses_body
 from .test_image import connection_test_request
 
 
-class OpenAIAnalysisProvider:
-    provider_id = "openai"
-    _URL = "https://api.openai.com/v1/responses"
-    models = tuple(model.id for model in models_for("openai"))
+class GrokAnalysisProvider:
+    provider_id = "grok"
+    _URL = "https://api.x.ai/v1/responses"
+    models = tuple(model.id for model in models_for("grok"))
 
     def __init__(self, client: httpx.Client, credential: Optional[str] = None):
         self._client = client
@@ -59,42 +48,5 @@ class OpenAIAnalysisProvider:
 
         return validate_or_repair(self, self.analyze(request), request)
 
-    def validate_configuration(self, config: ProviderConfig, credential: str) -> None:
-        """Compatibility validation for the 03-era public adapter contract."""
 
-        validate_configuration(config, credential, OpenAIProviderConfig)
-
-    def analyze_legacy(
-        self,
-        request: LegacyProviderRequest,
-        config: ProviderConfig,
-        credential: str,
-    ) -> StructuredAnalysis:
-        """Explicit legacy entrypoint; new callers must use ``analyze`` above."""
-
-        self.validate_configuration(config, credential)
-        assert isinstance(config, OpenAIProviderConfig)
-        payload: dict[str, Any] = {
-            "model": config.modelId,
-            "instructions": instructions(),
-            "input": [{"role": "user", "content": [
-                {"type": "input_image", "image_url": legacy_image_data_url(request)},
-                {"type": "input_text", "text": request_context(request)},
-            ]}],
-            "text": {"format": {
-                "type": "json_schema", "name": "structured_analysis", "strict": True,
-                "schema": response_schema(request),
-            }},
-        }
-        response = post_json(self._client, self._URL, {
-            "Authorization": "Bearer " + credential,
-            "Content-Type": "application/json",
-        }, payload)
-        try:
-            raw_text = response["output"][0]["content"][0]["text"]
-        except (KeyError, IndexError, TypeError):
-            raw_text = None
-        return validate_structured_analysis(raw_text)
-
-
-__all__ = ["OpenAIAnalysisProvider"]
+__all__ = ["GrokAnalysisProvider"]

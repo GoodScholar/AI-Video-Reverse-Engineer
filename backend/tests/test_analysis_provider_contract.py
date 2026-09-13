@@ -101,6 +101,12 @@ def configured_provider(provider_id, handler):
     ), client
 
 
+def analyze_legacy(provider_id, provider, request, config, credential):
+    if provider_id == "openai":
+        return provider.analyze_legacy(request, config, credential)
+    return provider.analyze(request, config, credential)
+
+
 @pytest.mark.parametrize("provider_id", ["bailian", "openai", "gemini", "doubao", "claude"])
 def test_each_provider_sends_only_analysis_proxy_contact_sheet_and_fixed_contract(provider_id):
     captured = []
@@ -111,7 +117,7 @@ def test_each_provider_sends_only_analysis_proxy_contact_sheet_and_fixed_contrac
 
     provider, config, client = configured_provider(provider_id, handler)
     try:
-        result = provider.analyze(analysis_request(), config, "secret-value")
+        result = analyze_legacy(provider_id, provider, analysis_request(), config, "secret-value")
     finally:
         client.close()
 
@@ -142,7 +148,7 @@ def test_each_provider_uses_its_native_official_image_and_structured_output_shap
 
     provider, config, client = configured_provider(provider_id, handler)
     try:
-        provider.analyze(analysis_request(), config, "secret-value")
+        analyze_legacy(provider_id, provider, analysis_request(), config, "secret-value")
     finally:
         client.close()
 
@@ -178,7 +184,7 @@ def test_each_provider_maps_http_and_invalid_response_failures_to_stable_codes(p
     provider, config, client = configured_provider(provider_id, handler)
     try:
         with pytest.raises(ProviderAnalysisError) as error:
-            provider.analyze(analysis_request(), config, "secret-value")
+            analyze_legacy(provider_id, provider, analysis_request(), config, "secret-value")
     finally:
         client.close()
 
@@ -205,7 +211,7 @@ def test_each_provider_maps_transport_failures_without_retries(provider_id, exce
     provider, config, client = configured_provider(provider_id, handler)
     try:
         with pytest.raises(ProviderAnalysisError) as error:
-            provider.analyze(analysis_request(), config, "secret-value")
+            analyze_legacy(provider_id, provider, analysis_request(), config, "secret-value")
     finally:
         client.close()
 
@@ -246,7 +252,7 @@ def test_transport_failure_does_not_retain_sensitive_provider_exception_text():
     provider, config, client = configured_provider("openai", handler)
     try:
         with pytest.raises(ProviderAnalysisError) as error:
-            provider.analyze(analysis_request(), config, "secret-value")
+            analyze_legacy("openai", provider, analysis_request(), config, "secret-value")
     finally:
         client.close()
 

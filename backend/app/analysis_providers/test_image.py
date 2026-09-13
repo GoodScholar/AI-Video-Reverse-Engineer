@@ -3,6 +3,7 @@ from io import BytesIO
 from PIL import Image
 
 from ..analysis_input import ImageAnalysisInput
+from ..analysis_prompt import build_analysis_prompt
 from .base import ProviderRequest
 
 
@@ -20,9 +21,10 @@ def connection_test_image() -> ImageAnalysisInput:
 
 
 def connection_test_request(model: str) -> ProviderRequest:
+    image = connection_test_image()
     return ProviderRequest(
-        analysisInput=connection_test_image(),
-        prompt="这是一张固定的 16×16 RGB 测试图。只返回一个 JSON 对象：{\"ok\":true}。",
+        analysisInput=image,
+        prompt=build_analysis_prompt(image),
         model=model,
     )
 
