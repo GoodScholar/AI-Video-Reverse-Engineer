@@ -57,3 +57,39 @@ git diff --check
 - `write_analysis_proxy` 按 90 到 60 的质量序列编码，始终保留不超过 8,000,000 字节的候选；无法满足时返回稳定的 `proxy_generation_failed`。
 - `assess_image_reproducibility(normalized_path, proxy_path)` 重新验证 PNG/JPEG 的可读性与技术约束，并明确将镜头、运动、主体和复杂交互标为 `not_assessed`，不从静态参考图片臆测时间事实。
 - `manifest.json` 由 Task 3 生成，因而必须在那里继续断言序列化清单不含原文件名或绝对路径；本层事实对象本身不携带这两类数据。
+
+## Fix round 1/5：CMYK ICC 转换
+
+审查发现原实现先将原图转换为 RGB/RGBA，再把该模式与源 ICC 传给 `ImageCms.profileToProfile`。这会令有效 CMYK ICC 的颜色模式不匹配，触发 `PyCMSError` 后退化为普通 RGB 转换。
+
+### RED
+
+新增仓库固定 fixture `backend/tests/fixtures/images/generic-cmyk.icc`（52,280 字节，SHA-256 为 `0c8a584b288a306eac9e1d3f1e68bc1b64331c717ceb051420e6257f17b3509a`），并以其构造真实 CMYK JPEG。新增测试先确认普通转换为 `(226, 143, 69)`，再要求标准化 PNG 的色彩管理结果为 `(211, 149, 89)`。
+
+修复前运行：
+
+```text
+PYTHONPATH=backend /Users/shen/SZG/AI Agent/AI Video Reverse Engineer/.venv/bin/pytest -q backend/tests/test_image_preprocessing.py
+1 failed, 5 passed in 0.18s
+
+E assert (226, 143, 69) == (211, 149, 89)
+```
+
+该失败证明代码错误地走了普通 `convert("RGB")` 路径，而不是测试配置或路径问题。
+
+### GREEN
+
+`_convert_to_srgb` 现会在源模式为 RGB、RGBA、CMYK、LAB 或 L 时，先将该源模式与嵌入 ICC 交给 `ImageCms.profileToProfile`，目标固定为 sRGB 的 RGB/RGBA；仅在无 ICC、模式不支持或 ICC 无效时才执行普通模式转换。这样透明度处理仍发生在色彩转换之后。
+
+修复后完整命令与结果：
+
+```text
+PYTHONPATH=backend /Users/shen/SZG/AI Agent/AI Video Reverse Engineer/.venv/bin/pytest -q backend/tests/test_image_preprocessing.py
+6 passed in 0.18s
+
+PYTHONPATH=backend /Users/shen/SZG/AI Agent/AI Video Reverse Engineer/.venv/bin/pytest -q backend/tests/test_reference_image.py backend/tests/test_local_preprocessing.py backend/tests/test_local_preprocessing_storage.py
+56 passed in 0.14s
+
+git diff --check
+通过
+```

@@ -10,6 +10,9 @@ from app.image_preprocessing import (
 )
 
 
+FIXTURES = Path(__file__).parent / "fixtures" / "images"
+
+
 def _srgb_icc_bytes() -> bytes:
     return ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
 
@@ -69,6 +72,27 @@ def test_normalize_applies_orientation_converts_srgb_flattens_alpha_and_removes_
         assert "icc_profile" not in image.info
         assert "source_name" not in image.info
         assert "source_path" not in image.info
+
+
+def test_normalize_converts_cmyk_pixels_with_the_embedded_icc_profile(tmp_path):
+    icc_profile = (FIXTURES / "generic-cmyk.icc").read_bytes()
+    source = tmp_path / "cmyk.jpg"
+    Image.new("CMYK", (1, 1), (10, 100, 180, 20)).save(
+        source,
+        format="JPEG",
+        icc_profile=icc_profile,
+    )
+    output = tmp_path / "normalized.png"
+
+    with Image.open(source) as image:
+        image.load()
+        assert image.convert("RGB").getpixel((0, 0)) == (226, 143, 69)
+    normalize_image(source, output)
+
+    with Image.open(output) as image:
+        image.load()
+        assert image.getpixel((0, 0)) == (211, 149, 89)
+        assert image.getpixel((0, 0)) != (226, 143, 69)
 
 
 def test_write_analysis_proxy_scales_long_edge_and_strips_source_metadata(tmp_path):

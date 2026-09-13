@@ -211,10 +211,11 @@ def _has_actual_transparency(image: Image.Image) -> bool:
 
 
 def _convert_to_srgb(image: Image.Image) -> Image.Image:
-    working = image.convert("RGBA" if _has_actual_transparency(image) else "RGB")
+    output_mode = "RGBA" if _has_actual_transparency(image) else "RGB"
     icc_profile = image.info.get("icc_profile")
     if not isinstance(icc_profile, bytes):
-        return working
+        return image.convert(output_mode)
+    working = image if image.mode in {"RGB", "RGBA", "CMYK", "LAB", "L"} else image.convert(output_mode)
     try:
         source_profile = ImageCms.ImageCmsProfile(BytesIO(icc_profile))
         srgb_profile = ImageCms.createProfile("sRGB")
@@ -222,11 +223,14 @@ def _convert_to_srgb(image: Image.Image) -> Image.Image:
             working,
             source_profile,
             srgb_profile,
-            outputMode=working.mode,
+            outputMode=output_mode,
         )
     except (OSError, ValueError, ImageCms.PyCMSError):
+        if working is image:
+            return image.convert(output_mode)
         return working
-    working.close()
+    if working is not image:
+        working.close()
     return converted
 
 
