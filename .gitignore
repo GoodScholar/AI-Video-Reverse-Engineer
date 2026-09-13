@@ -10,6 +10,7 @@ dist/
 frontend/dist/
 .impeccable/
 .superpowers/
+.worktrees/
 .env
 .env.*
 !.env.example
