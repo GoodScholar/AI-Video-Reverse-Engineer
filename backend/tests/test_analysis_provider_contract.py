@@ -102,7 +102,7 @@ def configured_provider(provider_id, handler):
 
 
 def analyze_legacy(provider_id, provider, request, config, credential):
-    if provider_id in {"openai", "claude"}:
+    if provider_id in {"openai", "gemini", "claude"}:
         return provider.analyze_legacy(request, config, credential)
     return provider.analyze(request, config, credential)
 
