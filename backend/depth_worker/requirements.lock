@@ -1,0 +1,9 @@
+numpy==1.24.0
+torch==2.1.1
+torchvision==0.16.1
+opencv-python==4.10.0.84
+imageio==2.37.0
+imageio-ffmpeg==0.4.7
+einops==0.4.1
+easydict==1.13
+tqdm==4.67.1

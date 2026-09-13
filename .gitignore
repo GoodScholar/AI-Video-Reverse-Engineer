@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+data/
+backend/data/
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+.impeccable/
+.superpowers/
+.env
+.env.*
+!.env.example

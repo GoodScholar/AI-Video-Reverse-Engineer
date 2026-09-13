@@ -1,0 +1,15 @@
+[project]
+name = "ai-video-reverse-engineer-service"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+  "fastapi==0.115.12",
+  "httpx==0.28.1",
+  "keyring==25.7.0",
+  "Pillow==11.3.0",
+  "python-multipart==0.0.20",
+  "uvicorn==0.34.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
