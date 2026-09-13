@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
+from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel
 
 from .local_preprocessing import (
@@ -148,6 +149,10 @@ def stage_artifacts_are_valid(
         return False
     if stage == "keyframeExtraction":
         return _keyframe_artifacts_are_valid(directory)
+    if stage == "imageNormalization":
+        return _image_artifact_is_valid(directory / "normalized.png", "PNG")
+    if stage == "proxyGeneration":
+        return _image_artifact_is_valid(directory / "analysis-proxy.jpg", "JPEG")
     if stage == "reproducibilityAssessment":
         manifest = _read_json_object(directory, "manifest.json")
         return (
@@ -245,6 +250,19 @@ def _stage_files_are_valid(directory: Path, files: tuple[str, ...]) -> bool:
         and _nonempty_regular_file(directory / filename)
         for filename in files
     )
+
+
+def _image_artifact_is_valid(path: Path, image_format: str) -> bool:
+    try:
+        if not _nonempty_regular_file(path):
+            return False
+        with Image.open(path) as image:
+            valid = image.format == image_format and image.mode == "RGB" and image.size[0] > 0 and image.size[1] > 0
+            if valid:
+                image.verify()
+            return valid
+    except (OSError, UnidentifiedImageError, ValueError, SyntaxError):
+        return False
 
 
 def _discard_stage_artifacts(

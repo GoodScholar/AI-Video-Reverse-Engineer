@@ -2,6 +2,7 @@ import json
 from datetime import datetime, timezone
 
 import pytest
+from PIL import Image
 
 from app.local_preprocessing import new_local_preprocessing
 from app.local_preprocessing_storage import (
@@ -42,6 +43,11 @@ def image_preprocessing():
 
 def storage_directory(tmp_path):
     return preprocessing_directory(tmp_path, "project-001", "prep-001")
+
+
+def write_valid_image_artifacts(directory):
+    Image.new("RGB", (256, 256), (12, 34, 56)).save(directory / "normalized.png", format="PNG")
+    Image.new("RGB", (256, 256), (12, 34, 56)).save(directory / "analysis-proxy.jpg", format="JPEG")
 
 
 def test_preprocessing_path_stays_below_data_directory(tmp_path):
@@ -226,8 +232,7 @@ def test_invalid_manifest_algorithm_version_resets_final_stage(tmp_path, preproc
 def test_image_completed_stages_require_media_specific_artifacts_and_manifest(tmp_path, image_preprocessing):
     directory = preprocessing_directory(tmp_path, "project-001", image_preprocessing.id)
     directory.mkdir(parents=True)
-    (directory / "normalized.png").write_bytes(b"png")
-    (directory / "analysis-proxy.jpg").write_bytes(b"jpeg")
+    write_valid_image_artifacts(directory)
     write_stage_json(directory, "manifest.json", {
         "schemaVersion": 1,
         "algorithmVersion": 1,
@@ -254,8 +259,7 @@ def test_image_manifest_requires_matching_media_algorithm_and_source(
 ):
     directory = preprocessing_directory(tmp_path, "project-001", image_preprocessing.id)
     directory.mkdir(parents=True)
-    (directory / "normalized.png").write_bytes(b"png")
-    (directory / "analysis-proxy.jpg").write_bytes(b"jpeg")
+    write_valid_image_artifacts(directory)
     manifest = {
         "schemaVersion": 1,
         "algorithmVersion": 1,

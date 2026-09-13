@@ -49,11 +49,12 @@ from app.local_preprocessing import (
     ALGORITHM_VERSION,
     LocalPreprocessing,
     LocalPreprocessingError,
-    STAGE_ORDER,
     StageName,
     new_local_preprocessing,
+    stage_order_for,
 )
 from app.local_preprocessing_jobs import LocalPreprocessingJobQueue
+from app.image_preprocessing_runner import run_image_preprocessing
 from app.local_preprocessing_runner import LocalPreprocessingFailure, run_local_preprocessing
 from app.local_preprocessing_storage import (
     discard_preprocessing,
@@ -101,6 +102,9 @@ _STAGE_LABELS = {
     "keyframeExtraction": "关键帧提取",
     "motionAnalysis": "运动分析",
     "reproducibilityAssessment": "可复现性判断",
+    "imageDecoding": "图片解码",
+    "imageNormalization": "图片标准化",
+    "proxyGeneration": "分析代理生成",
 }
 
 _MISSING_COMPLETED_ARTIFACT_CODES = {
@@ -109,6 +113,9 @@ _MISSING_COMPLETED_ARTIFACT_CODES = {
     "keyframeExtraction": "keyframe_extraction_failed",
     "motionAnalysis": "motion_analysis_failed",
     "reproducibilityAssessment": "assessment_failed",
+    "imageDecoding": "image_decode_failed",
+    "imageNormalization": "image_normalization_failed",
+    "proxyGeneration": "proxy_generation_failed",
 }
 _MISSING_COMPLETED_ARTIFACT_MESSAGE = "已完成结果缺少必需产物，请重新启动本地预处理。"
 _MEDIA_CHUNK_BYTES = 64 * 1024
@@ -474,15 +481,17 @@ def create_app(
 
     def first_unfinished_stage(preprocessing: LocalPreprocessing) -> StageName:
         states = {state.name: state for state in preprocessing.stages}
+        order = stage_order_for(preprocessing.mediaType)
         return next(
-            (stage for stage in STAGE_ORDER if states.get(stage) is None or states[stage].status != "completed"),
-            preprocessing.currentStage or STAGE_ORDER[-1],
+            (stage for stage in order if states.get(stage) is None or states[stage].status != "completed"),
+            preprocessing.currentStage or order[-1],
         )
 
     def reset_stages_from(preprocessing: LocalPreprocessing, stage: StageName) -> None:
-        start = STAGE_ORDER.index(stage)
+        order = stage_order_for(preprocessing.mediaType)
+        start = order.index(stage)
         for state in preprocessing.stages:
-            if STAGE_ORDER.index(state.name) >= start:
+            if order.index(state.name) >= start:
                 state.status = "pending"
                 state.startedAt = None
                 state.completedAt = None
@@ -549,7 +558,7 @@ def create_app(
             def prepare(project: Project) -> Project:
                 nonlocal preprocessing_id, should_run
                 task = project.localPreprocessing
-                if task is None or task.status != "queued" or project.referenceVideo is None:
+                if task is None or task.status != "queued" or project.referenceMedia is None:
                     return project
                 preprocessing_id = task.id
                 directory = preprocessing_directory(data_dir, project.id, task.id)
@@ -565,11 +574,12 @@ def create_app(
                 })
 
             project = update_project(project_id, prepare)
-            if not should_run or preprocessing_id is None or project.referenceVideo is None:
+            if not should_run or preprocessing_id is None or project.referenceMedia is None:
                 return
             task = project.localPreprocessing
             assert task is not None
-            source_path = resolve_reference_media_path(data_dir, project_id, project.referenceVideo)
+            reference = project.referenceMedia
+            source_path = resolve_reference_media_path(data_dir, project_id, reference)
             output_directory = preprocessing_directory(data_dir, project_id, preprocessing_id)
 
             def stage_started(stage: StageName) -> None:
@@ -592,9 +602,10 @@ def create_app(
                     state = next(item for item in task.stages if item.name == stage)
                     state.status = "completed"
                     state.completedAt = now
+                    order = stage_order_for(task.mediaType)
                     task.currentStage = next(
                         (
-                            candidate for candidate in STAGE_ORDER[STAGE_ORDER.index(stage) + 1:]
+                            candidate for candidate in order[order.index(stage) + 1:]
                             if next(item for item in task.stages if item.name == candidate).status != "completed"
                         ),
                         None,
@@ -603,15 +614,25 @@ def create_app(
                     return task
                 persist_preprocessing_change(project_id, preprocessing_id, update)
 
-            result = preprocessing_runner(
-                source_path=source_path,
-                reference=project.referenceVideo,
-                preprocessing=task,
-                output_directory=output_directory,
-                ffmpeg_path=ffmpeg_path,
-                on_stage_started=stage_started,
-                on_stage_completed=stage_completed,
-            )
+            if reference.type == "image":
+                result = run_image_preprocessing(
+                    source_path=source_path,
+                    reference=reference,
+                    preprocessing=task,
+                    output_directory=output_directory,
+                    on_stage_started=stage_started,
+                    on_stage_completed=stage_completed,
+                )
+            else:
+                result = preprocessing_runner(
+                    source_path=source_path,
+                    reference=reference,
+                    preprocessing=task,
+                    output_directory=output_directory,
+                    ffmpeg_path=ffmpeg_path,
+                    on_stage_started=stage_started,
+                    on_stage_completed=stage_completed,
+                )
             now = datetime.now(timezone.utc).isoformat()
 
             def complete(task: LocalPreprocessing) -> LocalPreprocessing:
@@ -1079,7 +1100,7 @@ def create_app(
 
         def prepare_for_start(project: Project) -> Project:
             nonlocal completed, dispatching
-            if project.referenceVideo is None:
+            if project.referenceMedia is None:
                 raise HTTPException(
                     status_code=409,
                     detail={
@@ -1106,7 +1127,8 @@ def create_app(
             if (
                 existing is not None
                 and existing.status == "completed"
-                and existing.sourceReferenceVideoId == project.referenceVideo.id
+                and existing.sourceReferenceMediaId == project.referenceMedia.id
+                and existing.mediaType == project.referenceMedia.type
                 and existing.algorithmVersion == ALGORITHM_VERSION
             ):
                 directory = preprocessing_directory(data_dir, project.id, existing.id)
@@ -1117,14 +1139,15 @@ def create_app(
             if (
                 existing is not None
                 and existing.status == "failed"
-                and existing.sourceReferenceVideoId == project.referenceVideo.id
+                and existing.sourceReferenceMediaId == project.referenceMedia.id
+                and existing.mediaType == project.referenceMedia.type
                 and existing.algorithmVersion == ALGORITHM_VERSION
             ):
                 directory = preprocessing_directory(data_dir, project.id, existing.id)
                 retry = validate_completed_stages(existing, directory).preprocessing
                 restart_stage = retry.currentStage or first_unfinished_stage(retry)
                 if all(state.status == "completed" for state in retry.stages):
-                    restart_stage = STAGE_ORDER[0]
+                    restart_stage = stage_order_for(retry.mediaType)[0]
                 reset_stage_artifacts(directory, restart_stage, retry.mediaType)
                 reset_stages_from(retry, restart_stage)
                 retry.status = "queued"
@@ -1139,7 +1162,7 @@ def create_app(
                 task = retry
             else:
                 task = new_local_preprocessing(
-                    str(uuid4()), project.referenceVideo.id, "video", now,
+                    str(uuid4()), project.referenceMedia.id, project.referenceMedia.type, now,
                 )
             dispatching_project_ids.add(project.id)
             dispatching = True

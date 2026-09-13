@@ -1,8 +1,10 @@
 import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from io import BytesIO
 from threading import Event
 
+from PIL import Image
 from fastapi.testclient import TestClient
 
 from app import main
@@ -57,6 +59,42 @@ def client_with_video_and_queue(tmp_path):
         **project, "referenceMedia": reference.model_dump(),
     }]), encoding="utf-8")
     return client, project, holder["queue"]
+
+
+def client_with_image_and_queue(tmp_path):
+    holder = {}
+
+    def queue_factory(handler):
+        holder["queue"] = ManualQueue(handler)
+        return holder["queue"]
+
+    client = TestClient(create_app(data_dir=tmp_path, preprocessing_queue_factory=queue_factory))
+    project = client.post("/api/projects", json={"name": "图片预处理项目"}).json()
+    image = Image.new("RGB", (256, 256), (12, 34, 56))
+    payload = BytesIO()
+    image.save(payload, format="PNG")
+    response = client.put(
+        f"/api/projects/{project['id']}/reference-media",
+        files={"file": ("private-reference.png", payload.getvalue(), "image/png")},
+    )
+    assert response.status_code == 200
+    return client, project, holder["queue"]
+
+
+def test_image_job_persists_four_completed_stages_and_is_dispatched_to_the_image_runner(tmp_path):
+    client, project, queue = client_with_image_and_queue(tmp_path)
+
+    response = client.post(f"/api/projects/{project['id']}/local-preprocessing")
+
+    assert response.status_code == 202
+    queue.run_next()
+    task = client.get(f"/api/projects/{project['id']}").json()["localPreprocessing"]
+    assert task["status"] == "completed"
+    assert task["proxySummary"]["mediaType"] == "image"
+    assert [stage["name"] for stage in task["stages"]] == [
+        "imageDecoding", "imageNormalization", "proxyGeneration", "reproducibilityAssessment",
+    ]
+    assert all(stage["status"] == "completed" for stage in task["stages"])
 
 
 def write_completed_project_with_artifacts(tmp_path, *, first_invalid_stage):
