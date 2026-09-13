@@ -2,9 +2,42 @@ import json
 from typing import Literal, Union
 
 from .analysis_input import AnalysisInput, ImageAnalysisInput, VideoAnalysisInput
+from .semantic_analysis import StructuredVisualAnalysis
 
 
 PROMPT_VERSION = 1
+_NON_CONTRACT_SCHEMA_KEYS = frozenset({"title", "description", "default", "examples"})
+
+
+def structured_analysis_schema(media_type: Literal["image", "video"]) -> dict:
+    """Return the exact response schema, narrowed for the source media."""
+
+    if media_type not in {"image", "video"}:
+        raise ValueError("不支持的媒体类型")
+    schema = _without_non_contract_metadata(StructuredVisualAnalysis.model_json_schema())
+    if media_type == "image":
+        schema["$defs"]["ObservedFacts"]["properties"]["temporal"] = {"type": "null"}
+    return schema
+
+
+def _without_non_contract_metadata(value):
+    if isinstance(value, dict):
+        return {
+            key: _without_non_contract_metadata(nested)
+            for key, nested in value.items()
+            if key not in _NON_CONTRACT_SCHEMA_KEYS
+        }
+    if isinstance(value, list):
+        return [_without_non_contract_metadata(item) for item in value]
+    return value
+
+
+def _schema_text(media_type: Literal["image", "video"]) -> str:
+    return json.dumps(
+        structured_analysis_schema(media_type),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def build_analysis_prompt(media_type: Union[Literal["image", "video"], AnalysisInput]) -> str:
@@ -29,7 +62,8 @@ def build_analysis_prompt(media_type: Union[Literal["image", "video"], AnalysisI
         "项目资料或本地信息描述为事实。可观察事实必须写入 observedFacts，生成策略"
         "必须写入 generationSuggestions。"
         + temporal_rule
-        + "只返回一个符合约定结构的 JSON 对象，不要使用 Markdown、解释或代码围栏。"
+        + "只返回一个符合下列 JSON Schema 的 JSON 对象，不要使用 Markdown、解释或代码围栏。\n"
+        + _schema_text(media_type)
     )
 
 
@@ -53,7 +87,11 @@ def analysis_input_context(value: AnalysisInput) -> str:
     return json.dumps(context, ensure_ascii=False, separators=(",", ":"))
 
 
-def repair_prompt(candidate_json: str, error_summary: str) -> str:
+def repair_prompt(
+    candidate_json: str,
+    error_summary: str,
+    media_type: Literal["image", "video"],
+) -> str:
     return (
         "下方候选 JSON 不符合结构化契约。仅修复其 JSON 结构和缺失字段；"
         "不要加入解释、Markdown 或任何未提供的媒体内容。只返回修复后的 JSON 对象。\n"
@@ -61,7 +99,15 @@ def repair_prompt(candidate_json: str, error_summary: str) -> str:
         + candidate_json
         + "\n校验错误摘要：\n"
         + error_summary
+        + "\n必须符合下列 JSON Schema：\n"
+        + _schema_text(media_type)
     )
 
 
-__all__ = ["PROMPT_VERSION", "analysis_input_context", "build_analysis_prompt", "repair_prompt"]
+__all__ = [
+    "PROMPT_VERSION",
+    "analysis_input_context",
+    "build_analysis_prompt",
+    "repair_prompt",
+    "structured_analysis_schema",
+]

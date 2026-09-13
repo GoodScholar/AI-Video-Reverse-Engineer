@@ -1,6 +1,6 @@
 from typing import Optional, Protocol, Union, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..analysis_input import AnalysisInput
 
@@ -11,6 +11,7 @@ _FAILURES = {
     "rate_limited": ("分析服务暂时限流，请稍后重试。", True),
     "network_error": ("无法连接分析服务，请检查网络后重试。", True),
     "timeout": ("分析服务响应超时，请稍后重试。", True),
+    "unsupported_model_capability": ("所选模型不支持所需的视觉或结构化输出能力。", False),
     "provider_error": ("分析服务暂时不可用，请稍后重试。", True),
     "invalid_analysis_response": ("分析服务返回的数据不符合结构化契约。", True),
 }
@@ -59,7 +60,17 @@ class ProviderRequest(BaseModel):
             raise ValueError("供应商请求文本不能为空白。")
         return value
 
+    @model_validator(mode="after")
+    def request_shape_matches_its_role(self) -> "ProviderRequest":
+        if self.isRepair and self.analysisInput is not None:
+            raise ValueError("修复请求不得携带分析输入。")
+        if not self.isRepair and self.analysisInput is None:
+            raise ValueError("初始供应商请求必须携带分析输入。")
+        return self
+
     def repair(self, prompt: str) -> "ProviderRequest":
+        if self.isRepair:
+            raise ValueError("修复请求不能再次修复。")
         return ProviderRequest(
             prompt=prompt,
             model=self.model,

@@ -5,7 +5,7 @@ import httpx
 from ..analysis_models import StructuredAnalysis
 from ..analysis_provider import BailianProviderConfig, ProviderConfig, ProviderRequest
 from . import image_data_url, instructions, post_json, request_context, response_schema, validate_configuration, validate_structured_analysis
-from .base import ProviderRequest as CoreProviderRequest
+from .base import ProviderAnalysisError, ProviderFailure, ProviderRequest as CoreProviderRequest
 from .base import ProviderResult
 from .openai_compatible_chat import post_chat_completion
 from .test_image import connection_test_request
@@ -38,6 +38,8 @@ class BailianAnalysisProvider:
         if isinstance(request, CoreProviderRequest):
             if config is not None or credential is not None:
                 raise TypeError("新供应商请求不接受旧配置对象。")
+            if request.model not in self.models:
+                raise ProviderAnalysisError(ProviderFailure.for_code("unsupported_model_capability"))
             return post_chat_completion(self._client, self._URL, self._credential, request)
         if config is None or credential is None:
             raise TypeError("旧供应商请求需要配置和凭据。")

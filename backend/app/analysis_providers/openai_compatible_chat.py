@@ -9,6 +9,9 @@ from ..analysis_prompt import analysis_input_context
 from .base import ProviderAnalysisError, ProviderFailure, ProviderRequest, ProviderResult, failure_for_status
 
 
+MAX_PROVIDER_RESPONSE_BYTES = 256_000
+
+
 def image_data_url(value: Union[ImageAnalysisInput, VideoAnalysisInput]) -> str:
     if isinstance(value, ImageAnalysisInput):
         image_bytes = value.analysisProxyBytes
@@ -49,17 +52,20 @@ def post_chat_completion(
             url,
             headers=headers,
             json=build_chat_payload(request),
+            follow_redirects=False,
         )
     except httpx.TimeoutException:
         raise ProviderAnalysisError(ProviderFailure.for_code("timeout")) from None
     except httpx.RequestError:
         raise ProviderAnalysisError(ProviderFailure.for_code("network_error")) from None
-    if response.status_code >= 400:
+    if response.status_code >= 300:
         raise ProviderAnalysisError(failure_for_status(response.status_code))
     try:
+        if len(response.content) > MAX_PROVIDER_RESPONSE_BYTES:
+            raise ValueError("响应超过安全边界")
         payload = response.json()
         raw_text = payload["choices"][0]["message"]["content"]
-    except (ValueError, TypeError, KeyError, IndexError):
+    except (ValueError, TypeError, KeyError, IndexError, RecursionError):
         raise ProviderAnalysisError(ProviderFailure.for_code("invalid_analysis_response")) from None
     if not isinstance(raw_text, str):
         raise ProviderAnalysisError(ProviderFailure.for_code("invalid_analysis_response"))

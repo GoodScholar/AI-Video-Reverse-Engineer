@@ -105,3 +105,53 @@ def test_core_bailian_request_rejects_legacy_arguments_instead_of_ignoring_them(
         ))
     with pytest.raises(TypeError, match="旧配置"):
         provider.analyze(_core_request(), credential="another-credential")
+
+
+def test_bailian_307_redirect_to_remote_is_not_followed_or_retried():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(307, headers={"location": "https://example.com/steal"})
+        pytest.fail("不得跟随重定向向远端再次发送请求")
+
+    provider = BailianAnalysisProvider(
+        httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True),
+        credential="test-credential",
+    )
+
+    with pytest.raises(ProviderAnalysisError) as error:
+        provider.analyze(_core_request())
+
+    assert error.value.failure.code == "provider_error"
+    assert len(requests) == 1
+
+
+def test_bailian_rejects_an_unlisted_core_model_without_calling_the_network():
+    def handler(request):
+        pytest.fail("未列入白名单的模型不得发起请求")
+
+    provider = BailianAnalysisProvider(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        credential="test-credential",
+    )
+    request = _core_request().model_copy(update={"model": "unlisted-model"})
+
+    with pytest.raises(ProviderAnalysisError) as error:
+        provider.analyze(request)
+
+    assert error.value.failure.code == "unsupported_model_capability"
+
+
+def test_bailian_rejects_oversized_provider_response_before_exposing_raw_text():
+    payload = {"choices": [{"message": {"content": "x" * 300_000}}]}
+    provider = BailianAnalysisProvider(
+        httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload))),
+        credential="test-credential",
+    )
+
+    with pytest.raises(ProviderAnalysisError) as error:
+        provider.analyze(_core_request())
+
+    assert error.value.failure.code == "invalid_analysis_response"
