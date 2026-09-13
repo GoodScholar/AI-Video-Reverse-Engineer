@@ -50,6 +50,15 @@ def write_valid_image_artifacts(directory):
     Image.new("RGB", (256, 256), (12, 34, 56)).save(directory / "analysis-proxy.jpg", format="JPEG")
 
 
+def write_image_manifest(directory, source_reference_media_id):
+    write_stage_json(directory, "manifest.json", {
+        "schemaVersion": 1,
+        "algorithmVersion": 1,
+        "mediaType": "image",
+        "sourceReferenceMediaId": source_reference_media_id,
+    })
+
+
 def test_preprocessing_path_stays_below_data_directory(tmp_path):
     path = preprocessing_directory(tmp_path, "project-001", "prep-001")
 
@@ -233,17 +242,40 @@ def test_image_completed_stages_require_media_specific_artifacts_and_manifest(tm
     directory = preprocessing_directory(tmp_path, "project-001", image_preprocessing.id)
     directory.mkdir(parents=True)
     write_valid_image_artifacts(directory)
-    write_stage_json(directory, "manifest.json", {
-        "schemaVersion": 1,
-        "algorithmVersion": 1,
-        "mediaType": "image",
-        "sourceReferenceMediaId": image_preprocessing.sourceReferenceMediaId,
-    })
+    write_image_manifest(directory, image_preprocessing.sourceReferenceMediaId)
 
     valid = validate_completed_stages(image_preprocessing, directory)
 
     assert valid.firstInvalidStage is None
     assert [stage.status for stage in valid.preprocessing.stages] == ["completed"] * 4
+
+
+@pytest.mark.parametrize("invalid_proxy", ["truncated", "oversized"])
+def test_invalid_image_proxy_rewinds_only_proxy_and_following_stages(
+    tmp_path, image_preprocessing, invalid_proxy,
+):
+    directory = preprocessing_directory(tmp_path, "project-001", image_preprocessing.id)
+    directory.mkdir(parents=True)
+    write_valid_image_artifacts(directory)
+    proxy = directory / "analysis-proxy.jpg"
+    if invalid_proxy == "truncated":
+        proxy.write_bytes(proxy.read_bytes()[:-20])
+        with Image.open(proxy) as image:
+            with pytest.raises(OSError):
+                image.load()
+    else:
+        Image.new("RGB", (3000, 2000), (12, 34, 56)).save(proxy, format="JPEG")
+    write_image_manifest(directory, image_preprocessing.sourceReferenceMediaId)
+
+    valid = validate_completed_stages(image_preprocessing, directory)
+
+    assert valid.firstInvalidStage == "proxyGeneration"
+    assert [stage.status for stage in valid.preprocessing.stages] == [
+        "completed", "completed", "pending", "pending",
+    ]
+    assert (directory / "normalized.png").is_file()
+    assert not proxy.exists()
+    assert not (directory / "manifest.json").exists()
 
 
 @pytest.mark.parametrize(

@@ -9,6 +9,7 @@ from typing import Any, Optional
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel
 
+from .image_preprocessing import ANALYSIS_PROXY_LONG_EDGE, MAX_ANALYSIS_PROXY_BYTES
 from .local_preprocessing import (
     ALGORITHM_VERSION,
     LocalPreprocessing,
@@ -256,11 +257,19 @@ def _image_artifact_is_valid(path: Path, image_format: str) -> bool:
     try:
         if not _nonempty_regular_file(path):
             return False
+        if image_format == "JPEG" and path.stat().st_size > MAX_ANALYSIS_PROXY_BYTES:
+            return False
         with Image.open(path) as image:
-            valid = image.format == image_format and image.mode == "RGB" and image.size[0] > 0 and image.size[1] > 0
-            if valid:
-                image.verify()
-            return valid
+            if (
+                image.format != image_format
+                or image.mode != "RGB"
+                or image.size[0] <= 0
+                or image.size[1] <= 0
+                or (image_format == "JPEG" and max(image.size) > ANALYSIS_PROXY_LONG_EDGE)
+            ):
+                return False
+            image.load()
+            return True
     except (OSError, UnidentifiedImageError, ValueError, SyntaxError):
         return False
 
