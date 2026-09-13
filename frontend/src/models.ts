@@ -118,6 +118,62 @@ export type ImageLocalPreprocessing = LocalPreprocessingBase & {
 
 export type LocalPreprocessing = VideoLocalPreprocessing | ImageLocalPreprocessing;
 
+export type StaticVisualFacts = {
+  subject: string;
+  scene: string;
+  composition: string;
+  viewpoint: string;
+  lighting: string;
+  color: string;
+  visualStyle: string;
+};
+
+export type TemporalFacts = {
+  subjectMotion: string;
+  environmentalMotion: string;
+  cameraMotion: string;
+  rhythm: string;
+};
+
+export type StructuredVisualAnalysis = {
+  version: number;
+  observedFacts: {
+    staticVisual: StaticVisualFacts;
+    temporal: TemporalFacts | null;
+  };
+  generationSuggestions: {
+    subjectMotion: string;
+    environmentalMotion: string;
+    cameraMotion: string;
+    rhythm: string;
+    suggestedDuration: number;
+    audio: string;
+  };
+};
+
+export type SemanticAnalysisError = {
+  code: string;
+  message: string;
+  retryable: boolean;
+};
+
+export type SemanticAnalysis = {
+  id: string;
+  sourceReferenceMediaId: string;
+  sourcePreprocessingId: string;
+  provider: "bailian" | "openai" | "doubao" | "gemini" | "grok" | "claude" | "local_openai_compatible";
+  model: string;
+  promptVersion: number;
+  schemaVersion: number;
+  status: "queued" | "running" | "completed" | "failed";
+  createdAt: string;
+  startedAt: string | null;
+  updatedAt: string;
+  completedAt: string | null;
+  result: StructuredVisualAnalysis | null;
+  error: SemanticAnalysisError | null;
+};
+
 export type DepthCaptureStageName =
   | "preparing"
   | "estimatingDepth"
@@ -223,6 +279,7 @@ export type Project = {
   updatedAt: string;
   referenceMedia: ReferenceMedia | null;
   localPreprocessing: LocalPreprocessing | null;
+  semanticAnalysis?: SemanticAnalysis | null;
   depthCaptures?: DepthCapture[];
   activeDepthCaptureId?: string | null;
 };

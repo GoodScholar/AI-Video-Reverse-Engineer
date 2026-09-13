@@ -76,6 +76,7 @@ from app.depth_capture_jobs import LocalComputeJobQueue, LocalPreprocessingQueue
 from app.depth_capture_runner import DepthCaptureFailure, DepthCaptureRequest, run_depth_capture
 from app.depth_capture_storage import inspect_depth_artifacts
 from app.depth_capture_storage import DepthPreviewUnavailableError, open_validated_depth_preview
+from app.semantic_analysis import SemanticAnalysis
 
 
 class CreateProjectInput(BaseModel):
@@ -189,6 +190,7 @@ class Project(BaseModel):
     localPreprocessing: Optional[LocalPreprocessing] = None
     depthCaptures: list[DepthCapture] = Field(default_factory=list)
     activeDepthCaptureId: Optional[str] = None
+    semanticAnalysis: Optional[SemanticAnalysis] = None
 
     @field_validator("id")
     @classmethod
@@ -1007,6 +1009,8 @@ def create_app(
             payload.pop("depthCaptures", None)
         if "activeDepthCaptureId" not in project.model_fields_set:
             payload.pop("activeDepthCaptureId", None)
+        if "semanticAnalysis" not in project.model_fields_set:
+            payload.pop("semanticAnalysis", None)
         return payload
 
     @app.get("/api/projects", response_model=None)
