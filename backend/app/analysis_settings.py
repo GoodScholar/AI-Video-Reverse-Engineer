@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Literal, Optional
 from urllib.parse import urlsplit
 
+import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .credential_store import ANALYSIS_PROVIDER_IDS
@@ -17,10 +18,14 @@ class _StrictModel(BaseModel):
 def validate_loopback_base_url(value: str) -> str:
     if not isinstance(value, str):
         raise ValueError("本地分析服务地址必须使用回环主机。")
-    parsed = urlsplit(value)
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value) or "?" in value or "#" in value:
+        raise ValueError("本地分析服务地址必须使用回环主机。")
     try:
+        parsed = urlsplit(value)
         port = parsed.port
-    except ValueError:
+        normalized = value.rstrip("/")
+        httpx.URL(normalized)
+    except (ValueError, httpx.InvalidURL):
         raise ValueError("本地分析服务地址必须使用回环主机。") from None
     if (
         parsed.scheme not in {"http", "https"}
@@ -32,7 +37,7 @@ def validate_loopback_base_url(value: str) -> str:
         or port is None and parsed.netloc.endswith(":")
     ):
         raise ValueError("本地分析服务地址必须使用回环主机。")
-    return value.rstrip("/")
+    return normalized
 
 
 class _StoredProviderConfiguration(_StrictModel):
@@ -114,22 +119,38 @@ class AnalysisSettings:
         base_url: Optional[str],
         selected_provider: Optional[str],
     ) -> _StoredProviderConfiguration:
-        self._validate_provider(provider)
-        self._validate_provider(selected_provider)
-        candidate = _StoredProviderConfiguration(
+        candidate, prepared_settings = self.prepare_save(
             provider=provider,
             model=model,
-            baseUrl=base_url,
+            base_url=base_url,
+            selected_provider=selected_provider,
         )
+        self.commit(prepared_settings)
+        return candidate
+
+    def prepare_save(
+        self,
+        *,
+        provider: str,
+        model: str,
+        base_url: Optional[str],
+        selected_provider: Optional[str],
+    ) -> tuple[_StoredProviderConfiguration, _StoredAnalysisSettings]:
+        self._validate_provider(provider)
+        self._validate_provider(selected_provider)
+        if provider == "local_openai_compatible" and base_url is None:
+            raise ValueError("本地分析服务地址必须使用回环主机。")
+        candidate = _StoredProviderConfiguration(provider=provider, model=model, baseUrl=base_url)
         current = self._read()
         by_provider = {item.provider: item for item in current.providers}
         by_provider[provider] = candidate
-        saved = _StoredAnalysisSettings(
+        return candidate, _StoredAnalysisSettings(
             providers=[by_provider[item] for item in sorted(by_provider)],
             selectedProvider=selected_provider,
         )
-        self._write(saved)
-        return candidate
+
+    def commit(self, settings: _StoredAnalysisSettings) -> None:
+        self._write(settings)
 
     @staticmethod
     def _validate_provider(provider: Optional[str]) -> None:

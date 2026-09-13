@@ -78,7 +78,7 @@ from app.depth_capture_storage import inspect_depth_artifacts
 from app.depth_capture_storage import DepthPreviewUnavailableError, open_validated_depth_preview
 from app.semantic_analysis import SemanticAnalysis
 from app.analysis_service_secrets import SecureStorageUnavailable
-from app.analysis_settings import AnalysisProviderConfiguration, AnalysisSettings, validate_loopback_base_url
+from app.analysis_settings import AnalysisProviderConfiguration, AnalysisSettings
 from app.credential_store import CredentialStore
 
 
@@ -1119,40 +1119,14 @@ def create_app(
                 detail={
                     "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
             )
-        if provider == "local_openai_compatible" and base_url is None:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "code": "invalid_analysis_provider_configuration", "message": "本地分析服务地址必须使用回环主机。"},
-            )
-        previous_credential = None
-        credential_store_for_update = None
         try:
-            if api_key is not None:
-                credential_store_for_update = credentials()
-                previous_credential = credential_store_for_update.get(provider)
-                credential_store_for_update.set(provider, api_key)
-            configured_analysis_settings.save(
+            candidate, prepared_settings = configured_analysis_settings.prepare_save(
                 provider=provider,
                 model=model,
-                base_url=(
-                    validate_loopback_base_url(base_url)
-                    if provider == "local_openai_compatible" else base_url
-                ),
+                base_url=base_url,
                 selected_provider=provider,
             )
-            return analysis_provider_configuration(provider)
-        except SecureStorageUnavailable as error:
-            raise secure_storage_unavailable() from error
         except (OSError, ValueError) as error:
-            if credential_store_for_update is not None:
-                try:
-                    if previous_credential is None:
-                        credential_store_for_update.delete(provider)
-                    else:
-                        credential_store_for_update.set(provider, previous_credential)
-                except SecureStorageUnavailable:
-                    logging.getLogger(__name__).warning("无法回退分析供应商凭据：%s", provider)
             if isinstance(error, OSError):
                 raise HTTPException(
                     status_code=503,
@@ -1164,6 +1138,46 @@ def create_app(
                 detail={
                     "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
             ) from error
+
+        try:
+            credential_store_for_update = credentials()
+            previous_credential = credential_store_for_update.get(provider)
+        except SecureStorageUnavailable as error:
+            raise secure_storage_unavailable() from error
+
+        credential_write_succeeded = False
+        credential_state = previous_credential is not None
+        try:
+            if api_key is not None:
+                credential_store_for_update.set(provider, api_key)
+                credential_write_succeeded = True
+                credential_state = True
+            configured_analysis_settings.commit(prepared_settings)
+        except (OSError, SecureStorageUnavailable) as error:
+            if credential_write_succeeded:
+                try:
+                    if previous_credential is None:
+                        credential_store_for_update.delete(provider)
+                    else:
+                        credential_store_for_update.set(provider, previous_credential)
+                except SecureStorageUnavailable as rollback_error:
+                    logging.getLogger(__name__).warning("无法回退分析供应商凭据：%s", provider)
+                    raise secure_storage_unavailable() from rollback_error
+            if isinstance(error, SecureStorageUnavailable):
+                raise secure_storage_unavailable() from error
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "analysis_settings_unavailable", "message": "分析供应商设置不可用。"},
+            ) from error
+
+        return AnalysisProviderConfiguration(
+            provider=provider,
+            model=candidate.model,
+            baseUrl=candidate.baseUrl,
+            credentialState="configured" if credential_state else "unconfigured",
+            selectedProvider=provider,
+        )
 
     @app.post("/api/projects", status_code=201)
     def create_project(payload: CreateProjectInput) -> Project:
