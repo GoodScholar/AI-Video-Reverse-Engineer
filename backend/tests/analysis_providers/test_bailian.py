@@ -1,3 +1,7 @@
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 import httpx
 import pytest
 
@@ -186,6 +190,26 @@ class _StreamingClient:
         return self.response
 
 
+class _LoopbackProviderServer:
+    def __init__(self, handler):
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self._thread = threading.Thread(target=self._server.serve_forever)
+
+    @property
+    def url(self):
+        return "http://127.0.0.1:%d/chat/completions" % self._server.server_port
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *args):
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=1.0)
+        assert not self._thread.is_alive()
+
+
 def test_bailian_stops_streaming_response_as_soon_as_byte_limit_is_exceeded():
     def chunks():
         yield b"{" + b"x" * 256_000
@@ -213,3 +237,57 @@ def test_bailian_streaming_response_enforces_one_total_deadline(monkeypatch):
 
     assert error.value.failure.code == "timeout"
     assert response.closed is True
+
+
+def test_bailian_total_deadline_interrupts_a_real_loopback_server_before_first_response_byte(monkeypatch):
+    class DelayedFirstByteHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            time.sleep(0.4)
+            try:
+                self.wfile.write(b'{"choices":[{"message":{"content":"{}"}}]}')
+            except BrokenPipeError:
+                pass
+
+        def log_message(self, *args):
+            pass
+
+    monkeypatch.setattr(openai_chat, "TOTAL_PROVIDER_DEADLINE_SECONDS", 0.1)
+    with _LoopbackProviderServer(DelayedFirstByteHandler) as server, httpx.Client(timeout=1.0, trust_env=False) as client:
+        started = time.monotonic()
+        with pytest.raises(ProviderAnalysisError) as error:
+            openai_chat.post_chat_completion(client, server.url, "test-credential", _core_request())
+        elapsed = time.monotonic() - started
+
+    assert error.value.failure.code == "timeout"
+    assert elapsed < 0.25
+
+
+def test_bailian_total_deadline_interrupts_a_real_slow_drip_stream(monkeypatch):
+    class SlowDripHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            try:
+                for chunk in (b'{"choices":', b'[{"message":', b'{"content":"{}"}}]}'):
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                    time.sleep(0.06)
+            except BrokenPipeError:
+                pass
+
+        def log_message(self, *args):
+            pass
+
+    monkeypatch.setattr(openai_chat, "TOTAL_PROVIDER_DEADLINE_SECONDS", 0.1)
+    with _LoopbackProviderServer(SlowDripHandler) as server, httpx.Client(timeout=1.0, trust_env=False) as client:
+        started = time.monotonic()
+        with pytest.raises(ProviderAnalysisError) as error:
+            openai_chat.post_chat_completion(client, server.url, "test-credential", _core_request())
+        elapsed = time.monotonic() - started
+
+    assert error.value.failure.code == "timeout"
+    assert elapsed < 0.25

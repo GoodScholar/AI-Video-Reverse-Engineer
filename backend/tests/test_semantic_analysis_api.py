@@ -787,6 +787,11 @@ def test_retry_after_finalize_write_failure_recovers_validated_checkpoint_withou
     recovered = client.post(f"/api/projects/{project_id}/semantic-analysis", json=request)
 
     assert failed["status"] == "failed"
+    assert failed["error"] == {
+        "code": "semantic_analysis_finalize_failed",
+        "message": "语义分析结果已验证，但本地最终保存失败，请直接重试语义分析。",
+        "retryable": True,
+    }
     assert recovered.status_code == 200
     assert recovered.json()["semanticAnalysis"]["status"] == "completed"
     assert recovered.json()["semanticAnalysis"]["result"]["version"] == 1

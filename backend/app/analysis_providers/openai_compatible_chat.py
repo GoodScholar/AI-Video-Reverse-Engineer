@@ -1,5 +1,7 @@
 import base64
 import json
+import socket
+import threading
 import time
 from typing import Any, Optional, Union
 
@@ -50,10 +52,38 @@ def post_chat_completion(
     if credential is not None and credential.strip():
         headers["Authorization"] = "Bearer " + credential
     started_at = time.monotonic()
+    deadline_expired = threading.Event()
+    response_holder = [None]
+
+    def cancel_at_deadline() -> None:
+        deadline_expired.set()
+        response = response_holder[0]
+        if response is None:
+            client.close()
+        else:
+            stream = response.extensions.get("network_stream")
+            close_socket = getattr(stream, "get_extra_info", None)
+            if close_socket is not None:
+                try:
+                    network_socket = close_socket("socket")
+                    if network_socket is not None:
+                        network_socket.shutdown(socket.SHUT_RDWR)
+                        network_socket.close()
+                except OSError:
+                    pass
+            response.close()
+
+    deadline_timer = threading.Timer(TOTAL_PROVIDER_DEADLINE_SECONDS, cancel_at_deadline)
+    deadline_timer.daemon = True
+    deadline_timer.start()
     try:
         with client.stream(
             "POST", url, headers=headers, json=build_chat_payload(request), follow_redirects=False,
+            timeout=httpx.Timeout(TOTAL_PROVIDER_DEADLINE_SECONDS),
         ) as response:
+            response_holder[0] = response
+            if deadline_expired.is_set():
+                raise httpx.TimeoutException("total provider deadline exceeded")
             if time.monotonic() - started_at > TOTAL_PROVIDER_DEADLINE_SECONDS:
                 raise httpx.TimeoutException("total provider deadline exceeded")
             if response.status_code >= 300:
@@ -69,11 +99,16 @@ def post_chat_completion(
     except httpx.TimeoutException:
         raise ProviderAnalysisError(ProviderFailure.for_code("timeout")) from None
     except httpx.RequestError:
+        if deadline_expired.is_set():
+            raise ProviderAnalysisError(ProviderFailure.for_code("timeout")) from None
         raise ProviderAnalysisError(ProviderFailure.for_code("network_error")) from None
     except ProviderAnalysisError:
         raise
     except (TypeError, ValueError):
         raise ProviderAnalysisError(ProviderFailure.for_code("invalid_analysis_response")) from None
+    finally:
+        deadline_timer.cancel()
+        deadline_timer.join()
     try:
         payload = json.loads(response_bytes.decode("utf-8"))
         raw_text = payload["choices"][0]["message"]["content"]

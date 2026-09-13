@@ -1050,6 +1050,17 @@ def create_app(
                 )
         except (OSError, ValueError):
             if expected is not None:
+                checkpoint = load_completed_checkpoint_for_recovery(data_dir, project_id, expected)
+                if checkpoint is not None:
+                    fail_semantic_analysis(
+                        project_id, expected,
+                        semantic_analysis_error(
+                            "semantic_analysis_finalize_failed",
+                            "语义分析结果已验证，但本地最终保存失败，请直接重试语义分析。",
+                            True,
+                        ),
+                    )
+                    return
                 fail_semantic_analysis(
                     project_id, expected,
                     semantic_analysis_error(
