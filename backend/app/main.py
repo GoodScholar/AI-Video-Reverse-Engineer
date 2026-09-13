@@ -93,10 +93,15 @@ from app.analysis_prompt import PROMPT_VERSION
 from app.analysis_service_secrets import SecureStorageUnavailable
 from app.analysis_settings import AnalysisProviderConfiguration, AnalysisSettings
 from app.credential_store import CredentialStore
-from app.provider_models import PROVIDER_IDS, model_is_allowed
+from app.provider_models import CATALOG_VERSION, PROVIDER_IDS, model_is_allowed, provider_for
 from app.analysis_providers.bailian import BailianAnalysisProvider
 from app.analysis_providers.base import ProviderAnalysisError, ProviderFailure
+from app.analysis_providers.claude import ClaudeAnalysisProvider
+from app.analysis_providers.doubao import DoubaoAnalysisProvider
+from app.analysis_providers.gemini import GeminiAnalysisProvider
+from app.analysis_providers.grok import GrokAnalysisProvider
 from app.analysis_providers.local_openai_compatible import LocalOpenAICompatibleAnalysisProvider
+from app.analysis_providers.openai import OpenAIAnalysisProvider
 from app.analysis_providers.http_transport import new_provider_http_client
 
 
@@ -349,12 +354,21 @@ def create_app(
             configured = credentials().get(provider) is not None
         except SecureStorageUnavailable as error:
             raise secure_storage_unavailable() from error
+        catalog = provider_for(provider)
         return AnalysisProviderConfiguration(
             provider=provider,
+            label=catalog.label,
+            models=tuple(model.model_dump() for model in catalog.models),
             model=setting.model if setting is not None else None,
             baseUrl=setting.baseUrl if setting is not None else None,
             credentialState="configured" if configured else "unconfigured",
             selectedProvider=configured_analysis_settings.selected_provider(),
+            configurationRevision=setting.configurationRevision if setting is not None else None,
+            catalogVersion=setting.catalogVersion if setting is not None else CATALOG_VERSION,
+            verificationState=setting.verificationState if setting is not None else "unverified",
+            verifiedAt=setting.verifiedAt if setting is not None else None,
+            failedAt=setting.failedAt if setting is not None else None,
+            errorCode=setting.errorCode if setting is not None else None,
         )
 
     def storage_error(error: OSError) -> HTTPException:
@@ -934,6 +948,16 @@ def create_app(
             return BailianAnalysisProvider(client, credential)
         if provider == "local_openai_compatible" and base_url is not None:
             return LocalOpenAICompatibleAnalysisProvider(client, base_url, credential)
+        if provider == "openai":
+            return OpenAIAnalysisProvider(client, credential)
+        if provider == "doubao":
+            return DoubaoAnalysisProvider(client, credential=credential)
+        if provider == "gemini":
+            return GeminiAnalysisProvider(client, credential)
+        if provider == "grok":
+            return GrokAnalysisProvider(client, credential)
+        if provider == "claude":
+            return ClaudeAnalysisProvider(client, credential)
         raise ProviderAnalysisError(ProviderFailure.for_code("provider_unconfigured"))
 
     def analysis_provider_for(
@@ -1476,6 +1500,32 @@ def create_app(
         except SecureStorageUnavailable as error:
             raise secure_storage_unavailable() from error
 
+        if provider != "local_openai_compatible" and not (api_key or previous_credential):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
+            )
+        if api_key is not None and api_key != previous_credential:
+            try:
+                candidate, prepared_settings = configured_analysis_settings.prepare_save(
+                    provider=provider,
+                    model=model,
+                    base_url=base_url,
+                    selected_provider=provider,
+                    credential_changed=True,
+                )
+            except (OSError, ValueError) as error:
+                if isinstance(error, OSError):
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"code": "analysis_settings_unavailable", "message": "分析供应商设置不可用。"},
+                    ) from error
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
+                ) from error
+
         credential_write_succeeded = False
         credential_state = previous_credential is not None
         try:
@@ -1502,12 +1552,21 @@ def create_app(
                     "code": "analysis_settings_unavailable", "message": "分析供应商设置不可用。"},
             ) from error
 
+        catalog = provider_for(provider)
         return AnalysisProviderConfiguration(
             provider=provider,
+            label=catalog.label,
+            models=tuple(model.model_dump() for model in catalog.models),
             model=candidate.model,
             baseUrl=candidate.baseUrl,
             credentialState="configured" if credential_state else "unconfigured",
             selectedProvider=provider,
+            configurationRevision=candidate.configurationRevision,
+            catalogVersion=candidate.catalogVersion,
+            verificationState=candidate.verificationState,
+            verifiedAt=candidate.verifiedAt,
+            failedAt=candidate.failedAt,
+            errorCode=candidate.errorCode,
         )
 
     @app.post("/api/analysis-providers/{provider}/test-connection", response_model=None)
@@ -1525,7 +1584,7 @@ def create_app(
             ) from error
         if (
             setting is None
-            or provider == "bailian" and credential is None
+            or provider != "local_openai_compatible" and credential is None
             or not analysis_model_is_supported(provider, setting.model)
         ):
             raise HTTPException(
@@ -1536,6 +1595,8 @@ def create_app(
                 },
             )
         configured_provider = None
+        configuration_revision = setting.configurationRevision
+        catalog_version = setting.catalogVersion
         try:
             configured_provider = analysis_provider_for(
                 provider=provider,
@@ -1545,11 +1606,33 @@ def create_app(
             )
             configured_provider.test_connection(setting.model)
         except ProviderAnalysisError as error:
+            try:
+                configured_analysis_settings.record_verification(
+                    provider=provider,
+                    configuration_revision=configuration_revision,
+                    catalog_version=catalog_version,
+                    state="failed",
+                    error_code=error.failure.code,
+                    now=now_utc().isoformat(),
+                )
+            except (OSError, ValueError):
+                logging.getLogger(__name__).warning("分析供应商验证状态无法保存：provider=%s", provider)
             raise HTTPException(
                 status_code=502,
                 detail=error.failure.model_dump(),
             ) from None
         except Exception:
+            try:
+                configured_analysis_settings.record_verification(
+                    provider=provider,
+                    configuration_revision=configuration_revision,
+                    catalog_version=catalog_version,
+                    state="failed",
+                    error_code="provider_error",
+                    now=now_utc().isoformat(),
+                )
+            except (OSError, ValueError):
+                logging.getLogger(__name__).warning("分析供应商验证状态无法保存：provider=%s", provider)
             raise HTTPException(
                 status_code=502,
                 detail=semantic_analysis_error(
@@ -1559,7 +1642,17 @@ def create_app(
         finally:
             if configured_provider is not None:
                 close_default_analysis_provider(configured_provider)
-        return {"provider": provider, "model": setting.model, "status": "connected"}
+        try:
+            configured_analysis_settings.record_verification(
+                provider=provider,
+                configuration_revision=configuration_revision,
+                catalog_version=catalog_version,
+                state="available",
+                now=now_utc().isoformat(),
+            )
+        except (OSError, ValueError):
+            logging.getLogger(__name__).warning("分析供应商验证状态无法保存：provider=%s", provider)
+        return analysis_provider_configuration(provider).model_dump() | {"status": "connected"}
 
     @app.post("/api/projects/{project_id}/semantic-analysis", response_model=None)
     def start_semantic_analysis(
@@ -1665,7 +1758,7 @@ def create_app(
                 )
             if (
                 setting is None
-                or payload.provider == "bailian" and not has_credential
+                or payload.provider != "local_openai_compatible" and not has_credential
                 or setting.model != payload.model
             ):
                 raise HTTPException(

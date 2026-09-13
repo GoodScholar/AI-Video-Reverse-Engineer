@@ -156,14 +156,13 @@ def test_analysis_settings_persists_only_non_sensitive_provider_data_atomically(
     )
 
     persisted = json.loads(path.read_text(encoding="utf-8"))
-    assert persisted == {
-        "providers": [{
-            "provider": "local_openai_compatible",
-            "model": "vision-local",
-            "baseUrl": "http://localhost:1234/v1",
-        }],
-        "selectedProvider": "local_openai_compatible",
-    }
+    assert persisted["selectedProvider"] == "local_openai_compatible"
+    assert persisted["providers"][0]["provider"] == "local_openai_compatible"
+    assert persisted["providers"][0]["model"] == "vision-local"
+    assert persisted["providers"][0]["baseUrl"] == "http://localhost:1234/v1"
+    assert persisted["providers"][0]["configurationRevision"]
+    assert persisted["providers"][0]["catalogVersion"]
+    assert persisted["providers"][0]["verificationState"] == "unverified"
     assert "apiKey" not in json.dumps(persisted)
     assert AnalysisSettings(path).get("local_openai_compatible").model == "vision-local"
 
@@ -184,13 +183,12 @@ def test_configuration_response_never_returns_or_persists_secret(tmp_path):
 
     assert response.status_code == 200
     assert "secret-value" not in response.text
-    assert response.json() == {
-        "provider": "bailian",
-        "model": "qwen3.7-flash",
-        "baseUrl": None,
-        "credentialState": "configured",
-        "selectedProvider": "bailian",
+    body = response.json()
+    assert {key: body[key] for key in ("provider", "model", "baseUrl", "credentialState", "selectedProvider")} == {
+        "provider": "bailian", "model": "qwen3.7-flash", "baseUrl": None,
+        "credentialState": "configured", "selectedProvider": "bailian",
     }
+    assert body["verificationState"] == "unverified"
     assert "secret-value" not in settings_path.read_text(encoding="utf-8")
     assert credentials.values == {"bailian": "secret-value"}
 
@@ -229,13 +227,10 @@ def test_configuration_api_lists_catalog_providers_and_rejects_unknown_cloud_mod
     assert invalid.status_code == 400
     assert invalid.json()["detail"]["code"] == "invalid_analysis_model"
     assert valid.status_code == 200
-    assert valid.json() == {
-        "provider": "openai",
-        "model": "gpt-5.6-luna",
-        "baseUrl": None,
-        "credentialState": "configured",
-        "selectedProvider": "openai",
-    }
+    assert valid.json()["provider"] == "openai"
+    assert valid.json()["model"] == "gpt-5.6-luna"
+    assert valid.json()["credentialState"] == "configured"
+    assert valid.json()["verificationState"] == "unverified"
 
 
 def test_configuration_reports_secure_storage_unavailability_without_secret(tmp_path):
@@ -388,6 +383,89 @@ def test_successful_configuration_uses_the_credential_read_done_before_commit(tm
     assert response.status_code == 200
     assert response.json()["credentialState"] == "configured"
     assert credentials.operations == [("get", "bailian"), ("set", "bailian")]
+
+
+def test_configuration_listing_exposes_catalog_and_unverified_state_without_a_secret(tmp_path):
+    client = TestClient(create_app(
+        data_dir=tmp_path,
+        credential_store=InMemoryCredentials(),
+        analysis_settings=AnalysisSettings(tmp_path / "analysis-providers.json"),
+    ))
+
+    openai = next(item for item in client.get("/api/analysis-providers").json() if item["provider"] == "openai")
+
+    assert openai["label"] == "OpenAI"
+    assert openai["models"] == [{"id": "gpt-5.6-luna", "label": "GPT-5.6 Luna"}]
+    assert openai["catalogVersion"]
+    assert openai["configurationRevision"] is None
+    assert openai["verificationState"] == "unverified"
+    assert openai["verifiedAt"] is None
+    assert openai["failedAt"] is None
+    assert openai["errorCode"] is None
+
+
+def test_saving_unchanged_configuration_keeps_revision_but_changed_model_invalidates_verification(tmp_path):
+    settings = AnalysisSettings(tmp_path / "analysis-providers.json")
+    first = settings.save(
+        provider="local_openai_compatible", model="first", base_url="http://127.0.0.1:8080",
+        selected_provider="local_openai_compatible",
+    )
+    settings.record_verification(
+        provider="local_openai_compatible", configuration_revision=first.configurationRevision,
+        catalog_version=first.catalogVersion, state="available", now="2026-09-13T00:00:00+00:00",
+    )
+    unchanged = settings.save(
+        provider="local_openai_compatible", model="first", base_url="http://127.0.0.1:8080",
+        selected_provider="local_openai_compatible",
+    )
+    changed = settings.save(
+        provider="local_openai_compatible", model="second", base_url="http://127.0.0.1:8080",
+        selected_provider="local_openai_compatible",
+    )
+
+    assert unchanged.configurationRevision == first.configurationRevision
+    assert unchanged.verificationState == "available"
+    assert changed.configurationRevision != first.configurationRevision
+    assert changed.verificationState == "unverified"
+    assert changed.verifiedAt is None
+
+
+def test_late_connection_result_cannot_overwrite_newer_configuration(tmp_path):
+    settings = AnalysisSettings(tmp_path / "analysis-providers.json")
+    old = settings.save(
+        provider="local_openai_compatible", model="first", base_url="http://127.0.0.1:8080",
+        selected_provider="local_openai_compatible",
+    )
+    newer = settings.save(
+        provider="local_openai_compatible", model="second", base_url="http://127.0.0.1:8080",
+        selected_provider="local_openai_compatible",
+    )
+
+    assert not settings.record_verification(
+        provider="local_openai_compatible", configuration_revision=old.configurationRevision,
+        catalog_version=old.catalogVersion, state="failed", error_code="network_error", now="2026-09-13T00:00:00+00:00",
+    )
+    current = settings.get("local_openai_compatible")
+    assert current.configurationRevision == newer.configurationRevision
+    assert current.verificationState == "unverified"
+
+
+def test_catalog_version_change_invalidates_a_previously_available_configuration(tmp_path):
+    path = tmp_path / "analysis-providers.json"
+    path.write_text(json.dumps({
+        "providers": [{
+            "provider": "openai", "model": "gpt-5.6-luna", "configurationRevision": "old-revision",
+            "catalogVersion": "old-catalog", "verificationState": "available", "verifiedAt": "2026-09-12T00:00:00+00:00",
+        }],
+        "selectedProvider": "openai",
+    }), encoding="utf-8")
+
+    migrated = AnalysisSettings(path).get("openai")
+
+    assert migrated.catalogVersion != "old-catalog"
+    assert migrated.configurationRevision != "old-revision"
+    assert migrated.verificationState == "unverified"
+    assert migrated.verifiedAt is None
 
 
 def test_default_credential_store_initialization_failure_is_reported_safely(tmp_path, monkeypatch):

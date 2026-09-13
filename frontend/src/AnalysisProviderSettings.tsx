@@ -1,4 +1,4 @@
-import { type FormEvent, useEffect, useMemo, useState } from "react";
+import { type FormEvent, useEffect, useState } from "react";
 import { Check, CircleAlert, PlugZap, Save } from "lucide-react";
 
 import type { AnalysisProviderConfiguration, AnalysisProviderId } from "./models";
@@ -9,8 +9,10 @@ import {
 } from "./analysisProviderApi";
 
 const DESKTOP_QUERY = "(min-width: 1024px)";
-const BAILIAN_MODEL = "qwen3.7-flash";
-const IMPLEMENTED_PROVIDER_IDS = new Set<AnalysisProviderId>(["bailian", "local_openai_compatible"]);
+const PROVIDER_LABELS: Record<AnalysisProviderId, string> = {
+  bailian: "阿里云百炼", local_openai_compatible: "本地 OpenAI 兼容服务", openai: "OpenAI",
+  doubao: "火山方舟豆包", gemini: "Google Gemini", grok: "xAI Grok", claude: "Anthropic Claude",
+};
 
 type Props = {
   providers: AnalysisProviderConfiguration[];
@@ -36,8 +38,8 @@ function useDesktop() {
   return isDesktop;
 }
 
-function providerLabel(provider: AnalysisProviderId) {
-  return provider === "bailian" ? "阿里云百炼" : "本地 OpenAI 兼容服务";
+function providerLabel(provider: AnalysisProviderConfiguration) {
+  return provider.label ?? PROVIDER_LABELS[provider.provider];
 }
 
 function initialProvider(providers: AnalysisProviderConfiguration[]): AnalysisProviderId | null {
@@ -46,15 +48,17 @@ function initialProvider(providers: AnalysisProviderConfiguration[]): AnalysisPr
     ?? null;
 }
 
-function implementedProviders(providers: AnalysisProviderConfiguration[]) {
-  return providers.filter((provider) => IMPLEMENTED_PROVIDER_IDS.has(provider.provider));
-}
-
 function isConfigured(provider: AnalysisProviderConfiguration) {
   return provider.credentialState === "configured"
     || (provider.provider === "local_openai_compatible"
       && provider.selectedProvider === provider.provider
       && Boolean(provider.model?.trim() && provider.baseUrl?.trim()));
+}
+
+function verificationLabel(provider: AnalysisProviderConfiguration) {
+  if (provider.verificationState === "available") return "可用";
+  if (provider.verificationState === "failed") return "验证失败";
+  return "未验证";
 }
 
 function messageFor(error: unknown, fallback: string) {
@@ -68,8 +72,8 @@ export function AnalysisProviderSettings({
   testConnection = testAnalysisProviderConnection,
 }: Props) {
   const isDesktop = useDesktop();
-  const availableProviders = useMemo(() => implementedProviders(providers), [providers]);
-  const [selectedProvider, setSelectedProvider] = useState<AnalysisProviderId | null>(() => initialProvider(implementedProviders(providers)));
+  const availableProviders = providers;
+  const [selectedProvider, setSelectedProvider] = useState<AnalysisProviderId | null>(() => initialProvider(providers));
   const selected = availableProviders.find((provider) => provider.provider === selectedProvider) ?? null;
   const [model, setModel] = useState(selected?.model ?? "");
   const [baseUrl, setBaseUrl] = useState(selected?.baseUrl ?? "");
@@ -86,7 +90,7 @@ export function AnalysisProviderSettings({
 
   useEffect(() => {
     const next = availableProviders.find((provider) => provider.provider === selectedProvider);
-    setModel(next?.model ?? (selectedProvider === "bailian" ? BAILIAN_MODEL : ""));
+    setModel(next?.model ?? next?.models?.[0]?.id ?? "");
     setBaseUrl(next?.baseUrl ?? "");
     setApiKey("");
     setError("");
@@ -105,7 +109,7 @@ export function AnalysisProviderSettings({
     setError("");
     setConnectionStatus("");
     const input: AnalysisProviderConfigurationInput = {
-      model: selected.provider === "bailian" ? BAILIAN_MODEL : model.trim(),
+      model: selected.provider === "local_openai_compatible" ? model.trim() : (selected.models?.[0]?.id ?? model.trim()),
       ...(selected.provider === "local_openai_compatible" ? { baseUrl: baseUrl.trim() } : {}),
       ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
     };
@@ -130,7 +134,8 @@ export function AnalysisProviderSettings({
     setError("");
     setConnectionStatus("");
     try {
-      await testConnection(selected.provider);
+      const tested = await testConnection(selected.provider);
+      onProvidersChanged(providers.map((provider) => provider.provider === tested.provider ? { ...provider, ...tested } : provider));
       setConnectionStatus("连接正常；测试只发送固定探针，不上传项目素材。");
     } catch (testError) {
       setError(messageFor(testError, "无法测试分析服务连接，请重试。"));
@@ -154,14 +159,14 @@ export function AnalysisProviderSettings({
             <legend>选择分析服务</legend>
             {availableProviders.map((provider) => (
               <button key={provider.provider} className={provider.provider === selectedProvider ? "analysis-provider-option analysis-provider-option--selected" : "analysis-provider-option"} type="button" aria-pressed={provider.provider === selectedProvider} onClick={() => choose(provider.provider)}>
-                <span>{providerLabel(provider.provider)}</span>
-                <span>{isConfigured(provider) ? "已配置" : "尚未配置"}</span>
+                <span>{providerLabel(provider)}</span>
+                <span>{isConfigured(provider) ? "已配置" : "尚未配置"}</span><span> · {verificationLabel(provider)}</span>
               </button>
             ))}
           </fieldset>
           {selected && (
             <form className="analysis-provider-form" onSubmit={(event) => void submit(event)}>
-              <h3>{providerLabel(selected.provider)}</h3>
+              <h3>{providerLabel(selected)}</h3>
               {selected.provider === "local_openai_compatible" ? (
                 <>
                   <label htmlFor="local-analysis-base-url">本地服务 Base URL</label>
@@ -169,16 +174,16 @@ export function AnalysisProviderSettings({
                   <label htmlFor="local-analysis-model">本地服务模型</label>
                   <input id="local-analysis-model" value={model} onChange={(event) => setModel(event.target.value)} placeholder="例如：vision-local" autoComplete="off" disabled={!isDesktop} required />
                 </>
-              ) : <p className="analysis-provider-model">已验证模型：<strong>{BAILIAN_MODEL}</strong></p>}
-              <label htmlFor="analysis-api-key">{selected.provider === "bailian" ? "百炼 API Key" : "本地服务 API Key（可选）"}</label>
-              <input id="analysis-api-key" type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} autoComplete="new-password" disabled={!isDesktop} />
-              <p className="analysis-provider-key-state">{selected.credentialState === "configured" ? "密钥已配置" : selected.provider === "bailian" ? "需要 API Key 后才能开始分析" : "本地服务允许不填写 API Key"}</p>
+              ) : <><label htmlFor="analysis-provider-model">内置模型</label><select id="analysis-provider-model" value={selected.models?.[0]?.id ?? model} onChange={() => undefined} disabled={!isDesktop}>{(selected.models ?? []).map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></>}
+              <label htmlFor="analysis-api-key">{selected.provider === "local_openai_compatible" ? "本地服务 API Key（可选）" : selected.provider === "bailian" ? "百炼 API Key" : `${providerLabel(selected)} API Key`}</label>
+              <input id="analysis-api-key" type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} autoComplete="new-password" disabled={!isDesktop} required={selected.provider !== "local_openai_compatible"} />
+              <p className="analysis-provider-key-state">{selected.credentialState === "configured" ? "密钥已配置" : selected.provider === "local_openai_compatible" ? "本地服务允许不填写 API Key" : "需要 API Key 后才能开始分析"}</p>
               <p className="analysis-provider-probe-note">连接测试只发送固定探针，不上传项目素材。</p>
               {error && <p className="analysis-provider-error" role="alert"><CircleAlert aria-hidden="true" size={17} />{error}</p>}
               {connectionStatus && <p className="analysis-provider-success" role="status"><Check aria-hidden="true" size={17} />{connectionStatus}</p>}
               {isDesktop && <div className="analysis-provider-actions">
                 <button className="secondary-action" type="button" disabled={isTesting || isSaving} onClick={() => void test()}><PlugZap aria-hidden="true" size={17} />{isTesting ? "正在测试…" : "测试连接"}</button>
-                <button className="primary-action" type="submit" disabled={isSaving || isTesting}><Save aria-hidden="true" size={17} />{isSaving ? "正在保存…" : `保存${selected.provider === "bailian" ? "百炼" : "本地服务"}配置`}</button>
+                <button className="primary-action" type="submit" disabled={isSaving || isTesting}><Save aria-hidden="true" size={17} />{isSaving ? "正在保存…" : `保存${selected.provider === "local_openai_compatible" ? "本地服务" : providerLabel(selected).replace("阿里云", "")}配置`}</button>
               </div>}
             </form>
           )}

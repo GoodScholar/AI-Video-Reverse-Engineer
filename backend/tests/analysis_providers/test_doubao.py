@@ -1,5 +1,6 @@
 import base64
 import json
+from unittest.mock import ANY
 
 import httpx
 import pytest
@@ -215,6 +216,29 @@ def test_doubao_connection_probe_uses_fixed_png_and_the_normal_strict_validation
 
     assert result.observedFacts.temporal is None
     assert "data:image/png;base64," in captured[0].content.decode("utf-8")
+
+
+def test_doubao_connection_probe_makes_one_request_on_success_and_one_text_only_repair_after_invalid_output():
+    captured = []
+    responses = iter([
+        _responses("{}"),
+        _responses(json.dumps(_valid_analysis(), ensure_ascii=False)),
+    ])
+
+    def handler(request):
+        captured.append(request)
+        return httpx.Response(200, json=next(responses))
+
+    provider = DoubaoAnalysisProvider(
+        httpx.Client(transport=httpx.MockTransport(handler)), credential="test-key",
+    )
+
+    assert provider.test_connection().observedFacts.temporal is None
+    assert len(captured) == 2
+    first = json.loads(captured[0].content)["input"][0]["content"]
+    repair = json.loads(captured[1].content)["input"][0]["content"]
+    assert any(part["type"] == "input_image" for part in first)
+    assert repair == [{"type": "input_text", "text": ANY}]
 
 
 def test_doubao_core_credential_is_keyword_only_while_legacy_endpoint_bindings_stay_positional():

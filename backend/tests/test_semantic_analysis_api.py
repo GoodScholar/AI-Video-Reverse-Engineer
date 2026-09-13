@@ -462,7 +462,10 @@ def test_connection_test_uses_configured_provider_without_reading_project_media(
     )
 
     assert response.status_code == 200
-    assert response.json() == {"provider": "bailian", "model": "qwen3.7-flash", "status": "connected"}
+    assert response.json()["provider"] == "bailian"
+    assert response.json()["model"] == "qwen3.7-flash"
+    assert response.json()["status"] == "connected"
+    assert response.json()["verificationState"] == "available"
     assert calls == ["qwen3.7-flash"]
 
 

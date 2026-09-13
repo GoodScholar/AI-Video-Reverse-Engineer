@@ -4,6 +4,9 @@ from typing import Literal, Mapping
 from pydantic import BaseModel, ConfigDict, Field
 
 
+CATALOG_VERSION = "2026-09-13.1"
+
+
 ProviderId = Literal[
     "bailian",
     "local_openai_compatible",
@@ -94,6 +97,6 @@ PROVIDER_IDS = tuple(PROVIDER_CATALOG)
 
 
 __all__ = [
-    "MODEL_CATALOG", "PROVIDER_CATALOG", "PROVIDER_IDS", "ProviderCatalogEntry", "ProviderId", "ProviderModel",
+    "CATALOG_VERSION", "MODEL_CATALOG", "PROVIDER_CATALOG", "PROVIDER_IDS", "ProviderCatalogEntry", "ProviderId", "ProviderModel",
     "model_is_allowed", "models_for", "provider_for",
 ]

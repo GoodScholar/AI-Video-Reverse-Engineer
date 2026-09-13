@@ -90,7 +90,7 @@ function analysisServiceCapability(capability: Capability, providers: AnalysisPr
   if (!provider) return capability;
   return {
     state: provider.credentialState === "configured" ? "configured" : "unconfigured",
-    label: `${provider.provider === "bailian" ? "百炼" : "本地兼容服务"} · ${provider.model ?? "未配置模型"}`,
+    label: `${provider.label ?? provider.provider} · ${provider.model ?? "未配置模型"}`,
   };
 }
 

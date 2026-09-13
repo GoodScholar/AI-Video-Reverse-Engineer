@@ -39,7 +39,7 @@ export function saveAnalysisProviderConfiguration(
   );
 }
 
-export function testAnalysisProviderConnection(provider: AnalysisProviderId): Promise<{ provider: AnalysisProviderId; model: string; status: "connected" }> {
+export function testAnalysisProviderConnection(provider: AnalysisProviderId): Promise<AnalysisProviderConfiguration & { status: "connected" }> {
   return request(
     `/api/analysis-providers/${encodeURIComponent(provider)}/test-connection`,
     { method: "POST", headers: ANALYSIS_INTENT_HEADERS, body: "{}" },

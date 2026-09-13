@@ -18,7 +18,7 @@
 | Task 3 | Claude Messages 适配器 | Task 1、1.5 | 已完成 |
 | Task 4 | Gemini generateContent 适配器 | Task 1、1.5 | 已完成 |
 | Task 5 | 豆包 Ark Responses 适配器 | Task 1、1.5 | 已完成（模拟契约） |
-| Task 6 | 工厂注册、CAS 验证状态、前端、冒烟入口、文档 | Task 2～5 | 待实现 |
+| Task 6 | 工厂注册、CAS 验证状态、前端、冒烟入口、文档 | Task 2～5 | 已完成（模拟与本地 API 路径） |
 
 ## 固定裁决
 
@@ -56,3 +56,4 @@
 - 2026-09-13：Task 3 完成 Claude `claude-sonnet-5` 固定 Messages 适配器：核心 `analyze(ProviderRequest)` 复用强化 HTTP 边界，使用 `x-api-key`、`anthropic-version`、`output_config.format` 和真实 PNG/JPEG base64 image source；repair 仅发送完整文本。Claude wire schema 深拷贝后移除官方不支持的约束、补足每个对象的 `additionalProperties:false`，不改领域 schema。响应仅拼接 `text` 内容块，跳过 thinking/signature 等非文本块，并拒绝拒绝、截断、空文本和畸形响应。探针发送固定 PNG，并经 `validate_or_repair` 的一次文本修复和严格结构校验；未注册主工厂。遗留三参数入口显式重命名为 `analyze_legacy`。
 - 2026-09-13：Task 4 完成 Gemini `gemini-2.5-flash` 固定 GenerateContent 适配器：核心 `analyze(ProviderRequest)` 使用目录白名单与安全 URL 组成、官方 `x-goog-api-key` Header、真实 PNG/JPEG `inlineData` Base64、完整提示与媒体上下文、`generationConfig.responseMimeType`/`responseJsonSchema`。出站 schema 深拷贝后内联本地引用、将可空对象改为 Gemini 方言的类型数组并移除不支持约束，领域 `StructuredVisualAnalysis` 仍由本地最终严格校验。响应仅收集 `thought` 以外的文本，拒绝空候选、安全阻断、非 `STOP`、thought-only 与畸形响应；HTTP/网络/超时均映射稳定且不回显正文。探针发送固定 PNG，并通过完整提示、一次纯文本修复和严格验证；遗留三参数入口显式保留为 `analyze_legacy`。未注册主工厂，未使用真实密钥，状态保持 `unverified`。
 - 2026-09-13：Task 5 完成豆包 `doubao-seed-2-0-lite-260428` 固定 Ark Responses 适配器：核心 `analyze(ProviderRequest)` 与 `test_connection(model=None)` 使用固定 `https://ark.cn-beijing.volces.com/api/v3/responses`、目录白名单、Bearer、共享强化传输、`store:false`、真实 PNG/JPEG data URL、`input_text`/`input_image`、完整 `text.format` JSON Schema 与 `message/output_text` 遍历。探针只发送 16×16 内置 PNG，并通过正常的单次修复和严格结构校验路径；HTTP/传输/解析错误使用既有稳定错误码且不回显供应商正文。旧 endpoint binding 继续位于第二个位置参数，核心 credential 强制关键字传入，旧三参数实现保留为 `analyze_legacy`；未注册主工厂。方舟 260428 的图片/结构化组合仍是协议兼容推断，未使用真实密钥或伪造冒烟，目录状态保持 `unverified`，未改用 260215。
+- 2026-09-13：Task 6 注册七家默认工厂；每次创建均取得独立强化 HTTP client。设置保存非敏感 `configurationRevision`、`catalogVersion` 和验证状态，旧设置读入时稳定迁移为 `unverified`；密钥、模型、回环地址或目录版本变化使验证失效，同配置不会无意义改修订。连接测试捕获修订/目录版本并以 CAS 写回成功或稳定失败码，原始供应商响应不持久化。前端直接使用 API 目录标签和模型清单，显示“已配置”与“未验证/可用/验证失败”两个维度。新增脚本仅调用 UI 所用的本地 connection-test API。Gemini wire-schema 与豆包一次修复测试已补齐。未执行真实供应商冒烟：当前工作环境没有运行中、已配置的本地 API/密钥；所有云端状态仍应保持 `unverified`。

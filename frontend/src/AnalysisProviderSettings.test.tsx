@@ -74,3 +74,13 @@ it("只允许配置已实现的百炼和本地服务，不把未实现云端显�
   expect(screen.getByRole("heading", { name: "阿里云百炼" })).toBeVisible();
   expect(screen.queryByText("本地服务 API Key（可选）")).not.toBeInTheDocument();
 });
+
+it("展示目录中的云端供应商，并将尚未验证与已配置分开说明", () => {
+  vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  render(<AnalysisProviderSettings providers={providersWithUnimplementedCloud} save={vi.fn()} testConnection={vi.fn()} />);
+
+  const openai = screen.getByRole("button", { name: /^OpenAI/ });
+  expect(openai).toBeVisible();
+  expect(within(openai).getByText(/未验证/)).toBeVisible();
+  expect(screen.queryByText("可用")).not.toBeInTheDocument();
+});

@@ -64,9 +64,13 @@ macOS 使用 Homebrew 时，可安装 `brew install ffmpeg-full`。它是独立�
 
 ## 语义分析
 
-04c 已支持图片和视频的统一、可恢复语义分析。当前仅支持阿里云百炼 `qwen3.7-flash` 与用户配置的回环地址本地 OpenAI 兼容服务；OpenAI、Gemini、豆包、Grok 等云端供应商属于 04d 后续范围。
+04c 已支持图片和视频的统一、可恢复语义分析。当前设置目录包含阿里云百炼 `qwen3.7-flash`、本地 OpenAI 兼容服务（回环地址、自填非空模型）、OpenAI `gpt-5.6-luna`、火山方舟豆包 `doubao-seed-2-0-lite-260428`、Google Gemini `gemini-2.5-flash`、xAI Grok `grok-4.6` 与 Anthropic Claude `claude-sonnet-5`。五家云端与百炼必须配置 API Key；本地服务的 Key 可选，Base URL 仅允许回环主机。
+
+目录中的“未验证/可用/验证失败”是当前本机配置的连接测试结果，不是供应商可用性的承诺。连接测试只发送内置的 16×16 PNG 和完整结构化分析提示；它不会发送参考素材。豆包图片与结构化输出组合基于方舟 Responses 兼容协议推断，在真实密钥的本地连接测试成功前保持“未验证”。模拟契约测试不能替代真实冒烟。
 
 用户在宽度至少 1024px 的项目页先查看接收方、将发送的代理内容和明确不发送内容，再确认提交。凭据仅由本地服务的系统安全存储管理，前端、项目数据和日志不保存或回显密钥。任务会保存检查点以便重新打开后恢复状态；失败保留本地预处理结果，且不会自动切换供应商或模型。窄屏仅可查看配置、任务和结果。
+
+可用本地服务的同一路径执行脱敏连接冒烟：`PYTHONPATH=backend .venv/bin/python backend/scripts/smoke_analysis_provider.py --provider openai`。它只调用本机 `/api/analysis-providers/<id>/test-connection`，不会直接读取安全存储、打印凭据、请求体或供应商原始响应；未配置或失败时非零退出。
 
 ## 生产预览
 

@@ -52,7 +52,7 @@ describe("项目首页", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent("无法读取分析服务设置");
     await userEvent.click(screen.getByRole("button", { name: "重新读取分析服务设置" }));
-    expect(await screen.findByText("百炼 · qwen3.7-flash")).toBeVisible();
+    expect(await screen.findByText("bailian · qwen3.7-flash")).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: /雨夜人像复刻/ }));
     expect(screen.getByRole("button", { name: "开始语义分析" })).toBeEnabled();
   });

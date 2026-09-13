@@ -185,10 +185,18 @@ export type AnalysisProviderId =
 
 export type AnalysisProviderConfiguration = {
   provider: AnalysisProviderId;
+  label?: string;
+  models?: { id: string; label: string }[];
   model: string | null;
   baseUrl: string | null;
   credentialState: "configured" | "unconfigured";
   selectedProvider: AnalysisProviderId | null;
+  configurationRevision?: string | null;
+  catalogVersion?: string;
+  verificationState?: "unverified" | "available" | "failed";
+  verifiedAt?: string | null;
+  failedAt?: string | null;
+  errorCode?: string | null;
 };
 
 export type DepthCaptureStageName =

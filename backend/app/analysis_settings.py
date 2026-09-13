@@ -9,7 +9,8 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .credential_store import ANALYSIS_PROVIDER_IDS
-from .provider_models import ProviderId
+from .provider_models import CATALOG_VERSION, ProviderId
+from uuid import uuid4
 
 
 class _StrictModel(BaseModel):
@@ -45,6 +46,12 @@ class _StoredProviderConfiguration(_StrictModel):
     provider: ProviderId
     model: str = Field(min_length=1)
     baseUrl: Optional[str] = None
+    configurationRevision: str = Field(default_factory=lambda: str(uuid4()), min_length=1)
+    catalogVersion: str = Field(default=CATALOG_VERSION, min_length=1)
+    verificationState: Literal["unverified", "available", "failed"] = "unverified"
+    verifiedAt: Optional[str] = None
+    failedAt: Optional[str] = None
+    errorCode: Optional[str] = None
 
     @field_validator("model")
     @classmethod
@@ -90,10 +97,18 @@ class _StoredAnalysisSettings(_StrictModel):
 
 class AnalysisProviderConfiguration(_StrictModel):
     provider: ProviderId
+    label: str
+    models: tuple[dict[str, str], ...]
     model: Optional[str] = None
     baseUrl: Optional[str] = None
     credentialState: Literal["configured", "unconfigured"]
     selectedProvider: Optional[ProviderId] = None
+    configurationRevision: Optional[str] = None
+    catalogVersion: str = CATALOG_VERSION
+    verificationState: Literal["unverified", "available", "failed"] = "unverified"
+    verifiedAt: Optional[str] = None
+    failedAt: Optional[str] = None
+    errorCode: Optional[str] = None
 
 
 class AnalysisSettings:
@@ -136,14 +151,33 @@ class AnalysisSettings:
         model: str,
         base_url: Optional[str],
         selected_provider: Optional[str],
+        credential_changed: bool = False,
     ) -> tuple[_StoredProviderConfiguration, _StoredAnalysisSettings]:
         self._validate_provider(provider)
         self._validate_provider(selected_provider)
         if provider == "local_openai_compatible" and base_url is None:
             raise ValueError("本地分析服务地址必须使用回环主机。")
-        candidate = _StoredProviderConfiguration(provider=provider, model=model, baseUrl=base_url)
         current = self._read()
         by_provider = {item.provider: item for item in current.providers}
+        previous = by_provider.get(provider)
+        unchanged = (
+            previous is not None
+            and previous.model == model
+            and previous.baseUrl == base_url
+            and previous.catalogVersion == CATALOG_VERSION
+            and not credential_changed
+        )
+        candidate = _StoredProviderConfiguration(
+            provider=provider,
+            model=model,
+            baseUrl=base_url,
+            configurationRevision=previous.configurationRevision if unchanged else str(uuid4()),
+            catalogVersion=CATALOG_VERSION,
+            verificationState=previous.verificationState if unchanged else "unverified",
+            verifiedAt=previous.verifiedAt if unchanged else None,
+            failedAt=previous.failedAt if unchanged else None,
+            errorCode=previous.errorCode if unchanged else None,
+        )
         by_provider[provider] = candidate
         return candidate, _StoredAnalysisSettings(
             providers=[by_provider[item] for item in sorted(by_provider)],
@@ -152,6 +186,38 @@ class AnalysisSettings:
 
     def commit(self, settings: _StoredAnalysisSettings) -> None:
         self._write(settings)
+
+    def record_verification(
+        self,
+        *,
+        provider: str,
+        configuration_revision: str,
+        catalog_version: str,
+        state: Literal["available", "failed"],
+        now: str,
+        error_code: Optional[str] = None,
+    ) -> bool:
+        self._validate_provider(provider)
+        current = self._read()
+        by_provider = {item.provider: item for item in current.providers}
+        setting = by_provider.get(provider)
+        if (
+            setting is None
+            or setting.configurationRevision != configuration_revision
+            or setting.catalogVersion != catalog_version
+        ):
+            return False
+        by_provider[provider] = setting.model_copy(update={
+            "verificationState": state,
+            "verifiedAt": now if state == "available" else None,
+            "failedAt": now if state == "failed" else None,
+            "errorCode": None if state == "available" else error_code,
+        })
+        self._write(_StoredAnalysisSettings(
+            providers=[by_provider[item] for item in sorted(by_provider)],
+            selectedProvider=current.selectedProvider,
+        ))
+        return True
 
     @staticmethod
     def _validate_provider(provider: Optional[str]) -> None:
@@ -163,7 +229,19 @@ class AnalysisSettings:
             return _StoredAnalysisSettings()
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
-            return _StoredAnalysisSettings.model_validate(raw)
+            settings = _StoredAnalysisSettings.model_validate(raw)
+            migrated = [
+                item.model_copy(update={
+                    "configurationRevision": str(uuid4()),
+                    "catalogVersion": CATALOG_VERSION,
+                    "verificationState": "unverified",
+                    "verifiedAt": None,
+                    "failedAt": None,
+                    "errorCode": None,
+                }) if item.catalogVersion != CATALOG_VERSION else item
+                for item in settings.providers
+            ]
+            return settings if migrated == settings.providers else settings.model_copy(update={"providers": migrated})
         except (json.JSONDecodeError, UnicodeDecodeError, ValidationError, ValueError) as error:
             raise ValueError("分析供应商设置无效。") from error
 

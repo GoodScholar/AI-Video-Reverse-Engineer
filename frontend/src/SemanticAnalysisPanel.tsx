@@ -48,8 +48,12 @@ function messageFor(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
 }
 
-function providerLabel(provider: string) {
-  return provider === "bailian" ? "阿里云百炼" : "本地 OpenAI 兼容服务";
+function providerLabel(provider: AnalysisProviderConfiguration | string) {
+  if (typeof provider !== "string") return provider.label ?? provider.provider;
+  return {
+    bailian: "阿里云百炼", local_openai_compatible: "本地 OpenAI 兼容服务", openai: "OpenAI",
+    doubao: "火山方舟豆包", gemini: "Google Gemini", grok: "xAI Grok", claude: "Anthropic Claude",
+  }[provider] ?? provider;
 }
 
 function taskTitle(task: SemanticAnalysis) {
@@ -90,7 +94,7 @@ function Disclosure({ identity, provider, headingRef, onCancel, onConfirm, isSub
   const ratio = dimensions ? `${dimensions.width}:${dimensions.height}` : "由本地预处理记录";
   return <div className="semantic-analysis-disclosure" aria-labelledby="semantic-disclosure-title">
     <h3 ref={headingRef} id="semantic-disclosure-title" tabIndex={-1}>确认发送分析代理</h3>
-    <p>将使用 {providerLabel(provider.provider)} 的 {provider.model} 进行本次语义分析。</p>
+    <p>将使用 {providerLabel(provider)} 的 {provider.model} 进行本次语义分析。</p>
     <dl>
       <div><dt>实际发送内容</dt><dd>{isImage ? `analysis-proxy.jpg（${dimensions?.width ?? "未知"}×${dimensions?.height ?? "未知"}，比例 ${ratio}）` : "contact-sheet.jpg 与 analysis-proxy.json"}</dd></div>
       <div><dt>明确不发送</dt><dd>不会发送原始素材、项目名或本地文件路径。</dd></div>

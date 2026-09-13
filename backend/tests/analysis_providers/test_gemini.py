@@ -123,6 +123,34 @@ def test_gemini_sends_fixed_generate_content_request_with_header_inline_png_and_
     assert '{"mediaType":"image","width":32,"height":24,"aspectRatio":1.3333333333333333}' in text_parts
 
 
+def test_gemini_wire_schema_keeps_nullable_video_and_repair_objects_strict():
+    captured = []
+    provider = GeminiAnalysisProvider(
+        httpx.Client(transport=httpx.MockTransport(lambda request: (
+            captured.append(request) or httpx.Response(200, json=_candidate({"text": "{}"}))
+        ))),
+        credential="test-key",
+    )
+
+    provider.analyze(_image_request())
+    provider.analyze(_video_request())
+    provider.analyze(_video_request().repair("只修复 JSON。"))
+
+    image_schema = json.loads(captured[0].content)["generationConfig"]["responseJsonSchema"]
+    video_schema = json.loads(captured[1].content)["generationConfig"]["responseJsonSchema"]
+    repair_schema = json.loads(captured[2].content)["generationConfig"]["responseJsonSchema"]
+    assert image_schema["properties"]["observedFacts"]["properties"]["temporal"] == {"type": "null"}
+    temporal = video_schema["properties"]["observedFacts"]["properties"]["temporal"]
+    repair_temporal = repair_schema["properties"]["observedFacts"]["properties"]["temporal"]
+    suggestions = video_schema["properties"]["generationSuggestions"]
+    assert temporal["type"] == ["object", "null"]
+    assert repair_temporal["type"] == ["object", "null"]
+    assert temporal["additionalProperties"] is False
+    assert set(temporal["required"]) == set(temporal["properties"])
+    assert suggestions["additionalProperties"] is False
+    assert set(suggestions["required"]) == set(suggestions["properties"])
+
+
 def test_gemini_sends_video_contact_sheet_with_real_jpeg_mime_and_context():
     captured = []
     provider = GeminiAnalysisProvider(
