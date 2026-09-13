@@ -40,6 +40,7 @@
 - 2026-09-13：`node frontend/scripts/verify-color-contrast.mjs` → PASS。
 - 2026-09-13：Task 1.5 定向回归 `PYTHONPATH=backend /Users/shen/SZG/AI Agent/AI Video Reverse Engineer/.venv/bin/pytest -q backend/tests/analysis_providers/test_bailian.py backend/tests/analysis_providers/test_local_openai_compatible.py backend/tests/test_semantic_analysis_api.py` → `45 passed`；供应商与网络边界回归 `PYTHONPATH=backend /Users/shen/SZG/AI Agent/AI Video Reverse Engineer/.venv/bin/pytest -q backend/tests/analysis_providers backend/tests/test_analysis_provider.py` → `115 passed`；完整后端 `PYTHONPATH=backend /Users/shen/SZG/AI Agent/AI Video Reverse Engineer/.venv/bin/pytest -q backend/tests` → `773 passed, 8 skipped`；`git diff --check` → PASS。
 - 2026-09-13：Task 2 RED：新增 OpenAI/Grok 测试后，`PYTHONPATH=backend /Users/shen/SZG/AI Agent/AI Video Reverse Engineer/.venv/bin/pytest -q backend/tests/analysis_providers/test_openai.py backend/tests/analysis_providers/test_grok.py` 因缺少 `app.analysis_providers.grok` 失败。探针提示契约测试随后以旧 `{"ok":true}` 提示对完整分析提示的偏差稳定失败。GREEN：适配器与共享契约回归 `125 passed`；完整后端 `797 passed, 8 skipped`；`compileall -q backend/app` 与 `git diff --check` 均通过。未使用真实密钥，因此云端验证状态仍为 `unverified`。
+- 2026-09-13：Task 2 审查修复 RED：Responses wire schema 的根 `version` 不在 `required`，且 `message.status: incomplete` 仍被提取为文本；新增图片、视频、repair 递归 schema 与未完成 message 回归后为 `4 failed`。GREEN：在不修改领域/共享 schema 的前提下，出站 Responses schema 深拷贝后递归将每个 `properties` 集合精确写入 `required`；非 `completed` 的显式 message 状态被拒绝。定向 `129 passed`，完整后端 `801 passed, 8 skipped`，`compileall` 和 `git diff --check` 通过。
 
 ## 执行记录
 

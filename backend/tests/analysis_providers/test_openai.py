@@ -13,11 +13,12 @@ from app.analysis_input import (
     VideoScene,
     VideoSource,
 )
-from app.analysis_prompt import build_analysis_prompt
+from app.analysis_prompt import build_analysis_prompt, structured_analysis_schema
 from app.analysis_provider import OpenAIProviderConfig, ProviderRequest as LegacyProviderRequest
 from app.analysis_providers import ProviderAnalysisError as LegacyProviderAnalysisError
 from app.analysis_providers.base import ProviderAnalysisError, ProviderRequest
 from app.analysis_providers.openai import OpenAIAnalysisProvider
+from app.analysis_providers.responses_api import build_responses_payload
 
 
 def _image_request():
@@ -77,6 +78,21 @@ def _valid_analysis():
             "rhythm": "平缓", "suggestedDuration": 5.0, "audio": "环境音建议",
         },
     }
+
+
+def _assert_all_object_properties_are_required(schema):
+    if isinstance(schema, dict):
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            assert set(schema.get("required", [])) == set(properties)
+            for value in properties.values():
+                _assert_all_object_properties_are_required(value)
+        for key, value in schema.items():
+            if key != "properties":
+                _assert_all_object_properties_are_required(value)
+    elif isinstance(schema, list):
+        for value in schema:
+            _assert_all_object_properties_are_required(value)
 
 
 def test_openai_sends_a_nonpersistent_responses_image_request_with_real_png_mime():
@@ -145,6 +161,15 @@ def test_openai_repair_request_sends_only_text_and_keeps_responses_structured_ou
     assert body["input"][0]["content"] == [{"type": "input_text", "text": "只修复 JSON。"}]
 
 
+@pytest.mark.parametrize("provider_request", [_image_request(), _video_request(), _image_request().repair("只修复 JSON。")])
+def test_openai_responses_schema_marks_every_object_property_required(provider_request):
+    schema = build_responses_payload(provider_request)["text"]["format"]["schema"]
+
+    assert "version" in schema["required"]
+    _assert_all_object_properties_are_required(schema)
+    assert "version" not in structured_analysis_schema("image")["required"]
+
+
 def test_openai_collects_only_output_text_from_all_message_output_items():
     response = {
         "status": "completed",
@@ -170,6 +195,10 @@ def test_openai_collects_only_output_text_from_all_message_output_items():
     [
         {"status": "incomplete", "output": []},
         {"status": "completed", "incomplete_details": {"reason": "max_output_tokens"}, "output": []},
+        {"status": "completed", "output": [{
+            "type": "message", "status": "incomplete",
+            "content": [{"type": "output_text", "text": "{}"}],
+        }]},
         {"status": "completed", "output": [{"type": "message", "content": [{"type": "refusal", "refusal": "no"}]}]},
         {"status": "completed", "output": [{"type": "message", "content": [{"type": "output_text", "text": "   "}]}]},
     ],

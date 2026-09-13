@@ -1,5 +1,6 @@
 """Protocol helpers shared by the fixed-endpoint Responses API adapters."""
 
+from copy import deepcopy
 from typing import Any, Optional
 
 from ..analysis_prompt import analysis_input_context, structured_analysis_schema
@@ -20,6 +21,7 @@ def build_responses_payload(request: ProviderRequest) -> dict[str, Any]:
         schema = structured_analysis_schema(request.analysisInput.mediaType)
     else:
         schema = StructuredVisualAnalysis.model_json_schema()
+    schema = _responses_schema(schema)
     return {
         "model": request.model,
         "store": False,
@@ -31,6 +33,26 @@ def build_responses_payload(request: ProviderRequest) -> dict[str, Any]:
             "schema": schema,
         }},
     }
+
+
+def _responses_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Copy a domain schema into the stricter Responses JSON Schema dialect."""
+
+    normalized = deepcopy(schema)
+    _require_all_object_properties(normalized)
+    return normalized
+
+
+def _require_all_object_properties(value: Any) -> None:
+    if isinstance(value, dict):
+        properties = value.get("properties")
+        if isinstance(properties, dict):
+            value["required"] = list(properties)
+        for nested in value.values():
+            _require_all_object_properties(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            _require_all_object_properties(nested)
 
 
 def result_from_responses_body(body: Any, request_id: Optional[str]) -> ProviderResult:
@@ -49,6 +71,8 @@ def result_from_responses_body(body: Any, request_id: Optional[str]) -> Provider
             raise ValueError("Responses 输出项无效")
         if item.get("type") != "message":
             continue
+        if item.get("status") not in (None, "completed"):
+            raise ValueError("Responses 消息未完成")
         content = item.get("content")
         if not isinstance(content, list):
             raise ValueError("Responses 消息内容无效")
