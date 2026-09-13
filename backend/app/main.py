@@ -1,4 +1,5 @@
 import errno
+import httpx
 import json
 import logging
 import os
@@ -76,10 +77,24 @@ from app.depth_capture_jobs import LocalComputeJobQueue, LocalPreprocessingQueue
 from app.depth_capture_runner import DepthCaptureFailure, DepthCaptureRequest, run_depth_capture
 from app.depth_capture_storage import inspect_depth_artifacts
 from app.depth_capture_storage import DepthPreviewUnavailableError, open_validated_depth_preview
-from app.semantic_analysis import SemanticAnalysis
+from app.semantic_analysis import SemanticAnalysis, SemanticAnalysisError
+from app.semantic_analysis_jobs import SemanticAnalysisJobQueue
+from app.semantic_analysis_runner import run_semantic_analysis
+from app.semantic_analysis_storage import (
+    SCHEMA_VERSION,
+    completed_checkpoint_matches,
+    discard_semantic_analysis_checkpoint,
+    interrupted_semantic_analysis,
+    new_semantic_analysis,
+    write_semantic_analysis_checkpoint,
+)
+from app.analysis_prompt import PROMPT_VERSION
 from app.analysis_service_secrets import SecureStorageUnavailable
 from app.analysis_settings import AnalysisProviderConfiguration, AnalysisSettings
 from app.credential_store import CredentialStore
+from app.analysis_providers.bailian import BailianAnalysisProvider
+from app.analysis_providers.base import ProviderAnalysisError, ProviderFailure
+from app.analysis_providers.local_openai_compatible import LocalOpenAICompatibleAnalysisProvider
 
 
 class CreateProjectInput(BaseModel):
@@ -95,6 +110,12 @@ class CreateProjectInput(BaseModel):
 
 class StartDepthCaptureInput(BaseModel):
     devicePreference: Literal["auto", "cuda", "mps", "cpu"] = "auto"
+
+
+class StartSemanticAnalysisInput(BaseModel):
+    provider: str
+    model: str
+    disclosureAccepted: bool
 
 
 STORAGE_UNAVAILABLE_MESSAGE = "本地项目存储不可用，请检查数据目录的访问权限后重试。"
@@ -283,6 +304,11 @@ def create_app(
     depth_device_probe: Optional[Callable[[], tuple[bool, bool]]] = None,
     credential_store=None,
     analysis_settings: Optional[AnalysisSettings] = None,
+    semantic_analysis_queue_factory: Optional[Callable] = None,
+    semantic_analysis_runner: Optional[Callable] = None,
+    analysis_provider_registry=None,
+    provider_registry=None,
+    clock: Optional[Callable[[], datetime]] = None,
 ) -> FastAPI:
     app = FastAPI(title="AI 视频复刻分析器")
     project_write_lock = Lock()
@@ -291,6 +317,8 @@ def create_app(
     reference_video_path_pattern = re.compile(r"^/api/projects/[^/]+/reference-video$")
     configured_credentials = credential_store
     configured_analysis_settings = analysis_settings or AnalysisSettings(data_dir / "analysis-providers.json")
+    now_utc = clock or (lambda: datetime.now(timezone.utc))
+    configured_provider_registry = provider_registry or analysis_provider_registry
 
     def credentials():
         nonlocal configured_credentials
@@ -847,8 +875,217 @@ def create_app(
         except OSError:
             logging.getLogger(__name__).exception("无法协调中断的深度捕捉任务")
 
+    def semantic_analysis_error(code: str, message: str, retryable: bool) -> SemanticAnalysisError:
+        return SemanticAnalysisError(code=code, message=message, retryable=retryable)
+
+    def semantic_task_matches(
+        project: Project,
+        task: SemanticAnalysis,
+        expected: SemanticAnalysis,
+    ) -> bool:
+        preprocessing = project.localPreprocessing
+        return (
+            task.id == expected.id
+            and task.sourceReferenceMediaId == expected.sourceReferenceMediaId
+            and task.sourcePreprocessingId == expected.sourcePreprocessingId
+            and task.provider == expected.provider
+            and task.model == expected.model
+            and task.promptVersion == expected.promptVersion
+            and task.schemaVersion == expected.schemaVersion
+            and project.referenceMedia is not None
+            and project.referenceMedia.id == expected.sourceReferenceMediaId
+            and preprocessing is not None
+            and preprocessing.id == expected.sourcePreprocessingId
+            and preprocessing.sourceReferenceMediaId == expected.sourceReferenceMediaId
+            and preprocessing.status == "completed"
+        )
+
+    def persist_semantic_analysis_change(
+        project_id: str,
+        expected: SemanticAnalysis,
+        transform: Callable[[SemanticAnalysis], SemanticAnalysis],
+    ) -> Project:
+        def update(project: Project) -> Project:
+            task = project.semanticAnalysis
+            if task is None or not semantic_task_matches(project, task, expected):
+                return project
+            updated = transform(task.model_copy(deep=True))
+            if updated.status == "completed":
+                write_semantic_analysis_checkpoint(data_dir, project.id, updated)
+            return project.model_copy(update={
+                "semanticAnalysis": updated,
+                "updatedAt": updated.updatedAt,
+            })
+        return update_project(project_id, update)
+
+    def default_analysis_provider(
+        *, provider: str, credential: Optional[str], base_url: Optional[str], model: str,
+    ):
+        client = httpx.Client(timeout=30.0)
+        if provider == "bailian":
+            return BailianAnalysisProvider(client, credential)
+        if provider == "local_openai_compatible" and base_url is not None:
+            return LocalOpenAICompatibleAnalysisProvider(client, base_url, credential)
+        raise ProviderAnalysisError(ProviderFailure.for_code("provider_unconfigured"))
+
+    def analysis_provider_for(
+        *, provider: str, credential: Optional[str], base_url: Optional[str], model: str,
+    ):
+        registry = configured_provider_registry
+        if registry is None:
+            return default_analysis_provider(
+                provider=provider, credential=credential, base_url=base_url, model=model,
+            )
+        factory = getattr(registry, "create", registry)
+        return factory(provider=provider, credential=credential, base_url=base_url, model=model)
+
+    def analysis_model_is_supported(provider: str, model: str) -> bool:
+        if provider == "bailian":
+            return model in BailianAnalysisProvider.models
+        # Local OpenAI-compatible services do not expose one reliable model
+        # catalog. The stored, non-blank configured model is its allow-list.
+        return provider == "local_openai_compatible" and bool(model.strip())
+
+    def close_default_analysis_provider(provider) -> None:
+        if configured_provider_registry is not None:
+            return
+        client = getattr(provider, "_client", None)
+        if isinstance(client, httpx.Client):
+            client.close()
+
+    def fail_semantic_analysis(
+        project_id: str,
+        expected: SemanticAnalysis,
+        error: SemanticAnalysisError,
+    ) -> None:
+        now = now_utc().isoformat()
+
+        def fail(task: SemanticAnalysis) -> SemanticAnalysis:
+            task.status = "failed"
+            task.updatedAt = now
+            task.completedAt = None
+            task.error = error
+            task.result = None
+            return task
+        try:
+            persist_semantic_analysis_change(project_id, expected, fail)
+        except (OSError, HTTPException):
+            logging.getLogger(__name__).warning("语义分析状态无法保存：projectId=%s", project_id)
+
+    def run_semantic_analysis_job(project_id: str) -> None:
+        expected: Optional[SemanticAnalysis] = None
+        project_for_run: Optional[Project] = None
+        try:
+            def mark_running(project: Project) -> Project:
+                nonlocal expected, project_for_run
+                task = project.semanticAnalysis
+                if task is None or task.status != "queued":
+                    return project
+                if not semantic_task_matches(project, task, task):
+                    return project
+                now = now_utc().isoformat()
+                running = task.model_copy(deep=True)
+                running.status = "running"
+                running.startedAt = running.startedAt or now
+                running.updatedAt = now
+                running.error = None
+                expected = running.model_copy(deep=True)
+                project_for_run = project.model_copy(update={"semanticAnalysis": running})
+                return project.model_copy(update={
+                    "semanticAnalysis": running,
+                    "updatedAt": now,
+                })
+
+            update_project(project_id, mark_running)
+            if expected is None or project_for_run is None:
+                return
+            task = expected
+            setting = configured_analysis_settings.get(task.provider)
+            credential = credentials().get(task.provider)
+            if (
+                setting is None
+                or setting.model != task.model
+                or task.provider == "bailian" and credential is None
+            ):
+                raise ProviderAnalysisError(ProviderFailure.for_code("provider_unconfigured"))
+            provider = analysis_provider_for(
+                provider=task.provider,
+                credential=credential,
+                base_url=setting.baseUrl,
+                model=task.model,
+            )
+            try:
+                runner = semantic_analysis_runner or run_semantic_analysis
+                result = runner(
+                    data_dir=data_dir,
+                    project=project_for_run,
+                    provider=provider,
+                    model=task.model,
+                )
+            finally:
+                close_default_analysis_provider(provider)
+            now = now_utc().isoformat()
+
+            def complete(current: SemanticAnalysis) -> SemanticAnalysis:
+                current.status = "completed"
+                current.updatedAt = now
+                current.completedAt = now
+                current.result = result
+                current.error = None
+                return current
+            persist_semantic_analysis_change(project_id, task, complete)
+        except ProviderAnalysisError as error:
+            if expected is not None:
+                fail_semantic_analysis(
+                    project_id, expected,
+                    semantic_analysis_error(
+                        error.failure.code, error.failure.message, error.failure.retryable,
+                    ),
+                )
+        except (OSError, ValueError):
+            if expected is not None:
+                fail_semantic_analysis(
+                    project_id, expected,
+                    semantic_analysis_error(
+                        "semantic_analysis_input_unavailable",
+                        "语义分析输入不可用，请重新完成本地预处理后再试。",
+                        True,
+                    ),
+                )
+        except Exception:
+            if expected is not None:
+                fail_semantic_analysis(
+                    project_id, expected,
+                    semantic_analysis_error(
+                        "semantic_analysis_unexpected_error",
+                        "语义分析出现未预期错误，请重试。",
+                        True,
+                    ),
+                )
+
+    def reconcile_interrupted_semantic_analyses() -> None:
+        try:
+            with project_write_lock:
+                projects = _read_projects(data_dir)
+                changed = False
+                for index, project in enumerate(projects):
+                    task = project.semanticAnalysis
+                    if task is None or task.status not in {"queued", "running"}:
+                        continue
+                    interrupted = interrupted_semantic_analysis(task, now_utc())
+                    projects[index] = project.model_copy(update={
+                        "semanticAnalysis": interrupted,
+                        "updatedAt": interrupted.updatedAt,
+                    })
+                    changed = True
+                if changed:
+                    _write_projects(data_dir, projects)
+        except OSError:
+            logging.getLogger(__name__).warning("无法协调中断的语义分析任务")
+
     reconcile_interrupted_preprocessing()
     reconcile_depth_captures()
+    reconcile_interrupted_semantic_analyses()
     compute_jobs = local_compute_queue or LocalComputeJobQueue()
     if preprocessing_queue_factory is None:
         preprocessing_jobs = LocalPreprocessingQueueAdapter(compute_jobs, run_preprocessing_job)
@@ -857,6 +1094,12 @@ def create_app(
     app.add_event_handler("shutdown", compute_jobs.shutdown)
     if preprocessing_queue_factory is not None:
         app.add_event_handler("shutdown", preprocessing_jobs.shutdown)
+
+    if semantic_analysis_queue_factory is None:
+        semantic_analysis_jobs = SemanticAnalysisJobQueue(run_semantic_analysis_job)
+    else:
+        semantic_analysis_jobs = semantic_analysis_queue_factory(run_semantic_analysis_job)
+    app.add_event_handler("shutdown", semantic_analysis_jobs.shutdown)
 
     def is_reference_video_request(request: Request) -> bool:
         return request.method == "PUT" and reference_video_path_pattern.fullmatch(request.url.path) is not None
@@ -1016,6 +1259,7 @@ def create_app(
                     "referenceMedia": reference,
                     "localPreprocessing": None,
                     "activeDepthCaptureId": None,
+                    "semanticAnalysis": None,
                     "updatedAt": datetime.now(timezone.utc).isoformat(),
                 }
             )
@@ -1037,6 +1281,13 @@ def create_app(
                     )
                 except OSError:
                     logging.getLogger(__name__).warning("无法删除已失效的本地预处理产物：%s", project_id)
+            if previous_project.semanticAnalysis is not None:
+                try:
+                    discard_semantic_analysis_checkpoint(
+                        data_dir, project_id, previous_project.semanticAnalysis,
+                    )
+                except OSError:
+                    logging.getLogger(__name__).warning("无法删除已失效的语义分析检查点：%s", project_id)
             return updated_project
 
     def project_response_data(project: Project) -> dict:
@@ -1178,6 +1429,220 @@ def create_app(
             credentialState="configured" if credential_state else "unconfigured",
             selectedProvider=provider,
         )
+
+    @app.post("/api/analysis-providers/{provider}/test-connection", response_model=None)
+    @app.post("/api/analysis-providers/{provider}/connection-test", response_model=None)
+    def test_analysis_provider_connection(provider: str) -> dict[str, str]:
+        try:
+            setting = configured_analysis_settings.get(provider)
+            credential = credentials().get(provider)
+        except SecureStorageUnavailable as error:
+            raise secure_storage_unavailable() from error
+        except (OSError, ValueError) as error:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "invalid_analysis_provider", "message": "分析供应商无效。"},
+            ) from error
+        if (
+            setting is None
+            or provider == "bailian" and credential is None
+            or not analysis_model_is_supported(provider, setting.model)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "analysis_provider_unconfigured",
+                    "message": "所选分析供应商或模型尚未配置。",
+                },
+            )
+        configured_provider = None
+        try:
+            configured_provider = analysis_provider_for(
+                provider=provider,
+                credential=credential,
+                base_url=setting.baseUrl,
+                model=setting.model,
+            )
+            configured_provider.test_connection(setting.model)
+        except ProviderAnalysisError as error:
+            raise HTTPException(
+                status_code=502,
+                detail=error.failure.model_dump(),
+            ) from None
+        except Exception:
+            raise HTTPException(
+                status_code=502,
+                detail=semantic_analysis_error(
+                    "provider_error", "分析服务暂时不可用，请稍后重试。", True,
+                ).model_dump(),
+            ) from None
+        finally:
+            if configured_provider is not None:
+                close_default_analysis_provider(configured_provider)
+        return {"provider": provider, "model": setting.model, "status": "connected"}
+
+    @app.post("/api/projects/{project_id}/semantic-analysis", response_model=None)
+    def start_semantic_analysis(
+        project_id: str,
+        payload: StartSemanticAnalysisInput,
+        response: Response,
+    ):
+        if not payload.disclosureAccepted:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "analysis_disclosure_required",
+                    "message": "请确认已同意将分析代理发送给所选服务。",
+                },
+            )
+        idempotent = False
+
+        def queue_analysis(project: Project) -> Project:
+            nonlocal idempotent
+            reference = project.referenceMedia
+            preprocessing = project.localPreprocessing
+            if (
+                reference is None
+                or preprocessing is None
+                or preprocessing.status != "completed"
+                or preprocessing.sourceReferenceMediaId != reference.id
+                or preprocessing.mediaType != reference.type
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "semantic_analysis_preprocessing_required",
+                        "message": "请先完成与当前参考素材一致的本地预处理。",
+                    },
+                )
+            try:
+                artifacts = inspect_completed_stages(
+                    preprocessing,
+                    preprocessing_directory(data_dir, project.id, preprocessing.id),
+                )
+            except OSError as error:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "semantic_analysis_preprocessing_invalid",
+                        "message": "本地预处理产物无效，请重新完成预处理。",
+                    },
+                ) from error
+            if artifacts.firstInvalidStage is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "semantic_analysis_preprocessing_invalid",
+                        "message": "本地预处理产物无效，请重新完成预处理。",
+                    },
+                )
+            existing = project.semanticAnalysis
+            if existing is not None and existing.status in {"queued", "running"}:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "semantic_analysis_in_progress",
+                        "message": "语义分析正在排队或运行，请稍后再试。",
+                    },
+                )
+            try:
+                setting = configured_analysis_settings.get(payload.provider)
+                has_credential = credentials().get(payload.provider) is not None
+            except SecureStorageUnavailable as error:
+                raise secure_storage_unavailable() from error
+            except (OSError, ValueError) as error:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "invalid_analysis_provider",
+                        "message": "分析供应商或模型无效。",
+                    },
+                ) from error
+            if not analysis_model_is_supported(payload.provider, payload.model):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "invalid_analysis_model",
+                        "message": "所选模型不在该分析供应商的可用清单中。",
+                    },
+                )
+            if (
+                setting is None
+                or payload.provider == "bailian" and not has_credential
+                or setting.model != payload.model
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "analysis_provider_unconfigured",
+                        "message": "所选分析供应商或模型尚未配置。",
+                    },
+                )
+            if (
+                existing is not None
+                and existing.status == "completed"
+                and existing.result is not None
+                and existing.sourceReferenceMediaId == reference.id
+                and existing.sourcePreprocessingId == preprocessing.id
+                and existing.provider == payload.provider
+                and existing.model == payload.model
+                and existing.promptVersion == PROMPT_VERSION
+                and existing.schemaVersion == SCHEMA_VERSION
+                and completed_checkpoint_matches(data_dir, project.id, existing)
+            ):
+                idempotent = True
+                return project
+            task = new_semantic_analysis(
+                reference_media_id=reference.id,
+                preprocessing_id=preprocessing.id,
+                provider=payload.provider,
+                model=payload.model,
+                now=now_utc(),
+            )
+            return project.model_copy(update={
+                "semanticAnalysis": task,
+                "updatedAt": task.updatedAt,
+            })
+
+        try:
+            project = update_project(project_id, queue_analysis)
+        except OSError as error:
+            raise storage_error(error) from error
+        if idempotent:
+            response.status_code = 200
+            return project_response_data(project)
+        if not semantic_analysis_jobs.submit(project_id):
+            task = project.semanticAnalysis
+            if task is not None:
+                failure = semantic_analysis_error(
+                    "semantic_analysis_queue_unavailable",
+                    "语义分析队列暂时不可用，请重试。",
+                    True,
+                )
+                now = now_utc().isoformat()
+
+                def mark_queue_failure(current: SemanticAnalysis) -> SemanticAnalysis:
+                    current.status = "failed"
+                    current.updatedAt = now
+                    current.completedAt = None
+                    current.result = None
+                    current.error = failure
+                    return current
+                try:
+                    persist_semantic_analysis_change(project_id, task, mark_queue_failure)
+                except (OSError, HTTPException):
+                    logging.getLogger(__name__).warning(
+                        "语义分析队列拒绝后的状态无法保存：projectId=%s", project_id,
+                    )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "semantic_analysis_queue_unavailable",
+                    "message": "语义分析队列暂时不可用，请重试。",
+                },
+            )
+        response.status_code = 202
+        return project_response_data(project)
 
     @app.post("/api/projects", status_code=201)
     def create_project(payload: CreateProjectInput) -> Project:

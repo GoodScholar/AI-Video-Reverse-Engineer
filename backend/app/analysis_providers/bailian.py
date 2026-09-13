@@ -76,5 +76,8 @@ class BailianAnalysisProvider:
             raw_text = None
         return validate_structured_analysis(raw_text)
 
-    def test_connection(self) -> ProviderResult:
-        return self.analyze(connection_test_request(self.models[0]))
+    def test_connection(self, model: Optional[str] = None) -> ProviderResult:
+        selected_model = model or self.models[0]
+        if selected_model not in self.models:
+            raise ProviderAnalysisError(ProviderFailure.for_code("unsupported_model_capability"))
+        return self.analyze(connection_test_request(selected_model))
