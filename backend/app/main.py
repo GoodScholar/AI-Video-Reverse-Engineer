@@ -1611,7 +1611,11 @@ def create_app(
         if idempotent:
             response.status_code = 200
             return project_response_data(project)
-        if not semantic_analysis_jobs.submit(project_id):
+        try:
+            submitted = semantic_analysis_jobs.submit(project_id)
+        except Exception:
+            submitted = False
+        if not submitted:
             task = project.semanticAnalysis
             if task is not None:
                 failure = semantic_analysis_error(
@@ -1714,9 +1718,10 @@ def create_app(
     def start_local_preprocessing(project_id: str, response: Response) -> Project:
         completed = False
         dispatching = False
+        stale_semantic_analysis: Optional[SemanticAnalysis] = None
 
         def prepare_for_start(project: Project) -> Project:
-            nonlocal completed, dispatching
+            nonlocal completed, dispatching, stale_semantic_analysis
             if project.referenceMedia is None:
                 raise HTTPException(
                     status_code=409,
@@ -1783,8 +1788,10 @@ def create_app(
                 )
             dispatching_project_ids.add(project.id)
             dispatching = True
+            stale_semantic_analysis = project.semanticAnalysis
             return project.model_copy(update={
                 "localPreprocessing": task,
+                "semanticAnalysis": None,
                 "updatedAt": task.updatedAt,
             })
 
@@ -1796,6 +1803,15 @@ def create_app(
             if completed:
                 response.status_code = 200
                 return project
+            if stale_semantic_analysis is not None:
+                try:
+                    discard_semantic_analysis_checkpoint(
+                        data_dir, project_id, stale_semantic_analysis,
+                    )
+                except OSError:
+                    logging.getLogger(__name__).warning(
+                        "无法删除因本地预处理重建而失效的语义分析检查点：%s", project_id,
+                    )
             if preprocessing_jobs.submit(project_id):
                 response.status_code = 202
                 return project

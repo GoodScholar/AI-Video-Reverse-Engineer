@@ -4,6 +4,7 @@ import json
 
 from fastapi.testclient import TestClient
 from PIL import Image
+import pytest
 
 from app.analysis_settings import AnalysisSettings
 from app.image_preprocessing_runner import run_image_preprocessing
@@ -53,6 +54,11 @@ class ManualQueue:
 class RejectingQueue(ManualQueue):
     def submit(self, project_id):
         return False
+
+
+class ExplodingQueue(ManualQueue):
+    def submit(self, project_id):
+        raise RuntimeError("queue unavailable")
 
 
 def ready_project(client, tmp_path):
@@ -161,6 +167,32 @@ def test_queue_rejection_marks_the_persisted_analysis_as_retryable_failure(tmp_p
     assert task["error"]["retryable"] is True
 
 
+def test_queue_submit_exception_is_mapped_to_a_retryable_failure(tmp_path):
+    def queue_factory(handler):
+        return ExplodingQueue(handler)
+
+    client = TestClient(create_app(
+        data_dir=tmp_path,
+        credential_store=InMemoryCredentials(),
+        analysis_settings=AnalysisSettings(tmp_path / "analysis-providers.json"),
+        semantic_analysis_queue_factory=queue_factory,
+    ), raise_server_exceptions=False)
+    project_id = ready_project(client, tmp_path)
+    assert client.put("/api/analysis-providers/bailian/configuration", json={
+        "model": "qwen3.7-flash",
+    }).status_code == 200
+
+    response = client.post(f"/api/projects/{project_id}/semantic-analysis", json={
+        "provider": "bailian", "model": "qwen3.7-flash", "disclosureAccepted": True,
+    })
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "semantic_analysis_queue_unavailable"
+    task = client.get(f"/api/projects/{project_id}").json()["semanticAnalysis"]
+    assert task["status"] == "failed"
+    assert task["error"]["code"] == "semantic_analysis_queue_unavailable"
+
+
 def test_analysis_rejects_completed_preprocessing_without_validated_artifacts(tmp_path):
     holder = {}
 
@@ -186,6 +218,109 @@ def test_analysis_rejects_completed_preprocessing_without_validated_artifacts(tm
 
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "semantic_analysis_preprocessing_invalid"
+
+
+@pytest.mark.parametrize("semantic_status", ["queued", "running"])
+def test_rebuilding_invalid_preprocessing_releases_stale_semantic_analysis(
+    tmp_path, semantic_status,
+):
+    holder = {}
+
+    def semantic_queue_factory(handler):
+        holder["semantic"] = ManualQueue(handler)
+        return holder["semantic"]
+
+    def preprocessing_queue_factory(handler):
+        holder["preprocessing"] = ManualQueue(handler)
+        return holder["preprocessing"]
+
+    client = TestClient(create_app(
+        data_dir=tmp_path,
+        credential_store=InMemoryCredentials(),
+        analysis_settings=AnalysisSettings(tmp_path / "analysis-providers.json"),
+        semantic_analysis_queue_factory=semantic_queue_factory,
+        preprocessing_queue_factory=preprocessing_queue_factory,
+    ))
+    project_id = ready_project(client, tmp_path)
+    assert client.put("/api/analysis-providers/bailian/configuration", json={
+        "model": "qwen3.7-flash",
+    }).status_code == 200
+    request = {"provider": "bailian", "model": "qwen3.7-flash", "disclosureAccepted": True}
+    assert client.post(f"/api/projects/{project_id}/semantic-analysis", json=request).status_code == 202
+    if semantic_status == "running":
+        projects = json.loads((tmp_path / "projects.json").read_text(encoding="utf-8"))
+        projects[0]["semanticAnalysis"]["status"] = "running"
+        projects[0]["semanticAnalysis"]["startedAt"] = datetime.now(timezone.utc).isoformat()
+        (tmp_path / "projects.json").write_text(json.dumps(projects), encoding="utf-8")
+    old_preprocessing_id = "preprocessing-001"
+    (preprocessing_directory(tmp_path, project_id, old_preprocessing_id) / "analysis-proxy.jpg").unlink()
+
+    rebuilt = client.post(f"/api/projects/{project_id}/local-preprocessing")
+
+    assert rebuilt.status_code == 202
+    assert rebuilt.json()["semanticAnalysis"] is None
+    assert rebuilt.json()["localPreprocessing"]["id"] != old_preprocessing_id
+    holder["preprocessing"].run_next()
+    holder["semantic"].run_next()
+
+    current = client.get(f"/api/projects/{project_id}").json()
+    assert current["semanticAnalysis"] is None
+    assert current["localPreprocessing"]["status"] == "completed"
+    restarted = client.post(f"/api/projects/{project_id}/semantic-analysis", json=request)
+    assert restarted.status_code == 202
+
+
+def test_running_worker_cannot_overwrite_preprocessing_rebuild(tmp_path):
+    holder = {}
+    client = None
+
+    def semantic_queue_factory(handler):
+        holder["semantic"] = ManualQueue(handler)
+        return holder["semantic"]
+
+    def preprocessing_queue_factory(handler):
+        holder["preprocessing"] = ManualQueue(handler)
+        return holder["preprocessing"]
+
+    def runner(**kwargs):
+        project_id = kwargs["project"].id
+        preprocessing_id = kwargs["project"].localPreprocessing.id
+        (preprocessing_directory(tmp_path, project_id, preprocessing_id) / "analysis-proxy.jpg").unlink()
+        rebuilt = client.post(f"/api/projects/{project_id}/local-preprocessing")
+        assert rebuilt.status_code == 202
+        return StructuredVisualAnalysis.model_validate({
+            "observedFacts": {"staticVisual": {
+                "subject": "人物", "scene": "室内", "composition": "中景", "viewpoint": "平视",
+                "lighting": "柔光", "color": "暖色", "visualStyle": "写实",
+            }, "temporal": None},
+            "generationSuggestions": {
+                "subjectMotion": "轻微动作", "environmentalMotion": "无", "cameraMotion": "固定",
+                "rhythm": "平稳", "suggestedDuration": 3, "audio": "环境声",
+            },
+        })
+
+    client = TestClient(create_app(
+        data_dir=tmp_path,
+        credential_store=InMemoryCredentials(),
+        analysis_settings=AnalysisSettings(tmp_path / "analysis-providers.json"),
+        semantic_analysis_queue_factory=semantic_queue_factory,
+        preprocessing_queue_factory=preprocessing_queue_factory,
+        semantic_analysis_runner=runner,
+    ))
+    project_id = ready_project(client, tmp_path)
+    assert client.put("/api/analysis-providers/bailian/configuration", json={
+        "model": "qwen3.7-flash",
+    }).status_code == 200
+    request = {"provider": "bailian", "model": "qwen3.7-flash", "disclosureAccepted": True}
+    assert client.post(f"/api/projects/{project_id}/semantic-analysis", json=request).status_code == 202
+
+    holder["semantic"].run_next()
+
+    after_race = client.get(f"/api/projects/{project_id}").json()
+    assert after_race["semanticAnalysis"] is None
+    assert after_race["localPreprocessing"]["status"] == "queued"
+    holder["preprocessing"].run_next()
+    assert client.post(f"/api/projects/{project_id}/semantic-analysis", json=request).status_code == 202
 
 
 def test_analysis_rejects_a_model_outside_the_provider_catalog(tmp_path):
