@@ -174,7 +174,14 @@ export type SemanticAnalysis = {
   error: SemanticAnalysisError | null;
 };
 
-export type AnalysisProviderId = "bailian" | "local_openai_compatible";
+export type AnalysisProviderId =
+  | "bailian"
+  | "local_openai_compatible"
+  | "openai"
+  | "doubao"
+  | "gemini"
+  | "grok"
+  | "claude";
 
 export type AnalysisProviderConfiguration = {
   provider: AnalysisProviderId;

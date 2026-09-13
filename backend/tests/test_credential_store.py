@@ -51,12 +51,22 @@ def test_credential_store_scopes_system_keyring_entries_to_analysis_provider_ser
     assert store.get("bailian") is None
 
 
-@pytest.mark.parametrize("provider", ["", "openai", "bailian ", None])
+@pytest.mark.parametrize("provider", ["", "bailian ", None])
 def test_credential_store_rejects_unavailable_or_unknown_provider_before_secret_access(provider):
     store = CredentialStore(backend=InMemorySystemKeyring())
 
     with pytest.raises(ValueError, match="不支持的分析供应商"):
         store.get(provider)
+
+
+@pytest.mark.parametrize("provider", ["bailian", "local_openai_compatible", "openai", "doubao", "gemini", "grok", "claude"])
+def test_credential_store_accepts_every_catalog_provider(provider):
+    backend = InMemorySystemKeyring()
+    store = CredentialStore(backend=backend)
+
+    store.set(provider, "secret-value")
+
+    assert store.get(provider) == "secret-value"
 
 
 def test_credential_store_converts_system_store_errors_without_exposing_secret():

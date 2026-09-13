@@ -325,25 +325,13 @@ def test_running_worker_cannot_overwrite_preprocessing_rebuild(tmp_path):
 
 
 def test_analysis_rejects_a_model_outside_the_provider_catalog(tmp_path):
-    holder = {}
-
-    def queue_factory(handler):
-        holder["queue"] = ManualQueue(handler)
-        return holder["queue"]
-
     client = TestClient(create_app(
         data_dir=tmp_path,
         credential_store=InMemoryCredentials(),
         analysis_settings=AnalysisSettings(tmp_path / "analysis-providers.json"),
-        semantic_analysis_queue_factory=queue_factory,
     ))
-    project_id = ready_project(client, tmp_path)
-    assert client.put("/api/analysis-providers/bailian/configuration", json={
+    response = client.put("/api/analysis-providers/bailian/configuration", json={
         "model": "not-a-bailian-vision-model",
-    }).status_code == 200
-
-    response = client.post(f"/api/projects/{project_id}/semantic-analysis", json={
-        "provider": "bailian", "model": "not-a-bailian-vision-model", "disclosureAccepted": True,
     })
 
     assert response.status_code == 400

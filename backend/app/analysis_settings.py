@@ -9,6 +9,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .credential_store import ANALYSIS_PROVIDER_IDS
+from .provider_models import ProviderId
 
 
 class _StrictModel(BaseModel):
@@ -41,7 +42,7 @@ def validate_loopback_base_url(value: str) -> str:
 
 
 class _StoredProviderConfiguration(_StrictModel):
-    provider: Literal["bailian", "local_openai_compatible"]
+    provider: ProviderId
     model: str = Field(min_length=1)
     baseUrl: Optional[str] = None
 
@@ -69,7 +70,7 @@ class _StoredProviderConfiguration(_StrictModel):
 
 class _StoredAnalysisSettings(_StrictModel):
     providers: list[_StoredProviderConfiguration] = Field(default_factory=list)
-    selectedProvider: Optional[Literal["bailian", "local_openai_compatible"]] = None
+    selectedProvider: Optional[ProviderId] = None
 
     @field_validator("providers")
     @classmethod
@@ -88,11 +89,11 @@ class _StoredAnalysisSettings(_StrictModel):
 
 
 class AnalysisProviderConfiguration(_StrictModel):
-    provider: Literal["bailian", "local_openai_compatible"]
+    provider: ProviderId
     model: Optional[str] = None
     baseUrl: Optional[str] = None
     credentialState: Literal["configured", "unconfigured"]
-    selectedProvider: Optional[Literal["bailian", "local_openai_compatible"]] = None
+    selectedProvider: Optional[ProviderId] = None
 
 
 class AnalysisSettings:

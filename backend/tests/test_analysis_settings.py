@@ -195,6 +195,49 @@ def test_configuration_response_never_returns_or_persists_secret(tmp_path):
     assert credentials.values == {"bailian": "secret-value"}
 
 
+def test_configuration_api_lists_catalog_providers_and_rejects_unknown_cloud_model(tmp_path):
+    settings_path = tmp_path / "analysis-providers.json"
+    settings_path.write_text(json.dumps({
+        "providers": [{
+            "provider": "bailian",
+            "model": "qwen3.7-flash",
+        }],
+        "selectedProvider": "bailian",
+    }), encoding="utf-8")
+    client = TestClient(create_app(
+        data_dir=tmp_path,
+        credential_store=InMemoryCredentials(),
+        analysis_settings=AnalysisSettings(settings_path),
+    ))
+
+    listed = client.get("/api/analysis-providers")
+    invalid = client.put("/api/analysis-providers/openai/configuration", json={
+        "apiKey": "secret-value",
+        "model": "user-entered-model",
+    })
+    valid = client.put("/api/analysis-providers/openai/configuration", json={
+        "apiKey": "secret-value",
+        "model": "gpt-5.6-luna",
+    })
+
+    configurations = listed.json()
+    assert [item["provider"] for item in configurations] == [
+        "bailian", "local_openai_compatible", "openai", "doubao", "gemini", "grok", "claude",
+    ]
+    assert configurations[0]["model"] == "qwen3.7-flash"
+    assert configurations[0]["selectedProvider"] == "bailian"
+    assert invalid.status_code == 400
+    assert invalid.json()["detail"]["code"] == "invalid_analysis_model"
+    assert valid.status_code == 200
+    assert valid.json() == {
+        "provider": "openai",
+        "model": "gpt-5.6-luna",
+        "baseUrl": None,
+        "credentialState": "configured",
+        "selectedProvider": "openai",
+    }
+
+
 def test_configuration_reports_secure_storage_unavailability_without_secret(tmp_path):
     client = TestClient(create_app(
         data_dir=tmp_path,
@@ -225,18 +268,18 @@ def test_failed_credential_write_preserves_the_previous_non_sensitive_configurat
     ))
     initial = client.put("/api/analysis-providers/bailian/configuration", json={
         "apiKey": "first-secret",
-        "model": "first-model",
+        "model": "qwen3.7-flash",
     })
     assert initial.status_code == 200
     credentials.fail_writes = True
 
     response = client.put("/api/analysis-providers/bailian/configuration", json={
         "apiKey": "replacement-secret",
-        "model": "replacement-model",
+        "model": "qwen3.7-flash",
     })
 
     assert response.status_code == 503
-    assert settings.get("bailian").model == "first-model"
+    assert settings.get("bailian").model == "qwen3.7-flash"
     assert credentials.get("bailian") == "first-secret"
     assert "replacement-secret" not in response.text
 
@@ -288,7 +331,7 @@ def test_credential_read_failure_without_an_api_key_preserves_existing_configura
     settings = AnalysisSettings(tmp_path / "analysis-providers.json")
     settings.save(
         provider="bailian",
-        model="first-model",
+        model="qwen3.7-flash",
         base_url=None,
         selected_provider="bailian",
     )
@@ -299,11 +342,11 @@ def test_credential_read_failure_without_an_api_key_preserves_existing_configura
     ))
 
     response = client.put("/api/analysis-providers/bailian/configuration", json={
-        "model": "replacement-model",
+        "model": "qwen3.7-flash",
     })
 
     assert response.status_code == 503
-    assert settings.get("bailian").model == "first-model"
+    assert settings.get("bailian").model == "qwen3.7-flash"
 
 
 def test_invalid_local_url_never_attempts_a_credential_rollback(tmp_path):

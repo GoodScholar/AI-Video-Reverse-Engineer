@@ -4,6 +4,7 @@ import httpx
 
 from ..analysis_models import StructuredAnalysis
 from ..analysis_provider import BailianProviderConfig, ProviderConfig, ProviderRequest
+from ..provider_models import models_for
 from . import image_data_url, instructions, post_json, request_context, response_schema, validate_configuration, validate_structured_analysis
 from .base import ProviderAnalysisError, ProviderFailure, ProviderRequest as CoreProviderRequest
 from .base import ProviderResult
@@ -14,7 +15,7 @@ from .test_image import connection_test_request
 class BailianAnalysisProvider:
     provider_id = "bailian"
     _URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-    models = ("qwen3.7-flash",)
+    models = tuple(model.id for model in models_for("bailian"))
 
     def __init__(self, client: httpx.Client, credential: Optional[str] = None):
         self._client = client

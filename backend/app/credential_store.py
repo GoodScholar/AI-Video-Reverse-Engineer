@@ -1,10 +1,8 @@
 from .analysis_service_secrets import ProviderSecretStore
+from .provider_models import PROVIDER_IDS
 
 
-ANALYSIS_PROVIDER_IDS = frozenset({
-    "bailian",
-    "local_openai_compatible",
-})
+ANALYSIS_PROVIDER_IDS = frozenset(PROVIDER_IDS)
 
 
 class CredentialStore(ProviderSecretStore):

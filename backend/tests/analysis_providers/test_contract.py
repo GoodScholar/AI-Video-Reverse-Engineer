@@ -10,6 +10,7 @@ from app.analysis_prompt import build_analysis_prompt, repair_prompt, structured
 from app.analysis_providers.base import ProviderRequest
 from app.analysis_providers.bailian import BailianAnalysisProvider
 from app.analysis_providers.base import ProviderAnalysisError, ProviderResult
+from app.analysis_providers.test_image import connection_test_request
 from app.analysis_response import validate_or_repair
 
 
@@ -161,6 +162,16 @@ def test_provider_request_enforces_distinct_initial_and_repair_shapes():
 
     with pytest.raises(ValueError, match="不能再次修复"):
         repaired.repair("another")
+
+
+def test_connection_test_has_no_project_data():
+    request = connection_test_request("gpt-5.6-luna")
+
+    assert request.analysisInput.mediaType == "image"
+    assert (request.analysisInput.width, request.analysisInput.height) == (16, 16)
+    assert request.analysisInput.aspectRatio == 1.0
+    assert request.model == "gpt-5.6-luna"
+    assert request.isRepair is False
 
 
 def test_validate_or_repair_rejects_a_repair_request_as_an_initial_request():

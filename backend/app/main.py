@@ -93,6 +93,7 @@ from app.analysis_prompt import PROMPT_VERSION
 from app.analysis_service_secrets import SecureStorageUnavailable
 from app.analysis_settings import AnalysisProviderConfiguration, AnalysisSettings
 from app.credential_store import CredentialStore
+from app.provider_models import PROVIDER_IDS, model_is_allowed
 from app.analysis_providers.bailian import BailianAnalysisProvider
 from app.analysis_providers.base import ProviderAnalysisError, ProviderFailure
 from app.analysis_providers.local_openai_compatible import LocalOpenAICompatibleAnalysisProvider
@@ -947,11 +948,10 @@ def create_app(
         return factory(provider=provider, credential=credential, base_url=base_url, model=model)
 
     def analysis_model_is_supported(provider: str, model: str) -> bool:
-        if provider == "bailian":
-            return model in BailianAnalysisProvider.models
-        # Local OpenAI-compatible services do not expose one reliable model
-        # catalog. The stored, non-blank configured model is its allow-list.
-        return provider == "local_openai_compatible" and bool(model.strip())
+        try:
+            return model_is_allowed(provider, model)
+        except ValueError:
+            return False
 
     def close_default_analysis_provider(provider) -> None:
         if configured_provider_registry is not None:
@@ -1391,7 +1391,7 @@ def create_app(
         try:
             return [
                 analysis_provider_configuration(provider)
-                for provider in ("bailian", "local_openai_compatible")
+                for provider in PROVIDER_IDS
             ]
         except (OSError, ValueError) as error:
             raise HTTPException(
@@ -1437,6 +1437,18 @@ def create_app(
                 status_code=400,
                 detail={
                     "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
+            )
+        if provider not in PROVIDER_IDS:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
+            )
+        if not analysis_model_is_supported(provider, model):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_analysis_model", "message": "所选模型不在该分析供应商的可用清单中。"},
             )
         try:
             candidate, prepared_settings = configured_analysis_settings.prepare_save(
