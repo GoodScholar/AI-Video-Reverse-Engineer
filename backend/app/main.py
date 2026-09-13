@@ -96,6 +96,7 @@ from app.credential_store import CredentialStore
 from app.analysis_providers.bailian import BailianAnalysisProvider
 from app.analysis_providers.base import ProviderAnalysisError, ProviderFailure
 from app.analysis_providers.local_openai_compatible import LocalOpenAICompatibleAnalysisProvider
+from app.analysis_providers.openai_compatible_chat import new_cancellable_client
 
 
 class CreateProjectInput(BaseModel):
@@ -927,7 +928,7 @@ def create_app(
     def default_analysis_provider(
         *, provider: str, credential: Optional[str], base_url: Optional[str], model: str,
     ):
-        client = httpx.Client(timeout=30.0, trust_env=False, follow_redirects=False)
+        client = new_cancellable_client(timeout=30.0)
         if provider == "bailian":
             return BailianAnalysisProvider(client, credential)
         if provider == "local_openai_compatible" and base_url is not None:

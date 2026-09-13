@@ -255,7 +255,7 @@ def test_bailian_total_deadline_interrupts_a_real_loopback_server_before_first_r
             pass
 
     monkeypatch.setattr(openai_chat, "TOTAL_PROVIDER_DEADLINE_SECONDS", 0.1)
-    with _LoopbackProviderServer(DelayedFirstByteHandler) as server, httpx.Client(timeout=1.0, trust_env=False) as client:
+    with _LoopbackProviderServer(DelayedFirstByteHandler) as server, openai_chat.new_cancellable_client(timeout=1.0) as client:
         started = time.monotonic()
         with pytest.raises(ProviderAnalysisError) as error:
             openai_chat.post_chat_completion(client, server.url, "test-credential", _core_request())
@@ -283,7 +283,28 @@ def test_bailian_total_deadline_interrupts_a_real_slow_drip_stream(monkeypatch):
             pass
 
     monkeypatch.setattr(openai_chat, "TOTAL_PROVIDER_DEADLINE_SECONDS", 0.1)
-    with _LoopbackProviderServer(SlowDripHandler) as server, httpx.Client(timeout=1.0, trust_env=False) as client:
+    with _LoopbackProviderServer(SlowDripHandler) as server, openai_chat.new_cancellable_client(timeout=1.0) as client:
+        started = time.monotonic()
+        with pytest.raises(ProviderAnalysisError) as error:
+            openai_chat.post_chat_completion(client, server.url, "test-credential", _core_request())
+        elapsed = time.monotonic() - started
+
+    assert error.value.failure.code == "timeout"
+    assert elapsed < 0.25
+
+
+def test_bailian_total_deadline_interrupts_when_only_partial_response_headers_arrive(monkeypatch):
+    class PartialHeadersHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n")
+            self.wfile.flush()
+            time.sleep(0.4)
+
+        def log_message(self, *args):
+            pass
+
+    monkeypatch.setattr(openai_chat, "TOTAL_PROVIDER_DEADLINE_SECONDS", 0.1)
+    with _LoopbackProviderServer(PartialHeadersHandler) as server, openai_chat.new_cancellable_client(timeout=1.0) as client:
         started = time.monotonic()
         with pytest.raises(ProviderAnalysisError) as error:
             openai_chat.post_chat_completion(client, server.url, "test-credential", _core_request())
