@@ -281,3 +281,106 @@ def test_bailian_sends_only_contact_sheet_and_proxy_for_video_input():
     assert '"contactSheetFile":"contact-sheet.jpg"' in context
     for forbidden in ("analysis-proxy.jpg", "original.mp4", "/Users/", "test-credential"):
         assert forbidden not in body
+
+
+def _repair_request():
+    return ProviderRequest(
+        analysisInput=ImageAnalysisInput(
+            analysisProxyBytes=b"\xff\xd8\xff\xe0analysis-proxy\xff\xd9",
+            width=16,
+            height=16,
+            aspectRatio=1.0,
+        ),
+        prompt="initial",
+        model="model",
+    )
+
+
+def _candidate_from_repair_prompt(prompt):
+    return prompt.split("候选 JSON：\n", 1)[1].split("\n校验错误摘要：", 1)[0]
+
+
+def test_repair_decodes_and_recursively_sanitizes_escaped_json_keys_and_values():
+    class RecordingProvider:
+        provider_id = "bailian"
+
+        def __init__(self):
+            self.requests = []
+
+        def analyze(self, request):
+            self.requests.append(request)
+            return ProviderResult(rawText=json.dumps(_valid_image_result(), ensure_ascii=False))
+
+    provider = RecordingProvider()
+    raw = (
+        '{"\\u0042earer escaped-key":"\\u0042earer escaped-value",'
+        '"image":"data\\u003aimage/jpeg;base64,ESCAPED_IMAGE",'
+        '"path":' + json.dumps(r"C:\\Users\\sentinel\\private.png") + "}"
+    )
+
+    validate_or_repair(provider, ProviderResult(rawText=raw), _repair_request())
+
+    candidate = _candidate_from_repair_prompt(provider.requests[0].prompt)
+    decoded = json.loads(candidate)
+    serialized = json.dumps(decoded, ensure_ascii=False)
+    for forbidden in ("escaped-key", "escaped-value", "ESCAPED_IMAGE", r"C:\Users\sentinel"):
+        assert forbidden not in serialized
+    assert "<redacted>" in serialized
+    assert "<redacted-image>" in serialized
+
+
+def test_unparseable_candidate_uses_a_fixed_safe_json_placeholder():
+    class RecordingProvider:
+        provider_id = "bailian"
+
+        def __init__(self):
+            self.requests = []
+
+        def analyze(self, request):
+            self.requests.append(request)
+            return ProviderResult(rawText=json.dumps(_valid_image_result(), ensure_ascii=False))
+
+    provider = RecordingProvider()
+    raw = '{"secret":"\\u0042earer escaped-value data\\u003aimage/jpeg;base64,ESCAPED_IMAGE C:\\\\Users\\\\sentinel"'
+
+    validate_or_repair(provider, ProviderResult(rawText=raw), _repair_request())
+
+    candidate = _candidate_from_repair_prompt(provider.requests[0].prompt)
+    assert json.loads(candidate) == {"candidate": "<unavailable>"}
+    for forbidden in ("escaped-value", "ESCAPED_IMAGE", r"C:\Users\sentinel"):
+        assert forbidden not in candidate
+
+
+def _deep_candidate_json():
+    value = "x"
+    for index in range(40):
+        value = {"field%d" % index: value}
+    return json.dumps(value)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        json.dumps({"field": "x" * 5_000}),
+        _deep_candidate_json(),
+        json.dumps({"field%d" % index: "x" for index in range(100)}),
+        json.dumps({"field": "x" * 20_000}),
+    ],
+)
+def test_repair_candidate_resource_limits_use_the_same_safe_placeholder(raw):
+    class RecordingProvider:
+        provider_id = "bailian"
+
+        def __init__(self):
+            self.requests = []
+
+        def analyze(self, request):
+            self.requests.append(request)
+            return ProviderResult(rawText=json.dumps(_valid_image_result(), ensure_ascii=False))
+
+    provider = RecordingProvider()
+
+    validate_or_repair(provider, ProviderResult(rawText=raw), _repair_request())
+
+    candidate = _candidate_from_repair_prompt(provider.requests[0].prompt)
+    assert json.loads(candidate) == {"candidate": "<unavailable>"}

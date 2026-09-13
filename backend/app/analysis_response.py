@@ -1,4 +1,5 @@
 import json
+import math
 import re
 from typing import Union
 
@@ -14,6 +15,9 @@ MAX_RESPONSE_DEPTH = 64
 MAX_REPAIR_CANDIDATE_CHARS = 16_000
 MAX_REPAIR_CANDIDATE_BYTES = 32_000
 MAX_REPAIR_ERRORS = 8
+MAX_REPAIR_JSON_DEPTH = 32
+MAX_REPAIR_JSON_NODES = 64
+MAX_REPAIR_JSON_STRING_CHARS = 4_096
 _SCHEMA_LOCATION_SEGMENTS = frozenset({
     "version", "observedFacts", "staticVisual", "temporal",
     "generationSuggestions", "subject", "scene", "composition", "viewpoint",
@@ -25,6 +29,7 @@ _BEARER = re.compile(r"\bbearer\s+[^\s\"\\]+", re.IGNORECASE)
 _SK_CREDENTIAL = re.compile(r"\bsk-[A-Za-z0-9_-]+", re.IGNORECASE)
 _POSIX_PATH = re.compile(r"(?<![A-Za-z0-9])/(?:[^\s\"\\/]+(?:/[^\s\"\\/]+)*)")
 _WINDOWS_PATH = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/](?:[^\s\"\\]+[\\/]?)*")
+_REPAIR_CANDIDATE_UNAVAILABLE = {"candidate": "<unavailable>"}
 
 
 class _ResponseBoundaryError(ValueError):
@@ -99,13 +104,56 @@ def _assert_response_boundary(raw_text: str) -> None:
 
 
 def _safe_repair_candidate(raw_text: str) -> str:
-    candidate = _redact(raw_text)
-    if (
-        len(candidate) > MAX_REPAIR_CANDIDATE_CHARS
-        or len(candidate.encode("utf-8")) > MAX_REPAIR_CANDIDATE_BYTES
-    ):
-        raise _ResponseBoundaryError("供应商响应超过修复边界")
-    return candidate
+    """Return a valid, decoded-and-redacted candidate or a fixed placeholder.
+
+    Raw provider text is never re-sent when it cannot be parsed as JSON: its
+    escape sequences may conceal credentials or paths that a text regex cannot
+    reliably identify.  The same placeholder is used for parsed candidates
+    that exceed traversal/resource limits.
+    """
+
+    try:
+        parsed = json.loads(raw_text)
+        cleaned = _clean_repair_json(parsed, depth=0, nodes=[0])
+        candidate = json.dumps(cleaned, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        if (
+            len(candidate) > MAX_REPAIR_CANDIDATE_CHARS
+            or len(candidate.encode("utf-8")) > MAX_REPAIR_CANDIDATE_BYTES
+        ):
+            raise _ResponseBoundaryError("供应商响应超过修复边界")
+        return candidate
+    except (ValueError, TypeError, RecursionError, _ResponseBoundaryError):
+        return json.dumps(_REPAIR_CANDIDATE_UNAVAILABLE, ensure_ascii=False, separators=(",", ":"))
+
+
+def _clean_repair_json(value, *, depth: int, nodes: list):
+    if depth > MAX_REPAIR_JSON_DEPTH:
+        raise _ResponseBoundaryError("修复候选超过嵌套边界")
+    nodes[0] += 1
+    if nodes[0] > MAX_REPAIR_JSON_NODES:
+        raise _ResponseBoundaryError("修复候选超过节点边界")
+    if isinstance(value, str):
+        if len(value) > MAX_REPAIR_JSON_STRING_CHARS:
+            raise _ResponseBoundaryError("修复候选字符串过长")
+        return _redact(value)
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise _ResponseBoundaryError("修复候选包含非 JSON 数值")
+        return value
+    if isinstance(value, list):
+        return [_clean_repair_json(item, depth=depth + 1, nodes=nodes) for item in value]
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, nested in value.items():
+            if not isinstance(key, str) or len(key) > MAX_REPAIR_JSON_STRING_CHARS:
+                raise _ResponseBoundaryError("修复候选键无效")
+            cleaned[_redact(key)] = _clean_repair_json(nested, depth=depth + 1, nodes=nodes)
+        return cleaned
+    raise _ResponseBoundaryError("修复候选包含未知 JSON 类型")
 
 
 def _validate(raw_text: str, request: ProviderRequest) -> StructuredVisualAnalysis:
