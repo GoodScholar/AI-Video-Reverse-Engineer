@@ -464,7 +464,7 @@ def test_configuration_api_lists_catalog_providers_and_rejects_unknown_cloud_mod
 
     configurations = listed.json()
     assert [item["provider"] for item in configurations] == [
-        "bailian", "local_openai_compatible", "openai", "doubao", "gemini", "grok", "claude",
+        "bailian", "local_openai_compatible", "openai", "doubao", "gemini", "grok", "claude", "chatanywhere",
     ]
     assert configurations[0]["model"] == "qwen3.7-flash"
     assert configurations[0]["selectedProvider"] == "bailian"
@@ -475,6 +475,66 @@ def test_configuration_api_lists_catalog_providers_and_rejects_unknown_cloud_mod
     assert valid.json()["model"] == "gpt-5.6-luna"
     assert valid.json()["credentialState"] == "configured"
     assert valid.json()["verificationState"] == "unverified"
+
+
+def test_chatanywhere_configuration_uses_keyring_only_and_rejects_a_remote_base_url(tmp_path):
+    credentials = InMemoryCredentials()
+    settings_path = tmp_path / "analysis-providers.json"
+    client = TestClient(create_app(
+        data_dir=tmp_path,
+        credential_store=credentials,
+        analysis_settings=AnalysisSettings(settings_path),
+    ))
+
+    listed = next(item for item in client.get("/api/analysis-providers").json() if item["provider"] == "chatanywhere")
+    rejected = client.put("/api/analysis-providers/chatanywhere/configuration", json={
+        "apiKey": "chatanywhere-secret", "model": "gpt-5.6-sol", "baseUrl": "https://example.test/v1",
+    })
+    saved = client.put("/api/analysis-providers/chatanywhere/configuration", json={
+        "apiKey": "chatanywhere-secret", "model": "gpt-5.6-sol",
+    })
+
+    assert listed["label"] == "ChatAnywhere"
+    assert listed["models"] == [{"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol"}]
+    assert rejected.status_code == 400
+    assert saved.status_code == 200
+    assert saved.json()["baseUrl"] is None
+    assert saved.json()["credentialState"] == "configured"
+    assert credentials.values == {"chatanywhere": "chatanywhere-secret"}
+    assert "chatanywhere-secret" not in settings_path.read_text(encoding="utf-8")
+
+
+def test_chatanywhere_connection_endpoint_uses_saved_configuration_and_marks_the_strict_probe_available(tmp_path):
+    credentials = InMemoryCredentials()
+    calls = []
+
+    class StrictProbeProvider:
+        def test_connection(self, model):
+            calls.append(model)
+
+    def registry(**configuration):
+        assert configuration == {
+            "provider": "chatanywhere", "credential": "chatanywhere-secret",
+            "base_url": None, "model": "gpt-5.6-sol",
+        }
+        return StrictProbeProvider()
+
+    client = TestClient(create_app(
+        data_dir=tmp_path,
+        credential_store=credentials,
+        analysis_settings=AnalysisSettings(tmp_path / "analysis-providers.json"),
+        analysis_provider_registry=registry,
+    ))
+    assert client.put("/api/analysis-providers/chatanywhere/configuration", json={
+        "apiKey": "chatanywhere-secret", "model": "gpt-5.6-sol",
+    }).status_code == 200
+
+    response = client.post("/api/analysis-providers/chatanywhere/test-connection", json={})
+
+    assert response.status_code == 200
+    assert calls == ["gpt-5.6-sol"]
+    assert response.json()["status"] == "connected"
+    assert response.json()["verificationState"] == "available"
 
 
 def test_configuration_reports_secure_storage_unavailability_without_secret(tmp_path):

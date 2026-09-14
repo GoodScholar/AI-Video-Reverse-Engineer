@@ -64,7 +64,7 @@ macOS 使用 Homebrew 时，可安装 `brew install ffmpeg-full`。它是独立�
 
 ## 语义分析
 
-04c 已支持图片和视频的统一、可恢复语义分析。当前设置目录包含阿里云百炼 `qwen3.7-flash`、本地 OpenAI 兼容服务（回环地址、自填非空模型）、OpenAI `gpt-5.6-luna`、火山方舟豆包 `doubao-seed-2-0-lite-260428`、Google Gemini `gemini-2.5-flash`、xAI Grok `grok-4.6` 与 Anthropic Claude `claude-sonnet-5`。五家云端与百炼必须配置 API Key；本地服务的 Key 可选，Base URL 仅允许回环主机。
+04c 已支持图片和视频的统一、可恢复语义分析。当前设置目录包含阿里云百炼 `qwen3.7-flash`、本地 OpenAI 兼容服务（回环地址、自填非空模型）、OpenAI `gpt-5.6-luna`、火山方舟豆包 `doubao-seed-2-0-lite-260428`、Google Gemini `gemini-2.5-flash`、xAI Grok `grok-4.6`、Anthropic Claude `claude-sonnet-5` 与 ChatAnywhere `gpt-5.6-sol`。六家云端与百炼必须配置 API Key；本地服务的 Key 可选，Base URL 仅允许回环主机。
 
 目录中的“未验证/可用/验证失败”是当前本机配置的连接测试结果，不是供应商可用性的承诺。连接测试只发送内置的 16×16 PNG 和完整结构化分析提示；它不会发送参考素材。豆包图片与结构化输出组合基于方舟 Responses 兼容协议推断，在真实密钥的本地连接测试成功前保持“未验证”。模拟契约测试不能替代真实冒烟。
 

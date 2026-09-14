@@ -72,7 +72,7 @@ def catalog_with_verified_doubao(endpoint_bindings):
 
 def test_catalog_exposes_all_unified_provider_ids_and_verified_bailian_model():
     assert set(CATALOG.providers) == {
-        "bailian", "local_openai_compatible", "openai", "doubao", "gemini", "grok", "claude",
+        "bailian", "local_openai_compatible", "openai", "doubao", "gemini", "grok", "claude", "chatanywhere",
     }
 
     bailian = CATALOG.providers["bailian"]

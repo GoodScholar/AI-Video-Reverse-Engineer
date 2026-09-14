@@ -143,3 +143,22 @@ it("已配置的云端 Key 可空输入保存且不提交 apiKey", async () => {
 
   expect(save).toHaveBeenCalledWith("openai", { model: "gpt-5.6-luna" });
 });
+
+it("从 API 目录渲染 ChatAnywhere 的固定模型并按云端供应商保存", async () => {
+  vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  const user = userEvent.setup();
+  const provider = {
+    provider: "chatanywhere" as const, label: "ChatAnywhere", credentialState: "unconfigured" as const,
+    selectedProvider: "chatanywhere" as const, model: "gpt-5.6-sol", baseUrl: null,
+    models: [{ id: "gpt-5.6-sol", label: "GPT-5.6 Sol" }],
+  };
+  const save = vi.fn().mockResolvedValue({ ...provider, credentialState: "configured" as const });
+  render(<AnalysisProviderSettings providers={[provider]} save={save} testConnection={vi.fn()} />);
+
+  expect(screen.getByRole("option", { name: "GPT-5.6 Sol" })).toBeVisible();
+  await user.type(screen.getByLabelText("ChatAnywhere API Key"), "one-shot-secret");
+  await user.click(screen.getByRole("button", { name: "保存ChatAnywhere配置" }));
+
+  expect(save).toHaveBeenCalledWith("chatanywhere", { model: "gpt-5.6-sol", apiKey: "one-shot-secret" });
+  expect(screen.queryByText("one-shot-secret")).not.toBeInTheDocument();
+});

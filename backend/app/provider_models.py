@@ -4,7 +4,7 @@ from typing import Literal, Mapping
 from pydantic import BaseModel, ConfigDict, Field
 
 
-CATALOG_VERSION = "2026-09-13.1"
+CATALOG_VERSION = "2026-09-14.1"
 
 
 ProviderId = Literal[
@@ -15,6 +15,7 @@ ProviderId = Literal[
     "gemini",
     "grok",
     "claude",
+    "chatanywhere",
 ]
 
 
@@ -64,6 +65,10 @@ PROVIDER_CATALOG: Mapping[ProviderId, ProviderCatalogEntry] = MappingProxyType({
     ),
     "claude": ProviderCatalogEntry(
         id="claude", label="Anthropic Claude", models=(ProviderModel(id="claude-sonnet-5", label="Claude Sonnet 5"),),
+        compatibilityAvailability="unverified", compatibilityRegions=("global",),
+    ),
+    "chatanywhere": ProviderCatalogEntry(
+        id="chatanywhere", label="ChatAnywhere", models=(ProviderModel(id="gpt-5.6-sol", label="GPT-5.6 Sol"),),
         compatibilityAvailability="unverified", compatibilityRegions=("global",),
     ),
 })

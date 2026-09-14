@@ -98,6 +98,7 @@ from app.provider_models import CATALOG_VERSION, PROVIDER_IDS, model_is_allowed,
 from app.analysis_providers.bailian import BailianAnalysisProvider
 from app.analysis_providers.base import ProviderAnalysisError, ProviderFailure
 from app.analysis_providers.claude import ClaudeAnalysisProvider
+from app.analysis_providers.chatanywhere import ChatAnywhereAnalysisProvider
 from app.analysis_providers.doubao import DoubaoAnalysisProvider
 from app.analysis_providers.gemini import GeminiAnalysisProvider
 from app.analysis_providers.grok import GrokAnalysisProvider
@@ -981,6 +982,8 @@ def create_app(
             return GrokAnalysisProvider(client, credential)
         if provider == "claude":
             return ClaudeAnalysisProvider(client, credential)
+        if provider == "chatanywhere":
+            return ChatAnywhereAnalysisProvider(client, credential)
         raise ProviderAnalysisError(ProviderFailure.for_code("provider_unconfigured"))
 
     def analysis_provider_for(
@@ -1058,7 +1061,7 @@ def create_app(
             if (
                 setting is None
                 or setting.model != task.model
-                or task.provider == "bailian" and credential is None
+                or task.provider != "local_openai_compatible" and credential is None
             ):
                 raise ProviderAnalysisError(ProviderFailure.for_code("provider_unconfigured"))
             provider = analysis_provider_for(

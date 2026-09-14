@@ -161,7 +161,7 @@ export type SemanticAnalysis = {
   id: string;
   sourceReferenceMediaId: string;
   sourcePreprocessingId: string;
-  provider: "bailian" | "openai" | "doubao" | "gemini" | "grok" | "claude" | "local_openai_compatible";
+  provider: "bailian" | "openai" | "doubao" | "gemini" | "grok" | "claude" | "chatanywhere" | "local_openai_compatible";
   model: string;
   promptVersion: number;
   schemaVersion: number;
@@ -181,7 +181,8 @@ export type AnalysisProviderId =
   | "doubao"
   | "gemini"
   | "grok"
-  | "claude";
+  | "claude"
+  | "chatanywhere";
 
 export type AnalysisProviderConfiguration = {
   provider: AnalysisProviderId;

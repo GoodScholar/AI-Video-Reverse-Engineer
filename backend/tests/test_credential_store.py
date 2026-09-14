@@ -59,7 +59,7 @@ def test_credential_store_rejects_unavailable_or_unknown_provider_before_secret_
         store.get(provider)
 
 
-@pytest.mark.parametrize("provider", ["bailian", "local_openai_compatible", "openai", "doubao", "gemini", "grok", "claude"])
+@pytest.mark.parametrize("provider", ["bailian", "local_openai_compatible", "openai", "doubao", "gemini", "grok", "claude", "chatanywhere"])
 def test_credential_store_accepts_every_catalog_provider(provider):
     backend = InMemorySystemKeyring()
     store = CredentialStore(backend=backend)

@@ -72,6 +72,10 @@ def test_smoke_script_rejects_non_loopback_base_url(base_url, capsys):
     assert capsys.readouterr().out == "openai connection test failed\n"
 
 
+def test_smoke_script_accepts_chatanywhere_as_a_catalog_provider():
+    assert _script().parse_args(["--provider", "chatanywhere"]).provider == "chatanywhere"
+
+
 def test_smoke_script_rejects_redirects_and_connected_but_unverified(monkeypatch, capsys):
     script = _script()
 

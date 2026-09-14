@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 
 
 PROVIDERS = (
-    "bailian", "local_openai_compatible", "openai", "doubao", "gemini", "grok", "claude",
+    "bailian", "local_openai_compatible", "openai", "doubao", "gemini", "grok", "claude", "chatanywhere",
 )
 _MAX_RESPONSE_BYTES = 64 * 1024
 

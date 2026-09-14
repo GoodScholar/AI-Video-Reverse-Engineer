@@ -13,6 +13,7 @@ from app.provider_models import MODEL_CATALOG, PROVIDER_IDS, models_for, model_i
         ("gemini", "gemini-2.5-flash"),
         ("grok", "grok-4.6"),
         ("claude", "claude-sonnet-5"),
+        ("chatanywhere", "gpt-5.6-sol"),
     ],
 )
 def test_cloud_model_catalog_is_closed(provider, model):
@@ -29,6 +30,15 @@ def test_local_openai_compatible_keeps_a_non_empty_custom_model_escape_hatch():
 def test_unknown_provider_has_no_catalog_entry():
     with pytest.raises(ValueError, match="不支持的分析供应商"):
         models_for("unknown")
+
+
+def test_chatanywhere_directory_entry_has_the_fixed_user_facing_identity():
+    provider = provider_for("chatanywhere")
+
+    assert provider.label == "ChatAnywhere"
+    assert [model.model_dump() for model in provider.models] == [
+        {"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol"},
+    ]
 
 
 def test_model_catalog_cannot_be_mutated_after_import():
