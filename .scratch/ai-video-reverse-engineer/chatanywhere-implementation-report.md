@@ -66,3 +66,28 @@ passed
 ## 未完成的外部验证
 
 有效真实 Key 的连接和图片语义冒烟未执行：需求明确禁止使用占位 Key，当前未提供真实 Key。模拟 HTTP 401 契约已验证为 `authentication_failed`；真实连通性须在持有有效 Key 的本机通过安全存储配置后运行既有本地冒烟脚本。
+
+## 修复轮：语义任务领域类型
+
+审查发现 `SemanticAnalysis.provider` 是另一处手写供应商 `Literal`，遗漏 `chatanywhere` 会让配置保存成功后，启动语义分析在创建任务时返回 500。新增回归覆盖 ChatAnywhere 的“启动 → 队列/worker → 完成 → 应用重启后已完成检查点恢复”完整路径。
+
+### RED
+
+```text
+PYTHONPATH=backend .venv/bin/python -m pytest backend/tests/test_semantic_analysis_api.py -q -k chatanywhere
+1 failed: expected 202, received 500
+
+直接领域模型校验：literal_error
+```
+
+### GREEN
+
+- 将 `chatanywhere` 加入 `SemanticAnalysis.provider` 的领域枚举。
+- 检索手写供应商集合后，将 `ProviderSecretStore` 的默认允许集合改为统一目录派生，并添加 ChatAnywhere 回归；应用实际使用的 `CredentialStore` 仍保持系统安全存储边界。
+
+```text
+semantic ChatAnywhere 回归：1 passed
+analysis_service_secrets：22 passed
+
+修复后全量后端回归：901 passed, 8 skipped；前端全量：129 passed；生产构建、颜色对比度、`compileall` 与 `git diff --check` 均通过。
+```

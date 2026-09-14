@@ -1,9 +1,9 @@
 from typing import Optional
 
+from .provider_models import PROVIDER_IDS
 
-_ALLOWED_PROVIDER_IDS = frozenset({
-    "bailian", "openai", "gemini", "doubao", "claude",
-})
+
+_ALLOWED_PROVIDER_IDS = frozenset(PROVIDER_IDS)
 _ALLOWED_BACKEND_MODULES = frozenset({
     "keyring.backends.macOS",
     "keyring.backends.Windows",

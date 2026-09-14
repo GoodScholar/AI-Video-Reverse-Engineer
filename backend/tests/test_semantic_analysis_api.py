@@ -773,6 +773,75 @@ def test_queued_analysis_runs_once_and_persists_a_completed_result(tmp_path):
     assert calls[0]["model"] == "qwen3.7-flash"
 
 
+def test_chatanywhere_analysis_runs_to_completion_and_completed_checkpoint_survives_restart(tmp_path):
+    holder = {}
+    calls = []
+
+    def queue_factory(handler):
+        holder["queue"] = ManualQueue(handler)
+        return holder["queue"]
+
+    def runner(**kwargs):
+        calls.append(kwargs)
+        return StructuredVisualAnalysis.model_validate({
+            "observedFacts": {"staticVisual": {
+                "subject": "人物", "scene": "室内", "composition": "中景", "viewpoint": "平视",
+                "lighting": "柔光", "color": "暖色", "visualStyle": "写实",
+            }, "temporal": None},
+            "generationSuggestions": {
+                "subjectMotion": "轻微动作", "environmentalMotion": "无", "cameraMotion": "固定",
+                "rhythm": "平稳", "suggestedDuration": 3, "audio": "环境声",
+            },
+        })
+
+    credentials = InMemoryCredentials()
+    settings = AnalysisSettings(tmp_path / "analysis-providers.json")
+    client = TestClient(create_app(
+        data_dir=tmp_path,
+        credential_store=credentials,
+        analysis_settings=settings,
+        semantic_analysis_queue_factory=queue_factory,
+        semantic_analysis_runner=runner,
+    ), raise_server_exceptions=False)
+    project_id = ready_project(client, tmp_path)
+    assert client.put("/api/analysis-providers/chatanywhere/configuration", json={
+        "apiKey": "test-chatanywhere-key", "model": "gpt-5.6-sol",
+    }).status_code == 200
+    request = {
+        "provider": "chatanywhere", "model": "gpt-5.6-sol", "disclosureAccepted": True,
+    }
+
+    started = client.post(f"/api/projects/{project_id}/semantic-analysis", json=request)
+
+    assert started.status_code == 202
+    analysis_id = started.json()["semanticAnalysis"]["id"]
+    assert holder["queue"].pending == [project_id]
+    holder["queue"].run_next()
+    completed = client.get(f"/api/projects/{project_id}").json()["semanticAnalysis"]
+
+    def restarted_queue_factory(handler):
+        holder["restarted"] = ManualQueue(handler)
+        return holder["restarted"]
+
+    restarted = TestClient(create_app(
+        data_dir=tmp_path,
+        credential_store=credentials,
+        analysis_settings=settings,
+        semantic_analysis_queue_factory=restarted_queue_factory,
+        semantic_analysis_runner=runner,
+    ))
+    recovered = restarted.post(f"/api/projects/{project_id}/semantic-analysis", json=request)
+
+    assert completed["id"] == analysis_id
+    assert completed["provider"] == "chatanywhere"
+    assert completed["status"] == "completed"
+    assert recovered.status_code == 200
+    assert recovered.json()["semanticAnalysis"]["id"] == analysis_id
+    assert recovered.json()["semanticAnalysis"]["status"] == "completed"
+    assert holder["restarted"].pending == []
+    assert len(calls) == 1
+
+
 def test_matching_completed_analysis_is_idempotent(tmp_path):
     holder = {}
 

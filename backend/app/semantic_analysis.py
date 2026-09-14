@@ -58,7 +58,7 @@ class SemanticAnalysis(_StrictModel):
     sourceReferenceMediaId: str = Field(min_length=1)
     sourcePreprocessingId: str = Field(min_length=1)
     provider: Literal[
-        "bailian", "openai", "doubao", "gemini", "grok", "claude", "local_openai_compatible",
+        "bailian", "openai", "doubao", "gemini", "grok", "claude", "chatanywhere", "local_openai_compatible",
     ]
     model: str = Field(min_length=1)
     promptVersion: int = Field(ge=1)

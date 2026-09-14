@@ -73,9 +73,17 @@ def test_get_configured_and_delete_use_the_provider_scoped_secret(fake_keyring):
     assert store.configured("gemini") is False
 
 
+def test_default_secret_store_accepts_chatanywhere_from_the_provider_directory(fake_keyring):
+    store = ProviderSecretStore(fake_keyring)
+
+    store.set("chatanywhere", "secret-value")
+
+    assert store.get("chatanywhere") == "secret-value"
+
+
 @pytest.mark.parametrize(
     "provider_id",
-    ["grok", "azure-openai", "", "OpenAI", "openai ", None],
+    ["azure-openai", "", "OpenAI", "openai ", None],
 )
 def test_unknown_provider_ids_are_rejected_before_accessing_keyring(fake_keyring, provider_id):
     store = ProviderSecretStore(fake_keyring)
