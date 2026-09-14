@@ -12,7 +12,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from .credential_store import ANALYSIS_PROVIDER_IDS
-from .provider_models import CATALOG_VERSION, ProviderId
+from .provider_models import CATALOG_VERSION, ProviderId, model_is_allowed
 
 
 # These are the stable, user-safe codes emitted by ProviderFailure.  Keep the
@@ -337,30 +337,46 @@ class AnalysisSettings:
                     "configurationRevision", "catalogVersion", "verificationState",
                     "verifiedAt", "failedAt", "errorCode",
                 })
+                retired_models = {
+                    item.get("provider")
+                    for item in raw_providers
+                    if isinstance(item, dict)
+                    and isinstance(item.get("provider"), str)
+                    and isinstance(item.get("model"), str)
+                    and not model_is_allowed(item["provider"], item["model"])
+                } if isinstance(raw_providers, list) else set()
                 needs_migration = not isinstance(raw_providers, list) or any(
                     not isinstance(item, dict)
                     or not current_fields <= item.keys()
                     or item.get("catalogVersion") != CATALOG_VERSION
                     for item in raw_providers
-                )
+                ) or bool(retired_models)
                 # Older files never had verification metadata.  Normalize them
                 # before strict validation, then persist that single migration.
+                # A model retired from the directory cannot remain selectable or
+                # retain a successful verification under a new catalog version.
                 if needs_migration and isinstance(raw_providers, list):
+                    providers = [
+                        {
+                            **item,
+                            "configurationRevision": str(uuid4()),
+                            "catalogVersion": CATALOG_VERSION,
+                            "verificationState": "unverified",
+                            "verifiedAt": None,
+                            "failedAt": None,
+                            "errorCode": None,
+                        }
+                        for item in raw_providers
+                        if isinstance(item, dict) and item.get("provider") not in retired_models
+                    ]
                     raw = {
                         **raw,
-                        "providers": [
-                            {
-                                **item,
-                                "configurationRevision": str(uuid4()),
-                                "catalogVersion": CATALOG_VERSION,
-                                "verificationState": "unverified",
-                                "verifiedAt": None,
-                                "failedAt": None,
-                                "errorCode": None,
-                            }
-                            if isinstance(item, dict) else item
-                            for item in raw_providers
-                        ],
+                        "providers": providers,
+                        "selectedProvider": (
+                            raw.get("selectedProvider")
+                            if raw.get("selectedProvider") not in retired_models
+                            else None
+                        ),
                     }
                 settings = _StoredAnalysisSettings.model_validate(raw)
                 if needs_migration:

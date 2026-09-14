@@ -76,6 +76,33 @@ def test_smoke_script_accepts_chatanywhere_as_a_catalog_provider():
     assert _script().parse_args(["--provider", "chatanywhere"]).provider == "chatanywhere"
 
 
+def test_smoke_script_reports_the_current_chatanywhere_model(monkeypatch, capsys):
+    script = _script()
+
+    class Response:
+        def __init__(self, body):
+            self.body = body
+
+        def read(self, amount=-1):
+            return self.body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    def open_url(call, timeout):
+        if call.method == "GET":
+            return Response(b'[{"provider":"chatanywhere","model":"gpt-4o-mini","configurationRevision":"revision","catalogVersion":"catalog"}]')
+        return Response(b'{"provider":"chatanywhere","model":"gpt-4o-mini","status":"connected","verificationState":"available","configurationRevision":"revision","catalogVersion":"catalog"}')
+
+    monkeypatch.setattr(script, "_open_connection", open_url)
+
+    assert script.main(["--provider", "chatanywhere"]) == 0
+    assert capsys.readouterr().out == "chatanywhere gpt-4o-mini connected\n"
+
+
 def test_smoke_script_rejects_redirects_and_connected_but_unverified(monkeypatch, capsys):
     script = _script()
 

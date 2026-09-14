@@ -149,16 +149,16 @@ it("从 API 目录渲染 ChatAnywhere 的固定模型并按云端供应商保存
   const user = userEvent.setup();
   const provider = {
     provider: "chatanywhere" as const, label: "ChatAnywhere", credentialState: "unconfigured" as const,
-    selectedProvider: "chatanywhere" as const, model: "gpt-5.6-sol", baseUrl: null,
-    models: [{ id: "gpt-5.6-sol", label: "GPT-5.6 Sol" }],
+    selectedProvider: "chatanywhere" as const, model: "gpt-4o-mini", baseUrl: null,
+    models: [{ id: "gpt-4o-mini", label: "GPT-4o mini" }],
   };
   const save = vi.fn().mockResolvedValue({ ...provider, credentialState: "configured" as const });
   render(<AnalysisProviderSettings providers={[provider]} save={save} testConnection={vi.fn()} />);
 
-  expect(screen.getByRole("option", { name: "GPT-5.6 Sol" })).toBeVisible();
+  expect(screen.getByRole("option", { name: "GPT-4o mini" })).toBeVisible();
   await user.type(screen.getByLabelText("ChatAnywhere API Key"), "one-shot-secret");
   await user.click(screen.getByRole("button", { name: "保存ChatAnywhere配置" }));
 
-  expect(save).toHaveBeenCalledWith("chatanywhere", { model: "gpt-5.6-sol", apiKey: "one-shot-secret" });
+  expect(save).toHaveBeenCalledWith("chatanywhere", { model: "gpt-4o-mini", apiKey: "one-shot-secret" });
   expect(screen.queryByText("one-shot-secret")).not.toBeInTheDocument();
 });

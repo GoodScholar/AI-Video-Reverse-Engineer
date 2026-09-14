@@ -14,7 +14,7 @@ def _request():
         analysisProxyBytes=b"\x89PNG\r\n\x1a\nimage-proxy", width=16, height=16, aspectRatio=1.0,
     )
     return ProviderRequest(
-        analysisInput=image, prompt=build_analysis_prompt(image), model="gpt-5.6-sol",
+        analysisInput=image, prompt=build_analysis_prompt(image), model="gpt-4o-mini",
     )
 
 
@@ -53,7 +53,7 @@ def test_chatanywhere_uses_fixed_responses_endpoint_bearer_auth_and_strict_image
     assert str(captured[0].url) == "https://api.chatanywhere.tech/v1/responses"
     assert captured[0].headers["authorization"] == "Bearer test-key"
     body = json.loads(captured[0].content)
-    assert body["model"] == "gpt-5.6-sol"
+    assert body["model"] == "gpt-4o-mini"
     assert body["store"] is False
     assert body["text"]["format"]["type"] == "json_schema"
     assert body["text"]["format"]["strict"] is True

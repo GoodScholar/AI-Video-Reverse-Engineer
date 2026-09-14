@@ -77,7 +77,7 @@ _Avoid_: 结果页、编辑器、控制台
 _Avoid_: 系统检测、报错检查、兼容性扫描
 
 **分析服务**：
-接收分析代理并返回图片或视频统一结构化语义结果的外部多模态模型服务。目录固定收录百炼 `qwen3.7-flash`、回环地址本地 OpenAI 兼容服务（自填模型）、OpenAI `gpt-5.6-luna`、火山方舟豆包 `doubao-seed-2-0-lite-260428`、Google Gemini `gemini-2.5-flash`、xAI Grok `grok-4.6`、Anthropic Claude `claude-sonnet-5` 和 ChatAnywhere `gpt-5.6-sol`；用户在显式发送披露后选择，凭据由本地系统安全存储管理，失败时不得静默切换。云端与百炼必须有 Key，本地 Key 可选且地址限回环；ChatAnywhere 固定使用 `https://api.chatanywhere.tech/v1/responses`，不接受自定义地址。每份配置有非敏感修订和目录版本，连接测试结果以 CAS 绑定，迟到结果不得覆盖新配置；“可用”仅表示该修订的固定探针验证成功，不是未验证供应商的能力承诺。豆包的图片/结构化协议组合仍须以真实本地冒烟确认。
+接收分析代理并返回图片或视频统一结构化语义结果的外部多模态模型服务。目录固定收录百炼 `qwen3.7-flash`、回环地址本地 OpenAI 兼容服务（自填模型）、OpenAI `gpt-5.6-luna`、火山方舟豆包 `doubao-seed-2-0-lite-260428`、Google Gemini `gemini-2.5-flash`、xAI Grok `grok-4.6`、Anthropic Claude `claude-sonnet-5` 和 ChatAnywhere `gpt-4o-mini`；用户在显式发送披露后选择，凭据由本地系统安全存储管理，失败时不得静默切换。云端与百炼必须有 Key，本地 Key 可选且地址限回环；ChatAnywhere 固定使用 `https://api.chatanywhere.tech/v1/responses`，不接受自定义地址。每份配置有非敏感修订和目录版本，连接测试结果以 CAS 绑定，迟到结果不得覆盖新配置；“可用”仅表示该修订的固定探针验证成功，不是未验证供应商的能力承诺。目录更新会丢弃已退役模型的配置和验证状态，要求重新保存并验证。豆包的图片/结构化协议组合仍须以真实本地冒烟确认。
 _Avoid_: AI 后端、云端分析器、大模型接口
 
 **分析供应商**：

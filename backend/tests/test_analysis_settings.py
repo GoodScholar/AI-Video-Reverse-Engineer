@@ -487,15 +487,20 @@ def test_chatanywhere_configuration_uses_keyring_only_and_rejects_a_remote_base_
     ))
 
     listed = next(item for item in client.get("/api/analysis-providers").json() if item["provider"] == "chatanywhere")
+    retired_model = client.put("/api/analysis-providers/chatanywhere/configuration", json={
+        "apiKey": "chatanywhere-secret", "model": "gpt-5.6-sol",
+    })
     rejected = client.put("/api/analysis-providers/chatanywhere/configuration", json={
-        "apiKey": "chatanywhere-secret", "model": "gpt-5.6-sol", "baseUrl": "https://example.test/v1",
+        "apiKey": "chatanywhere-secret", "model": "gpt-4o-mini", "baseUrl": "https://example.test/v1",
     })
     saved = client.put("/api/analysis-providers/chatanywhere/configuration", json={
-        "apiKey": "chatanywhere-secret", "model": "gpt-5.6-sol",
+        "apiKey": "chatanywhere-secret", "model": "gpt-4o-mini",
     })
 
     assert listed["label"] == "ChatAnywhere"
-    assert listed["models"] == [{"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol"}]
+    assert listed["models"] == [{"id": "gpt-4o-mini", "label": "GPT-4o mini"}]
+    assert retired_model.status_code == 400
+    assert retired_model.json()["detail"]["code"] == "invalid_analysis_model"
     assert rejected.status_code == 400
     assert saved.status_code == 200
     assert saved.json()["baseUrl"] is None
@@ -515,7 +520,7 @@ def test_chatanywhere_connection_endpoint_uses_saved_configuration_and_marks_the
     def registry(**configuration):
         assert configuration == {
             "provider": "chatanywhere", "credential": "chatanywhere-secret",
-            "base_url": None, "model": "gpt-5.6-sol",
+            "base_url": None, "model": "gpt-4o-mini",
         }
         return StrictProbeProvider()
 
@@ -526,13 +531,13 @@ def test_chatanywhere_connection_endpoint_uses_saved_configuration_and_marks_the
         analysis_provider_registry=registry,
     ))
     assert client.put("/api/analysis-providers/chatanywhere/configuration", json={
-        "apiKey": "chatanywhere-secret", "model": "gpt-5.6-sol",
+        "apiKey": "chatanywhere-secret", "model": "gpt-4o-mini",
     }).status_code == 200
 
     response = client.post("/api/analysis-providers/chatanywhere/test-connection", json={})
 
     assert response.status_code == 200
-    assert calls == ["gpt-5.6-sol"]
+    assert calls == ["gpt-4o-mini"]
     assert response.json()["status"] == "connected"
     assert response.json()["verificationState"] == "available"
 
@@ -847,6 +852,23 @@ def test_catalog_version_change_invalidates_a_previously_available_configuration
     assert migrated.configurationRevision != "old-revision"
     assert migrated.verificationState == "unverified"
     assert migrated.verifiedAt is None
+
+
+def test_chatanywhere_catalog_migration_discards_retired_sol_configuration_and_verification(tmp_path):
+    path = tmp_path / "analysis-providers.json"
+    path.write_text(json.dumps({
+        "providers": [{
+            "provider": "chatanywhere", "model": "gpt-5.6-sol", "configurationRevision": "old-revision",
+            "catalogVersion": "2026-09-14.1", "verificationState": "available", "verifiedAt": "2026-09-14T00:00:00+00:00",
+        }],
+        "selectedProvider": "chatanywhere",
+    }), encoding="utf-8")
+
+    settings = AnalysisSettings(path)
+
+    assert settings.get("chatanywhere") is None
+    assert settings.selected_provider() is None
+    assert json.loads(path.read_text(encoding="utf-8")) == {"providers": [], "selectedProvider": None}
 
 
 def test_catalog_migration_is_persisted_once_and_can_be_verified_afterward(tmp_path):

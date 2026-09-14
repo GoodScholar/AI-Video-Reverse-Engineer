@@ -805,10 +805,10 @@ def test_chatanywhere_analysis_runs_to_completion_and_completed_checkpoint_survi
     ), raise_server_exceptions=False)
     project_id = ready_project(client, tmp_path)
     assert client.put("/api/analysis-providers/chatanywhere/configuration", json={
-        "apiKey": "test-chatanywhere-key", "model": "gpt-5.6-sol",
+        "apiKey": "test-chatanywhere-key", "model": "gpt-4o-mini",
     }).status_code == 200
     request = {
-        "provider": "chatanywhere", "model": "gpt-5.6-sol", "disclosureAccepted": True,
+        "provider": "chatanywhere", "model": "gpt-4o-mini", "disclosureAccepted": True,
     }
 
     started = client.post(f"/api/projects/{project_id}/semantic-analysis", json=request)
