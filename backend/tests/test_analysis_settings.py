@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from app.analysis_service_secrets import SecureStorageUnavailable
 from app.analysis_settings import AnalysisSettings, validate_loopback_base_url
 from app.main import create_app
+from app.provider_models import CATALOG_VERSION
 
 
 class InMemoryCredentials:
@@ -869,6 +870,46 @@ def test_chatanywhere_catalog_migration_discards_retired_sol_configuration_and_v
     assert settings.get("chatanywhere") is None
     assert settings.selected_provider() is None
     assert json.loads(path.read_text(encoding="utf-8")) == {"providers": [], "selectedProvider": None}
+
+
+def test_chatanywhere_catalog_migration_preserves_unaffected_current_configuration_and_rejects_old_cas(tmp_path):
+    path = tmp_path / "analysis-providers.json"
+    path.write_text(json.dumps({
+        "providers": [
+            {
+                "provider": "chatanywhere", "model": "gpt-5.6-sol", "baseUrl": None,
+                "configurationRevision": "retired-revision", "catalogVersion": "2026-09-14.1",
+                "verificationState": "available", "verifiedAt": "2026-09-14T00:00:00+00:00",
+                "failedAt": None, "errorCode": None,
+            },
+            {
+                "provider": "openai", "model": "gpt-5.6-luna", "baseUrl": None,
+                "configurationRevision": "openai-revision", "catalogVersion": "2026-09-14.1",
+                "verificationState": "available", "verifiedAt": "2026-09-14T00:00:00+00:00",
+                "failedAt": None, "errorCode": None,
+            },
+        ],
+        "selectedProvider": "openai",
+    }), encoding="utf-8")
+
+    settings = AnalysisSettings(path)
+    migrated = settings.get("openai")
+
+    assert settings.get("chatanywhere") is None
+    assert migrated.model == "gpt-5.6-luna"
+    assert migrated.baseUrl is None
+    assert migrated.configurationRevision == "openai-revision"
+    assert migrated.catalogVersion == CATALOG_VERSION
+    assert migrated.verificationState == "available"
+    assert migrated.verifiedAt == "2026-09-14T00:00:00+00:00"
+    assert migrated.failedAt is None
+    assert migrated.errorCode is None
+    assert settings.selected_provider() == "openai"
+    assert not settings.record_verification(
+        provider="openai", configuration_revision="openai-revision", catalog_version="2026-09-14.1",
+        state="failed", error_code="timeout", now="2026-09-14T00:01:00+00:00",
+    )
+    assert settings.get("openai").verificationState == "available"
 
 
 def test_catalog_migration_is_persisted_once_and_can_be_verified_afterward(tmp_path):

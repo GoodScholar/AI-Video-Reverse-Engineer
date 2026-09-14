@@ -27,6 +27,7 @@ _VERIFICATION_ERROR_CODES = frozenset({
     "provider_error",
     "invalid_analysis_response",
 })
+_PREVIOUS_CATALOG_VERSION = "2026-09-14.1"
 
 
 class AnalysisSettingsConflictError(Exception):
@@ -356,19 +357,24 @@ class AnalysisSettings:
                 # A model retired from the directory cannot remain selectable or
                 # retain a successful verification under a new catalog version.
                 if needs_migration and isinstance(raw_providers, list):
-                    providers = [
-                        {
-                            **item,
-                            "configurationRevision": str(uuid4()),
-                            "catalogVersion": CATALOG_VERSION,
-                            "verificationState": "unverified",
-                            "verifiedAt": None,
-                            "failedAt": None,
-                            "errorCode": None,
-                        }
-                        for item in raw_providers
-                        if isinstance(item, dict) and item.get("provider") not in retired_models
-                    ]
+                    providers = []
+                    for item in raw_providers:
+                        if not isinstance(item, dict):
+                            providers.append(item)
+                        elif item.get("provider") in retired_models:
+                            continue
+                        elif current_fields <= item.keys() and item.get("catalogVersion") == _PREVIOUS_CATALOG_VERSION:
+                            providers.append({**item, "catalogVersion": CATALOG_VERSION})
+                        else:
+                            providers.append({
+                                **item,
+                                "configurationRevision": str(uuid4()),
+                                "catalogVersion": CATALOG_VERSION,
+                                "verificationState": "unverified",
+                                "verifiedAt": None,
+                                "failedAt": None,
+                                "errorCode": None,
+                            })
                     raw = {
                         **raw,
                         "providers": providers,
