@@ -238,6 +238,94 @@ def test_configuration_response_uses_the_verification_state_merged_during_commit
     assert credentials.reads == 1
 
 
+def test_configuration_conflict_rolls_back_the_new_credential_and_preserves_the_current_provider(tmp_path):
+    settings = AnalysisSettings(tmp_path / "analysis-providers.json")
+    initial = settings.save(
+        provider="openai", model="gpt-5.6-luna", base_url=None, selected_provider="openai",
+    )
+
+    class InterleavingCredentials(InMemoryCredentials):
+        def __init__(self):
+            super().__init__()
+            self.values["openai"] = "b-secret"
+            self.interleaved = False
+
+        def set(self, provider, secret):
+            if not self.interleaved:
+                self.interleaved = True
+                _, prepared = settings.prepare_save(
+                    provider="openai",
+                    model="gpt-5.6-luna",
+                    base_url=None,
+                    selected_provider="openai",
+                    credential_changed=True,
+                )
+                committed = settings.commit(prepared)
+                current = next(item for item in committed.providers if item.provider == "openai")
+                assert settings.record_verification(
+                    provider="openai",
+                    configuration_revision=current.configurationRevision,
+                    catalog_version=current.catalogVersion,
+                    state="available",
+                    now="2026-09-14T00:00:00+00:00",
+                )
+            super().set(provider, secret)
+
+    credentials = InterleavingCredentials()
+    client = TestClient(create_app(
+        data_dir=tmp_path,
+        credential_store=credentials,
+        analysis_settings=settings,
+    ))
+
+    response = client.put("/api/analysis-providers/openai/configuration", json={
+        "apiKey": "a-secret", "model": "gpt-5.6-luna",
+    })
+
+    persisted = settings.get("openai")
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "analysis_provider_configuration_changed"
+    assert persisted.configurationRevision != initial.configurationRevision
+    assert persisted.verificationState == "available"
+    assert credentials.values["openai"] == "b-secret"
+    assert "a-secret" not in response.text
+
+
+def test_configuration_response_uses_selected_provider_from_the_committed_settings(tmp_path):
+    settings = AnalysisSettings(tmp_path / "analysis-providers.json")
+
+    class InterleavingCredentials(InMemoryCredentials):
+        def __init__(self):
+            super().__init__()
+            self.values["openai"] = "openai-secret"
+
+        def get(self, provider):
+            if provider == "openai":
+                settings.save(
+                    provider="bailian",
+                    model="qwen3.7-flash",
+                    base_url=None,
+                    selected_provider="bailian",
+                )
+            return super().get(provider)
+
+    client = TestClient(create_app(
+        data_dir=tmp_path,
+        credential_store=InterleavingCredentials(),
+        analysis_settings=settings,
+    ))
+
+    response = client.put("/api/analysis-providers/openai/configuration", json={
+        "model": "gpt-5.6-luna",
+    })
+
+    assert response.status_code == 200
+    assert response.json()["provider"] == "openai"
+    assert response.json()["selectedProvider"] == "bailian"
+    assert settings.get("openai").model == "gpt-5.6-luna"
+    assert settings.selected_provider() == "bailian"
+
+
 def test_cloud_configuration_reuses_a_stored_api_key_when_resaved_without_one(tmp_path):
     credentials = InMemoryCredentials()
     client = TestClient(create_app(

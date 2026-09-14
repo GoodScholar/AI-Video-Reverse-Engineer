@@ -91,7 +91,7 @@ from app.semantic_analysis_storage import (
 )
 from app.analysis_prompt import PROMPT_VERSION
 from app.analysis_service_secrets import SecureStorageUnavailable
-from app.analysis_settings import AnalysisProviderConfiguration, AnalysisSettings
+from app.analysis_settings import AnalysisProviderConfiguration, AnalysisSettings, AnalysisSettingsConflictError
 from app.credential_store import CredentialStore
 from app.provider_models import CATALOG_VERSION, PROVIDER_IDS, model_is_allowed, provider_for
 from app.analysis_providers.bailian import BailianAnalysisProvider
@@ -1549,7 +1549,7 @@ def create_app(
                 credential_state = True
             committed_settings = configured_analysis_settings.commit(prepared_settings)
             candidate = next(item for item in committed_settings.providers if item.provider == provider)
-        except (OSError, SecureStorageUnavailable) as error:
+        except (OSError, SecureStorageUnavailable, AnalysisSettingsConflictError) as error:
             if credential_write_succeeded:
                 try:
                     if previous_credential is None:
@@ -1561,6 +1561,14 @@ def create_app(
                     raise secure_storage_unavailable() from rollback_error
             if isinstance(error, SecureStorageUnavailable):
                 raise secure_storage_unavailable() from error
+            if isinstance(error, AnalysisSettingsConflictError):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "analysis_provider_configuration_changed",
+                        "message": "分析供应商配置已变化，请重新保存。",
+                    },
+                ) from error
             raise HTTPException(
                 status_code=503,
                 detail={
@@ -1575,7 +1583,7 @@ def create_app(
             model=candidate.model,
             baseUrl=candidate.baseUrl,
             credentialState="configured" if credential_state else "unconfigured",
-            selectedProvider=provider,
+            selectedProvider=committed_settings.selectedProvider,
             configurationRevision=candidate.configurationRevision,
             catalogVersion=candidate.catalogVersion,
             verificationState=candidate.verificationState,

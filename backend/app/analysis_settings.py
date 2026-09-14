@@ -29,6 +29,10 @@ _VERIFICATION_ERROR_CODES = frozenset({
 })
 
 
+class AnalysisSettingsConflictError(Exception):
+    """A prepared provider configuration was superseded before it could commit."""
+
+
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -250,7 +254,7 @@ class AnalysisSettings:
                 else:
                     committed_target = candidate
             else:
-                committed_target = current_target
+                raise AnalysisSettingsConflictError()
             merged_by_provider = {
                 **current_by_provider,
                 prepared.target_provider: committed_target,
