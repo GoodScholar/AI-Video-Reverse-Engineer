@@ -1,4 +1,5 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import threading
 
@@ -292,8 +293,51 @@ def test_configuration_conflict_rolls_back_the_new_credential_and_preserves_the_
     assert "a-secret" not in response.text
 
 
-def test_concurrent_configuration_requests_keep_the_later_credential_bound_to_its_revision(tmp_path):
-    credentials = RecordingCredentials()
+def test_configuration_save_is_not_bound_to_a_destroyed_event_loop(tmp_path):
+    credentials = InMemoryCredentials()
+
+    async def save_from_a_temporary_event_loop():
+        app = create_app(
+            data_dir=tmp_path,
+            credential_store=credentials,
+            analysis_settings=AnalysisSettings(tmp_path / "analysis-providers.json"),
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver",
+        ) as client:
+            response = await client.put("/api/analysis-providers/openai/configuration", json={
+                "apiKey": "first-secret", "model": "gpt-5.6-luna",
+            })
+        assert response.status_code == 200
+
+    asyncio.run(save_from_a_temporary_event_loop())
+
+    with TestClient(create_app(
+        data_dir=tmp_path,
+        credential_store=credentials,
+        analysis_settings=AnalysisSettings(tmp_path / "analysis-providers.json"),
+    )) as client:
+        response = client.put("/api/analysis-providers/openai/configuration", json={
+            "apiKey": "second-secret", "model": "gpt-5.6-luna",
+        })
+
+    assert response.status_code == 200
+    assert credentials.values["openai"] == "second-secret"
+
+
+def test_concurrent_complete_configuration_requests_keep_later_credential_bound_to_its_revision(tmp_path):
+    first_write_started = threading.Event()
+    release_first_write = threading.Event()
+    second_request_started = threading.Event()
+
+    class FirstWriteBlockingCredentials(RecordingCredentials):
+        def set(self, provider, secret):
+            if secret == "a-secret":
+                first_write_started.set()
+                assert release_first_write.wait(timeout=5)
+            super().set(provider, secret)
+
+    credentials = FirstWriteBlockingCredentials()
     settings = AnalysisSettings(tmp_path / "analysis-providers.json")
     app = create_app(
         data_dir=tmp_path,
@@ -301,29 +345,21 @@ def test_concurrent_configuration_requests_keep_the_later_credential_bound_to_it
         analysis_settings=settings,
     )
 
-    async def configure_concurrently():
-        lock = app.state.analysis_provider_configuration_lock
-        await lock.acquire()
-        try:
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app), base_url="http://testserver",
-            ) as client:
-                first = asyncio.create_task(client.put(
-                    "/api/analysis-providers/openai/configuration",
-                    json={"apiKey": "a-secret", "model": "gpt-5.6-luna"},
-                ))
-                await asyncio.sleep(0)
-                second = asyncio.create_task(client.put(
-                    "/api/analysis-providers/openai/configuration",
-                    json={"apiKey": "b-secret", "model": "gpt-5.6-luna"},
-                ))
-                await asyncio.sleep(0)
-                assert credentials.operations == []
-        finally:
-            lock.release()
-        return await asyncio.gather(first, second)
+    def put_configuration(api_key):
+        if api_key == "b-secret":
+            second_request_started.set()
+        with TestClient(app) as client:
+            return client.put("/api/analysis-providers/openai/configuration", json={
+                "apiKey": api_key, "model": "gpt-5.6-luna",
+            })
 
-    first, second = asyncio.run(configure_concurrently())
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(put_configuration, "a-secret")
+        assert first_write_started.wait(timeout=5)
+        second = executor.submit(put_configuration, "b-secret")
+        assert second_request_started.wait(timeout=5)
+        release_first_write.set()
+        first, second = first.result(timeout=5), second.result(timeout=5)
 
     assert first.status_code == 200
     assert second.status_code == 200

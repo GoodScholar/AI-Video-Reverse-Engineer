@@ -1,4 +1,3 @@
-import asyncio
 import errno
 import httpx
 import json
@@ -19,6 +18,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -325,7 +325,7 @@ def create_app(
     clock: Optional[Callable[[], datetime]] = None,
 ) -> FastAPI:
     app = FastAPI(title="AI 视频复刻分析器")
-    app.state.analysis_provider_configuration_lock = asyncio.Lock()
+    analysis_provider_configuration_lock = Lock()
     project_write_lock = Lock()
     dispatching_project_ids: set[str] = set()
     reference_media_path_pattern = re.compile(r"^/api/projects/[^/]+/reference-media$")
@@ -1442,55 +1442,13 @@ def create_app(
                 },
             ) from error
 
-    @app.put(
-        "/api/analysis-providers/{provider}/configuration",
-        response_model=AnalysisProviderConfiguration,
-    )
-    async def put_analysis_provider_configuration(
+    def save_analysis_provider_configuration(
         provider: str,
-        request: Request,
-    ) -> AnalysisProviderConfiguration:
-        try:
-            payload = await request.json()
-        except (UnicodeDecodeError, ValueError):
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
-            ) from None
-        if not isinstance(payload, dict) or set(payload) - {"apiKey", "baseUrl", "model"}:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
-            )
-        model = payload.get("model")
-        api_key = payload.get("apiKey")
-        base_url = payload.get("baseUrl")
-        if (
-            not isinstance(model, str)
-            or not model.strip()
-            or api_key is not None and (not isinstance(api_key, str) or not api_key.strip())
-            or base_url is not None and not isinstance(base_url, str)
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
-            )
-        if provider not in PROVIDER_IDS:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
-            )
-        if not analysis_model_is_supported(provider, model):
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "code": "invalid_analysis_model", "message": "所选模型不在该分析供应商的可用清单中。"},
-            )
-        async with app.state.analysis_provider_configuration_lock:
+        model: str,
+        base_url: Optional[str],
+        api_key: Optional[str],
+    ):
+        with analysis_provider_configuration_lock:
             try:
                 candidate, prepared_settings = configured_analysis_settings.prepare_save(
                     provider=provider,
@@ -1577,6 +1535,63 @@ def create_app(
                     detail={
                         "code": "analysis_settings_unavailable", "message": "分析供应商设置不可用。"},
                 ) from error
+            return candidate, committed_settings, credential_state
+
+    @app.put(
+        "/api/analysis-providers/{provider}/configuration",
+        response_model=AnalysisProviderConfiguration,
+    )
+    async def put_analysis_provider_configuration(
+        provider: str,
+        request: Request,
+    ) -> AnalysisProviderConfiguration:
+        try:
+            payload = await request.json()
+        except (UnicodeDecodeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
+            ) from None
+        if not isinstance(payload, dict) or set(payload) - {"apiKey", "baseUrl", "model"}:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
+            )
+        model = payload.get("model")
+        api_key = payload.get("apiKey")
+        base_url = payload.get("baseUrl")
+        if (
+            not isinstance(model, str)
+            or not model.strip()
+            or api_key is not None and (not isinstance(api_key, str) or not api_key.strip())
+            or base_url is not None and not isinstance(base_url, str)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
+            )
+        if provider not in PROVIDER_IDS:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
+            )
+        if not analysis_model_is_supported(provider, model):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_analysis_model", "message": "所选模型不在该分析供应商的可用清单中。"},
+            )
+        candidate, committed_settings, credential_state = await run_in_threadpool(
+            save_analysis_provider_configuration,
+            provider,
+            model,
+            base_url,
+            api_key,
+        )
 
         catalog = provider_for(provider)
         return AnalysisProviderConfiguration(
