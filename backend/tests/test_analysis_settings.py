@@ -1,3 +1,4 @@
+import asyncio
 import json
 import threading
 
@@ -289,6 +290,60 @@ def test_configuration_conflict_rolls_back_the_new_credential_and_preserves_the_
     assert persisted.verificationState == "available"
     assert credentials.values["openai"] == "b-secret"
     assert "a-secret" not in response.text
+
+
+def test_concurrent_configuration_requests_keep_the_later_credential_bound_to_its_revision(tmp_path):
+    credentials = RecordingCredentials()
+    settings = AnalysisSettings(tmp_path / "analysis-providers.json")
+    app = create_app(
+        data_dir=tmp_path,
+        credential_store=credentials,
+        analysis_settings=settings,
+    )
+
+    async def configure_concurrently():
+        lock = app.state.analysis_provider_configuration_lock
+        await lock.acquire()
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://testserver",
+            ) as client:
+                first = asyncio.create_task(client.put(
+                    "/api/analysis-providers/openai/configuration",
+                    json={"apiKey": "a-secret", "model": "gpt-5.6-luna"},
+                ))
+                await asyncio.sleep(0)
+                second = asyncio.create_task(client.put(
+                    "/api/analysis-providers/openai/configuration",
+                    json={"apiKey": "b-secret", "model": "gpt-5.6-luna"},
+                ))
+                await asyncio.sleep(0)
+                assert credentials.operations == []
+        finally:
+            lock.release()
+        return await asyncio.gather(first, second)
+
+    first, second = asyncio.run(configure_concurrently())
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["configurationRevision"] != second.json()["configurationRevision"]
+    assert second.json()["credentialState"] == "configured"
+    assert credentials.operations == [
+        ("get", "openai"), ("set", "openai"),
+        ("get", "openai"), ("set", "openai"),
+    ]
+    persisted = settings.get("openai")
+    assert persisted.configurationRevision == second.json()["configurationRevision"]
+    assert credentials.values["openai"] == "b-secret"
+    assert settings.record_verification(
+        provider="openai",
+        configuration_revision=persisted.configurationRevision,
+        catalog_version=persisted.catalogVersion,
+        state="available",
+        now="2026-09-14T00:00:00+00:00",
+    )
+    assert settings.get("openai").verificationState == "available"
 
 
 def test_configuration_response_uses_selected_provider_from_the_committed_settings(tmp_path):

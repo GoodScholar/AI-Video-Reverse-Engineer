@@ -1,3 +1,4 @@
+import asyncio
 import errno
 import httpx
 import json
@@ -324,6 +325,7 @@ def create_app(
     clock: Optional[Callable[[], datetime]] = None,
 ) -> FastAPI:
     app = FastAPI(title="AI 视频复刻分析器")
+    app.state.analysis_provider_configuration_lock = asyncio.Lock()
     project_write_lock = Lock()
     dispatching_project_ids: set[str] = set()
     reference_media_path_pattern = re.compile(r"^/api/projects/[^/]+/reference-media$")
@@ -1488,92 +1490,93 @@ def create_app(
                 detail={
                     "code": "invalid_analysis_model", "message": "所选模型不在该分析供应商的可用清单中。"},
             )
-        try:
-            candidate, prepared_settings = configured_analysis_settings.prepare_save(
-                provider=provider,
-                model=model,
-                base_url=base_url,
-                selected_provider=provider,
-            )
-        except (OSError, ValueError) as error:
-            if isinstance(error, OSError):
-                raise HTTPException(
-                    status_code=503,
-                    detail={
-                        "code": "analysis_settings_unavailable", "message": "分析供应商设置不可用。"},
-                ) from error
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
-            ) from error
-
-        try:
-            credential_store_for_update = credentials()
-            previous_credential = credential_store_for_update.get(provider)
-        except SecureStorageUnavailable as error:
-            raise secure_storage_unavailable() from error
-
-        if provider != "local_openai_compatible" and not (api_key or previous_credential):
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
-            )
-        if api_key is not None and api_key != previous_credential:
+        async with app.state.analysis_provider_configuration_lock:
             try:
                 candidate, prepared_settings = configured_analysis_settings.prepare_save(
                     provider=provider,
                     model=model,
                     base_url=base_url,
                     selected_provider=provider,
-                    credential_changed=True,
                 )
             except (OSError, ValueError) as error:
                 if isinstance(error, OSError):
                     raise HTTPException(
                         status_code=503,
-                        detail={"code": "analysis_settings_unavailable", "message": "分析供应商设置不可用。"},
+                        detail={
+                            "code": "analysis_settings_unavailable", "message": "分析供应商设置不可用。"},
                     ) from error
                 raise HTTPException(
                     status_code=400,
-                    detail={"code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
+                    detail={
+                        "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
                 ) from error
 
-        credential_write_succeeded = False
-        credential_state = previous_credential is not None
-        try:
-            if api_key is not None:
-                credential_store_for_update.set(provider, api_key)
-                credential_write_succeeded = True
-                credential_state = True
-            committed_settings = configured_analysis_settings.commit(prepared_settings)
-            candidate = next(item for item in committed_settings.providers if item.provider == provider)
-        except (OSError, SecureStorageUnavailable, AnalysisSettingsConflictError) as error:
-            if credential_write_succeeded:
-                try:
-                    if previous_credential is None:
-                        credential_store_for_update.delete(provider)
-                    else:
-                        credential_store_for_update.set(provider, previous_credential)
-                except SecureStorageUnavailable as rollback_error:
-                    logging.getLogger(__name__).warning("无法回退分析供应商凭据：%s", provider)
-                    raise secure_storage_unavailable() from rollback_error
-            if isinstance(error, SecureStorageUnavailable):
+            try:
+                credential_store_for_update = credentials()
+                previous_credential = credential_store_for_update.get(provider)
+            except SecureStorageUnavailable as error:
                 raise secure_storage_unavailable() from error
-            if isinstance(error, AnalysisSettingsConflictError):
+
+            if provider != "local_openai_compatible" and not (api_key or previous_credential):
                 raise HTTPException(
-                    status_code=409,
+                    status_code=400,
                     detail={
-                        "code": "analysis_provider_configuration_changed",
-                        "message": "分析供应商配置已变化，请重新保存。",
-                    },
+                        "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
+                )
+            if api_key is not None and api_key != previous_credential:
+                try:
+                    candidate, prepared_settings = configured_analysis_settings.prepare_save(
+                        provider=provider,
+                        model=model,
+                        base_url=base_url,
+                        selected_provider=provider,
+                        credential_changed=True,
+                    )
+                except (OSError, ValueError) as error:
+                    if isinstance(error, OSError):
+                        raise HTTPException(
+                            status_code=503,
+                            detail={"code": "analysis_settings_unavailable", "message": "分析供应商设置不可用。"},
+                        ) from error
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
+                    ) from error
+
+            credential_write_succeeded = False
+            credential_state = previous_credential is not None
+            try:
+                if api_key is not None:
+                    credential_store_for_update.set(provider, api_key)
+                    credential_write_succeeded = True
+                    credential_state = True
+                committed_settings = configured_analysis_settings.commit(prepared_settings)
+                candidate = next(item for item in committed_settings.providers if item.provider == provider)
+            except (OSError, SecureStorageUnavailable, AnalysisSettingsConflictError) as error:
+                if credential_write_succeeded:
+                    try:
+                        if previous_credential is None:
+                            credential_store_for_update.delete(provider)
+                        else:
+                            credential_store_for_update.set(provider, previous_credential)
+                    except SecureStorageUnavailable as rollback_error:
+                        logging.getLogger(__name__).warning("无法回退分析供应商凭据：%s", provider)
+                        raise secure_storage_unavailable() from rollback_error
+                if isinstance(error, SecureStorageUnavailable):
+                    raise secure_storage_unavailable() from error
+                if isinstance(error, AnalysisSettingsConflictError):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "analysis_provider_configuration_changed",
+                            "message": "分析供应商配置已变化，请重新保存。",
+                        },
+                    ) from error
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "analysis_settings_unavailable", "message": "分析供应商设置不可用。"},
                 ) from error
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "code": "analysis_settings_unavailable", "message": "分析供应商设置不可用。"},
-            ) from error
 
         catalog = provider_for(provider)
         return AnalysisProviderConfiguration(
