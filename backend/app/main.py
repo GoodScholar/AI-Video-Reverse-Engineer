@@ -350,17 +350,24 @@ def create_app(
             },
         )
 
-    def analysis_provider_configuration(provider: str) -> AnalysisProviderConfiguration:
-        setting = configured_analysis_settings.get(provider)
-        try:
-            configured = credentials().get(provider) is not None
-        except SecureStorageUnavailable as error:
-            raise secure_storage_unavailable() from error
+    def _analysis_provider_snapshot_locked(provider: str):
+        return (
+            configured_analysis_settings.get(provider),
+            credentials().get(provider),
+            configured_analysis_settings.selected_provider(),
+        )
+
+    def analysis_provider_snapshot(provider: str):
+        with analysis_provider_configuration_lock:
+            return _analysis_provider_snapshot_locked(provider)
+
+    def _analysis_provider_configuration_locked(provider: str) -> AnalysisProviderConfiguration:
+        setting, credential, selected_provider = _analysis_provider_snapshot_locked(provider)
         return analysis_provider_configuration_snapshot(
             provider=provider,
             setting=setting,
-            credential_configured=configured,
-            selected_provider=configured_analysis_settings.selected_provider(),
+            credential_configured=credential is not None,
+            selected_provider=selected_provider,
         )
 
     def analysis_provider_configuration_snapshot(
@@ -1047,8 +1054,7 @@ def create_app(
             if expected is None or project_for_run is None:
                 return
             task = expected
-            setting = configured_analysis_settings.get(task.provider)
-            credential = credentials().get(task.provider)
+            setting, credential, _ = analysis_provider_snapshot(task.provider)
             if (
                 setting is None
                 or setting.model != task.model
@@ -1429,10 +1435,10 @@ def create_app(
     @app.get("/api/analysis-providers", response_model=list[AnalysisProviderConfiguration])
     def get_analysis_provider_configurations() -> list[AnalysisProviderConfiguration]:
         try:
-            return [
-                analysis_provider_configuration(provider)
-                for provider in PROVIDER_IDS
-            ]
+            with analysis_provider_configuration_lock:
+                return [_analysis_provider_configuration_locked(provider) for provider in PROVIDER_IDS]
+        except SecureStorageUnavailable as error:
+            raise secure_storage_unavailable() from error
         except (OSError, ValueError) as error:
             raise HTTPException(
                 status_code=503,
@@ -1614,8 +1620,7 @@ def create_app(
     @app.post("/api/analysis-providers/{provider}/connection-test", response_model=None)
     def test_analysis_provider_connection(provider: str) -> dict[str, str]:
         try:
-            setting = configured_analysis_settings.get(provider)
-            credential = credentials().get(provider)
+            setting, credential, _ = analysis_provider_snapshot(provider)
         except SecureStorageUnavailable as error:
             raise secure_storage_unavailable() from error
         except (OSError, ValueError) as error:
@@ -1695,8 +1700,9 @@ def create_app(
                 close_default_analysis_provider(configured_provider)
         persist_verification(state="available")
         try:
-            verified = configured_analysis_settings.get(provider)
-            selected_provider = configured_analysis_settings.selected_provider()
+            verified, current_credential, selected_provider = analysis_provider_snapshot(provider)
+        except SecureStorageUnavailable as error:
+            raise secure_storage_unavailable() from error
         except (OSError, ValueError) as error:
             raise HTTPException(
                 status_code=503,
@@ -1717,7 +1723,7 @@ def create_app(
         return analysis_provider_configuration_snapshot(
             provider=provider,
             setting=verified,
-            credential_configured=credential is not None,
+            credential_configured=current_credential is not None,
             selected_provider=selected_provider,
         ).model_dump() | {"status": "connected"}
 
@@ -1803,8 +1809,8 @@ def create_app(
                         "updatedAt": checkpoint.updatedAt,
                     })
             try:
-                setting = configured_analysis_settings.get(payload.provider)
-                has_credential = credentials().get(payload.provider) is not None
+                setting, credential, _ = analysis_provider_snapshot(payload.provider)
+                has_credential = credential is not None
             except SecureStorageUnavailable as error:
                 raise secure_storage_unavailable() from error
             except (OSError, ValueError) as error:

@@ -515,6 +515,184 @@ def test_connection_test_rejects_a_late_result_after_configuration_changes(tmp_p
     assert responses[0].json().get("status") != "connected"
 
 
+def test_connection_test_does_not_verify_rolled_back_configuration_with_a_new_credential(tmp_path):
+    probe_requested = threading.Event()
+    probe_read_new_credential = threading.Event()
+    rollback_completed = threading.Event()
+    commit_started = threading.Event()
+
+    class FailingCommitSettings(AnalysisSettings):
+        def __init__(self, path):
+            super().__init__(path)
+            self.fail_commit = False
+
+        def commit(self, prepared):
+            if self.fail_commit:
+                commit_started.set()
+                assert probe_requested.wait(timeout=2)
+                probe_read_new_credential.wait(timeout=0.2)
+                raise OSError("configuration write failed")
+            return super().commit(prepared)
+
+    class RollbackTrackingCredentials(InMemoryCredentials):
+        def __init__(self):
+            super().__init__()
+            self.values["openai"] = "old-secret"
+            self.new_credential_written = False
+
+        def get(self, provider):
+            credential = super().get(provider)
+            if credential == "new-secret":
+                probe_read_new_credential.set()
+            return credential
+
+        def set(self, provider, secret):
+            super().set(provider, secret)
+            if secret == "new-secret":
+                self.new_credential_written = True
+            elif secret == "old-secret" and self.new_credential_written:
+                rollback_completed.set()
+
+    class ProbeProvider:
+        def __init__(self, credential):
+            self.credential = credential
+
+        def test_connection(self, model):
+            if self.credential == "new-secret":
+                assert rollback_completed.wait(timeout=2)
+                return None
+            raise RuntimeError("old credential is rejected")
+
+    settings = FailingCommitSettings(tmp_path / "analysis-providers.json")
+    initial = settings.save(
+        provider="openai", model="gpt-5.6-luna", base_url=None, selected_provider="openai",
+    )
+    credentials = RollbackTrackingCredentials()
+    app = create_app(
+        data_dir=tmp_path,
+        credential_store=credentials,
+        analysis_settings=settings,
+        provider_registry=lambda **kwargs: ProbeProvider(kwargs["credential"]),
+    )
+    settings.fail_commit = True
+    save_response = []
+    probe_response = []
+
+    def save_configuration():
+        with TestClient(app) as client:
+            save_response.append(client.put("/api/analysis-providers/openai/configuration", json={
+                "apiKey": "new-secret", "model": "gpt-5.6-luna",
+            }))
+
+    def probe_connection():
+        probe_requested.set()
+        with TestClient(app) as client:
+            probe_response.append(client.post(
+                "/api/analysis-providers/openai/test-connection",
+                content="{}", headers=_sensitive_headers(),
+            ))
+
+    save_thread = threading.Thread(target=save_configuration)
+    save_thread.start()
+    assert commit_started.wait(timeout=2)
+    probe_thread = threading.Thread(target=probe_connection)
+    probe_thread.start()
+    save_thread.join(timeout=2)
+    probe_thread.join(timeout=2)
+
+    assert not save_thread.is_alive()
+    assert not probe_thread.is_alive()
+    assert save_response[0].status_code == 503
+    assert probe_response[0].status_code == 502
+    assert probe_response[0].json()["detail"]["code"] == "provider_error"
+    persisted = settings.get("openai")
+    assert persisted.configurationRevision == initial.configurationRevision
+    assert persisted.verificationState == "failed"
+    assert credentials.values["openai"] == "old-secret"
+    assert "new-secret" not in save_response[0].text
+    assert "new-secret" not in probe_response[0].text
+
+
+def test_connection_test_waits_for_a_successful_save_before_using_its_configuration_snapshot(tmp_path):
+    commit_started = threading.Event()
+    release_commit = threading.Event()
+    probe_started = threading.Event()
+    probe_finished = threading.Event()
+
+    class PausingCommitSettings(AnalysisSettings):
+        def __init__(self, path):
+            super().__init__(path)
+            self.pause_commit = False
+
+        def commit(self, prepared):
+            if self.pause_commit:
+                commit_started.set()
+                assert release_commit.wait(timeout=2)
+            return super().commit(prepared)
+
+    credentials = InMemoryCredentials()
+    credentials.values["openai"] = "old-secret"
+    settings = PausingCommitSettings(tmp_path / "analysis-providers.json")
+    initial = settings.save(
+        provider="openai", model="gpt-5.6-luna", base_url=None, selected_provider="openai",
+    )
+    used_credentials = []
+
+    class ProbeProvider:
+        def test_connection(self, model):
+            return None
+
+    def registry(**kwargs):
+        used_credentials.append(kwargs["credential"])
+        return ProbeProvider()
+
+    app = create_app(
+        data_dir=tmp_path,
+        credential_store=credentials,
+        analysis_settings=settings,
+        provider_registry=registry,
+    )
+    settings.pause_commit = True
+    save_response = []
+    probe_response = []
+
+    def save_configuration():
+        with TestClient(app) as client:
+            save_response.append(client.put("/api/analysis-providers/openai/configuration", json={
+                "apiKey": "new-secret", "model": "gpt-5.6-luna",
+            }))
+
+    def probe_connection():
+        probe_started.set()
+        with TestClient(app) as client:
+            probe_response.append(client.post(
+                "/api/analysis-providers/openai/test-connection",
+                content="{}", headers=_sensitive_headers(),
+            ))
+        probe_finished.set()
+
+    save_thread = threading.Thread(target=save_configuration)
+    save_thread.start()
+    assert commit_started.wait(timeout=2)
+    probe_thread = threading.Thread(target=probe_connection)
+    probe_thread.start()
+    assert probe_started.wait(timeout=2)
+    finished_while_save_paused = probe_finished.wait(timeout=0.2)
+    release_commit.set()
+    save_thread.join(timeout=2)
+    probe_thread.join(timeout=2)
+
+    assert not save_thread.is_alive()
+    assert not probe_thread.is_alive()
+    assert not finished_while_save_paused
+    assert save_response[0].status_code == 200
+    assert probe_response[0].status_code == 200
+    assert used_credentials == ["new-secret"]
+    assert probe_response[0].json()["configurationRevision"] != initial.configurationRevision
+    assert probe_response[0].json()["configurationRevision"] == save_response[0].json()["configurationRevision"]
+    assert probe_response[0].json()["status"] == "connected"
+
+
 def test_connection_test_does_not_report_connected_when_verification_write_fails(tmp_path):
     class WriteFailingSettings(AnalysisSettings):
         def record_verification(self, **_):
