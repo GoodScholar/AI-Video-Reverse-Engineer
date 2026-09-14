@@ -541,6 +541,38 @@ def test_commit_preserves_a_verification_written_after_prepare_save(tmp_path):
     assert persisted.errorCode == "timeout"
 
 
+def test_commit_does_not_restore_another_provider_changed_after_prepare(tmp_path):
+    settings = AnalysisSettings(tmp_path / "analysis-providers.json")
+    previous_openai = settings.save(
+        provider="openai", model="gpt-5.6-luna", base_url=None, selected_provider="openai",
+    )
+    old_local = settings.save(
+        provider="local_openai_compatible", model="old", base_url="http://127.0.0.1:8080",
+        selected_provider="openai",
+    )
+    candidate_openai, prepared_openai = settings.prepare_save(
+        provider="openai", model="gpt-5.6-luna", base_url=None, selected_provider="openai",
+        credential_changed=True,
+    )
+    new_local = settings.save(
+        provider="local_openai_compatible", model="new", base_url="http://127.0.0.1:8080",
+        selected_provider="local_openai_compatible",
+    )
+
+    settings.commit(prepared_openai)
+
+    local = settings.get("local_openai_compatible")
+    assert settings.get("openai").configurationRevision == candidate_openai.configurationRevision
+    assert candidate_openai.configurationRevision != previous_openai.configurationRevision
+    assert local.model == "new"
+    assert local.configurationRevision == new_local.configurationRevision
+    assert settings.selected_provider() == "local_openai_compatible"
+    assert not settings.record_verification(
+        provider="local_openai_compatible", configuration_revision=old_local.configurationRevision,
+        catalog_version=old_local.catalogVersion, state="available", now="2026-09-13T00:00:00+00:00",
+    )
+
+
 def test_record_verification_rejects_nonstandard_error_code_before_persisting(tmp_path):
     settings = AnalysisSettings(tmp_path / "analysis-providers.json")
     saved = settings.save(

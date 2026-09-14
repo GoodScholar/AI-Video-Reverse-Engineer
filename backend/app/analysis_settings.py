@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 from typing import Literal, Optional
@@ -122,6 +123,14 @@ class _StoredAnalysisSettings(_StrictModel):
         return value
 
 
+@dataclass(frozen=True)
+class _PreparedAnalysisSettings:
+    settings: _StoredAnalysisSettings
+    target_provider: ProviderId
+    target_before_prepare: Optional[_StoredProviderConfiguration]
+    selected_provider_before_prepare: Optional[ProviderId]
+
+
 class AnalysisProviderConfiguration(_StrictModel):
     provider: ProviderId
     label: str
@@ -184,7 +193,7 @@ class AnalysisSettings:
         base_url: Optional[str],
         selected_provider: Optional[str],
         credential_changed: bool = False,
-    ) -> tuple[_StoredProviderConfiguration, _StoredAnalysisSettings]:
+    ) -> tuple[_StoredProviderConfiguration, _PreparedAnalysisSettings]:
         with self._lock:
             self._validate_provider(provider)
             self._validate_provider(selected_provider)
@@ -212,44 +221,64 @@ class AnalysisSettings:
                 errorCode=previous.errorCode if unchanged else None,
             )
             by_provider[provider] = candidate
-            return candidate, _StoredAnalysisSettings(
-                providers=[by_provider[item] for item in sorted(by_provider)],
-                selectedProvider=selected_provider,
+            return candidate, _PreparedAnalysisSettings(
+                settings=_StoredAnalysisSettings(
+                    providers=[by_provider[item] for item in sorted(by_provider)],
+                    selectedProvider=selected_provider,
+                ),
+                target_provider=provider,
+                target_before_prepare=previous,
+                selected_provider_before_prepare=current.selectedProvider,
             )
 
-    def commit(self, settings: _StoredAnalysisSettings) -> _StoredAnalysisSettings:
+    def commit(self, prepared: _PreparedAnalysisSettings) -> _StoredAnalysisSettings:
         with self._lock:
             current = self._read()
             current_by_provider = {item.provider: item for item in current.providers}
-            prepared_by_provider = {item.provider: item for item in settings.providers}
-            merged_providers = []
-            for provider in sorted(set(current_by_provider) | set(prepared_by_provider)):
-                prepared = prepared_by_provider.get(provider)
-                current_setting = current_by_provider.get(provider)
-                if prepared is None:
-                    merged_providers.append(current_setting)
-                elif (
-                    current_setting is not None
-                    and current_setting.model == prepared.model
-                    and current_setting.baseUrl == prepared.baseUrl
-                    and current_setting.configurationRevision == prepared.configurationRevision
-                    and current_setting.catalogVersion == prepared.catalogVersion
-                ):
-                    merged_providers.append(_StoredProviderConfiguration.model_validate({
-                        **prepared.model_dump(),
-                        "verificationState": current_setting.verificationState,
-                        "verifiedAt": current_setting.verifiedAt,
-                        "failedAt": current_setting.failedAt,
-                        "errorCode": current_setting.errorCode,
-                    }))
+            candidate_by_provider = {item.provider: item for item in prepared.settings.providers}
+            candidate = candidate_by_provider[prepared.target_provider]
+            current_target = current_by_provider.get(prepared.target_provider)
+            if self._same_configuration_identity(current_target, prepared.target_before_prepare):
+                if self._same_configuration_identity(current_target, candidate):
+                    committed_target = _StoredProviderConfiguration.model_validate({
+                        **candidate.model_dump(),
+                        "verificationState": current_target.verificationState,
+                        "verifiedAt": current_target.verifiedAt,
+                        "failedAt": current_target.failedAt,
+                        "errorCode": current_target.errorCode,
+                    })
                 else:
-                    merged_providers.append(prepared)
+                    committed_target = candidate
+            else:
+                committed_target = current_target
+            merged_by_provider = {
+                **current_by_provider,
+                prepared.target_provider: committed_target,
+            }
             committed = _StoredAnalysisSettings.model_validate({
-                "providers": merged_providers,
-                "selectedProvider": settings.selectedProvider,
+                "providers": [merged_by_provider[item] for item in sorted(merged_by_provider)],
+                "selectedProvider": (
+                    prepared.settings.selectedProvider
+                    if current.selectedProvider == prepared.selected_provider_before_prepare
+                    else current.selectedProvider
+                ),
             })
             self._write(committed)
             return committed
+
+    @staticmethod
+    def _same_configuration_identity(
+        left: Optional[_StoredProviderConfiguration],
+        right: Optional[_StoredProviderConfiguration],
+    ) -> bool:
+        if left is None or right is None:
+            return left is right
+        return (
+            left.model == right.model
+            and left.baseUrl == right.baseUrl
+            and left.configurationRevision == right.configurationRevision
+            and left.catalogVersion == right.catalogVersion
+        )
 
     def record_verification(
         self,
