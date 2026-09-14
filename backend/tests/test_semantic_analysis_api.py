@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from io import BytesIO
 import json
+import threading
 
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -467,6 +468,80 @@ def test_connection_test_uses_configured_provider_without_reading_project_media(
     assert response.json()["status"] == "connected"
     assert response.json()["verificationState"] == "available"
     assert calls == ["qwen3.7-flash"]
+
+
+def test_connection_test_rejects_a_late_result_after_configuration_changes(tmp_path):
+    started = threading.Event()
+    release = threading.Event()
+    settings = AnalysisSettings(tmp_path / "analysis-providers.json")
+
+    class BlockingProvider:
+        def test_connection(self, model):
+            started.set()
+            assert release.wait(timeout=2)
+
+    app = create_app(
+        data_dir=tmp_path,
+        credential_store=InMemoryCredentials(),
+        analysis_settings=settings,
+        provider_registry=lambda **_: BlockingProvider(),
+    )
+    client = TestClient(app)
+    assert client.put("/api/analysis-providers/bailian/configuration", json={
+        "model": "qwen3.7-flash",
+    }).status_code == 200
+    responses = []
+
+    def test_connection():
+        with TestClient(app) as thread_client:
+            responses.append(thread_client.post(
+                "/api/analysis-providers/bailian/test-connection",
+                content="{}", headers=_sensitive_headers(),
+            ))
+
+    thread = threading.Thread(target=test_connection)
+    thread.start()
+    assert started.wait(timeout=2)
+    changed = client.put("/api/analysis-providers/bailian/configuration", json={
+        "model": "qwen3.7-flash", "apiKey": "new-test-key",
+    })
+    release.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert changed.status_code == 200
+    assert responses[0].status_code == 409
+    assert responses[0].json()["detail"]["code"] == "analysis_provider_configuration_changed"
+    assert responses[0].json().get("status") != "connected"
+
+
+def test_connection_test_does_not_report_connected_when_verification_write_fails(tmp_path):
+    class WriteFailingSettings(AnalysisSettings):
+        def record_verification(self, **_):
+            raise OSError("disk unavailable")
+
+    class ProbeProvider:
+        def test_connection(self, model):
+            return None
+
+    client = TestClient(create_app(
+        data_dir=tmp_path,
+        credential_store=InMemoryCredentials(),
+        analysis_settings=WriteFailingSettings(tmp_path / "analysis-providers.json"),
+        provider_registry=lambda **_: ProbeProvider(),
+    ))
+    assert client.put("/api/analysis-providers/bailian/configuration", json={
+        "model": "qwen3.7-flash",
+    }).status_code == 200
+
+    response = client.post(
+        "/api/analysis-providers/bailian/test-connection",
+        content="{}", headers=_sensitive_headers(),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "analysis_settings_unavailable"
+    assert response.json().get("status") != "connected"
 
 
 def test_queued_analysis_runs_once_and_persists_a_completed_result(tmp_path):

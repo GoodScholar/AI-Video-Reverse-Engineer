@@ -50,10 +50,11 @@ function messageFor(error: unknown, fallback: string) {
 
 function providerLabel(provider: AnalysisProviderConfiguration | string) {
   if (typeof provider !== "string") return provider.label ?? provider.provider;
-  return {
-    bailian: "阿里云百炼", local_openai_compatible: "本地 OpenAI 兼容服务", openai: "OpenAI",
-    doubao: "火山方舟豆包", gemini: "Google Gemini", grok: "xAI Grok", claude: "Anthropic Claude",
-  }[provider] ?? provider;
+  return provider;
+}
+
+function taskProviderLabel(provider: string, configured: AnalysisProviderConfiguration | null) {
+  return configured?.provider === provider ? providerLabel(configured) : provider;
 }
 
 function taskTitle(task: SemanticAnalysis) {
@@ -263,7 +264,7 @@ export function SemanticAnalysisPanel({
     {task?.status === "failed" && isDesktop && !disclosure && <button ref={retryButtonRef} className="secondary-action semantic-analysis-retry" type="button" disabled={!canStart} onClick={() => openDisclosure("retry")}><RotateCcw aria-hidden="true" size={17} />只重试语义分析</button>}
     {disclosure && disclosureIsCurrent && provider && <Disclosure identity={disclosure} provider={provider} headingRef={disclosureHeadingRef} isSubmitting={isSubmitting} onCancel={cancelDisclosure} onConfirm={() => void confirm()} />}
     {disclosure && !disclosureIsCurrent && <p className="semantic-analysis-error" role="alert">参考素材或本地预处理已变化，请重新确认发送内容。</p>}
-    {task && <div className={`semantic-analysis-task semantic-analysis-task--${task.status}`} role="status" aria-live="polite" aria-label={taskTitle(task)}><div><h3>{taskTitle(task)}</h3><p>{providerLabel(task.provider)} · {task.model}</p></div>{task.status === "completed" ? <Check aria-hidden="true" size={20} /> : task.status === "failed" ? <CircleAlert aria-hidden="true" size={20} /> : task.status === "running" ? <LoaderCircle aria-hidden="true" size={20} /> : <Clock3 aria-hidden="true" size={20} />}</div>}
+    {task && <div className={`semantic-analysis-task semantic-analysis-task--${task.status}`} role="status" aria-live="polite" aria-label={taskTitle(task)}><div><h3>{taskTitle(task)}</h3><p>{taskProviderLabel(task.provider, provider)} · {task.model}</p></div>{task.status === "completed" ? <Check aria-hidden="true" size={20} /> : task.status === "failed" ? <CircleAlert aria-hidden="true" size={20} /> : task.status === "running" ? <LoaderCircle aria-hidden="true" size={20} /> : <Clock3 aria-hidden="true" size={20} />}</div>}
     {task?.status === "failed" && task.error && <p className="semantic-analysis-error" role="alert"><CircleAlert aria-hidden="true" size={17} />{task.error.message}</p>}
     {submitError && <p className="semantic-analysis-error" role="alert"><CircleAlert aria-hidden="true" size={17} />{submitError}</p>}
     {refreshError && canPoll && <p className="semantic-analysis-refresh-error">暂时无法刷新状态：{refreshError} <RefreshCw aria-hidden="true" size={15} /></p>}

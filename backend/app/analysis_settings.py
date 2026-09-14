@@ -2,15 +2,30 @@ import json
 import os
 import tempfile
 from pathlib import Path
+from threading import RLock
 from typing import Literal, Optional
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from .credential_store import ANALYSIS_PROVIDER_IDS
 from .provider_models import CATALOG_VERSION, ProviderId
-from uuid import uuid4
+
+
+# These are the stable, user-safe codes emitted by ProviderFailure.  Keep the
+# persisted setting vocabulary deliberately narrower than arbitrary provider text.
+_VERIFICATION_ERROR_CODES = frozenset({
+    "provider_unconfigured",
+    "authentication_failed",
+    "rate_limited",
+    "network_error",
+    "timeout",
+    "unsupported_model_capability",
+    "provider_error",
+    "invalid_analysis_response",
+})
 
 
 class _StrictModel(BaseModel):
@@ -46,12 +61,24 @@ class _StoredProviderConfiguration(_StrictModel):
     provider: ProviderId
     model: str = Field(min_length=1)
     baseUrl: Optional[str] = None
-    configurationRevision: str = Field(default_factory=lambda: str(uuid4()), min_length=1)
-    catalogVersion: str = Field(default=CATALOG_VERSION, min_length=1)
+    configurationRevision: str = Field(min_length=1)
+    catalogVersion: str = Field(min_length=1)
     verificationState: Literal["unverified", "available", "failed"] = "unverified"
     verifiedAt: Optional[str] = None
     failedAt: Optional[str] = None
     errorCode: Optional[str] = None
+
+    @model_validator(mode="after")
+    def verification_fields_are_consistent(self):
+        if self.verificationState == "unverified":
+            if any((self.verifiedAt, self.failedAt, self.errorCode)):
+                raise ValueError("未验证配置不能包含验证结果。")
+        elif self.verificationState == "available":
+            if not self.verifiedAt or self.failedAt is not None or self.errorCode is not None:
+                raise ValueError("可用配置的验证结果无效。")
+        elif not self.failedAt or self.verifiedAt is not None or self.errorCode not in _VERIFICATION_ERROR_CODES:
+            raise ValueError("失败配置的验证结果无效。")
+        return self
 
     @field_validator("model")
     @classmethod
@@ -116,16 +143,20 @@ class AnalysisSettings:
 
     def __init__(self, path: Path):
         self._path = path
+        self._lock = RLock()
 
     def get(self, provider: str) -> Optional[_StoredProviderConfiguration]:
-        self._validate_provider(provider)
-        return next((item for item in self._read().providers if item.provider == provider), None)
+        with self._lock:
+            self._validate_provider(provider)
+            return next((item for item in self._read().providers if item.provider == provider), None)
 
     def selected_provider(self) -> Optional[str]:
-        return self._read().selectedProvider
+        with self._lock:
+            return self._read().selectedProvider
 
     def providers(self) -> list[_StoredProviderConfiguration]:
-        return list(self._read().providers)
+        with self._lock:
+            return list(self._read().providers)
 
     def save(
         self,
@@ -135,14 +166,15 @@ class AnalysisSettings:
         base_url: Optional[str],
         selected_provider: Optional[str],
     ) -> _StoredProviderConfiguration:
-        candidate, prepared_settings = self.prepare_save(
-            provider=provider,
-            model=model,
-            base_url=base_url,
-            selected_provider=selected_provider,
-        )
-        self.commit(prepared_settings)
-        return candidate
+        with self._lock:
+            candidate, prepared_settings = self.prepare_save(
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                selected_provider=selected_provider,
+            )
+            committed = self.commit(prepared_settings)
+            return next(item for item in committed.providers if item.provider == candidate.provider)
 
     def prepare_save(
         self,
@@ -153,39 +185,71 @@ class AnalysisSettings:
         selected_provider: Optional[str],
         credential_changed: bool = False,
     ) -> tuple[_StoredProviderConfiguration, _StoredAnalysisSettings]:
-        self._validate_provider(provider)
-        self._validate_provider(selected_provider)
-        if provider == "local_openai_compatible" and base_url is None:
-            raise ValueError("本地分析服务地址必须使用回环主机。")
-        current = self._read()
-        by_provider = {item.provider: item for item in current.providers}
-        previous = by_provider.get(provider)
-        unchanged = (
-            previous is not None
-            and previous.model == model
-            and previous.baseUrl == base_url
-            and previous.catalogVersion == CATALOG_VERSION
-            and not credential_changed
-        )
-        candidate = _StoredProviderConfiguration(
-            provider=provider,
-            model=model,
-            baseUrl=base_url,
-            configurationRevision=previous.configurationRevision if unchanged else str(uuid4()),
-            catalogVersion=CATALOG_VERSION,
-            verificationState=previous.verificationState if unchanged else "unverified",
-            verifiedAt=previous.verifiedAt if unchanged else None,
-            failedAt=previous.failedAt if unchanged else None,
-            errorCode=previous.errorCode if unchanged else None,
-        )
-        by_provider[provider] = candidate
-        return candidate, _StoredAnalysisSettings(
-            providers=[by_provider[item] for item in sorted(by_provider)],
-            selectedProvider=selected_provider,
-        )
+        with self._lock:
+            self._validate_provider(provider)
+            self._validate_provider(selected_provider)
+            if provider == "local_openai_compatible" and base_url is None:
+                raise ValueError("本地分析服务地址必须使用回环主机。")
+            current = self._read()
+            by_provider = {item.provider: item for item in current.providers}
+            previous = by_provider.get(provider)
+            unchanged = (
+                previous is not None
+                and previous.model == model
+                and previous.baseUrl == base_url
+                and previous.catalogVersion == CATALOG_VERSION
+                and not credential_changed
+            )
+            candidate = _StoredProviderConfiguration(
+                provider=provider,
+                model=model,
+                baseUrl=base_url,
+                configurationRevision=previous.configurationRevision if unchanged else str(uuid4()),
+                catalogVersion=CATALOG_VERSION,
+                verificationState=previous.verificationState if unchanged else "unverified",
+                verifiedAt=previous.verifiedAt if unchanged else None,
+                failedAt=previous.failedAt if unchanged else None,
+                errorCode=previous.errorCode if unchanged else None,
+            )
+            by_provider[provider] = candidate
+            return candidate, _StoredAnalysisSettings(
+                providers=[by_provider[item] for item in sorted(by_provider)],
+                selectedProvider=selected_provider,
+            )
 
-    def commit(self, settings: _StoredAnalysisSettings) -> None:
-        self._write(settings)
+    def commit(self, settings: _StoredAnalysisSettings) -> _StoredAnalysisSettings:
+        with self._lock:
+            current = self._read()
+            current_by_provider = {item.provider: item for item in current.providers}
+            prepared_by_provider = {item.provider: item for item in settings.providers}
+            merged_providers = []
+            for provider in sorted(set(current_by_provider) | set(prepared_by_provider)):
+                prepared = prepared_by_provider.get(provider)
+                current_setting = current_by_provider.get(provider)
+                if prepared is None:
+                    merged_providers.append(current_setting)
+                elif (
+                    current_setting is not None
+                    and current_setting.model == prepared.model
+                    and current_setting.baseUrl == prepared.baseUrl
+                    and current_setting.configurationRevision == prepared.configurationRevision
+                    and current_setting.catalogVersion == prepared.catalogVersion
+                ):
+                    merged_providers.append(_StoredProviderConfiguration.model_validate({
+                        **prepared.model_dump(),
+                        "verificationState": current_setting.verificationState,
+                        "verifiedAt": current_setting.verifiedAt,
+                        "failedAt": current_setting.failedAt,
+                        "errorCode": current_setting.errorCode,
+                    }))
+                else:
+                    merged_providers.append(prepared)
+            committed = _StoredAnalysisSettings.model_validate({
+                "providers": merged_providers,
+                "selectedProvider": settings.selectedProvider,
+            })
+            self._write(committed)
+            return committed
 
     def record_verification(
         self,
@@ -197,27 +261,30 @@ class AnalysisSettings:
         now: str,
         error_code: Optional[str] = None,
     ) -> bool:
-        self._validate_provider(provider)
-        current = self._read()
-        by_provider = {item.provider: item for item in current.providers}
-        setting = by_provider.get(provider)
-        if (
-            setting is None
-            or setting.configurationRevision != configuration_revision
-            or setting.catalogVersion != catalog_version
-        ):
-            return False
-        by_provider[provider] = setting.model_copy(update={
-            "verificationState": state,
-            "verifiedAt": now if state == "available" else None,
-            "failedAt": now if state == "failed" else None,
-            "errorCode": None if state == "available" else error_code,
-        })
-        self._write(_StoredAnalysisSettings(
-            providers=[by_provider[item] for item in sorted(by_provider)],
-            selectedProvider=current.selectedProvider,
-        ))
-        return True
+        with self._lock:
+            self._validate_provider(provider)
+            current = self._read()
+            by_provider = {item.provider: item for item in current.providers}
+            setting = by_provider.get(provider)
+            if (
+                setting is None
+                or setting.configurationRevision != configuration_revision
+                or setting.catalogVersion != catalog_version
+            ):
+                return False
+            by_provider[provider] = _StoredProviderConfiguration.model_validate({
+                **setting.model_dump(),
+                "verificationState": state,
+                "verifiedAt": now if state == "available" else None,
+                "failedAt": now if state == "failed" else None,
+                "errorCode": None if state == "available" else error_code,
+            })
+            updated_settings = _StoredAnalysisSettings.model_validate({
+                "providers": [by_provider[item] for item in sorted(by_provider)],
+                "selectedProvider": current.selectedProvider,
+            })
+            self._write(updated_settings)
+            return True
 
     @staticmethod
     def _validate_provider(provider: Optional[str]) -> None:
@@ -225,45 +292,70 @@ class AnalysisSettings:
             raise ValueError("不支持的分析供应商。")
 
     def _read(self) -> _StoredAnalysisSettings:
-        if not self._path.exists():
-            return _StoredAnalysisSettings()
-        try:
-            raw = json.loads(self._path.read_text(encoding="utf-8"))
-            settings = _StoredAnalysisSettings.model_validate(raw)
-            migrated = [
-                item.model_copy(update={
-                    "configurationRevision": str(uuid4()),
-                    "catalogVersion": CATALOG_VERSION,
-                    "verificationState": "unverified",
-                    "verifiedAt": None,
-                    "failedAt": None,
-                    "errorCode": None,
-                }) if item.catalogVersion != CATALOG_VERSION else item
-                for item in settings.providers
-            ]
-            return settings if migrated == settings.providers else settings.model_copy(update={"providers": migrated})
-        except (json.JSONDecodeError, UnicodeDecodeError, ValidationError, ValueError) as error:
-            raise ValueError("分析供应商设置无效。") from error
+        with self._lock:
+            if not self._path.exists():
+                return _StoredAnalysisSettings()
+            try:
+                raw = json.loads(self._path.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    raise ValueError("分析供应商设置无效。")
+                raw_providers = raw.get("providers")
+                current_fields = frozenset({
+                    "configurationRevision", "catalogVersion", "verificationState",
+                    "verifiedAt", "failedAt", "errorCode",
+                })
+                needs_migration = not isinstance(raw_providers, list) or any(
+                    not isinstance(item, dict)
+                    or not current_fields <= item.keys()
+                    or item.get("catalogVersion") != CATALOG_VERSION
+                    for item in raw_providers
+                )
+                # Older files never had verification metadata.  Normalize them
+                # before strict validation, then persist that single migration.
+                if needs_migration and isinstance(raw_providers, list):
+                    raw = {
+                        **raw,
+                        "providers": [
+                            {
+                                **item,
+                                "configurationRevision": str(uuid4()),
+                                "catalogVersion": CATALOG_VERSION,
+                                "verificationState": "unverified",
+                                "verifiedAt": None,
+                                "failedAt": None,
+                                "errorCode": None,
+                            }
+                            if isinstance(item, dict) else item
+                            for item in raw_providers
+                        ],
+                    }
+                settings = _StoredAnalysisSettings.model_validate(raw)
+                if needs_migration:
+                    self._write(settings)
+                return settings
+            except (json.JSONDecodeError, UnicodeDecodeError, ValidationError, ValueError) as error:
+                raise ValueError("分析供应商设置无效。") from error
 
     def _write(self, settings: _StoredAnalysisSettings) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_path = tempfile.mkstemp(
-            dir=self._path.parent,
-            prefix=".analysis-providers-",
-            suffix=".tmp",
-            text=True,
-        )
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as file:
-                json.dump(
-                    settings.model_dump(exclude_none=True),
-                    file,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                file.flush()
-                os.fsync(file.fileno())
-            os.replace(temporary_path, self._path)
-        except OSError:
-            Path(temporary_path).unlink(missing_ok=True)
-            raise
+        with self._lock:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_path = tempfile.mkstemp(
+                dir=self._path.parent,
+                prefix=".analysis-providers-",
+                suffix=".tmp",
+                text=True,
+            )
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+                    json.dump(
+                        settings.model_dump(),
+                        file,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    file.flush()
+                    os.fsync(file.fileno())
+                os.replace(temporary_path, self._path)
+            except OSError:
+                Path(temporary_path).unlink(missing_ok=True)
+                raise

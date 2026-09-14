@@ -7,13 +7,13 @@ import { AnalysisProviderSettings } from "./AnalysisProviderSettings";
 import type { AnalysisProviderConfiguration } from "./models";
 
 const providers: AnalysisProviderConfiguration[] = [
-  { provider: "bailian" as const, model: "qwen3.7-flash", baseUrl: null, credentialState: "configured" as const, selectedProvider: "bailian" as const },
-  { provider: "local_openai_compatible" as const, model: "vision-local", baseUrl: "http://127.0.0.1:8080", credentialState: "unconfigured" as const, selectedProvider: "bailian" as const },
+  { provider: "bailian" as const, label: "阿里云百炼", models: [{ id: "qwen3.7-flash", label: "Qwen 3.7 Flash" }], model: "qwen3.7-flash", baseUrl: null, credentialState: "configured" as const, selectedProvider: "bailian" as const },
+  { provider: "local_openai_compatible" as const, label: "本地 OpenAI 兼容服务", models: [], model: "vision-local", baseUrl: "http://127.0.0.1:8080", credentialState: "unconfigured" as const, selectedProvider: "bailian" as const },
 ];
 
 const providersWithUnimplementedCloud = [
   ...providers,
-  { provider: "openai" as const, model: null, baseUrl: null, credentialState: "unconfigured" as const, selectedProvider: "openai" as const },
+  { provider: "openai" as const, label: "OpenAI", models: [{ id: "gpt-5.6-luna", label: "GPT-5.6 Luna" }], model: "gpt-5.6-luna", baseUrl: null, credentialState: "unconfigured" as const, selectedProvider: "openai" as const },
 ];
 
 it("保存密钥后立即清空密码输入且只显示配置状态", async () => {
@@ -43,6 +43,23 @@ it("在连接测试前后都说明固定探针不会上传项目素材", async (
   await user.click(screen.getByRole("button", { name: "测试连接" }));
   expect(screen.getByText("连接测试只发送固定探针，不上传项目素材。")).toBeVisible();
   expect(screen.getByRole("alert")).toHaveTextContent("服务未响应");
+});
+
+it("连接测试失败后刷新配置并保留原始失败信息", async () => {
+  vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  const user = userEvent.setup();
+  const load = vi.fn().mockResolvedValue([{ ...providers[0], verificationState: "failed" as const, failedAt: "2026-09-13T00:00:00+00:00", errorCode: "timeout" }]);
+  function SettingsHarness() {
+    const [currentProviders, setCurrentProviders] = useState(providers);
+    return <AnalysisProviderSettings providers={currentProviders} onProvidersChanged={setCurrentProviders} save={vi.fn()} testConnection={vi.fn().mockRejectedValue(new Error("连接超时"))} load={load} />;
+  }
+  render(<SettingsHarness />);
+
+  await user.click(screen.getByRole("button", { name: "测试连接" }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("连接超时");
+  expect(load).toHaveBeenCalledOnce();
+  expect(screen.getByRole("button", { name: /验证失败/ })).toBeVisible();
 });
 
 it("保存无密钥的本地兼容服务后标为已配置且已选择", async () => {
@@ -83,4 +100,46 @@ it("展示目录中的云端供应商，并将尚未验证与已配置分开说�
   expect(openai).toBeVisible();
   expect(within(openai).getByText(/未验证/)).toBeVisible();
   expect(screen.queryByText("可用")).not.toBeInTheDocument();
+});
+
+it("API 未提供供应商标签时回退显示供应商 id", () => {
+  vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  render(<AnalysisProviderSettings providers={[{ ...providers[0], label: undefined }]} save={vi.fn()} testConnection={vi.fn()} />);
+
+  expect(screen.getAllByRole("button", { name: /bailian/ })[0]).toHaveAttribute("aria-pressed", "true");
+  expect(screen.getByRole("heading", { name: "bailian" })).toBeVisible();
+});
+
+it("云端模型下拉提交用户选择的目录模型", async () => {
+  vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  const user = userEvent.setup();
+  const cloud = {
+    provider: "openai" as const, label: "OpenAI", credentialState: "configured" as const,
+    selectedProvider: "openai" as const, model: "gpt-5.6-luna", baseUrl: null,
+    models: [{ id: "gpt-5.6-luna", label: "GPT-5.6 Luna" }, { id: "gpt-5.6-terra", label: "GPT-5.6 Terra" }],
+  };
+  const save = vi.fn().mockResolvedValue(cloud);
+  render(<AnalysisProviderSettings providers={[cloud]} save={save} testConnection={vi.fn()} />);
+
+  await user.selectOptions(screen.getByLabelText("内置模型"), "gpt-5.6-terra");
+  await user.click(screen.getByRole("button", { name: "保存OpenAI配置" }));
+
+  expect(save).toHaveBeenCalledWith("openai", { model: "gpt-5.6-terra" });
+});
+
+it("已配置的云端 Key 可空输入保存且不提交 apiKey", async () => {
+  vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  const user = userEvent.setup();
+  const cloud = {
+    provider: "openai" as const, label: "OpenAI", credentialState: "configured" as const,
+    selectedProvider: "openai" as const, model: "gpt-5.6-luna", baseUrl: null,
+    models: [{ id: "gpt-5.6-luna", label: "GPT-5.6 Luna" }],
+  };
+  const save = vi.fn().mockResolvedValue(cloud);
+  render(<AnalysisProviderSettings providers={[cloud]} save={save} testConnection={vi.fn()} />);
+
+  expect(screen.getByLabelText("OpenAI API Key")).not.toBeRequired();
+  await user.click(screen.getByRole("button", { name: "保存OpenAI配置" }));
+
+  expect(save).toHaveBeenCalledWith("openai", { model: "gpt-5.6-luna" });
 });

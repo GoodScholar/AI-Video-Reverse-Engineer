@@ -31,16 +31,27 @@ it("将完成结果分为可观察事实和生成建议，并在首次开始时�
   vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
   const user = userEvent.setup();
   const startAnalysis = vi.fn();
-  render(<SemanticAnalysisPanel project={project()} provider={{ provider: "bailian", model: "qwen3.7-flash", baseUrl: null, credentialState: "configured", selectedProvider: "bailian" }} onProjectUpdated={vi.fn()} start={startAnalysis} />);
+  render(<SemanticAnalysisPanel project={project()} provider={{ provider: "bailian", label: "百炼目录标签", model: "qwen3.7-flash", baseUrl: null, credentialState: "configured", selectedProvider: "bailian" }} onProjectUpdated={vi.fn()} start={startAnalysis} />);
 
   expect(screen.getByRole("heading", { name: "可观察事实" })).toBeInTheDocument();
   expect(screen.getByRole("heading", { name: "生成建议" })).toBeInTheDocument();
+  expect(screen.getByText("百炼目录标签 · qwen3.7-flash")).toBeVisible();
   expect(screen.getByText("建议时长")).toBeVisible();
   expect(screen.getByText("音频建议")).toBeVisible();
   await user.click(screen.getByRole("button", { name: "开始语义分析" }));
 
   expect(screen.getByText(/不会发送原始素材/)).toBeInTheDocument();
   expect(startAnalysis).not.toHaveBeenCalled();
+});
+
+it("API 未提供供应商标签时仅回退到供应商 id", async () => {
+  vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  const user = userEvent.setup();
+  render(<SemanticAnalysisPanel project={{ ...project(), semanticAnalysis: null }} provider={{ provider: "bailian", model: "qwen3.7-flash", baseUrl: null, credentialState: "configured", selectedProvider: "bailian" }} onProjectUpdated={vi.fn()} />);
+
+  await user.click(screen.getByRole("button", { name: "开始语义分析" }));
+
+  expect(screen.getByText("将使用 bailian 的 qwen3.7-flash 进行本次语义分析。")).toBeVisible();
 });
 
 it("取消披露后把焦点交还给开始按钮", async () => {

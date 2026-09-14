@@ -1,4 +1,5 @@
 import json
+import threading
 
 import httpx
 import pytest
@@ -191,6 +192,70 @@ def test_configuration_response_never_returns_or_persists_secret(tmp_path):
     assert body["verificationState"] == "unverified"
     assert "secret-value" not in settings_path.read_text(encoding="utf-8")
     assert credentials.values == {"bailian": "secret-value"}
+
+
+def test_configuration_response_uses_the_verification_state_merged_during_commit(tmp_path):
+    settings = AnalysisSettings(tmp_path / "analysis-providers.json")
+    initial = settings.save(
+        provider="openai", model="gpt-5.6-luna", base_url=None, selected_provider="openai",
+    )
+    assert settings.record_verification(
+        provider="openai", configuration_revision=initial.configurationRevision,
+        catalog_version=initial.catalogVersion, state="available", now="2026-09-13T00:00:00+00:00",
+    )
+
+    class InterleavingCredentials(InMemoryCredentials):
+        def __init__(self):
+            super().__init__()
+            self.values["openai"] = "stored-secret"
+            self.reads = 0
+
+        def get(self, provider):
+            self.reads += 1
+            assert settings.record_verification(
+                provider="openai", configuration_revision=initial.configurationRevision,
+                catalog_version=initial.catalogVersion, state="failed", error_code="timeout",
+                now="2026-09-13T00:01:00+00:00",
+            )
+            return super().get(provider)
+
+    credentials = InterleavingCredentials()
+    client = TestClient(create_app(
+        data_dir=tmp_path,
+        credential_store=credentials,
+        analysis_settings=settings,
+    ))
+
+    response = client.put("/api/analysis-providers/openai/configuration", json={
+        "model": "gpt-5.6-luna",
+    })
+
+    assert response.status_code == 200
+    assert response.json()["verificationState"] == "failed"
+    assert response.json()["failedAt"] == "2026-09-13T00:01:00+00:00"
+    assert response.json()["errorCode"] == "timeout"
+    assert settings.get("openai").verificationState == "failed"
+    assert credentials.reads == 1
+
+
+def test_cloud_configuration_reuses_a_stored_api_key_when_resaved_without_one(tmp_path):
+    credentials = InMemoryCredentials()
+    client = TestClient(create_app(
+        data_dir=tmp_path,
+        credential_store=credentials,
+        analysis_settings=AnalysisSettings(tmp_path / "analysis-providers.json"),
+    ))
+    assert client.put("/api/analysis-providers/openai/configuration", json={
+        "apiKey": "stored-secret", "model": "gpt-5.6-luna",
+    }).status_code == 200
+
+    response = client.put("/api/analysis-providers/openai/configuration", json={
+        "model": "gpt-5.6-luna",
+    })
+
+    assert response.status_code == 200
+    assert response.json()["credentialState"] == "configured"
+    assert credentials.values["openai"] == "stored-secret"
 
 
 def test_configuration_api_lists_catalog_providers_and_rejects_unknown_cloud_model(tmp_path):
@@ -450,6 +515,51 @@ def test_late_connection_result_cannot_overwrite_newer_configuration(tmp_path):
     assert current.verificationState == "unverified"
 
 
+def test_commit_preserves_a_verification_written_after_prepare_save(tmp_path):
+    settings = AnalysisSettings(tmp_path / "analysis-providers.json")
+    saved = settings.save(
+        provider="openai", model="gpt-5.6-luna", base_url=None, selected_provider="openai",
+    )
+    assert settings.record_verification(
+        provider="openai", configuration_revision=saved.configurationRevision,
+        catalog_version=saved.catalogVersion, state="available", now="2026-09-13T00:00:00+00:00",
+    )
+    _, prepared = settings.prepare_save(
+        provider="openai", model="gpt-5.6-luna", base_url=None, selected_provider="openai",
+    )
+    assert settings.record_verification(
+        provider="openai", configuration_revision=saved.configurationRevision,
+        catalog_version=saved.catalogVersion, state="failed", error_code="timeout",
+        now="2026-09-13T00:01:00+00:00",
+    )
+
+    settings.commit(prepared)
+
+    persisted = settings.get("openai")
+    assert persisted.verificationState == "failed"
+    assert persisted.failedAt == "2026-09-13T00:01:00+00:00"
+    assert persisted.errorCode == "timeout"
+
+
+def test_record_verification_rejects_nonstandard_error_code_before_persisting(tmp_path):
+    settings = AnalysisSettings(tmp_path / "analysis-providers.json")
+    saved = settings.save(
+        provider="local_openai_compatible", model="vision-local", base_url="http://127.0.0.1:8080",
+        selected_provider="local_openai_compatible",
+    )
+
+    with pytest.raises(ValueError, match="失败配置的验证结果无效"):
+        settings.record_verification(
+            provider="local_openai_compatible", configuration_revision=saved.configurationRevision,
+            catalog_version=saved.catalogVersion, state="failed", error_code="supplier_raw_error",
+            now="2026-09-13T00:00:00+00:00",
+        )
+
+    persisted = settings.get("local_openai_compatible")
+    assert persisted.verificationState == "unverified"
+    assert persisted.errorCode is None
+
+
 def test_catalog_version_change_invalidates_a_previously_available_configuration(tmp_path):
     path = tmp_path / "analysis-providers.json"
     path.write_text(json.dumps({
@@ -466,6 +576,94 @@ def test_catalog_version_change_invalidates_a_previously_available_configuration
     assert migrated.configurationRevision != "old-revision"
     assert migrated.verificationState == "unverified"
     assert migrated.verifiedAt is None
+
+
+def test_catalog_migration_is_persisted_once_and_can_be_verified_afterward(tmp_path):
+    path = tmp_path / "analysis-providers.json"
+    path.write_text(json.dumps({
+        "providers": [{
+            "provider": "openai", "model": "gpt-5.6-luna", "configurationRevision": "old-revision",
+            "catalogVersion": "old-catalog", "verificationState": "available", "verifiedAt": "2026-09-12T00:00:00+00:00",
+        }], "selectedProvider": "openai",
+    }), encoding="utf-8")
+    settings = AnalysisSettings(path)
+
+    migrated = settings.get("openai")
+    again = settings.get("openai")
+
+    assert again.configurationRevision == migrated.configurationRevision
+    assert json.loads(path.read_text(encoding="utf-8"))["providers"][0]["configurationRevision"] == migrated.configurationRevision
+    assert settings.record_verification(
+        provider="openai", configuration_revision=migrated.configurationRevision,
+        catalog_version=migrated.catalogVersion, state="available", now="2026-09-13T00:00:00+00:00",
+    )
+
+
+def test_legacy_raw_configuration_without_revision_or_catalog_is_migrated_once(tmp_path):
+    path = tmp_path / "analysis-providers.json"
+    path.write_text(json.dumps({
+        "providers": [{"provider": "openai", "model": "gpt-5.6-luna"}],
+        "selectedProvider": "openai",
+    }), encoding="utf-8")
+    settings = AnalysisSettings(path)
+
+    first = settings.get("openai")
+    second = settings.get("openai")
+    persisted = json.loads(path.read_text(encoding="utf-8"))["providers"][0]
+
+    assert first.configurationRevision
+    assert first.catalogVersion
+    assert second.configurationRevision == first.configurationRevision
+    assert second.catalogVersion == first.catalogVersion
+    assert persisted["configurationRevision"] == first.configurationRevision
+    assert persisted["catalogVersion"] == first.catalogVersion
+
+
+def test_concurrent_old_verification_cannot_overwrite_a_newer_configuration(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class PausingSettings(AnalysisSettings):
+        def _read(self):
+            value = super()._read()
+            if threading.current_thread().name == "verification":
+                entered.set()
+                assert release.wait(timeout=2)
+            return value
+
+    settings = PausingSettings(tmp_path / "analysis-providers.json")
+    old = settings.save(
+        provider="local_openai_compatible", model="old", base_url="http://127.0.0.1:8080",
+        selected_provider="local_openai_compatible",
+    )
+    result = []
+    verifier = threading.Thread(name="verification", target=lambda: result.append(settings.record_verification(
+        provider="local_openai_compatible", configuration_revision=old.configurationRevision,
+        catalog_version=old.catalogVersion, state="available", now="2026-09-13T00:00:00+00:00",
+    )))
+    verifier.start()
+    assert entered.wait(timeout=2)
+    writer_finished = threading.Event()
+
+    def save_newer_configuration():
+        settings.save(
+            provider="local_openai_compatible", model="new", base_url="http://127.0.0.1:8080",
+            selected_provider="local_openai_compatible",
+        )
+        writer_finished.set()
+
+    writer = threading.Thread(target=save_newer_configuration)
+    writer.start()
+    assert not writer_finished.wait(timeout=0.1)
+    release.set()
+    verifier.join(timeout=2)
+    writer.join(timeout=2)
+
+    current = settings.get("local_openai_compatible")
+    assert result == [True]
+    assert current.model == "new"
+    assert current.configurationRevision != old.configurationRevision
+    assert current.verificationState == "unverified"
 
 
 def test_default_credential_store_initialization_failure_is_reported_safely(tmp_path, monkeypatch):

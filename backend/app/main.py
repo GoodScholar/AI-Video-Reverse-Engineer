@@ -354,6 +354,20 @@ def create_app(
             configured = credentials().get(provider) is not None
         except SecureStorageUnavailable as error:
             raise secure_storage_unavailable() from error
+        return analysis_provider_configuration_snapshot(
+            provider=provider,
+            setting=setting,
+            credential_configured=configured,
+            selected_provider=configured_analysis_settings.selected_provider(),
+        )
+
+    def analysis_provider_configuration_snapshot(
+        *,
+        provider: str,
+        setting,
+        credential_configured: bool,
+        selected_provider: Optional[str],
+    ) -> AnalysisProviderConfiguration:
         catalog = provider_for(provider)
         return AnalysisProviderConfiguration(
             provider=provider,
@@ -361,8 +375,8 @@ def create_app(
             models=tuple(model.model_dump() for model in catalog.models),
             model=setting.model if setting is not None else None,
             baseUrl=setting.baseUrl if setting is not None else None,
-            credentialState="configured" if configured else "unconfigured",
-            selectedProvider=configured_analysis_settings.selected_provider(),
+            credentialState="configured" if credential_configured else "unconfigured",
+            selectedProvider=selected_provider,
             configurationRevision=setting.configurationRevision if setting is not None else None,
             catalogVersion=setting.catalogVersion if setting is not None else CATALOG_VERSION,
             verificationState=setting.verificationState if setting is not None else "unverified",
@@ -1533,7 +1547,8 @@ def create_app(
                 credential_store_for_update.set(provider, api_key)
                 credential_write_succeeded = True
                 credential_state = True
-            configured_analysis_settings.commit(prepared_settings)
+            committed_settings = configured_analysis_settings.commit(prepared_settings)
+            candidate = next(item for item in committed_settings.providers if item.provider == provider)
         except (OSError, SecureStorageUnavailable) as error:
             if credential_write_succeeded:
                 try:
@@ -1597,6 +1612,36 @@ def create_app(
         configured_provider = None
         configuration_revision = setting.configurationRevision
         catalog_version = setting.catalogVersion
+
+        def persist_verification(
+            *, state: Literal["available", "failed"], error_code: Optional[str] = None,
+        ) -> None:
+            try:
+                persisted = configured_analysis_settings.record_verification(
+                    provider=provider,
+                    configuration_revision=configuration_revision,
+                    catalog_version=catalog_version,
+                    state=state,
+                    error_code=error_code,
+                    now=now_utc().isoformat(),
+                )
+            except (OSError, ValueError) as error:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "analysis_settings_unavailable",
+                        "message": "分析供应商设置不可用。",
+                    },
+                ) from error
+            if not persisted:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "analysis_provider_configuration_changed",
+                        "message": "分析供应商配置已变化，请重新测试连接。",
+                    },
+                )
+
         try:
             configured_provider = analysis_provider_for(
                 provider=provider,
@@ -1606,33 +1651,13 @@ def create_app(
             )
             configured_provider.test_connection(setting.model)
         except ProviderAnalysisError as error:
-            try:
-                configured_analysis_settings.record_verification(
-                    provider=provider,
-                    configuration_revision=configuration_revision,
-                    catalog_version=catalog_version,
-                    state="failed",
-                    error_code=error.failure.code,
-                    now=now_utc().isoformat(),
-                )
-            except (OSError, ValueError):
-                logging.getLogger(__name__).warning("分析供应商验证状态无法保存：provider=%s", provider)
+            persist_verification(state="failed", error_code=error.failure.code)
             raise HTTPException(
                 status_code=502,
                 detail=error.failure.model_dump(),
             ) from None
         except Exception:
-            try:
-                configured_analysis_settings.record_verification(
-                    provider=provider,
-                    configuration_revision=configuration_revision,
-                    catalog_version=catalog_version,
-                    state="failed",
-                    error_code="provider_error",
-                    now=now_utc().isoformat(),
-                )
-            except (OSError, ValueError):
-                logging.getLogger(__name__).warning("分析供应商验证状态无法保存：provider=%s", provider)
+            persist_verification(state="failed", error_code="provider_error")
             raise HTTPException(
                 status_code=502,
                 detail=semantic_analysis_error(
@@ -1642,17 +1667,33 @@ def create_app(
         finally:
             if configured_provider is not None:
                 close_default_analysis_provider(configured_provider)
+        persist_verification(state="available")
         try:
-            configured_analysis_settings.record_verification(
-                provider=provider,
-                configuration_revision=configuration_revision,
-                catalog_version=catalog_version,
-                state="available",
-                now=now_utc().isoformat(),
+            verified = configured_analysis_settings.get(provider)
+            selected_provider = configured_analysis_settings.selected_provider()
+        except (OSError, ValueError) as error:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "analysis_settings_unavailable", "message": "分析供应商设置不可用。"},
+            ) from error
+        if (
+            verified is None
+            or verified.configurationRevision != configuration_revision
+            or verified.catalogVersion != catalog_version
+            or verified.verificationState != "available"
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "analysis_provider_configuration_changed", "message": "分析供应商配置已变化，请重新测试连接。"},
             )
-        except (OSError, ValueError):
-            logging.getLogger(__name__).warning("分析供应商验证状态无法保存：provider=%s", provider)
-        return analysis_provider_configuration(provider).model_dump() | {"status": "connected"}
+        return analysis_provider_configuration_snapshot(
+            provider=provider,
+            setting=verified,
+            credential_configured=credential is not None,
+            selected_provider=selected_provider,
+        ).model_dump() | {"status": "connected"}
 
     @app.post("/api/projects/{project_id}/semantic-analysis", response_model=None)
     def start_semantic_analysis(

@@ -4,21 +4,18 @@ import { Check, CircleAlert, PlugZap, Save } from "lucide-react";
 import type { AnalysisProviderConfiguration, AnalysisProviderId } from "./models";
 import {
   type AnalysisProviderConfigurationInput,
+  listAnalysisProviders,
   saveAnalysisProviderConfiguration,
   testAnalysisProviderConnection,
 } from "./analysisProviderApi";
 
 const DESKTOP_QUERY = "(min-width: 1024px)";
-const PROVIDER_LABELS: Record<AnalysisProviderId, string> = {
-  bailian: "阿里云百炼", local_openai_compatible: "本地 OpenAI 兼容服务", openai: "OpenAI",
-  doubao: "火山方舟豆包", gemini: "Google Gemini", grok: "xAI Grok", claude: "Anthropic Claude",
-};
-
 type Props = {
   providers: AnalysisProviderConfiguration[];
   onProvidersChanged?: (providers: AnalysisProviderConfiguration[]) => void;
   save?: typeof saveAnalysisProviderConfiguration;
   testConnection?: typeof testAnalysisProviderConnection;
+  load?: typeof listAnalysisProviders;
 };
 
 function useDesktop() {
@@ -39,7 +36,7 @@ function useDesktop() {
 }
 
 function providerLabel(provider: AnalysisProviderConfiguration) {
-  return provider.label ?? PROVIDER_LABELS[provider.provider];
+  return provider.label ?? provider.provider;
 }
 
 function initialProvider(providers: AnalysisProviderConfiguration[]): AnalysisProviderId | null {
@@ -70,6 +67,7 @@ export function AnalysisProviderSettings({
   onProvidersChanged = () => undefined,
   save = saveAnalysisProviderConfiguration,
   testConnection = testAnalysisProviderConnection,
+  load = listAnalysisProviders,
 }: Props) {
   const isDesktop = useDesktop();
   const availableProviders = providers;
@@ -93,13 +91,13 @@ export function AnalysisProviderSettings({
     setModel(next?.model ?? next?.models?.[0]?.id ?? "");
     setBaseUrl(next?.baseUrl ?? "");
     setApiKey("");
-    setError("");
-    setConnectionStatus("");
   }, [availableProviders, selectedProvider]);
 
   function choose(provider: AnalysisProviderId) {
     if (!isDesktop) return;
     setSelectedProvider(provider);
+    setError("");
+    setConnectionStatus("");
   }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -109,7 +107,7 @@ export function AnalysisProviderSettings({
     setError("");
     setConnectionStatus("");
     const input: AnalysisProviderConfigurationInput = {
-      model: selected.provider === "local_openai_compatible" ? model.trim() : (selected.models?.[0]?.id ?? model.trim()),
+      model: model.trim(),
       ...(selected.provider === "local_openai_compatible" ? { baseUrl: baseUrl.trim() } : {}),
       ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
     };
@@ -138,6 +136,11 @@ export function AnalysisProviderSettings({
       onProvidersChanged(providers.map((provider) => provider.provider === tested.provider ? { ...provider, ...tested } : provider));
       setConnectionStatus("连接正常；测试只发送固定探针，不上传项目素材。");
     } catch (testError) {
+      try {
+        onProvidersChanged(await load());
+      } catch {
+        // Keep the safe test error if the refresh itself is unavailable.
+      }
       setError(messageFor(testError, "无法测试分析服务连接，请重试。"));
     } finally {
       setIsTesting(false);
@@ -174,9 +177,9 @@ export function AnalysisProviderSettings({
                   <label htmlFor="local-analysis-model">本地服务模型</label>
                   <input id="local-analysis-model" value={model} onChange={(event) => setModel(event.target.value)} placeholder="例如：vision-local" autoComplete="off" disabled={!isDesktop} required />
                 </>
-              ) : <><label htmlFor="analysis-provider-model">内置模型</label><select id="analysis-provider-model" value={selected.models?.[0]?.id ?? model} onChange={() => undefined} disabled={!isDesktop}>{(selected.models ?? []).map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></>}
+              ) : <><label htmlFor="analysis-provider-model">内置模型</label><select id="analysis-provider-model" value={model} onChange={(event) => setModel(event.target.value)} disabled={!isDesktop}>{(selected.models ?? []).map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></>}
               <label htmlFor="analysis-api-key">{selected.provider === "local_openai_compatible" ? "本地服务 API Key（可选）" : selected.provider === "bailian" ? "百炼 API Key" : `${providerLabel(selected)} API Key`}</label>
-              <input id="analysis-api-key" type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} autoComplete="new-password" disabled={!isDesktop} required={selected.provider !== "local_openai_compatible"} />
+              <input id="analysis-api-key" type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} autoComplete="new-password" disabled={!isDesktop} required={selected.provider !== "local_openai_compatible" && selected.credentialState !== "configured"} />
               <p className="analysis-provider-key-state">{selected.credentialState === "configured" ? "密钥已配置" : selected.provider === "local_openai_compatible" ? "本地服务允许不填写 API Key" : "需要 API Key 后才能开始分析"}</p>
               <p className="analysis-provider-probe-note">连接测试只发送固定探针，不上传项目素材。</p>
               {error && <p className="analysis-provider-error" role="alert"><CircleAlert aria-hidden="true" size={17} />{error}</p>}
