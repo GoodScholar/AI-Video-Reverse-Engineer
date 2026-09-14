@@ -3,6 +3,7 @@ from typing import Optional
 import httpx
 
 from ..analysis_settings import validate_loopback_base_url
+from ..semantic_analysis import StructuredVisualAnalysis
 from .base import ProviderRequest, ProviderResult
 from .openai_compatible_chat import post_chat_completion
 from .test_image import connection_test_request
@@ -26,8 +27,11 @@ class LocalOpenAICompatibleAnalysisProvider:
             credential_required=False,
         )
 
-    def test_connection(self, model: str) -> ProviderResult:
-        return self.analyze(connection_test_request(model))
+    def test_connection(self, model: str) -> StructuredVisualAnalysis:
+        request = connection_test_request(model)
+        from ..analysis_response import validate_or_repair
+
+        return validate_or_repair(self, self.analyze(request), request)
 
 
 __all__ = ["LocalOpenAICompatibleAnalysisProvider"]

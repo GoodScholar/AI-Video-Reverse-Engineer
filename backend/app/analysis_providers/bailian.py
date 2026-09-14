@@ -5,6 +5,7 @@ import httpx
 from ..analysis_models import StructuredAnalysis
 from ..analysis_provider import BailianProviderConfig, ProviderConfig, ProviderRequest
 from ..provider_models import models_for
+from ..semantic_analysis import StructuredVisualAnalysis
 from . import image_data_url, instructions, post_json, request_context, response_schema, validate_configuration, validate_structured_analysis
 from .base import ProviderAnalysisError, ProviderFailure, ProviderRequest as CoreProviderRequest
 from .base import ProviderResult
@@ -77,8 +78,11 @@ class BailianAnalysisProvider:
             raw_text = None
         return validate_structured_analysis(raw_text)
 
-    def test_connection(self, model: Optional[str] = None) -> ProviderResult:
+    def test_connection(self, model: Optional[str] = None) -> StructuredVisualAnalysis:
         selected_model = model or self.models[0]
         if selected_model not in self.models:
             raise ProviderAnalysisError(ProviderFailure.for_code("unsupported_model_capability"))
-        return self.analyze(connection_test_request(selected_model))
+        request = connection_test_request(selected_model)
+        from ..analysis_response import validate_or_repair
+
+        return validate_or_repair(self, self.analyze(request), request)

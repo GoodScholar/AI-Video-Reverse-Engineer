@@ -1,3 +1,4 @@
+import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,6 +14,22 @@ from app.analysis_providers import ProviderAnalysisError as LegacyProviderAnalys
 from app.analysis_providers.base import ProviderAnalysisError, ProviderRequest
 from app.analysis_providers.bailian import BailianAnalysisProvider
 from app.analysis_providers.test_image import connection_test_image
+
+
+def _valid_analysis():
+    return {
+        "observedFacts": {
+            "staticVisual": {
+                "subject": "人物", "scene": "室内", "composition": "居中", "viewpoint": "平视",
+                "lighting": "柔光", "color": "暖色", "visualStyle": "纪实",
+            },
+            "temporal": None,
+        },
+        "generationSuggestions": {
+            "subjectMotion": "缓慢移动", "environmentalMotion": "轻微变化", "cameraMotion": "稳定",
+            "rhythm": "平缓", "suggestedDuration": 5.0, "audio": "环境音建议",
+        },
+    }
 
 
 def _core_request():
@@ -98,18 +115,89 @@ def test_bailian_connection_test_sends_the_built_in_probe_not_user_input():
 
     def handler(request):
         captured.append(request)
-        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+        return httpx.Response(200, json={"choices": [{"message": {
+            "content": json.dumps(_valid_analysis(), ensure_ascii=False),
+        }}]})
 
     provider = BailianAnalysisProvider(
         httpx.Client(transport=httpx.MockTransport(handler)),
         credential="test-credential",
     )
 
-    provider.test_connection()
+    result = provider.test_connection()
 
     body = captured[0].content.decode("utf-8")
+    assert result.observedFacts.temporal is None
     assert "data:image/png;base64," in body
     assert "analysis-proxy" not in body
+
+
+def test_bailian_connection_test_rejects_invalid_text_after_one_safe_repair_attempt():
+    captured = []
+    original_text = "这不是 JSON：Bearer test-credential data:image/png;base64,NOT_A_REAL_IMAGE"
+
+    def handler(request):
+        captured.append(request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": original_text}}]})
+
+    provider = BailianAnalysisProvider(
+        httpx.Client(transport=httpx.MockTransport(handler)), credential="test-credential",
+    )
+    observed_requests = []
+    original_analyze = provider.analyze
+
+    def observe_request(request, *args, **kwargs):
+        observed_requests.append(request)
+        return original_analyze(request, *args, **kwargs)
+
+    provider.analyze = observe_request
+
+    with pytest.raises(ProviderAnalysisError) as error:
+        provider.test_connection()
+
+    assert error.value.failure.code == "invalid_analysis_response"
+    assert [request.isRepair for request in observed_requests] == [False, True]
+    assert len(captured) == 2
+    repair = json.loads(captured[1].content)
+    assert repair["response_format"] == {"type": "json_object"}
+    assert [part["type"] for part in repair["messages"][0]["content"]] == ["text"]
+    assert "data:image/png;base64," not in repair["messages"][0]["content"][0]["text"]
+    assert original_text not in repair["messages"][0]["content"][0]["text"]
+    assert "test-credential" not in repair["messages"][0]["content"][0]["text"]
+
+
+def test_bailian_connection_test_returns_a_repaired_structured_result_after_one_text_only_retry():
+    captured = []
+    responses = iter(["{}", json.dumps(_valid_analysis(), ensure_ascii=False)])
+
+    def handler(request):
+        captured.append(request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": next(responses)}}]})
+
+    provider = BailianAnalysisProvider(
+        httpx.Client(transport=httpx.MockTransport(handler)), credential="test-credential",
+    )
+    observed_requests = []
+    original_analyze = provider.analyze
+
+    def observe_request(request, *args, **kwargs):
+        observed_requests.append(request)
+        return original_analyze(request, *args, **kwargs)
+
+    provider.analyze = observe_request
+
+    result = provider.test_connection()
+
+    assert result.observedFacts.temporal is None
+    assert [request.isRepair for request in observed_requests] == [False, True]
+    assert len(captured) == 2
+    first = json.loads(captured[0].content)
+    repair = json.loads(captured[1].content)
+    assert [part["type"] for part in first["messages"][0]["content"]] == [
+        "text", "text", "image_url",
+    ]
+    assert repair["response_format"] == {"type": "json_object"}
+    assert [part["type"] for part in repair["messages"][0]["content"]] == ["text"]
 
 
 def test_legacy_bailian_contract_has_an_explicit_compatibility_entrypoint():
