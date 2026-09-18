@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+import mmap
 import re
 import shutil
 import stat
@@ -12,7 +13,7 @@ from array import array
 from ast import literal_eval
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Literal, Optional
+from typing import Callable, Literal, Optional, Sequence
 
 from .depth_capture import DepthQualityAssessment
 from .depth_capture_storage import (
@@ -22,12 +23,12 @@ from .depth_capture_storage import (
     depth_capture_directory,
 )
 from .depth_quality import DepthQualityInput, SourceMotionSample, assess_depth_quality
-from .reference_video import validate_storage_id
+from .reference_video import MAX_REFERENCE_VIDEO_DURATION_SECONDS, validate_storage_id
 
 
-DEPTH_TIMEOUT_SECONDS = 900
+DEPTH_TIMEOUT_SECONDS = 1800
 FFMPEG_TIMEOUT_SECONDS = 180
-MAX_DEPTH_SECONDS = 10
+MAX_DEPTH_SECONDS = MAX_REFERENCE_VIDEO_DURATION_SECONDS
 MODEL_IDENTITY = {
     "modelId": "video-depth-anything-small-relative",
     "upstreamCommit": "4f5ae23172ba60fd7bc11ef671cca678842c7072",
@@ -44,10 +45,11 @@ CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 @dataclass(frozen=True)
 class _DepthFrames:
-    values: array
+    values: Sequence[float]
     frame_count: int
     height: int
     width: int
+    raw_path: Optional[Path] = None
 
 
 class DepthCaptureFailure(Exception):
@@ -69,6 +71,7 @@ class DepthCaptureRequest:
     upstream_root: Path
     execution_device: Device
     expected_duration_seconds: float
+    output_resolution: Literal["480p", "720p"] = "480p"
 
     def __post_init__(self) -> None:
         if type(self.expected_duration_seconds) not in (int, float) or not math.isfinite(self.expected_duration_seconds) or self.expected_duration_seconds <= 0:
@@ -99,19 +102,22 @@ def run_depth_capture(
     stage_started = on_stage_started or (lambda _: None)
     stage_completed = on_stage_completed or (lambda _: None)
     workspace = None
+    depths: Optional[_DepthFrames] = None
     try:
         stage_started("preparing")
         _validate_request_paths(request)
-        profile = _device_profile(request.execution_device)
+        profile = _device_profile(request.execution_device, request.output_resolution)
         workspace = create_depth_capture_workspace(
             request.data_dir, request.project_id, request.capture_id,
         )
+        cfr_input = workspace / ".source-cfr.mp4"
+        _normalize_input_timeline(request.input_video, cfr_input, profile.target_fps, profile.max_res, ffmpeg_path, run)
         stage_completed("preparing")
         worker_output = workspace / "worker-output"
         worker_output.mkdir(mode=0o700)
         command: list[str] = [
             worker_python, str(worker_script),
-            "--input", str(request.input_video),
+            "--input", str(cfr_input),
             "--output", str(worker_output),
             "--checkpoint", str(request.checkpoint),
             "--upstream-root", str(request.upstream_root),
@@ -119,12 +125,14 @@ def run_depth_capture(
             "--target-fps", str(profile.target_fps),
             "--input-size", str(profile.input_size),
             "--max-res", str(profile.max_res),
+            "--output-short-side", str(profile.output_short_side),
+            "--backbone-microbatch", str(profile.backbone_microbatch),
         ]
         stage_started("estimatingDepth")
         _run_worker(command, run)
         depths, worker_metadata = _read_worker_output(worker_output, request, profile)
+        cfr_input.unlink()
         source_motion_samples = _validate_source_motion_samples(worker_metadata.get("sourceMotionSamples"))
-        shutil.rmtree(worker_output)
         stage_completed("estimatingDepth")
         stage_started("encoding")
         _encode_depth_variants(
@@ -142,6 +150,8 @@ def run_depth_capture(
             expected_duration_seconds=request.expected_duration_seconds,
             source_motion_samples=source_motion_samples,
         ), input_fully_validated=True)
+        _close_depth_values(depths.values)
+        shutil.rmtree(worker_output)
         _write_final_metadata(workspace, worker_metadata, quality_assessment)
         _write_manifest(workspace, request.source_reference_video_id)
         directory = commit_depth_artifacts(
@@ -162,10 +172,14 @@ def run_depth_capture(
             qualityAssessment=quality_assessment,
         )
     except DepthCaptureFailure:
+        if depths is not None:
+            _close_depth_values(depths.values)
         if workspace is not None:
             _discard_workspace(workspace, request)
         raise
     except (OSError, ValueError, json.JSONDecodeError) as error:
+        if depths is not None:
+            _close_depth_values(depths.values)
         if workspace is not None:
             _discard_workspace(workspace, request)
         raise DepthCaptureFailure("depth_capture_storage_failed", "深度捕捉结果无法安全保存，请重试。") from error
@@ -176,13 +190,18 @@ class _DeviceProfile:
     target_fps: int
     input_size: int
     max_res: int
+    output_short_side: int
+    backbone_microbatch: int
 
 
-def _device_profile(device: Device) -> _DeviceProfile:
+def _device_profile(device: Device, output_resolution: Literal["480p", "720p"]) -> _DeviceProfile:
+    output_short_side = 480 if output_resolution == "480p" else 720
+    # 输出尺寸由 worker 在推理后实际编码；720 档同时使用更大的模型输入配置。
+    input_size, max_res = (350, 640) if output_resolution == "480p" else (518, 1280)
     if device == "cuda":
-        return _DeviceProfile(target_fps=16, input_size=518, max_res=1280)
+        return _DeviceProfile(target_fps=16, input_size=input_size, max_res=max_res, output_short_side=output_short_side, backbone_microbatch=2)
     if device in ("mps", "cpu"):
-        return _DeviceProfile(target_fps=8, input_size=350, max_res=640)
+        return _DeviceProfile(target_fps=8, input_size=input_size, max_res=max_res, output_short_side=output_short_side, backbone_microbatch=1 if device == "mps" else 2)
     raise DepthCaptureFailure("depth_device_unavailable", "所选深度计算设备不受支持或不可用。")
 
 
@@ -194,10 +213,10 @@ def _validate_request_paths(request: DepthCaptureRequest) -> None:
     except ValueError as error:
         raise DepthCaptureFailure("depth_input_invalid", "深度捕捉请求标识无效。") from error
     root = Path(request.data_dir).absolute()
-    expected_parent = root / "project-files" / request.project_id / "reference-videos"
     expected_candidates = {
-        expected_parent / f"{request.source_reference_video_id}.mp4",
-        expected_parent / f"{request.source_reference_video_id}.mov",
+        root / "project-files" / request.project_id / directory / f"{request.source_reference_video_id}.{extension}"
+        for directory in ("reference-media", "reference-videos")
+        for extension in ("mp4", "mov")
     }
     if root.is_symlink() or not root.is_dir() or request.input_video.absolute() not in expected_candidates:
         raise DepthCaptureFailure("depth_input_invalid", "输入视频不是受管的参考视频。")
@@ -239,7 +258,7 @@ def _run_worker(command: list[str], run: CommandRunner) -> None:
     logging.getLogger(__name__).warning("深度 worker 失败：exitCode=%s stderrChars=%s", result.returncode, len(diagnostic))
     if "out of memory" in diagnostic or "cuda oom" in diagnostic:
         raise DepthCaptureFailure("depth_device_out_of_memory", "所选设备内存不足，无法完成深度估计。")
-    if "unavailable" in diagnostic or "unsupported" in diagnostic or "not available" in diagnostic:
+    if re.search(r"(?:requested )?(?:cuda|mps|device)[^\n]*(?:unavailable|not available|unsupported)", diagnostic):
         raise DepthCaptureFailure("depth_device_unavailable", "所选深度计算设备不受支持或不可用。")
     raise DepthCaptureFailure("depth_worker_failed", "本地深度估计失败，请检查输入视频和本地模型配置后重试。")
 
@@ -249,7 +268,7 @@ def _read_worker_output(
     request: DepthCaptureRequest,
     profile: _DeviceProfile,
 ) -> tuple[_DepthFrames, dict]:
-    expected = {"depths.npz", "worker-metadata.json"}
+    expected = {"depths.gray", "worker-metadata.json"}
     try:
         names = {path.name for path in output.iterdir()}
     except OSError as error:
@@ -257,7 +276,6 @@ def _read_worker_output(
     if names != expected or any((output / name).is_symlink() or not (output / name).is_file() for name in expected):
         raise DepthCaptureFailure("depth_worker_output_invalid", "深度计算器输出无效。")
     try:
-        depths = _load_float32_depths(output / "depths.npz", profile)
         metadata = json.loads((output / "worker-metadata.json").read_text(encoding="utf-8"))
     except (
         OSError, ValueError, UnicodeError, SyntaxError, RuntimeError, NotImplementedError, zlib.error,
@@ -266,9 +284,12 @@ def _read_worker_output(
         raise DepthCaptureFailure("depth_worker_output_invalid", "深度计算器输出无效。") from error
     if not isinstance(metadata, dict):
         raise DepthCaptureFailure("depth_worker_output_invalid", "深度计算器输出无效。")
-    if depths.frame_count < 1 or not all(math.isfinite(value) for value in depths.values):
-        raise DepthCaptureFailure("depth_worker_output_invalid", "深度计算器输出无效。")
-    _validate_worker_metadata(metadata, depths, request, profile)
+    depths = _load_quantized_depths(output / "depths.gray", metadata, profile)
+    try:
+        _validate_worker_metadata(metadata, depths, request, profile)
+    except DepthCaptureFailure:
+        _close_depth_values(depths.values)
+        raise
     return depths, metadata
 
 
@@ -285,6 +306,8 @@ def _validate_worker_metadata(
         "targetFps": profile.target_fps,
         "inputSize": profile.input_size,
         "maxRes": profile.max_res,
+        "outputShortSide": profile.output_short_side,
+        "backboneMicrobatch": profile.backbone_microbatch,
         "frameCount": depths.frame_count,
         "width": depths.width,
         "height": depths.height,
@@ -305,10 +328,9 @@ def _validate_worker_metadata(
         or depths.frame_count > profile.target_fps * MAX_DEPTH_SECONDS
         or depths.frame_count / frame_rate > MAX_DEPTH_SECONDS + 1e-6
         or depths.width % 2 or depths.height % 2
-        or max(depths.width, depths.height) > profile.max_res
-        or min(depths.values) < 0 or max(depths.values) > 1
-        or not math.isclose(depth_min, min(depths.values), rel_tol=1e-6, abs_tol=1e-6)
-        or not math.isclose(depth_max, max(depths.values), rel_tol=1e-6, abs_tol=1e-6)
+        or min(depths.width, depths.height) != profile.output_short_side
+        or not math.isclose(depth_min, 0.0, rel_tol=1e-6, abs_tol=1e-6)
+        or not math.isclose(depth_max, 1.0, rel_tol=1e-6, abs_tol=1e-6)
         or depth_min < 0 or depth_max > 1
     ):
         raise DepthCaptureFailure("depth_worker_output_invalid", "深度计算器输出范围无效。")
@@ -341,9 +363,10 @@ def _encode_depth_variants(
     ffmpeg_path: str,
     run: CommandRunner,
 ) -> None:
-    raw_path = workspace / ".depth-raw"
+    raw_path = depths.raw_path
+    if raw_path is None:
+        raise DepthCaptureFailure("depth_worker_output_invalid", "深度计算器输出无效。")
     try:
-        _write_quantized_raw(raw_path, depths.values)
         height, width = depths.height, depths.width
         common: list[str] = [
             ffmpeg_path, "-hide_banner", "-nostdin", "-v", "error", "-y",
@@ -357,17 +380,8 @@ def _encode_depth_variants(
             common + ["-vf", "format=rgb24,pseudocolor=preset=turbo,format=rgb24", str(workspace / "depth-preview.mp4")], run,
         )
     finally:
-        try:
-            raw_path.unlink()
-        except (FileNotFoundError, OSError) as error:
-            if not isinstance(error, FileNotFoundError):
-                logging.getLogger(__name__).warning("深度原始帧临时文件清理失败：%s", type(error).__name__)
-
-
-def _write_quantized_raw(path: Path, values: array) -> None:
-    with path.open("wb") as file:
-        for start in range(0, len(values), 65_536):
-            file.write(bytearray(max(0, min(255, round(value * 255))) for value in values[start:start + 65_536]))
+        # worker-output 仍需供质量评估 mmap 读取，统一在 commit 前移除。
+        pass
 
 
 def _run_ffmpeg(command: list[str], run: CommandRunner) -> None:
@@ -380,6 +394,20 @@ def _run_ffmpeg(command: list[str], run: CommandRunner) -> None:
         raise DepthCaptureFailure("depth_encoding_failed", "深度视频编码失败，请检查本地 FFmpeg 后重试。") from error
     if result.returncode != 0 or not Path(command[-1]).is_file() or Path(command[-1]).stat().st_size == 0:
         raise DepthCaptureFailure("depth_encoding_failed", "深度视频编码失败，请检查本地 FFmpeg 后重试。")
+
+
+def _normalize_input_timeline(input_video: Path, output: Path, target_fps: int, max_res: int, ffmpeg_path: str, run: CommandRunner) -> None:
+    """按显示时间戳采样并应用默认旋转，避免 VFR 按帧号取样造成时间漂移。"""
+    try:
+        result = run([
+            ffmpeg_path, "-hide_banner", "-nostdin", "-v", "error", "-y", "-i", str(input_video),
+            "-map", "0:v:0", "-vf", f"fps={target_fps},scale={max_res}:{max_res}:force_original_aspect_ratio=decrease:force_divisible_by=2", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart", str(output),
+        ], capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS, check=False, shell=False)
+    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError) as error:
+        raise DepthCaptureFailure("depth_preparation_failed", "无法规范化参考视频时间线，请检查本地 FFmpeg 后重试。") from error
+    if result.returncode != 0 or not output.is_file() or output.stat().st_size == 0:
+        raise DepthCaptureFailure("depth_preparation_failed", "无法规范化参考视频时间线，请检查本地 FFmpeg 后重试。")
 
 
 def _write_final_metadata(
@@ -422,6 +450,54 @@ def _discard_workspace(workspace: Path, request: DepthCaptureRequest) -> None:
         shutil.rmtree(workspace)
     except (FileNotFoundError, OSError) as error:
         logging.getLogger(__name__).warning("深度捕捉工作目录清理失败：%s", type(error).__name__)
+
+
+class _QuantizedDepthValues(Sequence[float]):
+    """按需把 worker 的 uint8 灰度帧投影成质量门所需的 [0,1] 值。"""
+
+    def __init__(self, path: Path, length: int) -> None:
+        self._file = path.open("rb")
+        self._mapped = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+        self._length = length
+
+    def __len__(self) -> int:
+        return self._length
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[position] for position in range(*index.indices(self._length))]
+        if not 0 <= index < self._length:
+            raise IndexError(index)
+        return float(self._mapped[index]) / 255.0
+
+    def close(self) -> None:
+        if not self._mapped.closed:
+            self._mapped.close()
+        if not self._file.closed:
+            self._file.close()
+
+
+def _close_depth_values(values: Sequence[float]) -> None:
+    close = getattr(values, "close", None)
+    if callable(close):
+        close()
+
+
+def _load_quantized_depths(path: Path, metadata: dict, profile: _DeviceProfile) -> _DepthFrames:
+    try:
+        frame_count = metadata["frameCount"]
+        width = metadata["width"]
+        height = metadata["height"]
+        if any(type(value) is not int or value <= 0 for value in (frame_count, width, height)):
+            raise ValueError("invalid depth dimensions")
+        expected_size = frame_count * width * height
+        if path.stat().st_size != expected_size:
+            raise ValueError("invalid raw depth size")
+        if frame_count > profile.target_fps * MAX_DEPTH_SECONDS:
+            raise ValueError("depth frame count exceeds profile")
+        return _DepthFrames(_QuantizedDepthValues(path, expected_size), frame_count, height, width, path)
+    except (KeyError, OSError, ValueError) as error:
+        raise DepthCaptureFailure("depth_worker_output_invalid", "深度计算器输出无效。") from error
 
 
 def _load_float32_depths(path: Path, profile: _DeviceProfile) -> _DepthFrames:

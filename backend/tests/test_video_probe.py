@@ -15,10 +15,11 @@ from app.reference_video import (
 )
 
 
-def test_reference_video_serializes_the_video_discriminator():
+@pytest.mark.parametrize("duration", [2.0, 14.53, 60.0, 300.0])
+def test_reference_video_serializes_the_video_discriminator(duration):
     video = ReferenceVideo(
         id="video-001", originalName="clip.mp4", format="mp4", sizeBytes=10,
-        durationSeconds=2.5, width=854, height=480, frameRate=24,
+        durationSeconds=duration, width=854, height=480, frameRate=24,
     )
 
     assert video.model_dump()["type"] == "video"
@@ -65,7 +66,8 @@ def valid_probe_payload(
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
     reason="真实媒体集成测试需要 ffmpeg 和 ffprobe",
 )
-def test_real_ffprobe_accepts_a_two_second_480p_mp4(tmp_path):
+@pytest.mark.parametrize("width,height", [(854, 480), (320, 568)])
+def test_real_ffprobe_accepts_a_two_second_mp4(tmp_path, width, height):
     sample = tmp_path / "valid-2s-480p.mp4"
     subprocess.run(
         [
@@ -74,7 +76,7 @@ def test_real_ffprobe_accepts_a_two_second_480p_mp4(tmp_path):
             "-f",
             "lavfi",
             "-i",
-            "color=c=0x343938:s=854x480:r=24",
+            f"color=c=0x343938:s={width}x{height}:r=24",
             "-t",
             "2",
             "-c:v",
@@ -97,7 +99,7 @@ def test_real_ffprobe_accepts_a_two_second_480p_mp4(tmp_path):
 
     assert facts.format == "mp4"
     assert facts.duration_seconds == pytest.approx(2.0, abs=0.01)
-    assert (facts.width, facts.height) == (854, 480)
+    assert (facts.width, facts.height) == (width, height)
     assert facts.frame_rate == pytest.approx(24.0)
 
 
@@ -163,7 +165,11 @@ def test_probe_uses_ffprobe_major_brand_as_authoritative_container_identity(
     ("width", "height", "duration"),
     [
         (854, 480, "2.000000"),
-        (3840, 2160, "10.000000"),
+        (320, 568, "14.530000"),
+        (240, 320, "2.000000"),
+        (3840, 2160, "300.000000"),
+        (854, 480, "14.530000"),
+        (854, 480, "60.000000"),
         (2160, 3840, "2.000000"),
         (2160, 2160, "2.000000"),
     ],
@@ -203,13 +209,13 @@ def test_probe_accepts_inclusive_duration_and_resolution_edges(
             "matroska",
         ),
         ("clip.mp4", valid_probe_payload(duration="1.99"), 422, "video_too_short", "1.99"),
-        ("clip.mp4", valid_probe_payload(duration="10.01"), 422, "video_too_long", "10.01"),
+        ("clip.mp4", valid_probe_payload(duration="300.01"), 422, "video_too_long", "最长允许 300.00 秒"),
         (
             "clip.mp4",
-            valid_probe_payload(width=854, height=479),
+            valid_probe_payload(width=0, height=568),
             422,
-            "video_resolution_too_low",
-            "854×479",
+            "video_unreadable",
+            "有效视频帧",
         ),
         (
             "clip.mp4",
@@ -489,7 +495,6 @@ def test_probe_resolves_rotation_from_side_data_then_tags(
 @pytest.mark.parametrize(
     ("width", "height", "rotation", "expected_code", "measured"),
     [
-        (479, 854, "90", "video_resolution_too_low", "854×479"),
         (3841, 2160, "90", "video_resolution_too_high", "2160×3841"),
     ],
 )

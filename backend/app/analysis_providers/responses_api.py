@@ -13,7 +13,9 @@ def build_responses_payload(request: ProviderRequest) -> dict[str, Any]:
     """Encode the one allowed media proxy as a stateless Responses request."""
 
     content: list[dict[str, Any]] = [{"type": "input_text", "text": request.prompt}]
-    if request.analysisInput is not None:
+    if request.responseSchema is not None:
+        schema = request.responseSchema
+    elif request.analysisInput is not None:
         content.extend([
             {"type": "input_text", "text": analysis_input_context(request.analysisInput)},
             {"type": "input_image", "image_url": image_data_url(request.analysisInput)},
@@ -28,7 +30,7 @@ def build_responses_payload(request: ProviderRequest) -> dict[str, Any]:
         "input": [{"role": "user", "content": content}],
         "text": {"format": {
             "type": "json_schema",
-            "name": "structured_analysis",
+            "name": request.task,
             "strict": True,
             "schema": schema,
         }},

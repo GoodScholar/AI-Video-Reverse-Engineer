@@ -1,0 +1,53 @@
+.timeline-editor { border: 1px solid #c7c6bc; background: #f7f5ee; color: #202427; }
+.timeline-header, .timeline-toolbar, .timeline-render { display: flex; gap: 14px; align-items: center; justify-content: space-between; padding: 20px 24px; border-bottom: 1px solid #c7c6bc; }
+.timeline-header h2, .timeline-assets h3, .timeline-inspector h3, .timeline-render h3 { margin: 0; font-size: 20px; }
+.timeline-header p, .timeline-assets > p, .timeline-render p, .timeline-inspector > p { margin: 5px 0 0; color: #5f655d; font-size: 13px; line-height: 1.5; }
+.timeline-kicker { color: var(--metadata-text, #5f655d) !important; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .07em; }
+.timeline-header-actions, .timeline-toolbar, .timeline-render-actions, .timeline-track-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.timeline-toolbar { justify-content: flex-start; padding-top: 12px; padding-bottom: 12px; background: #eeece4; }
+.timeline-toolbar label, .timeline-form-grid label { display: grid; gap: 4px; color: #4c5454; font-size: 13px; }
+.timeline-toolbar input, .timeline-toolbar select { width: 110px; }
+.timeline-layout { display: grid; grid-template-columns: 205px minmax(380px, 1fr) 245px; min-height: 450px; }
+.timeline-assets, .timeline-inspector { padding: 18px; background: #eeece4; }
+.timeline-assets { border-right: 1px solid #c7c6bc; }
+.timeline-inspector { border-left: 1px solid #c7c6bc; }
+.timeline-assets > .secondary-action { width: 100%; justify-content: center; margin-top: 11px; }
+.timeline-assets ul { display: grid; gap: 8px; margin: 18px 0 0; padding: 0; list-style: none; }
+.timeline-assets li { display: grid; gap: 5px; padding: 10px 0; border-top: 1px solid #c7c6bc; }
+.timeline-assets li strong { overflow-wrap: anywhere; font-size: 14px; }
+.timeline-assets small { color: #5f655d; }
+.timeline-assets li button { width: fit-content; padding: 4px 0; border: 0; background: transparent; color: #33423f; text-decoration: underline; text-underline-offset: 2px; }
+.timeline-workarea { min-width: 0; overflow: auto; background: #dfe1da; }
+.timeline-ruler { position: relative; height: 35px; border-bottom: 1px solid #92968f; background: #eeece4; }
+.timeline-ruler span { position: absolute; top: 9px; padding-left: 4px; border-left: 1px solid #92968f; color: #5f655d; font: 11px ui-monospace, monospace; }
+.timeline-ruler i { position: absolute; z-index: 4; top: 0; bottom: -999px; width: 2px; background: #a83b20; pointer-events: none; }
+.timeline-tracks { display: grid; min-width: min-content; }
+.timeline-track { display: grid; grid-template-columns: 118px auto; min-height: 66px; border-bottom: 1px solid #b8bdb4; }
+.timeline-track.is-selected .timeline-track-label { box-shadow: inset 3px 0 #a83b20; background: #f7f5ee; }
+.timeline-track-label { display: grid; align-content: center; gap: 6px; padding: 7px 8px; border-right: 1px solid #b8bdb4; background: #eeece4; }
+.timeline-track-label > button { display: grid; gap: 2px; padding: 0; border: 0; background: transparent; color: #202427; text-align: left; font-weight: 700; }
+.timeline-track-label small { color: #5f655d; font-weight: 400; }
+.timeline-track-label div { display: flex; gap: 4px; }
+.timeline-track-label div button { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; padding: 0; border: 0; background: transparent; color: #4c5454; }
+.timeline-track-canvas { position: relative; min-height: 66px; background: repeating-linear-gradient(90deg, transparent 0, transparent calc(100% / 20 - 1px), rgba(91, 99, 91, .18) calc(100% / 20 - 1px), rgba(91, 99, 91, .18) calc(100% / 20)); }
+.timeline-clip { position: absolute; top: 11px; height: 43px; overflow: hidden; padding: 0 9px; border: 1px solid #536360; border-radius: 2px; background: #bdcec5; color: #202427; cursor: grab; text-align: left; text-overflow: ellipsis; white-space: nowrap; touch-action: none; }
+.timeline-track:nth-child(even) .timeline-clip { background: #d5c9b1; border-color: #786d55; }
+.timeline-clip.is-selected { outline: 2px solid #a83b20; outline-offset: 1px; }
+.timeline-track-actions { padding: 12px; border-top: 1px solid #c7c6bc; background: #eeece4; }
+.timeline-inspector h3 + p { margin-bottom: 14px; font-weight: 700; color: #202427; }
+.timeline-inspector h3:not(:first-child) { margin-top: 24px; padding-top: 16px; border-top: 1px solid #c7c6bc; }
+.timeline-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.timeline-form-grid input, .timeline-form-grid select { min-width: 0; width: 100%; }
+.timeline-render { align-items: flex-start; flex-wrap: wrap; }
+.timeline-preview { width: 100%; margin: 0; padding-top: 16px; border-top: 1px solid #c7c6bc; }
+.timeline-preview video { display: block; width: min(100%, 640px); max-height: 360px; background: #202427; }
+.timeline-preview figcaption { margin-top: 7px; color: #5f655d; font-size: 13px; }
+.timeline-runs { display: grid; gap: 5px; width: 100%; margin: 0; padding: 14px 0 0; border-top: 1px solid #c7c6bc; list-style: none; }
+.timeline-runs li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid #d1d0c8; font-size: 13px; }
+.timeline-runs li > span:first-child { flex: 1 1 180px; }
+.timeline-run--completed { color: #365d58; }.timeline-run--failed { color: #8a2c17; }.timeline-run--running, .timeline-run--queued { color: #955b14; }.timeline-run--cancelled { color: #5f655d; }
+.timeline-error { margin: 0; padding: 12px 24px; border-bottom: 1px solid #c7c6bc; background: #f5dfd6; color: #8a2c17; }
+.timeline-empty { margin: 0; padding: 28px; color: #5f655d; line-height: 1.5; }
+@media (prefers-reduced-motion: reduce) { .timeline-editor * { scroll-behavior: auto; } }
+@media (max-width: 1050px) { .timeline-layout { grid-template-columns: 180px minmax(340px, 1fr); }.timeline-inspector { grid-column: span 2; border-top: 1px solid #c7c6bc; border-left: 0; }.timeline-form-grid { grid-template-columns: repeat(4, minmax(100px, 1fr)); } }
+@media (max-width: 720px) { .timeline-header, .timeline-toolbar, .timeline-render { align-items: flex-start; flex-direction: column; padding-left: 16px; padding-right: 16px; }.timeline-layout { display: block; }.timeline-assets, .timeline-inspector { border: 0; border-bottom: 1px solid #c7c6bc; }.timeline-workarea { min-height: 240px; }.timeline-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }.timeline-header-actions, .timeline-render-actions { width: 100%; }.timeline-header-actions button, .timeline-render-actions button { flex: 1 1 130px; } }

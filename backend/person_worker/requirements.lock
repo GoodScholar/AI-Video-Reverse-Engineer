@@ -1,0 +1,12 @@
+mediapipe==0.10.21
+numpy==1.26.4
+opencv-contrib-python==4.10.0.84
+protobuf==4.25.3
+attrs==26.1.0
+sentencepiece==0.2.2
+absl-py==2.5.0
+flatbuffers==25.12.19
+sounddevice==0.5.6
+cffi==2.1.1
+matplotlib==3.8.4
+pytest==8.4.2

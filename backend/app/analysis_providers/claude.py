@@ -113,7 +113,9 @@ class ClaudeAnalysisProvider:
 
 def _messages_payload(request: ProviderRequest) -> dict[str, Any]:
     content = [{"type": "text", "text": request.prompt}]
-    if request.analysisInput is not None:
+    if request.responseSchema is not None:
+        schema = request.responseSchema
+    elif request.analysisInput is not None:
         content.extend([
             {"type": "text", "text": analysis_input_context(request.analysisInput)},
             {"type": "image", "source": _base64_image_source(request.analysisInput)},

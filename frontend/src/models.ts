@@ -222,6 +222,7 @@ export type DepthCaptureStages = [
 
 export type DepthDevicePreference = "auto" | "cuda" | "mps" | "cpu";
 export type DepthExecutionDevice = "cuda" | "mps" | "cpu";
+export type DepthOutputResolution = "480p" | "720p";
 
 export type DepthCaptureError = {
   code: string;
@@ -283,6 +284,7 @@ export type DepthCapture = {
   algorithmVersion: 1;
   status: "queued" | "running" | "completed" | "failed";
   devicePreference: DepthDevicePreference;
+  outputResolution?: DepthOutputResolution | null;
   executionDevice: DepthExecutionDevice | null;
   modelIdentity: DepthModelIdentity;
   normalizationDirection: "near_white_far_black";

@@ -103,7 +103,7 @@ function Disclosure({ identity, provider, headingRef, onCancel, onConfirm, isSub
     </dl>
     <div className="semantic-analysis-disclosure-actions">
       <button className="secondary-action" type="button" disabled={isSubmitting} onClick={onCancel}>取消</button>
-      <button className="primary-action" type="button" disabled={isSubmitting} onClick={onConfirm}><Play aria-hidden="true" size={17} />{isSubmitting ? "正在提交…" : "确认并开始语义分析"}</button>
+      <button className="primary-action" type="button" disabled={isSubmitting} onClick={onConfirm}>{isSubmitting ? <LoaderCircle className="loading-spinner" aria-hidden="true" size={17} /> : <Play aria-hidden="true" size={17} />}{isSubmitting ? "正在提交…" : "确认并开始语义分析"}</button>
     </div>
   </div>;
 }
@@ -264,7 +264,7 @@ export function SemanticAnalysisPanel({
     {task?.status === "failed" && isDesktop && !disclosure && <button ref={retryButtonRef} className="secondary-action semantic-analysis-retry" type="button" disabled={!canStart} onClick={() => openDisclosure("retry")}><RotateCcw aria-hidden="true" size={17} />只重试语义分析</button>}
     {disclosure && disclosureIsCurrent && provider && <Disclosure identity={disclosure} provider={provider} headingRef={disclosureHeadingRef} isSubmitting={isSubmitting} onCancel={cancelDisclosure} onConfirm={() => void confirm()} />}
     {disclosure && !disclosureIsCurrent && <p className="semantic-analysis-error" role="alert">参考素材或本地预处理已变化，请重新确认发送内容。</p>}
-    {task && <div className={`semantic-analysis-task semantic-analysis-task--${task.status}`} role="status" aria-live="polite" aria-label={taskTitle(task)}><div><h3>{taskTitle(task)}</h3><p>{taskProviderLabel(task.provider, provider)} · {task.model}</p></div>{task.status === "completed" ? <Check aria-hidden="true" size={20} /> : task.status === "failed" ? <CircleAlert aria-hidden="true" size={20} /> : task.status === "running" ? <LoaderCircle aria-hidden="true" size={20} /> : <Clock3 aria-hidden="true" size={20} />}</div>}
+    {task && <div className={`semantic-analysis-task semantic-analysis-task--${task.status}`} role="status" aria-live="polite" aria-label={taskTitle(task)}><div><h3>{taskTitle(task)}</h3><p>{taskProviderLabel(task.provider, provider)} · {task.model}</p></div>{task.status === "completed" ? <Check aria-hidden="true" size={20} /> : task.status === "failed" ? <CircleAlert aria-hidden="true" size={20} /> : task.status === "running" ? <LoaderCircle className="loading-spinner" aria-hidden="true" size={20} /> : <Clock3 aria-hidden="true" size={20} />}</div>}
     {task?.status === "failed" && task.error && <p className="semantic-analysis-error" role="alert"><CircleAlert aria-hidden="true" size={17} />{task.error.message}</p>}
     {submitError && <p className="semantic-analysis-error" role="alert"><CircleAlert aria-hidden="true" size={17} />{submitError}</p>}
     {refreshError && canPoll && <p className="semantic-analysis-refresh-error">暂时无法刷新状态：{refreshError} <RefreshCw aria-hidden="true" size={15} /></p>}

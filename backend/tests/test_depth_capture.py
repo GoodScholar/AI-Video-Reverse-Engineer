@@ -19,6 +19,14 @@ def test_new_depth_capture_has_fixed_stage_order():
         "preparing", "estimatingDepth", "encoding", "qualityAssessment"
     ]
     assert capture.status == "queued"
+    assert capture.outputResolution == "480p"
+
+
+def test_new_depth_capture_records_requested_output_resolution_without_rewriting_legacy_captures():
+    capture = new_depth_capture("video-1", "auto", "2026-09-12T00:00:00+00:00", "720p")
+
+    assert capture.outputResolution == "720p"
+    assert _depth_capture().outputResolution is None
 
 
 def test_auto_device_prefers_cuda_then_mps_then_cpu():

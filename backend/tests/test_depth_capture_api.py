@@ -1,4 +1,6 @@
 import json
+import io
+import zipfile
 from datetime import datetime, timezone
 from threading import Barrier, Event, Thread
 
@@ -198,6 +200,28 @@ def test_start_depth_capture_queues_after_preconditions(tmp_path):
     assert queue.pending[0][0] == ("depth_capture", "project-001")
 
 
+def test_start_depth_capture_allows_current_video_without_preprocessing_and_records_resolution(tmp_path):
+    now = datetime.now(timezone.utc).isoformat()
+    reference = ReferenceVideo(
+        id="video-001", originalName="clip.mp4", format="mp4", sizeBytes=1,
+        durationSeconds=2, width=640, height=360, frameRate=24,
+    )
+    (tmp_path / "projects.json").write_text(json.dumps([{
+        "id": "project-001", "name": "深度项目", "createdAt": now, "updatedAt": now,
+        "referenceMedia": reference.model_dump(),
+    }]), encoding="utf-8")
+    source = tmp_path / "project-files/project-001/reference-videos/video-001.mp4"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"video")
+    queue = ManualComputeQueue()
+    client = TestClient(create_app(data_dir=tmp_path, local_compute_queue=queue))
+
+    response = client.post("/api/projects/project-001/depth-captures", json={"outputResolution": "720p"})
+
+    assert response.status_code == 202
+    assert response.json()["depthCaptures"][-1]["outputResolution"] == "720p"
+
+
 def test_start_depth_capture_requires_completed_preprocessing(tmp_path):
     client = TestClient(create_app(data_dir=tmp_path, local_compute_queue=ManualComputeQueue()))
     project = client.post("/api/projects", json={"name": "没有预处理"}).json()
@@ -209,7 +233,7 @@ def test_start_depth_capture_requires_completed_preprocessing(tmp_path):
 
 
 @pytest.mark.parametrize("mutation", ["source", "out_of_scope", "assessment", "artifacts"])
-def test_start_rejects_each_completed_preprocessing_precondition(tmp_path, mutation):
+def test_start_ignores_semantic_and_reproducibility_preprocessing_state(tmp_path, mutation):
     _completed_project(tmp_path)
     payload = json.loads((tmp_path / "projects.json").read_text(encoding="utf-8"))
     preprocessing = payload[0]["localPreprocessing"]
@@ -233,8 +257,7 @@ def test_start_rejects_each_completed_preprocessing_precondition(tmp_path, mutat
 
     response = client.post("/api/projects/project-001/depth-captures", json={})
 
-    assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "depth_capture_preconditions_not_met"
+    assert response.status_code == 202
 
 
 def test_start_requires_existing_non_symlink_managed_reference_file(tmp_path):
@@ -813,3 +836,55 @@ def test_stage_persistence_failure_becomes_stable_storage_error(tmp_path, monkey
     assert capture["status"] == "failed"
     assert capture["error"]["code"] == "depth_capture_storage_failed"
     assert "private disk path" not in capture["error"]["message"]
+
+
+def test_default_worker_paths_do_not_depend_on_launch_directory(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    _completed_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    queue = ManualComputeQueue()
+    observed = {}
+
+    def runner(**kwargs):
+        observed.update(kwargs)
+        return _successful_runner(tmp_path, "passed")(**kwargs)
+
+    client = TestClient(create_app(
+        data_dir=tmp_path, local_compute_queue=queue, depth_capture_runner=runner,
+    ))
+    assert client.post("/api/projects/project-001/depth-captures", json={}).status_code == 202
+    queue.run_next()
+
+    worker_root = Path(main.__file__).resolve().parents[1] / "depth_worker"
+    assert observed["request"].checkpoint == worker_root / "checkpoints/video_depth_anything_vits.pth"
+    assert observed["request"].upstream_root == worker_root / "vendor/Video-Depth-Anything"
+    assert observed["worker_script"] == worker_root / "run_depth.py"
+    assert observed["worker_python"] == str(worker_root / ".venv/bin/python")
+
+@pytest.mark.parametrize('quality', ['passed', 'review_required', 'failed'])
+def test_depth_package_is_independent_of_prompts_and_generation(tmp_path, quality):
+    capture = _completed_capture(tmp_path, quality=quality)
+    client = TestClient(create_app(data_dir=tmp_path, local_compute_queue=ManualComputeQueue()))
+    response = client.get(f'/api/projects/project-001/depth-captures/{capture.id}/package')
+    assert response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        assert set(DEPTH_ARTIFACTS) <= set(archive.namelist())
+        assert archive.read('depth-control.mp4') == b'content'
+        record = json.loads(archive.read('capture.json'))
+        assert record['qualityAssessment']['status'] == quality
+        assert record['outputSummary']['frameCount'] == 16
+        assert 'ComfyUI' in archive.read('README.txt').decode()
+
+
+def test_depth_package_rejects_symlink_asset(tmp_path):
+    capture = _completed_capture(tmp_path)
+    client = TestClient(create_app(data_dir=tmp_path, local_compute_queue=ManualComputeQueue()))
+    asset = tmp_path / 'project-files/project-001/depth-captures' / capture.id / 'depth-control.mp4'
+    outside = tmp_path / 'private.txt'
+    outside.write_text('private')
+    asset.unlink()
+    asset.symlink_to(outside)
+    response = client.get(f'/api/projects/project-001/depth-captures/{capture.id}/package')
+    assert response.status_code == 404
+    assert b'private' not in response.content

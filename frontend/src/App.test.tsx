@@ -1,3 +1,6 @@
+vi.mock("./PreproductionWorkspace", () => ({ PreproductionWorkspace: ({ tools }: { tools: import("react").ReactNode }) => tools }));
+vi.mock("./CharacterMotionPanel", () => ({ CharacterMotionPanel: () => null }));
+vi.mock("./VideoToolkitPanel", () => ({ VideoToolkitPanel: () => null }));
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -10,6 +13,11 @@ const response = (body: unknown, status = 200) =>
 const capabilities = {
   analysisService: { state: "unconfigured", label: "未配置" },
   localComfyui: { state: "disconnected", label: "未连接" },
+};
+
+const upscaleState = {
+  environment: { available: false, message: "未配置本地 Real-ESRGAN" },
+  runs: [],
 };
 
 function deferred<T>() {
@@ -78,11 +86,17 @@ describe("项目首页", () => {
     fetchMock.mockResolvedValueOnce(response([readyProject]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
     fetchMock.mockResolvedValueOnce(response([]));
+    fetchMock.mockImplementation((url) => {
+      const path = String(url);
+      if (path.endsWith("/upscale")) return Promise.resolve(response(upscaleState));
+      if (path.endsWith("/preparation")) return Promise.resolve(response({ sourceId: "video-001", preprocessingId: "pre-001", revision: 0, shots: [], canAnalyze: false }));
+      return Promise.reject(new Error(`unexpected ${path}`));
+    });
 
     render(<App />);
     await userEvent.click(await screen.findByRole("button", { name: /雨夜人像复刻/ }));
 
-    expect(screen.getByRole("heading", { name: "深度捕捉审查" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "深度动作捕捉" })).toBeVisible();
     expect(screen.getByRole("status", { name: "本地深度捕捉正在运行" })).toBeVisible();
     expect(screen.getByText(/本地预处理或深度捕捉运行时不能更换参考素材/)).toBeVisible();
     expect(screen.getByLabelText("参考素材文件")).toBeDisabled();
@@ -101,10 +115,12 @@ describe("项目首页", () => {
     fetchMock.mockResolvedValueOnce(response([readyProject]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
     fetchMock.mockResolvedValueOnce(response([]));
-    fetchMock.mockReturnValueOnce(pending.promise);
+    fetchMock.mockImplementation((url) => String(url).endsWith("/preparation")
+      ? Promise.resolve(response({ sourceId: "video-001", preprocessingId: "pre-001", revision: 0, shots: [], canAnalyze: false }))
+      : pending.promise);
     render(<App />);
     await userEvent.click(await screen.findByRole("button", { name: /雨夜人像复刻/ }));
-    await userEvent.click(screen.getByRole("button", { name: "开始本地深度捕捉" }));
+    await userEvent.click(screen.getByRole("button", { name: "提取整段深度视频" }));
     expect(screen.getByLabelText("参考素材文件")).toBeDisabled();
   });
 
@@ -122,13 +138,14 @@ describe("项目首页", () => {
     fetchMock.mockResolvedValueOnce(response([readyProject]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
     fetchMock.mockResolvedValueOnce(response([]));
+    fetchMock.mockResolvedValueOnce(response(upscaleState));
 
     render(<App />);
     await userEvent.click(await screen.findByRole("button", { name: /雨夜人像复刻/ }));
 
     expect(screen.getByRole("heading", { name: "本地预处理" })).toBeVisible();
     expect(screen.getByRole("button", { name: "开始本地预处理" })).toBeVisible();
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
   it("图片本地预处理排队时锁定参考素材替换", async () => {
@@ -171,12 +188,14 @@ describe("项目首页", () => {
     fetchMock.mockResolvedValueOnce(response([readyProject]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
     fetchMock.mockResolvedValueOnce(response([]));
+    fetchMock.mockResolvedValueOnce(response({ sourceId: "video-001", preprocessingId: "preprocessing-001", revision: 0, shots: [], canAnalyze: false }));
 
     render(<App />);
     await userEvent.click(await screen.findByRole("button", { name: /雨夜人像复刻/ }));
 
     expect(screen.getByText("8 张关键帧")).toBeVisible();
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledWith("/api/projects/project-001/preparation", {});
+    expect(fetchMock.mock.calls.every(([, init]) => !init?.method || init.method === "GET")).toBe(true);
   });
 
   it("轮询返回新项目时同步当前页与首页集合", async () => {
@@ -196,6 +215,7 @@ describe("项目首页", () => {
     fetchMock.mockResolvedValueOnce(response([projectA, projectB]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
     fetchMock.mockResolvedValueOnce(response([]));
+    fetchMock.mockResolvedValueOnce(response(upscaleState));
     fetchMock.mockResolvedValueOnce(response(completed));
 
     render(<App />);
@@ -288,7 +308,7 @@ describe("项目首页", () => {
 
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "从一份参考素材开始一项可继续的复刻工作。" })).toBeVisible();
+    expect(await screen.findByRole("heading", { name: "拆解参考视频的镜头、动作与节奏，准备可编辑的复刻方案。" })).toBeVisible();
     expect(screen.getByText("从一个命名项目开始。参考图片或视频将在下一步添加。")).toBeVisible();
   });
 
@@ -376,6 +396,7 @@ describe("项目首页", () => {
     ]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
     fetchMock.mockResolvedValueOnce(response([]));
+    fetchMock.mockResolvedValueOnce(response(upscaleState));
     fetchMock.mockResolvedValueOnce(response({
       id: "project-001",
       name: "雨夜人像复刻",
@@ -420,6 +441,7 @@ describe("项目首页", () => {
     fetchMock.mockResolvedValueOnce(response([original, other]));
     fetchMock.mockResolvedValueOnce(response(capabilities));
     fetchMock.mockResolvedValueOnce(response([]));
+    fetchMock.mockResolvedValueOnce(response(upscaleState));
     fetchMock.mockReturnValueOnce(pending.promise);
 
     render(<App />);
@@ -515,7 +537,7 @@ describe("项目首页", () => {
     expect(await screen.findByRole("heading", { name: "室内产品复刻" })).toBeVisible();
   });
 
-  it("在环境检测失败时分别显示两项状态不可用，仍允许创建项目并可重新检测", async () => {
+  it("分析环境检测失败时仍允许创建项目并可重新检测", async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValueOnce(response([]));
     fetchMock.mockRejectedValueOnce(new Error("服务未启动"));
@@ -534,7 +556,7 @@ describe("项目首页", () => {
 
     render(<App />);
 
-    expect(await screen.findAllByText("状态不可用")).toHaveLength(2);
+    expect(await screen.findAllByText("状态不可用")).toHaveLength(1);
     await userEvent.click(screen.getByRole("button", { name: "重新检测" }));
     expect(await screen.findAllByText("未配置")).toHaveLength(1);
 

@@ -198,7 +198,7 @@ export function ReferenceMediaPanel({
         onDragOver={(event) => { if (!isLocked) event.preventDefault(); }}
         onDrop={(event) => { event.preventDefault(); if (!isLocked && event.dataTransfer.files?.[0]) selectFile(event.dataTransfer.files[0]); }}>
         <p>{copy}</p>
-        {!hasReferenceMedia && <p>支持 JPG、JPEG、PNG、WebP、MP4 或 MOV。图片最大 30 MB；视频最大 200 MB，时长 2～10 秒，最低 480P，最高 UHD 4K。</p>}
+        {!hasReferenceMedia && <p>支持 JPG、JPEG、PNG、WebP、MP4 或 MOV。图片最大 30 MB；视频最大 200 MB，时长 2～300 秒（5 分钟），最高 UHD 4K。低分辨率可能影响分析细节。</p>}
       </div>
     );
   }

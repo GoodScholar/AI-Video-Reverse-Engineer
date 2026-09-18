@@ -5,7 +5,7 @@ import {
   Clapperboard,
   FolderOpen,
   HardDrive,
-  MonitorCog,
+  LoaderCircle,
   Plus,
   RadioTower,
   RefreshCw,
@@ -14,6 +14,12 @@ import type { AnalysisProviderConfiguration, Capabilities, Capability, Project }
 import { listAnalysisProviders } from "./analysisProviderApi";
 import { AnalysisProviderSettings } from "./AnalysisProviderSettings";
 import { DepthCapturePanel } from "./DepthCapturePanel";
+import { ShotPreparationPanel } from "./ShotPreparationPanel";
+import { ReproductionPanel } from "./ReproductionPanel";
+import { PreproductionWorkspace } from "./PreproductionWorkspace";
+import { CharacterMotionPanel } from "./CharacterMotionPanel";
+import { VideoToolkitPanel } from "./VideoToolkitPanel";
+import { VideoUpscalePanel } from "./VideoUpscalePanel";
 import { LocalPreprocessingPanel } from "./LocalPreprocessingPanel";
 import { SemanticAnalysisPanel } from "./SemanticAnalysisPanel";
 import { ReferenceMediaPanel } from "./ReferenceMediaPanel";
@@ -118,6 +124,7 @@ export function App() {
   const [saveError, setSaveError] = useState("");
   const [isSaving, setIsSaving] = useState(false);
   const [depthMutationPending, setDepthMutationPending] = useState(false);
+  const [personMutationPending, setPersonMutationPending] = useState(false);
   const [shouldRestoreCreateFocus, setShouldRestoreCreateFocus] = useState(false);
   const newProjectButtonRef = useRef<HTMLButtonElement>(null);
 
@@ -230,7 +237,6 @@ export function App() {
           </button>
           <div className="topbar-status" aria-label="环境状态">
             <StatusLine icon={RadioTower} label="分析服务" capability={analysisServiceCapability(capabilities.analysisService, analysisProviders)} />
-            <StatusLine icon={MonitorCog} label="本地 ComfyUI" capability={capabilities.localComfyui} />
             {capabilities.analysisService.state === "unavailable" && (
               <button className="capability-retry" type="button" onClick={() => void refreshCapabilities()}><RefreshCw size={15} aria-hidden="true" />重新检测</button>
             )}
@@ -250,6 +256,7 @@ export function App() {
               <p className="muted">创建于 {formatTime(selectedProject.createdAt)} · 仅保存在本地</p>
             </div>
           </div>
+          <PreproductionWorkspace key={selectedProject.id} project={selectedProject} tools={<>
           <ReferenceMediaPanel
             project={selectedProject}
             onProjectUpdated={updateProject}
@@ -259,6 +266,7 @@ export function App() {
               || selectedProject.localPreprocessing?.status === "running"
               || depthCaptureLocked
               || depthMutationPending
+              || personMutationPending
             }
             hasPreprocessingResult={selectedProject.localPreprocessing !== null}
           />
@@ -267,6 +275,12 @@ export function App() {
           {analysisSettingsOpen && <AnalysisProviderSettings providers={analysisProviders} onProvidersChanged={setAnalysisProviders} />}
           <SemanticAnalysisPanel project={selectedProject} provider={selectedAnalysisProvider(analysisProviders)} onProjectUpdated={updateProject} />
           <DepthCapturePanel project={selectedProject} onProjectUpdated={updateProject} onMutationPendingChange={setDepthMutationPending} />
+          <ShotPreparationPanel project={selectedProject} onMutationPendingChange={setPersonMutationPending} />
+          <ReproductionPanel project={selectedProject} preparationOnly />
+          <CharacterMotionPanel key={`${selectedProject.id}:${selectedProject.referenceMedia?.id ?? ""}`} project={selectedProject} preparationOnly />
+          <VideoUpscalePanel project={selectedProject} />
+          <VideoToolkitPanel project={selectedProject} />
+          </>} />
         </section>
       </main>
     );
@@ -279,11 +293,10 @@ export function App() {
           <span className="brand-mark"><Clapperboard aria-hidden="true" size={15} strokeWidth={1.8} /></span>
           <span>AI Video Reverse Engineer</span>
           <span className="brand-divider" aria-hidden="true" />
-          <strong>AI 视频复刻分析器</strong>
+          <strong>视频复刻工作台</strong>
         </div>
         <div className="topbar-status" aria-label="环境状态">
           <StatusLine icon={RadioTower} label="分析服务" capability={analysisServiceCapability(capabilities.analysisService, analysisProviders)} />
-          <StatusLine icon={MonitorCog} label="本地 ComfyUI" capability={capabilities.localComfyui} />
           {capabilities.analysisService.state === "unavailable" && (
             <button className="capability-retry" type="button" onClick={() => void refreshCapabilities()}><RefreshCw size={15} aria-hidden="true" />重新检测</button>
           )}
@@ -294,8 +307,8 @@ export function App() {
 
       <section className="home-hero" aria-labelledby="home-title">
         <div>
-          <h1 id="home-title">从一份参考素材开始一项可继续的复刻工作。</h1>
-          <p className="lede">创建项目不会上传文件，也不要求账户、登录或已连接的本地 ComfyUI。</p>
+          <h1 id="home-title">拆解参考视频的镜头、动作与节奏，准备可编辑的复刻方案。</h1>
+          <p className="lede">素材与方案保存在本地。围绕参考画面、动作控制与镜头节奏准备复刻素材，剪辑与音频用于结果对齐和交付。</p>
         </div>
         <button className="primary-action" ref={newProjectButtonRef} type="button" onClick={() => { setIsCreating(true); setSaveError(""); }}>
           <Plus size={18} aria-hidden="true" /> 新建复刻项目
@@ -340,7 +353,7 @@ export function App() {
           {!isLoading && !loadError && <span className="project-count">{projects.length} 项</span>}
         </div>
 
-        {isLoading && <p className="loading-line">正在读取本地复刻项目…</p>}
+        {isLoading && <p className="loading-line" role="status"><LoaderCircle className="loading-spinner" aria-hidden="true" size={18} />正在读取本地复刻项目…</p>}
 
         {loadError && (
           <div className="inline-error" role="alert">

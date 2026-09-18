@@ -27,6 +27,8 @@ def main() -> int:
     parser.add_argument("--target-fps", required=True, type=int)
     parser.add_argument("--input-size", required=True, type=int)
     parser.add_argument("--max-res", required=True, type=int)
+    parser.add_argument("--output-short-side", required=True, type=int)
+    parser.add_argument("--backbone-microbatch", required=True, type=int)
     args = parser.parse_args()
 
     audit = os.environ.get("FAKE_WORKER_AUDIT")
@@ -52,7 +54,7 @@ def main() -> int:
         (output / "worker-metadata.json").write_text("{}", encoding="utf-8")
         return 0
     if mode == "bad-zip":
-        (output / "depths.npz").write_bytes(b"not a zip")
+        (output / "depths.gray").write_bytes(b"bad")
         (output / "worker-metadata.json").write_text("{}", encoding="utf-8")
         return 0
     if mode in ("bad-header-zero", "bad-header-one"):
@@ -62,42 +64,23 @@ def main() -> int:
             archive.writestr("depths.npy", npy)
         (output / "worker-metadata.json").write_text("{}", encoding="utf-8")
         return 0
-    depths = [0.1, 0.2, 0.2, 0.3, 0.2, 0.3, 0.3, 0.4]
-    if mode == "malformed":
-        depths[0] = float("nan")
-    if mode == "out-of-range":
-        depths = [-1.0, 2.0, -0.5, 1.5, 0.0, 1.0, 0.25, 0.75]
+    shape = (2, args.output_short_side, (int(round(args.output_short_side * 16 / 9)) + 1) // 2 * 2)
+    depths = [index % 256 for index in range(shape[0] * shape[1] * shape[2])]
     if mode == "constant":
-        depths = [0.5] * 8
-    shape = (2, 2, 2)
+        depths = [128] * len(depths)
     if mode == "odd":
         shape = (2, 2, 3)
-        depths = [index / 11 for index in range(12)]
+        depths = [index % 256 for index in range(12)]
     if mode == "too-large":
         shape = (2, 2, 642)
-        depths = [index / 2567 for index in range(2568)]
-    header = (
-        "{'descr': '<f4', 'fortran_order': False, 'shape': " + repr(shape) + ", }\n"
-    ).encode("ascii")
-    padding = b" " * ((16 - ((10 + len(header)) % 16)) % 16)
-    npy = b"\x93NUMPY\x01\x00" + struct.pack("<H", len(header) + len(padding)) + header[:-1] + padding + b"\n"
-    with zipfile.ZipFile(output / "depths.npz", "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("depths.npy", npy + struct.pack(f"<{len(depths)}f", *depths))
-    if mode == "bad-compression":
-        payload = bytearray((output / "depths.npz").read_bytes())
-        for signature, offset in ((b"PK\x03\x04", 8), (b"PK\x01\x02", 10)):
-            index = payload.index(signature)
-            payload[index + offset:index + offset + 2] = struct.pack("<H", 99)
-        (output / "depths.npz").write_bytes(payload)
-    if mode == "corrupt-deflate":
-        payload = bytearray((output / "depths.npz").read_bytes())
-        local = payload.index(b"PK\x03\x04")
-        compressed_size = struct.unpack("<I", payload[local + 18:local + 22])[0]
-        name_length = struct.unpack("<H", payload[local + 26:local + 28])[0]
-        extra_length = struct.unpack("<H", payload[local + 28:local + 30])[0]
-        data_start = local + 30 + name_length + extra_length
-        payload[data_start:data_start + compressed_size] = b"\xff" * compressed_size
-        (output / "depths.npz").write_bytes(payload)
+        depths = [index % 256 for index in range(2568)]
+    if mode == "long":
+        frames = int(os.environ["FAKE_WORKER_FRAMES"])
+        shape = (frames, args.output_short_side, (int(round(args.output_short_side * 16 / 9)) + 1) // 2 * 2)
+        with (output / "depths.gray").open("wb") as raw:
+            raw.truncate(shape[0] * shape[1] * shape[2])
+    else:
+        (output / "depths.gray").write_bytes(b"" if mode == "malformed" else bytes(depths))
     metadata = {
         "schemaVersion": 1,
         "modelIdentity": MODEL,
@@ -105,12 +88,14 @@ def main() -> int:
         "targetFps": args.target_fps,
         "inputSize": args.input_size,
         "maxRes": args.max_res,
+        "outputShortSide": args.output_short_side,
+        "backboneMicrobatch": args.backbone_microbatch,
         "frameCount": shape[0],
         "width": shape[2],
         "height": shape[1],
         "frameRate": 99.0 if mode == "too-large-fps" else float(args.target_fps),
-        "depthMin": min(depths),
-        "depthMax": max(depths),
+        "depthMin": 0.0,
+        "depthMax": 1.0,
         "finite": True,
         "normalizationDirection": "near_white_far_black",
         "normalizationPercentilePolicy": {

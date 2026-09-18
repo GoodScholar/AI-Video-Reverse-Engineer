@@ -117,6 +117,8 @@ class DepthCapture(BaseModel):
     algorithmVersion: Literal[1] = DEPTH_ALGORITHM_VERSION
     status: Literal["queued", "running", "completed", "failed"]
     devicePreference: Literal["auto", "cuda", "mps", "cpu"]
+    # 缺失表示旧产物；不得将其误标为新分辨率档位。
+    outputResolution: Optional[Literal["480p", "720p"]] = None
     executionDevice: Optional[Literal["cuda", "mps", "cpu"]] = None
     modelIdentity: DepthModelIdentity = Field(default_factory=DepthModelIdentity)
     normalizationDirection: Literal["near_white_far_black"] = "near_white_far_black"
@@ -164,6 +166,7 @@ def new_depth_capture(
     reference_video_id: str,
     device_preference: Literal["auto", "cuda", "mps", "cpu"],
     queued_at: str,
+    output_resolution: Literal["480p", "720p"] = "480p",
 ) -> DepthCapture:
     stages = [DepthCaptureStage(name=name) for name in DEPTH_STAGE_ORDER]
     return DepthCapture(
@@ -171,6 +174,7 @@ def new_depth_capture(
         sourceReferenceVideoId=reference_video_id,
         status="queued",
         devicePreference=device_preference,
+        outputResolution=output_resolution,
         stages=stages,
         queuedAt=queued_at,
         updatedAt=queued_at,

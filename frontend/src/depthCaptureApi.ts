@@ -1,4 +1,4 @@
-import type { DepthDevicePreference, Project } from "./models";
+import type { DepthDevicePreference, DepthOutputResolution, Project } from "./models";
 import { readApiError } from "./referenceMediaApi";
 
 const CONNECTION_ERROR = "无法连接本地服务，请确认应用服务正在运行后重试。";
@@ -22,16 +22,20 @@ export const referenceVideoContentUrl = (projectId: string): string =>
 export const depthPreviewUrl = (projectId: string, captureId: string): string =>
   `/api/projects/${encodeURIComponent(projectId)}/depth-captures/${encodeURIComponent(captureId)}/preview`;
 
+export const depthVideoUrl = (projectId: string, captureId: string, download = false): string =>
+  `/api/projects/${encodeURIComponent(projectId)}/depth-captures/${encodeURIComponent(captureId)}/video${download ? "?download=true" : ""}`;
+
 export function startDepthCapture(
   projectId: string,
   devicePreference: DepthDevicePreference = "auto",
+  outputResolution: DepthOutputResolution = "480p",
 ): Promise<Project> {
   return requestProject(
     `/api/projects/${encodeURIComponent(projectId)}/depth-captures`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ devicePreference }),
+      body: JSON.stringify({ devicePreference, outputResolution }),
     },
     "无法启动本地深度捕捉，请重试。",
   );

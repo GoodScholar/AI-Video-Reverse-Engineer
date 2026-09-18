@@ -144,6 +144,23 @@ def test_depth_preview_streams_only_a_valid_completed_current_capture(tmp_path):
     _assert_media_headers(response, size=1, content_range="bytes 0-0/6")
 
 
+def test_depth_video_streams_valid_grayscale_control_with_range_and_optional_download(tmp_path):
+    client, capture, _, _ = _client_with_media(tmp_path)
+
+    inline = client.get(
+        f"/api/projects/project-001/depth-captures/{capture.id}/video",
+        headers={"Range": "bytes=1-3"},
+    )
+    download = client.get(f"/api/projects/project-001/depth-captures/{capture.id}/video?download=true")
+
+    assert inline.status_code == 206
+    assert inline.content == b"rti"
+    _assert_media_headers(inline, size=3, content_range="bytes 1-3/8")
+    assert "content-disposition" not in inline.headers
+    assert download.status_code == 200
+    assert download.headers["content-disposition"] == f'attachment; filename="depth-{capture.id}.mp4"'
+
+
 @pytest.mark.parametrize("range_header", [
     "bytes=", "bytes=-", "bytes=3-1", "bytes=6-", "bytes=0-0,2-3", "items=0-1",
 ])

@@ -1,4 +1,4 @@
-from typing import Optional, Protocol, Union, runtime_checkable
+from typing import Any, Literal, Optional, Protocol, Union, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -51,6 +51,8 @@ class ProviderRequest(BaseModel):
     analysisInput: Optional[AnalysisInput] = None
     prompt: str = Field(min_length=1)
     model: str = Field(min_length=1)
+    task: Literal["analysis", "prompt_generation"] = "analysis"
+    responseSchema: Optional[dict[str, Any]] = None
     isRepair: bool = False
 
     @field_validator("prompt", "model")
@@ -62,6 +64,14 @@ class ProviderRequest(BaseModel):
 
     @model_validator(mode="after")
     def request_shape_matches_its_role(self) -> "ProviderRequest":
+        if self.task == "prompt_generation":
+            if self.analysisInput is not None:
+                raise ValueError("提示词生成请求不得携带分析输入。")
+            if self.isRepair:
+                raise ValueError("提示词生成请求不得作为修复请求。")
+            if self.responseSchema is None:
+                raise ValueError("提示词生成请求必须声明响应结构。")
+            return self
         if self.isRepair and self.analysisInput is not None:
             raise ValueError("修复请求不得携带分析输入。")
         if not self.isRepair and self.analysisInput is None:
@@ -74,6 +84,7 @@ class ProviderRequest(BaseModel):
         return ProviderRequest(
             prompt=prompt,
             model=self.model,
+            responseSchema=self.responseSchema,
             isRepair=True,
         )
 

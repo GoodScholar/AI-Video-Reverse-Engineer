@@ -6,6 +6,9 @@ import os
 import re
 import stat
 import tempfile
+import subprocess
+import zipfile
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -21,6 +24,12 @@ from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from app.shot_preparation_api import create_shot_preparation_router
+from app.shot_analysis import analyze_preparation_shot
+from app.reproduction_api import create_reproduction_router
+from app.character_motion_api import create_character_motion_router
+from app.prompt_generation import generate_prompts
 
 from app.reference_video import (
     DEFAULT_FFPROBE_TIMEOUT_SECONDS,
@@ -76,7 +85,7 @@ from app.depth_capture import (
 )
 from app.depth_capture_jobs import LocalComputeJobQueue, LocalPreprocessingQueueAdapter
 from app.depth_capture_runner import DepthCaptureFailure, DepthCaptureRequest, run_depth_capture
-from app.depth_capture_storage import inspect_depth_artifacts
+from app.depth_capture_storage import DEPTH_ARTIFACTS, open_validated_depth_artifact, inspect_depth_artifacts
 from app.depth_capture_storage import DepthPreviewUnavailableError, open_validated_depth_preview
 from app.semantic_analysis import SemanticAnalysis, SemanticAnalysisError
 from app.semantic_analysis_jobs import SemanticAnalysisJobQueue
@@ -120,6 +129,7 @@ class CreateProjectInput(BaseModel):
 
 class StartDepthCaptureInput(BaseModel):
     devicePreference: Literal["auto", "cuda", "mps", "cpu"] = "auto"
+    outputResolution: Literal["480p", "720p"] = "480p"
 
 
 class StartSemanticAnalysisInput(BaseModel):
@@ -300,6 +310,10 @@ def _write_projects(data_dir: Path, projects: list[Project]) -> None:
         raise
 
 
+DEPTH_WORKER_ROOT = Path(__file__).resolve().parents[1] / "depth_worker"
+PERSON_WORKER_ROOT = Path(__file__).resolve().parents[1] / "person_worker"
+
+
 def create_app(
     data_dir: Path,
     *,
@@ -312,11 +326,14 @@ def create_app(
     preprocessing_queue_factory: Optional[Callable] = None,
     local_compute_queue: Optional[LocalComputeJobQueue] = None,
     depth_capture_runner: Callable = run_depth_capture,
-    depth_worker_python: str = "backend/depth_worker/.venv/bin/python",
-    depth_worker_script: Path = Path("backend/depth_worker/run_depth.py"),
-    depth_checkpoint: Path = Path("backend/depth_worker/checkpoints/video_depth_anything_vits.pth"),
-    depth_upstream_root: Path = Path("backend/depth_worker/vendor/Video-Depth-Anything"),
+    depth_worker_python: str = str(DEPTH_WORKER_ROOT / ".venv/bin/python"),
+    depth_worker_script: Path = DEPTH_WORKER_ROOT / "run_depth.py",
+    depth_checkpoint: Path = DEPTH_WORKER_ROOT / "checkpoints/video_depth_anything_vits.pth",
+    depth_upstream_root: Path = DEPTH_WORKER_ROOT / "vendor/Video-Depth-Anything",
     depth_device_probe: Optional[Callable[[], tuple[bool, bool]]] = None,
+    person_worker_python: str = str(PERSON_WORKER_ROOT / ".venv/bin/python"),
+    person_worker_script: Path = PERSON_WORKER_ROOT / "run_person.py",
+    person_model: Path = PERSON_WORKER_ROOT / "models/pose_landmarker_full.task",
     credential_store=None,
     analysis_settings: Optional[AnalysisSettings] = None,
     semantic_analysis_queue_factory: Optional[Callable] = None,
@@ -823,7 +840,8 @@ def create_app(
         try:
             if depth_device_probe is not None:
                 return depth_device_probe()
-            import torch
+            import importlib
+            torch = importlib.import_module("torch")
             return bool(torch.cuda.is_available()), bool(
                 getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
             )
@@ -1158,7 +1176,6 @@ def create_app(
         preprocessing_jobs = LocalPreprocessingQueueAdapter(compute_jobs, run_preprocessing_job)
     else:
         preprocessing_jobs = preprocessing_queue_factory(run_preprocessing_job)
-    app.add_event_handler("shutdown", compute_jobs.shutdown)
     if preprocessing_queue_factory is not None:
         app.add_event_handler("shutdown", preprocessing_jobs.shutdown)
 
@@ -1177,9 +1194,15 @@ def create_app(
             or reference_media_path_pattern.fullmatch(request.url.path) is not None
         )
 
+    def is_character_motion_upload_request(request: Request) -> bool:
+        return request.method == "POST" and bool(re.fullmatch(r"/api/projects/[^/]+/character-motion/character", request.url.path))
+
     def is_sensitive_analysis_mutation(request: Request) -> bool:
         path = request.url.path
         return (
+            request.method in ("POST", "PUT")
+            and bool(re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|preparation|preproduction|timeline|upscale|character-motion|toolkit)(?:/.*)?", path))
+        ) or (
             request.method == "PUT" and bool(re.fullmatch(r"/api/analysis-providers/[^/]+/configuration", path))
         ) or (
             request.method == "POST" and (
@@ -1250,7 +1273,18 @@ def create_app(
 
     @app.middleware("http")
     async def reject_invalid_reference_video_request(request, call_next):
-        if is_sensitive_analysis_mutation(request):
+        if request.method == "POST" and re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|character-motion)/runs", request.url.path):
+            return JSONResponse(status_code=410, content={"detail": {
+                "code": "final_generation_disabled",
+                "message": "当前工作台只准备素材与方案，请导出后在外部工具执行视频生成。",
+            }})
+        if is_character_motion_upload_request(request) or (request.method == "POST" and re.fullmatch(r"/api/projects/[^/]+/preproduction/assets", request.url.path)):
+            origin = request.headers.get("origin")
+            if origin is not None and origin not in _ALLOWED_ANALYSIS_MUTATION_ORIGINS:
+                return JSONResponse(status_code=403, content={"detail": {
+                    "code": "request_origin_rejected", "message": "请求来源不被本地分析服务允许。",
+                }})
+        elif is_sensitive_analysis_mutation(request):
             rejection = sensitive_mutation_rejection(request)
             if rejection is not None:
                 return rejection
@@ -1279,6 +1313,11 @@ def create_app(
                     "message": "深度捕捉正在排队或运行，请完成后再更换参考视频。",
                 }},
             )
+        if compute_jobs.is_active("person_control", project_id):
+            return JSONResponse(status_code=409, content={"detail": {
+                "code": "person_control_in_progress",
+                "message": "人物控制素材正在排队或提取，请完成后再更换参考素材。",
+            }})
         semantic = project.semanticAnalysis
         if semantic is not None and semantic.status in {"queued", "running"}:
             return JSONResponse(
@@ -1351,6 +1390,11 @@ def create_app(
                         "message": "深度捕捉正在排队或运行，请完成后再更换参考视频。",
                     },
                 )
+            if compute_jobs.is_active("person_control", project_id):
+                raise HTTPException(status_code=409, detail={
+                    "code": "person_control_in_progress",
+                    "message": "人物控制素材正在排队或提取，请完成后再更换参考素材。",
+                })
             semantic = previous_project.semanticAnalysis
             if semantic is not None and semantic.status in {"queued", "running"}:
                 raise HTTPException(
@@ -1949,6 +1993,51 @@ def create_app(
     def get_reference_media_content(project_id: str, request: Request) -> Union[StreamingResponse, Response]:
         return reference_media_content_response(ensure_project_exists(project_id), request)
 
+    @app.get("/api/projects/{project_id}/depth-captures/{capture_id}/package", response_model=None)
+    def get_depth_capture_package(project_id: str, capture_id: str):
+        project = ensure_project_exists(project_id)
+        capture = next((item for item in project.depthCaptures if item.id == capture_id), None)
+        if (capture is None or capture.status != "completed" or project.referenceVideo is None
+                or capture.sourceReferenceVideoId != project.referenceVideo.id):
+            raise media_not_found()
+        output = tempfile.TemporaryFile()
+        try:
+            with zipfile.ZipFile(output, "w", zipfile.ZIP_STORED) as archive:
+                for name in DEPTH_ARTIFACTS:
+                    descriptor, _ = open_validated_depth_artifact(
+                        artifact=name, data_dir=data_dir, project_id=project.id, capture_id=capture.id,
+                        source_reference_video_id=capture.sourceReferenceVideoId,
+                        algorithm=capture.algorithmVersion,
+                    )
+                    with os.fdopen(descriptor, "rb") as source, archive.open(name, "w", force_zip64=True) as target:
+                        shutil.copyfileobj(source, target, length=1024 * 1024)
+                archive.writestr("capture.json", capture.model_dump_json(indent=2))
+                archive.writestr("README.txt", "完整深度素材包，无需 ComfyUI 或提示词。\n"
+                    "depth-control.mp4 是灰度控制视频，近白远黑；depth-preview.mp4 是彩色预览。\n"
+                    "保留提取产物的完整时长、帧率和尺寸，不按生成模板截短或补帧。\n"
+                    "capture.json 包含执行设备、版本、时间线与质量结论；其他 JSON 为提取报告。\n"
+                    "下载不代表质量通过；failed 不可用于正式生成，review_required 仍需人工复核。\n")
+            output.seek(0)
+        except OSError as error:
+            output.close()
+            if isinstance(error, DepthPreviewUnavailableError) or error.errno in _MEDIA_NOT_FOUND_ERRNOS:
+                raise media_not_found() from error
+            raise video_storage_error(error) from error
+        except BaseException:
+            output.close()
+            raise
+
+        def chunks():
+            try:
+                while chunk := output.read(1024 * 1024):
+                    yield chunk
+            finally:
+                output.close()
+
+        return StreamingResponse(chunks(), media_type="application/zip", headers={
+            "Content-Disposition": f'attachment; filename="depth-materials-{capture.id}.zip"',
+        }, background=BackgroundTask(output.close))
+
     @app.get("/api/projects/{project_id}/depth-captures/{capture_id}/preview", response_model=None)
     def get_depth_capture_preview(
         project_id: str,
@@ -1979,6 +2068,39 @@ def create_app(
                 raise media_not_found() from error
             raise video_storage_error(error) from error
         return media_response_from_descriptor(descriptor, size, request.headers.get("range"))
+
+    @app.get("/api/projects/{project_id}/depth-captures/{capture_id}/video", response_model=None)
+    def get_depth_capture_video(
+        project_id: str,
+        capture_id: str,
+        request: Request,
+        download: bool = False,
+    ) -> Union[StreamingResponse, Response]:
+        project = ensure_project_exists(project_id)
+        capture = next((item for item in project.depthCaptures if item.id == capture_id), None)
+        if (
+            capture is None
+            or capture.status != "completed"
+            or project.referenceVideo is None
+            or capture.sourceReferenceVideoId != project.referenceVideo.id
+        ):
+            raise media_not_found()
+        try:
+            descriptor, size = open_validated_depth_artifact(
+                artifact="depth-control.mp4", data_dir=data_dir, project_id=project.id,
+                capture_id=capture.id, source_reference_video_id=capture.sourceReferenceVideoId,
+                algorithm=capture.algorithmVersion,
+            )
+        except DepthPreviewUnavailableError as error:
+            raise media_not_found() from error
+        except OSError as error:
+            if error.errno in _MEDIA_NOT_FOUND_ERRNOS:
+                raise media_not_found() from error
+            raise video_storage_error(error) from error
+        response = media_response_from_descriptor(descriptor, size, request.headers.get("range"))
+        if download:
+            response.headers["Content-Disposition"] = f'attachment; filename="depth-{capture.id}.mp4"'
+        return response
 
     @app.post("/api/projects/{project_id}/local-preprocessing", response_model=Project)
     def start_local_preprocessing(project_id: str, response: Response) -> Project:
@@ -2110,22 +2232,9 @@ def create_app(
                     dispatching_project_ids.discard(project_id)
 
     def depth_capture_preconditions_met(project: Project) -> bool:
-        preprocessing = project.localPreprocessing
-        if project.referenceVideo is None or preprocessing is None:
-            return False
-        if (
-            preprocessing.status != "completed"
-            or preprocessing.sourceReferenceVideoId != project.referenceVideo.id
-            or preprocessing.reproducibilityAssessment is None
-            or preprocessing.reproducibilityAssessment.status == "out_of_scope"
-        ):
-            return False
-        if not managed_reference_media_is_safe(data_dir, project.id, project.referenceVideo):
-            return False
-        return validate_completed_stages(
-            preprocessing,
-            preprocessing_directory(data_dir, project.id, preprocessing.id),
-        ).firstInvalidStage is None
+        return project.referenceVideo is not None and managed_reference_media_is_safe(
+            data_dir, project.id, project.referenceVideo,
+        )
 
     def run_depth_capture_job(project_id: str) -> None:
         capture_id: Optional[str] = None
@@ -2164,6 +2273,7 @@ def create_app(
                 upstream_root=depth_upstream_root,
                 execution_device=capture.executionDevice,
                 expected_duration_seconds=project.referenceVideo.durationSeconds,
+                output_resolution=capture.outputResolution or "480p",
             )
 
             def stage_started(stage_name: str) -> None:
@@ -2327,19 +2437,10 @@ def create_app(
                     raise HTTPException(status_code=409, detail={
                         "code": "depth_capture_in_progress", "message": "深度捕捉正在排队或运行，请稍后再试。",
                     })
-                if (
-                    existing.status == "completed"
-                    and existing.sourceReferenceVideoId == project.referenceVideo.id
-                    and existing.algorithmVersion == DEPTH_ALGORITHM_VERSION
-                    and existing.devicePreference == payload.devicePreference
-                    and inspect_capture(project, existing)
-                    and existing.qualityAssessment is not None
-                    and existing.qualityAssessment.status in {"passed", "review_required"}
-                ):
-                    response.status_code = 200
-                    return project
             now = datetime.now(timezone.utc).isoformat()
-            capture = new_depth_capture(project.referenceVideo.id, payload.devicePreference, now)
+            capture = new_depth_capture(
+                project.referenceVideo.id, payload.devicePreference, now, payload.outputResolution,
+            )
             capture.executionDevice = device
             queued = True
             return project.model_copy(update={
@@ -2503,7 +2604,106 @@ def create_app(
     ) -> Project:
         return await upload_reference_media(project_id, file, require_video=True)
 
+    def generate_reproduction_prompts(project):
+        task = project.semanticAnalysis
+        setting, credential, _ = analysis_provider_snapshot(task.provider)
+        if setting is None or setting.model != task.model or (task.provider != "local_openai_compatible" and credential is None):
+            raise HTTPException(status_code=422, detail={
+                "code": "provider_unconfigured", "message": "原分析服务配置已变更或缺少凭据，请先重新配置并完成语义分析。",
+            })
+        provider = analysis_provider_for(
+            provider=task.provider, credential=credential, base_url=setting.baseUrl, model=task.model,
+        )
+        try:
+            return generate_prompts(task.result, provider, task.model)
+        except ProviderAnalysisError as error:
+            raise HTTPException(status_code=422, detail={
+                "code": error.failure.code, "message": error.failure.message,
+            }) from None
+        finally:
+            close_default_analysis_provider(provider)
+
+    def analyze_shot(project, shot):
+        task = project.semanticAnalysis
+        if task is None:
+            raise HTTPException(status_code=422, detail={
+                "code": "provider_unconfigured", "message": "请先在语义分析中选择并配置分析服务。",
+            })
+        setting, credential, _ = analysis_provider_snapshot(task.provider)
+        if setting is None or setting.model != task.model or (task.provider != "local_openai_compatible" and credential is None):
+            raise HTTPException(status_code=422, detail={
+                "code": "provider_unconfigured", "message": "分析服务配置已变更或缺少凭据，请先更新分析服务。",
+            })
+        provider = analysis_provider_for(
+            provider=task.provider, credential=credential, base_url=setting.baseUrl, model=task.model,
+        )
+        try:
+            return analyze_preparation_shot(data_dir, project, shot, provider, task.model, ffmpeg_path, ffprobe_path)
+        except ProviderAnalysisError as error:
+            raise HTTPException(status_code=422, detail={
+                "code": error.failure.code, "message": error.failure.message,
+            }) from None
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            raise HTTPException(status_code=422, detail={
+                "code": "shot_analysis_input_failed", "message": "镜头采样帧无法读取，请检查本地视频和 FFmpeg 后重试。",
+            }) from None
+        finally:
+            close_default_analysis_provider(provider)
+
+    app.include_router(create_shot_preparation_router(
+        data_dir, ensure_project_exists, ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
+        analyze_shot=analyze_shot, compute_queue=compute_jobs,
+        person_worker_python=person_worker_python, person_worker_script=person_worker_script, person_model=person_model,
+        source_lock=project_write_lock,
+    ))
+
+    from .video_upscale import UpscaleConfig
+    from .video_upscale_api import create_upscale_router
+    app.include_router(create_upscale_router(
+        data_dir, ensure_project_exists, compute_jobs,
+        config=UpscaleConfig.local(ffmpeg_path, ffprobe_path), source_lock=project_write_lock,
+    ))
+
+    app.include_router(create_reproduction_router(
+        data_dir, ensure_project_exists, generate_reproduction_prompts, ffmpeg_path=ffmpeg_path,
+    ))
+    app.include_router(create_character_motion_router(data_dir, ensure_project_exists, ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, source_lock=project_write_lock))
+
+    from .video_toolkit import ToolkitConfig
+    from .video_toolkit_api import create_toolkit_router
+    app.include_router(create_toolkit_router(data_dir, ensure_project_exists, compute_jobs,
+        config=ToolkitConfig.local(ffmpeg_path, ffprobe_path), source_lock=project_write_lock))
+    from .preproduction_api import create_preproduction_router
+    app.include_router(create_preproduction_router(
+        data_dir, ensure_project_exists, compute_jobs,
+        ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, source_lock=project_write_lock,
+    ))
+    from .timeline_api import create_timeline_router
+    app.include_router(create_timeline_router(
+        data_dir, ensure_project_exists, compute_jobs,
+        ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, source_lock=project_write_lock,
+    ))
+    app.add_event_handler("shutdown", compute_jobs.shutdown)
+
     return app
 
 
-app = create_app(Path(os.environ.get("AI_VIDEO_REVERSE_ENGINEER_DATA_DIR", "./data")))
+def resolve_default_binary(name: str) -> str:
+    env_key = f"{name.upper()}_PATH"
+    if env_val := os.environ.get(env_key):
+        return env_val
+    for candidate_dir in (
+        Path("/opt/homebrew/opt/ffmpeg-full/bin"),
+        Path("/usr/local/opt/ffmpeg-full/bin"),
+    ):
+        candidate = candidate_dir / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return name
+
+
+app = create_app(
+    Path(os.environ.get("AI_VIDEO_REVERSE_ENGINEER_DATA_DIR", "./data")),
+    ffmpeg_path=resolve_default_binary("ffmpeg"),
+    ffprobe_path=resolve_default_binary("ffprobe"),
+)

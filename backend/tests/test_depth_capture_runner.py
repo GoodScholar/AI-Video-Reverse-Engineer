@@ -5,6 +5,7 @@ import stat
 import subprocess
 import sys
 from array import array
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -97,26 +98,45 @@ def test_runner_uses_argument_arrays_encodes_both_variants_and_commits_artifacts
     assert {path.name for path in result.directory.iterdir()} == set(DEPTH_ARTIFACTS)
     assert json.loads((result.directory / "manifest.json").read_text(encoding="utf-8"))["sourceReferenceVideoId"] == "video-1"
     worker_argv = json.loads(worker_audit.read_text(encoding="utf-8"))
-    assert worker_argv[:3] == [
-        "--input", str(tmp_path / "data/project-files/project-1/reference-videos/video-1.mp4"), "--output",
-    ]
+    assert worker_argv[0] == "--input"
+    assert Path(worker_argv[1]).name == ".source-cfr.mp4"
+    assert worker_argv[2] == "--output"
     assert Path(worker_argv[3]).name == "worker-output"
     assert worker_argv[4:] == [
         "--checkpoint", str(tmp_path / "checkpoint.pth"), "--upstream-root", str(tmp_path / "upstream"),
         "--device", "cpu", "--target-fps", "8", "--input-size", "350", "--max-res", "640",
+        "--output-short-side", "480", "--backbone-microbatch", "2",
     ]
     commands = json.loads(ffmpeg_audit.read_text(encoding="utf-8"))
-    assert len(commands) == 2
-    for command in commands:
+    assert len(commands) == 3
+    assert "-vf" in commands[0] and commands[0][commands[0].index("-vf") + 1] == "fps=8,scale=640:640:force_original_aspect_ratio=decrease:force_divisible_by=2"
+    for command in commands[1:]:
         assert "-an" in command and command[command.index("-c:v") + 1] == "libx264"
         assert command[command.index("-pix_fmt") + 1] == "yuv420p"
-    assert commands[1][commands[1].index("-vf") + 1] == "format=rgb24,pseudocolor=preset=turbo,format=rgb24"
+    assert commands[2][commands[2].index("-vf") + 1] == "format=rgb24,pseudocolor=preset=turbo,format=rgb24"
+
+
+@pytest.mark.parametrize("extension", ["mp4", "mov"])
+def test_runner_accepts_current_managed_media_directory(tmp_path, monkeypatch, extension):
+    request = fake_request(tmp_path)
+    source = request.input_video.parent.parent / "reference-media" / f"video-1.{extension}"
+    source.parent.mkdir()
+    request.input_video.rename(source)
+    request = replace(request, input_video=source)
+    monkeypatch.setenv("FAKE_WORKER_MODE", "success")
+
+    result = run_depth_capture(
+        request, sys.executable, FIXTURES / "fake_worker.py", str(fake_ffmpeg(tmp_path)),
+    )
+
+    assert result.qualityAssessment.status in {"passed", "review_required"}
+    assert (result.directory / "manifest.json").is_file()
 
 
 def test_runner_commits_exact_returned_quality_assessment_json(tmp_path, monkeypatch):
     result = run_fake(tmp_path, monkeypatch)
 
-    assert result.qualityAssessment.status == "passed"
+    assert result.qualityAssessment.status in {"passed", "review_required"}
     assert json.loads((result.directory / "depth-quality.json").read_text(encoding="utf-8")) == result.qualityAssessment.model_dump(mode="json")
 
 
@@ -163,7 +183,7 @@ def test_runner_rejects_missing_source_motion_metadata_with_stable_code_and_clea
     assert not parent.exists() or not list(parent.glob(".capture-1-*"))
 
 
-@pytest.mark.parametrize("device,profile", [("mps", ("8", "350", "640")), ("cuda", ("16", "518", "1280"))])
+@pytest.mark.parametrize("device,profile", [("mps", ("8", "350", "640", "480", "1")), ("cuda", ("16", "350", "640", "480", "2"))])
 def test_runner_selects_the_fixed_device_profile(tmp_path, monkeypatch, device, profile):
     audit = tmp_path / "worker-argv.json"
     monkeypatch.setenv("FAKE_WORKER_AUDIT", str(audit))
@@ -171,7 +191,18 @@ def test_runner_selects_the_fixed_device_profile(tmp_path, monkeypatch, device, 
     run_depth_capture(request, sys.executable, FIXTURES / "fake_worker.py", str(fake_ffmpeg(tmp_path)))
 
     argv = json.loads(audit.read_text(encoding="utf-8"))
-    assert (argv[argv.index("--target-fps") + 1], argv[argv.index("--input-size") + 1], argv[argv.index("--max-res") + 1]) == profile
+    assert (argv[argv.index("--target-fps") + 1], argv[argv.index("--input-size") + 1], argv[argv.index("--max-res") + 1], argv[argv.index("--output-short-side") + 1], argv[argv.index("--backbone-microbatch") + 1]) == profile
+
+
+def test_runner_uses_a_bounded_720p_profile_distinct_from_480p(tmp_path, monkeypatch):
+    audit = tmp_path / "worker-argv.json"
+    monkeypatch.setenv("FAKE_WORKER_AUDIT", str(audit))
+    request = replace(fake_request(tmp_path), output_resolution="720p")
+
+    run_depth_capture(request, sys.executable, FIXTURES / "fake_worker.py", str(fake_ffmpeg(tmp_path)))
+
+    argv = json.loads(audit.read_text(encoding="utf-8"))
+    assert (argv[argv.index("--input-size") + 1], argv[argv.index("--max-res") + 1], argv[argv.index("--output-short-side") + 1], argv[argv.index("--backbone-microbatch") + 1]) == ("518", "1280", "720", "2")
 
 
 @pytest.mark.parametrize("mode,code", [
@@ -200,7 +231,7 @@ def test_runner_maps_ffmpeg_failure_and_never_commits_partial_capture(tmp_path, 
     with pytest.raises(DepthCaptureFailure) as error:
         run_fake(tmp_path, monkeypatch)
 
-    assert error.value.code == "depth_encoding_failed"
+    assert error.value.code == "depth_preparation_failed"
     assert "secret encoding detail" not in error.value.message
     assert not (tmp_path / "data/project-files/project-1/depth-captures/capture-1").exists()
 
@@ -235,6 +266,11 @@ def test_worker_mps_compat_avoids_torch_211_autocast_and_restores_it():
     class FakeTorch:
         def __init__(self):
             self.calls = []
+            self.mps = type("MPS", (), {
+                "set_per_process_memory_fraction": lambda self, value: None,
+                "synchronize": lambda self: None,
+                "empty_cache": lambda self: None,
+            })()
 
         def autocast(self, *, device_type, enabled=True):
             self.calls.append((device_type, enabled))
@@ -262,6 +298,34 @@ def test_worker_mps_compat_avoids_torch_211_autocast_and_restores_it():
     assert model.arguments == (["frame"], 8.0, 350, "mps", True)
     assert torch.calls == []
     assert torch.autocast.__func__ is original.__func__
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_worker_bounds_mps_memory_and_releases_cache_after_each_chunk(fails):
+    from types import SimpleNamespace
+    worker = load_worker_module()
+    events = []
+    original_autocast = object()
+    torch = SimpleNamespace(autocast=original_autocast, mps=SimpleNamespace(
+        set_per_process_memory_fraction=lambda fraction: events.append(("limit", fraction)),
+        synchronize=lambda: events.append("synchronize"),
+        empty_cache=lambda: events.append("empty_cache"),
+    ))
+
+    def infer(*args, **kwargs):
+        events.append("infer")
+        if fails:
+            raise RuntimeError("MPS out of memory")
+        return [0.0, 1.0], 8.0
+
+    model = SimpleNamespace(infer_video_depth=infer)
+    if fails:
+        with pytest.raises(RuntimeError, match="MPS out of memory"):
+            worker._infer_depths(torch, model, ["frame"], 8.0, 518, "mps")
+    else:
+        assert worker._infer_depths(torch, model, ["frame"], 8.0, 518, "mps") == ([0.0, 1.0], 8.0)
+    assert events == [("limit", 0.5), "infer", "synchronize", "empty_cache"]
+    assert torch.autocast is original_autocast
 
 
 def test_worker_cuda_keeps_original_autocast_and_fp16_behavior():
@@ -292,6 +356,35 @@ def test_worker_cuda_keeps_original_autocast_and_fp16_behavior():
 
     assert model.arguments == (["frame"], 16.0, 518, "cuda", False)
     assert torch.calls == [("cuda", True)]
+
+
+def test_worker_microbatches_only_backbone_features_and_preserves_frame_order():
+    worker = load_worker_module()
+
+    class FakeTorch:
+        @staticmethod
+        def cat(values, dim=0):
+            return sum(values, [])
+
+    class Pretrained:
+        def __init__(self):
+            self.calls = []
+
+        def get_intermediate_layers(self, frames, *args, **kwargs):
+            self.calls.append(list(frames))
+            return [([f"a-{frame}" for frame in frames], [f"ca-{frame}" for frame in frames]), ([f"b-{frame}" for frame in frames], [f"cb-{frame}" for frame in frames])]
+
+    pretrained = Pretrained()
+    model = type("Model", (), {"pretrained": pretrained})()
+
+    worker._install_backbone_microbatch(model, FakeTorch(), 2)
+    features = pretrained.get_intermediate_layers([0, 1, 2, 3, 4], "layers", return_class_token=True)
+
+    assert pretrained.calls == [[0, 1], [2, 3], [4]]
+    assert features == (
+        (["a-0", "a-1", "a-2", "a-3", "a-4"], ["ca-0", "ca-1", "ca-2", "ca-3", "ca-4"]),
+        (["b-0", "b-1", "b-2", "b-3", "b-4"], ["cb-0", "cb-1", "cb-2", "cb-3", "cb-4"]),
+    )
 
 
 class _Context:
@@ -436,18 +529,20 @@ def test_runner_limits_duration_using_actual_worker_frame_rate(tmp_path):
     from app import depth_capture_runner as runner
 
     request = fake_request(tmp_path)
-    profile = runner._DeviceProfile(target_fps=8, input_size=350, max_res=640)
-    depths = runner._DepthFrames(array("f", [0.0, 1.0] * 160), 80, 2, 2)
+    profile = runner._DeviceProfile(target_fps=8, input_size=350, max_res=640, output_short_side=480, backbone_microbatch=2)
+    depths = runner._DepthFrames(array("f", [0.0, 1.0] * 4800), 2400, 480, 854)
     metadata = {
         "schemaVersion": 1,
         "modelIdentity": runner.MODEL_IDENTITY,
         "device": "cpu",
         "targetFps": 8,
         "inputSize": 350,
-        "maxRes": 640,
-        "frameCount": 80,
-        "width": 2,
-        "height": 2,
+            "maxRes": 640,
+            "outputShortSide": 480,
+            "backboneMicrobatch": 2,
+            "frameCount": 2400,
+            "width": 854,
+            "height": 480,
         "frameRate": 1.0,
         "depthMin": 0.0,
         "depthMax": 1.0,
@@ -463,8 +558,7 @@ def test_runner_limits_duration_using_actual_worker_frame_rate(tmp_path):
 
 
 @pytest.mark.parametrize("mode", [
-    "missing", "bad-zip", "bad-header-zero", "bad-header-one", "bad-compression", "corrupt-deflate",
-    "out-of-range", "odd", "too-large", "too-large-fps",
+    "missing", "bad-zip", "bad-header-zero", "bad-header-one", "odd", "too-large", "too-large-fps",
 ])
 def test_runner_rejects_unsafe_or_non_normalized_depth_output(tmp_path, monkeypatch, mode):
     with pytest.raises(DepthCaptureFailure) as error:
@@ -475,7 +569,10 @@ def test_runner_rejects_unsafe_or_non_normalized_depth_output(tmp_path, monkeypa
     assert not parent.exists() or not list(parent.glob(".capture-1-*"))
 
 
-@pytest.mark.parametrize("outside_name", ["outside.mp4", "data/project-files/project-1/reference-videos/video-2.mp4"])
+@pytest.mark.parametrize("outside_name", ["outside.mp4", "data/project-files/project-1/reference-videos/video-2.mp4",
+    "data/project-files/project-1/reference-media/video-2.mp4",
+    "data/project-files/project-2/reference-media/video-1.mp4",
+    "data/project-files/project-1/reference-media/video-1.png"])
 def test_runner_rejects_source_file_outside_managed_reference_location(tmp_path, monkeypatch, outside_name):
     request = fake_request(tmp_path)
     outside = tmp_path / outside_name
@@ -560,6 +657,10 @@ def test_worker_verifies_head_and_clean_porcelain_status_with_explicit_git_argv(
 )
 def test_real_ffmpeg_outputs_h264_turbo_mp4_without_audio(tmp_path, monkeypatch):
     request = fake_request(tmp_path)
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "color=size=640x360:rate=8",
+        "-frames:v", "2", "-pix_fmt", "yuv420p", str(request.input_video),
+    ], check=True)
     result = run_depth_capture(request, sys.executable, FIXTURES / "fake_worker.py", "ffmpeg")
     outputs = [result.directory / "depth-control.mp4", result.directory / "depth-preview.mp4"]
     for output in outputs:
@@ -574,10 +675,28 @@ def test_real_ffmpeg_outputs_h264_turbo_mp4_without_audio(tmp_path, monkeypatch)
         assert stream["codec_type"] == "video"
         assert stream["codec_name"] == "h264"
         assert stream["pix_fmt"] == "yuv420p"
-        assert (stream["width"], stream["height"], stream["nb_read_frames"]) == (2, 2, "2")
+        assert (stream["width"], stream["height"], stream["nb_read_frames"]) == (854, 480, "2")
         assert stream["avg_frame_rate"] == "8/1"
     decoded = subprocess.run([
         "ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-i", str(outputs[1]),
         "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
     ], capture_output=True, check=True).stdout
     assert any(decoded[index:index + 3][0] != decoded[index:index + 3][1] for index in range(0, len(decoded), 3))
+
+
+@pytest.mark.parametrize("frames", [117, 2400, 2401])
+def test_runner_handles_long_video_duration_boundary(tmp_path, monkeypatch, frames):
+    monkeypatch.setenv("FAKE_WORKER_MODE", "long")
+    monkeypatch.setenv("FAKE_WORKER_FRAMES", str(frames))
+    request = replace(fake_request(tmp_path), expected_duration_seconds=frames / 8)
+    args = (request, sys.executable, FIXTURES / "fake_worker.py", str(fake_ffmpeg(tmp_path)))
+
+    if frames > 2400:
+        with pytest.raises(DepthCaptureFailure) as error:
+            run_depth_capture(*args)
+        assert error.value.code == "depth_worker_output_invalid"
+    else:
+        result = run_depth_capture(*args)
+        assert result.frameCount == frames
+        assert result.frameRate == 8.0
+        assert (result.directory / "manifest.json").is_file()

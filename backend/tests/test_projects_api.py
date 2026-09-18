@@ -354,3 +354,13 @@ def test_concurrent_project_creations_keep_every_project(tmp_path, monkeypatch):
 
     assert [response.status_code for response in responses] == [201] * 8
     assert {project["name"] for project in listed.json()} == {f"并发项目 {index}" for index in range(8)}
+
+
+def test_resolve_default_binary_prioritizes_environment_variable(monkeypatch):
+    monkeypatch.setenv("FFMPEG_PATH", "/custom/bin/ffmpeg")
+    assert main.resolve_default_binary("ffmpeg") == "/custom/bin/ffmpeg"
+
+
+def test_resolve_default_binary_detects_candidate_or_falls_back(monkeypatch):
+    monkeypatch.delenv("CUSTOM_BINARY_PATH", raising=False)
+    assert main.resolve_default_binary("custom_binary") == "custom_binary"

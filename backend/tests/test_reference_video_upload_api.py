@@ -1,6 +1,7 @@
 import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timezone
 from io import BytesIO
 from threading import Event
@@ -98,8 +99,12 @@ def test_staging_io_failure_removes_partial_file(tmp_path, monkeypatch):
     assert list(tmp_path.glob(".reference-*.part")) == []
 
 
-def test_user_uploads_video_and_reopens_project_after_restart(tmp_path, monkeypatch):
-    monkeypatch.setattr(main, "probe_reference_video", valid_probe)
+@pytest.mark.parametrize("duration", [2.5, 14.53, 300.0])
+def test_user_uploads_video_and_reopens_project_after_restart(tmp_path, monkeypatch, duration):
+    def probe(*args, **kwargs):
+        return replace(valid_probe(*args, **kwargs), duration_seconds=duration)
+
+    monkeypatch.setattr(main, "probe_reference_video", probe)
     first = TestClient(create_app(data_dir=tmp_path, max_reference_video_bytes=16))
     project = create_project(first)
 
@@ -109,7 +114,7 @@ def test_user_uploads_video_and_reopens_project_after_restart(tmp_path, monkeypa
     reference = uploaded.json()["referenceMedia"]
     assert reference["originalName"] == "clip.mp4"
     assert reference["sizeBytes"] == 11
-    assert reference["durationSeconds"] == 2.5
+    assert reference["durationSeconds"] == duration
     assert uploaded.json()["updatedAt"] != project["updatedAt"]
     persisted = (tmp_path / "projects.json").read_text(encoding="utf-8")
     assert str(tmp_path) not in persisted

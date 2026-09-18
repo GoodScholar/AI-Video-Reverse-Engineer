@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import json
 import math
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -14,6 +15,7 @@ from typing import Optional
 
 UPSTREAM_COMMIT = "4f5ae23172ba60fd7bc11ef671cca678842c7072"
 CHECKPOINT_SHA256 = "13379300b739e659f076a59d52e9801bd8d38c541a7e71f73bbca4dcfb013609"
+MPS_MEMORY_FRACTION = 0.5
 MODEL_IDENTITY = {
     "modelId": "video-depth-anything-small-relative",
     "upstreamCommit": UPSTREAM_COMMIT,
@@ -34,8 +36,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--upstream-root", required=True)
     parser.add_argument("--device", choices=("cuda", "mps", "cpu"), required=True)
     parser.add_argument("--target-fps", type=int, choices=(8, 16, 24), required=True)
-    parser.add_argument("--input-size", type=int, choices=(350, 518), required=True)
+    parser.add_argument("--input-size", type=int, choices=(350, 420, 518), required=True)
     parser.add_argument("--max-res", type=int, choices=(640, 960, 1280), required=True)
+    parser.add_argument("--output-short-side", type=int, choices=(480, 720), required=True)
+    parser.add_argument("--backbone-microbatch", type=int, choices=(1, 2, 4), required=True)
     return parser
 
 
@@ -48,6 +52,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     _verify_sha256(checkpoint)
 
     global np
+    if args.device == "mps":
+        # Torch 2.1 的 MPS 后端缺少部分上采样算子；仅让这些算子回退 CPU。
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     import cv2
     import numpy as np
     import torch
@@ -56,25 +63,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     sys.path.insert(0, str(upstream))
     from video_depth_anything.video_depth import VideoDepthAnything
 
-    frames, frame_rate = _read_frames(cv2, input_path, args.target_fps, args.max_res)
-    if not len(frames):
-        raise ValueError("输入视频不包含可读取的视频帧")
     model = VideoDepthAnything(
         encoder="vits", features=64, out_channels=[48, 96, 192, 384],
     )
     state = torch.load(checkpoint, map_location="cpu")
     model.load_state_dict(state, strict=True)
     model = model.to(args.device).eval()
-    with torch.no_grad():
-        depths, worker_fps = _infer_depths(
-            torch, model, frames, frame_rate, args.input_size, args.device,
-        )
-    worker_fps = _validated_worker_fps(worker_fps)
-    normalized = _normalize_depths(np.asarray(depths))
-    source_motion_samples = _source_motion_samples(frames, worker_fps)
-    _write_output(
-        output, normalized, worker_fps, args.device, args.target_fps,
-        args.input_size, args.max_res, source_motion_samples,
+    _install_backbone_microbatch(model, torch, args.backbone_microbatch)
+    _infer_chunked_to_gray(
+        cv2, torch, model, input_path, output, args.device, args.target_fps,
+        args.input_size, args.max_res, args.output_short_side, args.backbone_microbatch,
     )
     return 0
 
@@ -180,6 +178,131 @@ def _read_frames(cv2, input_path: Path, target_fps: int, max_res: int) -> tuple[
     return np.asarray(frames), effective_fps
 
 
+def _output_dimensions(width: int, height: int, short_side: int) -> tuple[int, int]:
+    if width <= 0 or height <= 0:
+        raise ValueError("输入视频尺寸无效")
+    scale = short_side / min(width, height)
+    scaled_width = max(2, int(round(width * scale)))
+    scaled_height = max(2, int(round(height * scale)))
+    return scaled_width + scaled_width % 2, scaled_height + scaled_height % 2
+
+
+def _chunked_frames(cv2, input_path: Path, max_res: int, *, chunk_size: int = 64, overlap: int = 8):
+    capture = cv2.VideoCapture(str(input_path))
+    if not capture.isOpened():
+        raise ValueError("无法打开输入视频")
+    fps = _validated_worker_fps(float(capture.get(cv2.CAP_PROP_FPS)))
+    previous: list = []
+    try:
+        while True:
+            fresh = []
+            while len(fresh) < chunk_size - len(previous):
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                height, width = frame.shape[:2]
+                target_width, target_height = _even_dimensions(width, height, max_res)
+                if (target_width, target_height) != (width, height):
+                    frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
+                fresh.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            if not fresh:
+                break
+            frames = previous + fresh
+            yield np.asarray(frames), fps, len(previous)
+            previous = frames[-overlap:]
+    finally:
+        capture.release()
+
+
+def _align_depth_chunk(depths, prior_tail):
+    if prior_tail is None:
+        return depths
+    overlap = min(len(prior_tail), len(depths))
+    if not overlap:
+        return depths
+    left = prior_tail[-overlap:].astype(np.float32, copy=False)
+    right = depths[:overlap].astype(np.float32, copy=False)
+    left_mean, right_mean = float(left.mean()), float(right.mean())
+    left_std, right_std = float(left.std()), float(right.std())
+    scale = left_std / right_std if left_std > 1e-6 and right_std > 1e-6 else 1.0
+    if not math.isfinite(scale):
+        scale = 1.0
+    return depths.astype(np.float32, copy=False) * scale + (left_mean - right_mean * scale)
+
+
+def _install_backbone_microbatch(model, torch, microbatch: int) -> None:
+    """拆分无跨帧状态的 DINO 空间 backbone；32 帧 temporal head 保持原调用。"""
+    original = model.pretrained.get_intermediate_layers
+
+    def get_intermediate_layers(frames, *args, **kwargs):
+        if len(frames) <= microbatch:
+            return original(frames, *args, **kwargs)
+        parts = [
+            original(frames[start:start + microbatch], *args, **kwargs)
+            for start in range(0, len(frames), microbatch)
+        ]
+        if kwargs.get("return_class_token", False):
+            return tuple(
+                tuple(torch.cat([part[layer][item] for part in parts], dim=0) for item in range(2))
+                for layer in range(len(parts[0]))
+            )
+        return tuple(torch.cat([part[layer] for part in parts], dim=0) for layer in range(len(parts[0])))
+
+    model.pretrained.get_intermediate_layers = get_intermediate_layers
+
+
+def _infer_chunked_to_gray(cv2, torch, model, input_path: Path, output: Path, device: str, target_fps: int, input_size: int, max_res: int, output_short_side: int, backbone_microbatch: int) -> None:
+    chunks: list[Path] = []
+    source_motion: list[dict[str, float]] = []
+    prior_tail = None
+    prior_frame = None
+    frame_rate = None
+    output_size = None
+    inference_size = None
+    frame_count = 0
+    for index, (frames, fps, overlap) in enumerate(_chunked_frames(cv2, input_path, max_res)):
+        frame_rate = fps if frame_rate is None else frame_rate
+        inference_size = (int(frames.shape[2]), int(frames.shape[1]))
+        output_size = _output_dimensions(*inference_size, output_short_side)
+        for frame in frames[overlap:]:
+            if prior_frame is not None:
+                source_motion.append({"timestampSeconds": frame_count / fps, "magnitude": float(np.abs(frame.astype(np.float32) - prior_frame.astype(np.float32)).mean() / 255.0)})
+            prior_frame = frame
+            frame_count += 1
+        with torch.no_grad():
+            values, worker_fps = _infer_depths(torch, model, frames, fps, input_size, device)
+        if not math.isclose(_validated_worker_fps(worker_fps), fps, rel_tol=0, abs_tol=1e-6):
+            raise ValueError("模型输出帧率与输入时间线不一致")
+        values = np.asarray(values)
+        if values.ndim != 3 or values.shape[0] != len(frames) or not np.isfinite(values).all():
+            raise ValueError("模型深度输出无效")
+        values = _align_depth_chunk(values, prior_tail)
+        if not np.isfinite(values).all():
+            raise ValueError("模型深度输出包含非有限值")
+        prior_tail = values[-8:].copy()
+        values = values[overlap:]
+        if len(values) != len(frames) - overlap:
+            raise ValueError("模型输出帧数与输入不一致")
+        path = output / f".depth-chunk-{index:04d}.npy"
+        np.save(path, values)
+        chunks.append(path)
+    if not chunks or frame_rate is None or output_size is None or inference_size is None:
+        raise ValueError("输入视频不包含可读取的视频帧")
+    samples = np.concatenate([np.load(path, mmap_mode="r").reshape(-1)[::max(1, np.load(path, mmap_mode="r").size // 8192)] for path in chunks])
+    low, high = (float(value) for value in np.percentile(samples, _normalization_percentiles()))
+    plan = _normalization_plan(low, high)
+    gray = output / "depths.gray"
+    with gray.open("wb") as target:
+        for path in chunks:
+            values = np.load(path, mmap_mode="r")
+            for frame in values:
+                normalized = np.full_like(frame, 0.5, dtype=np.float32) if plan is None else np.clip(_relative_scale(frame, *plan), 0.0, 1.0)
+                resized = cv2.resize(normalized, output_size, interpolation=cv2.INTER_LINEAR)
+                target.write(np.rint(resized * 255).astype(np.uint8).tobytes())
+            path.unlink()
+    _write_output(output, frame_count, output_size, inference_size, frame_rate, device, target_fps, input_size, max_res, output_short_side, backbone_microbatch, source_motion)
+
+
 def _sample_frame_indices(source_fps: float, target_fps: int, frame_count: int) -> tuple[list[int], float]:
     effective_fps = min(source_fps, float(target_fps))
     if not math.isfinite(effective_fps) or effective_fps <= 0 or frame_count <= 0:
@@ -267,6 +390,8 @@ def _infer_depths(torch, model, frames, frame_rate: float, input_size: int, devi
         )
     original_autocast = torch.autocast
     had_instance_autocast = "autocast" in getattr(torch, "__dict__", {})
+    # 使用 Metal 推荐工作集的一半，避免默认分配上限高于机器物理内存。
+    torch.mps.set_per_process_memory_fraction(MPS_MEMORY_FRACTION)
     try:
         torch.autocast = lambda *args, **kwargs: contextlib.nullcontext()
         return model.infer_video_depth(
@@ -277,21 +402,27 @@ def _infer_depths(torch, model, frames, frame_rate: float, input_size: int, devi
             torch.autocast = original_autocast
         else:
             delattr(torch, "autocast")
+        # 上游已将结果转回 CPU；每段释放空闲缓存，避免长片持续挤占统一内存。
+        torch.mps.synchronize()
+        torch.mps.empty_cache()
 
 
 def _write_output(
     output: Path,
-    depths: np.ndarray,
+    frame_count: int,
+    output_size: tuple[int, int],
+    inference_size: tuple[int, int],
     frame_rate: float,
     device: str,
     target_fps: int,
     input_size: int,
     max_res: int,
+    output_short_side: int,
+    backbone_microbatch: int,
     source_motion_samples: list[dict[str, float]],
 ) -> None:
     if not math.isfinite(frame_rate) or frame_rate <= 0:
         raise ValueError("输出帧率无效")
-    np.savez_compressed(output / "depths.npz", depths=depths)
     metadata = {
         "schemaVersion": 1,
         "modelIdentity": MODEL_IDENTITY,
@@ -299,12 +430,21 @@ def _write_output(
         "targetFps": target_fps,
         "inputSize": input_size,
         "maxRes": max_res,
-        "frameCount": int(depths.shape[0]),
-        "width": int(depths.shape[2]),
-        "height": int(depths.shape[1]),
+        "outputShortSide": output_short_side,
+        "frameCount": frame_count,
+        "width": output_size[0],
+        "height": output_size[1],
+        "inferenceDimensions": {"width": inference_size[0], "height": inference_size[1]},
+        "outputDimensions": {"width": output_size[0], "height": output_size[1]},
+        "chunkFrames": 64,
+        "chunkOverlapFrames": 8,
+        "backboneMicrobatch": backbone_microbatch,
+        "timelineMode": "cfr_opencv",
+        "mpsFallbackEnabled": device == "mps" and os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") == "1",
+        "mpsMemoryFraction": MPS_MEMORY_FRACTION if device == "mps" else None,
         "frameRate": frame_rate,
-        "depthMin": float(depths.min()),
-        "depthMax": float(depths.max()),
+        "depthMin": 0.0,
+        "depthMax": 1.0,
         "finite": True,
         "normalizationDirection": "near_white_far_black",
         "normalizationPercentilePolicy": NORMALIZATION_PERCENTILE_POLICY,

@@ -82,7 +82,7 @@ function stageStateText(status: LocalPreprocessing["stages"][number]["status"]) 
 
 function StageIcon({ status }: { status: LocalPreprocessing["stages"][number]["status"] }) {
   if (status === "completed") return <Check aria-hidden="true" size={16} />;
-  if (status === "running") return <LoaderCircle aria-hidden="true" size={16} />;
+  if (status === "running") return <LoaderCircle className="loading-spinner" aria-hidden="true" size={16} />;
   if (status === "failed") return <CircleAlert aria-hidden="true" size={16} />;
   return <Clock3 aria-hidden="true" size={16} />;
 }
@@ -315,7 +315,7 @@ export function LocalPreprocessingPanel({
                 ? "此步骤只在本机处理，将生成方向与色彩标准化后的分析代理。"
                 : "此步骤只在本机处理，尚不会发送分析代理。"}</p>
               <button ref={startButtonRef} className="primary-action" type="button" disabled={isSubmitting} onClick={() => void submit()}>
-                <Play aria-hidden="true" size={17} />{isSubmitting ? "正在启动本地预处理…" : "开始本地预处理"}
+                {isSubmitting ? <LoaderCircle className="loading-spinner" aria-hidden="true" size={17} /> : <Play aria-hidden="true" size={17} />}{isSubmitting ? "正在启动本地预处理…" : "开始本地预处理"}
               </button>
             </>
           ) : <p>请先添加并校验参考素材，再开始本地预处理。</p>}
@@ -333,7 +333,7 @@ export function LocalPreprocessingPanel({
       )}
       {task?.status === "failed" && isDesktop && (
         <button ref={retryButtonRef} className="secondary-action" type="button" disabled={isSubmitting} onClick={() => void submit()}>
-          <RotateCcw aria-hidden="true" size={17} />{isSubmitting ? "正在重新启动…" : "从失败阶段重试"}
+          {isSubmitting ? <LoaderCircle className="loading-spinner" aria-hidden="true" size={17} /> : <RotateCcw aria-hidden="true" size={17} />}{isSubmitting ? "正在重新启动…" : "从失败阶段重试"}
         </button>
       )}
       {submitError && <p className="local-preprocessing-error" role="alert"><CircleAlert aria-hidden="true" size={17} />{submitError}</p>}

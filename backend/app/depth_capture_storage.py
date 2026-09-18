@@ -40,7 +40,12 @@ class DepthPreviewUnavailableError(OSError):
     """The fixed preview asset is missing, unsafe, or fails artifact validation."""
 
 
-def open_validated_depth_preview(
+def open_validated_depth_preview(**kwargs) -> tuple[int, int]:
+    return open_validated_depth_artifact(artifact="depth-preview.mp4", **kwargs)
+
+
+def open_validated_depth_artifact(
+    artifact: str,
     *,
     data_dir: Path,
     project_id: str,
@@ -53,6 +58,8 @@ def open_validated_depth_preview(
     Unlike the read projection, this strict path preserves genuine I/O failures so
     the API can distinguish unavailable storage from an absent or unsafe asset.
     """
+    if artifact not in DEPTH_ARTIFACTS:
+        raise DepthPreviewUnavailableError("深度素材不可用")
     try:
         _validate_ids(project_id, capture_id)
         _validate_source_and_algorithm(source_reference_video_id, algorithm)
@@ -67,10 +74,10 @@ def open_validated_depth_preview(
                 source_reference_video_id=source_reference_video_id,
                 algorithm=algorithm,
             )
-            expected = os.stat("depth-preview.mp4", dir_fd=capture_fd, follow_symlinks=False)
+            expected = os.stat(artifact, dir_fd=capture_fd, follow_symlinks=False)
         except ValueError as error:
             raise DepthPreviewUnavailableError("深度预览不可用") from error
-        descriptor = os.open("depth-preview.mp4", _FILE_FLAGS, dir_fd=capture_fd)
+        descriptor = os.open(artifact, _FILE_FLAGS, dir_fd=capture_fd)
         actual = os.fstat(descriptor)
         if (
             not stat.S_ISREG(actual.st_mode)

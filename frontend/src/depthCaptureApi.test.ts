@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   confirmDepthReview,
   depthPreviewUrl,
+  depthVideoUrl,
   referenceVideoContentUrl,
   startDepthCapture,
 } from "./depthCaptureApi";
@@ -152,9 +153,15 @@ describe("depthCaptureApi", () => {
     expect(depthPreviewUrl("project/id", "capture/id")).toBe(
       "/api/projects/project%2Fid/depth-captures/capture%2Fid/preview",
     );
+    expect(depthVideoUrl("project/id", "capture/id")).toBe(
+      "/api/projects/project%2Fid/depth-captures/capture%2Fid/video",
+    );
+    expect(depthVideoUrl("project/id", "capture/id", true)).toBe(
+      "/api/projects/project%2Fid/depth-captures/capture%2Fid/video?download=true",
+    );
   });
 
-  it("starts depth capture with the default JSON device preference", async () => {
+  it("starts depth capture with the default device and 480P output", async () => {
     vi.mocked(fetch).mockResolvedValueOnce(response(project, 202));
 
     await expect(startDepthCapture("project/id")).resolves.toEqual(project);
@@ -164,18 +171,18 @@ describe("depthCaptureApi", () => {
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ devicePreference: "auto" }),
+        body: JSON.stringify({ devicePreference: "auto", outputResolution: "480p" }),
       },
     );
   });
 
-  it("starts depth capture with the selected device preference", async () => {
+  it("starts depth capture with the selected device and output resolution", async () => {
     vi.mocked(fetch).mockResolvedValueOnce(response(project, 202));
 
-    await startDepthCapture("project-001", "mps");
+    await startDepthCapture("project-001", "mps", "720p");
 
     expect(vi.mocked(fetch).mock.calls[0][1]).toMatchObject({
-      body: JSON.stringify({ devicePreference: "mps" }),
+      body: JSON.stringify({ devicePreference: "mps", outputResolution: "720p" }),
     });
   });
 

@@ -1,0 +1,323 @@
+"""Project-scoped persistence and queued rendering endpoints for timelines."""
+from __future__ import annotations
+
+import os
+import shutil
+import stat
+from contextlib import nullcontext
+from pathlib import Path
+from threading import RLock
+from typing import Any, Callable, Dict, Optional
+from uuid import uuid4
+
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
+
+from .preproduction import PreproductionStore
+from .reference_video import validate_storage_id
+from .timeline import TimelineStore, has_audible_audio, has_visible_video, validate_workspace
+
+
+ACTIVE_STATUSES = ("queued", "running")
+TERMINAL_STATUSES = ("completed", "failed", "cancelled")
+
+
+def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", source_lock=None, renderer=None):
+    root = Path(data_dir)
+    store = TimelineStore(root)
+    preproduction = PreproductionStore(root)
+    lock = RLock()
+    router = APIRouter(prefix="/api/projects/{project_id}/timeline")
+
+    def fail(code, message, status=409):
+        raise HTTPException(status_code=status, detail={"code": code, "message": message})
+
+    def project_for(project_id):
+        value = get_project(project_id)
+        if value is None:
+            fail("project_not_found", "复刻项目不存在。", 404)
+        return value
+
+    def state_for(project_id):
+        try:
+            return store.load(project_id)
+        except (OSError, ValueError):
+            fail("timeline_storage_invalid", "时间线状态无法读取。", 503)
+
+    def save(project_id, state):
+        try:
+            store.save(project_id, state)
+        except (OSError, ValueError):
+            fail("timeline_storage_failed", "时间线状态无法保存。", 503)
+
+    def asset_index(project_id):
+        try:
+            state = preproduction.load(project_id)
+        except (OSError, ValueError):
+            fail("preproduction_storage_invalid", "前置工作台状态无法读取。", 503)
+        result = {}
+        for asset in state.get("assets", []):
+            if isinstance(asset, dict) and isinstance(asset.get("id"), str):
+                result[asset["id"]] = dict(asset)
+        return result
+
+    def public_assets(project_id):
+        result = []
+        for asset in asset_index(project_id).values():
+            public = {key: value for key, value in asset.items() if key != "file" and not key.startswith("_")}
+            public["url"] = "/api/projects/{}/preproduction/assets/{}/file".format(project_id, asset["id"])
+            result.append(public)
+        return result
+
+    def public_run(project_id, run):
+        public = {key: value for key, value in run.items() if key not in ("snapshot", "sources", "output") and not key.startswith("_")}
+        if run["status"] == "completed":
+            public["url"] = "/api/projects/{}/timeline/runs/{}/output".format(project_id, run["id"])
+        return public
+
+    def response(project_id, state):
+        return {"revision": state["revision"], "settings": state["settings"], "tracks": state["tracks"], "assets": public_assets(project_id), "runs": [public_run(project_id, run) for run in state["runs"]]}
+
+    def find_run(state, run_id):
+        try:
+            validate_storage_id(run_id)
+        except ValueError:
+            fail("timeline_run_missing", "渲染任务不存在。", 404)
+        run = next((item for item in state["runs"] if item.get("id") == run_id), None)
+        if run is None:
+            fail("timeline_run_missing", "渲染任务不存在。", 404)
+        return run
+
+    def source_path(project_id, asset):
+        try:
+            filename = asset["file"]
+            validate_storage_id(filename)
+            path = preproduction.path(project_id, "assets", filename)
+            _regular_file(path)
+            return path
+        except (KeyError, OSError, ValueError):
+            fail("timeline_asset_unavailable", "素材文件不可用。", 409)
+
+    def snapshot_sources(project_id, run_id, tracks, assets):
+        used = sorted({clip["assetId"] for track in tracks for clip in track["clips"]})
+        run_dir = store.path(project_id, "runs", run_id)
+        source_dir = store.path(project_id, "runs", run_id, "sources")
+        try:
+            run_dir.mkdir(parents=True, exist_ok=False)
+            source_dir.mkdir()
+            sources = {}
+            for asset_id in used:
+                asset = assets[asset_id]
+                source = source_path(project_id, asset)
+                suffix = Path(asset["file"]).suffix.lower()
+                filename = asset_id + suffix
+                target = store.path(project_id, "runs", run_id, "sources", filename)
+                _copy_regular(source, target)
+                sources[asset_id] = filename
+            return sources
+        except HTTPException:
+            shutil.rmtree(run_dir, ignore_errors=True)
+            raise
+        except (OSError, ValueError):
+            shutil.rmtree(run_dir, ignore_errors=True)
+            fail("timeline_asset_unavailable", "素材文件不可用。", 409)
+
+    def queue_run(project_id, run_id):
+        accepted = compute_queue.submit("timeline:" + run_id, project_id, lambda pid: process(pid, run_id))
+        if accepted:
+            return
+        state = state_for(project_id)
+        run = find_run(state, run_id)
+        if run["status"] == "queued":
+            run.update(status="failed", error="本地处理队列不可用。")
+            save(project_id, state)
+
+    def cancelled(project_id, run_id):
+        with lock:
+            state = state_for(project_id)
+            run = find_run(state, run_id)
+            return run["status"] == "cancelled"
+
+    def process(project_id, run_id):
+        staging = None
+        try:
+            with lock:
+                state = state_for(project_id)
+                run = find_run(state, run_id)
+                if run["status"] != "queued":
+                    return
+                run["status"] = "running"
+                save(project_id, state)
+                snapshot = run["snapshot"]
+                source_names = dict(run["sources"])
+            sources = {}
+            for asset_id, filename in source_names.items():
+                path = store.path(project_id, "runs", run_id, "sources", filename)
+                _regular_file(path)
+                sources[asset_id] = path
+            suffix = ".wav" if run["format"] == "wav" else ".mp4"
+            staging = store.path(project_id, "runs", run_id, "output" + suffix)
+            actual_renderer = renderer
+            if actual_renderer is None:
+                from .timeline_render import render_timeline
+                actual_renderer = render_timeline
+            actual_renderer(snapshot, sources, staging, format=run["format"], ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, cancelled=lambda: cancelled(project_id, run_id))
+            _regular_file(staging)
+            with lock:
+                state = state_for(project_id)
+                run = find_run(state, run_id)
+                if run["status"] != "running":
+                    return
+                output = store.path(project_id, "outputs", run_id + suffix)
+                output.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(str(staging), str(output))
+                run.update(status="completed", error=None, output=output.name)
+                save(project_id, state)
+        except HTTPException:
+            raise
+        except BaseException as error:
+            with lock:
+                state = state_for(project_id)
+                run = find_run(state, run_id)
+                if run["status"] == "running":
+                    run.update(status="failed", error=_safe_error(error))
+                    save(project_id, state)
+        finally:
+            if staging is not None:
+                staging.unlink(missing_ok=True)
+
+    def recover():
+        base = root / "project-files"
+        if not base.is_dir() or base.is_symlink():
+            return
+        for project_dir in base.iterdir():
+            if project_dir.is_symlink() or not project_dir.is_dir():
+                continue
+            try:
+                state = store.load(project_dir.name)
+                changed = False
+                for run in state["runs"]:
+                    if run.get("status") in ACTIVE_STATUSES:
+                        run.update(status="failed", error="服务重启中断了渲染，可重新提交。")
+                        changed = True
+                if changed:
+                    store.save(project_dir.name, state)
+            except (OSError, ValueError):
+                continue
+
+    recover()
+
+    @router.get("")
+    def get_workspace(project_id: str):
+        project_for(project_id)
+        with lock:
+            return response(project_id, state_for(project_id))
+
+    @router.put("")
+    def save_workspace(project_id: str, body: Dict[str, Any]):
+        project_for(project_id)
+        with source_lock or nullcontext(), lock:
+            state = state_for(project_id)
+            try:
+                settings, tracks = validate_workspace(body, asset_index(project_id))
+            except ValueError as error:
+                fail("timeline_invalid", str(error), 422)
+            if body["revision"] != state["revision"]:
+                fail("timeline_conflict", "时间线已更新，请刷新后重试。")
+            state["settings"] = settings
+            state["tracks"] = tracks
+            state["revision"] += 1
+            save(project_id, state)
+            return response(project_id, state)
+
+    @router.post("/runs", status_code=202)
+    def submit_run(project_id: str, body: Dict[str, Any]):
+        project_for(project_id)
+        if not isinstance(body, dict) or set(body) != {"revision", "format"} or not isinstance(body.get("revision"), int) or isinstance(body.get("revision"), bool) or body.get("format") not in ("preview", "mp4", "wav"):
+            fail("timeline_invalid", "渲染请求无效。", 422)
+        with source_lock or nullcontext(), lock:
+            state = state_for(project_id)
+            if body["revision"] != state["revision"]:
+                fail("timeline_conflict", "时间线已更新，请先保存当前版本。")
+            if any(run.get("status") in ACTIVE_STATUSES for run in state["runs"]):
+                fail("timeline_run_active", "当前项目已有渲染任务正在执行。")
+            assets = asset_index(project_id)
+            try:
+                settings, tracks = validate_workspace({"revision": state["revision"], "settings": state["settings"], "tracks": state["tracks"]}, assets)
+            except ValueError as error:
+                fail("timeline_invalid", str(error), 422)
+            if body["format"] == "wav":
+                if not has_audible_audio(tracks, assets):
+                    fail("timeline_audible_audio_required", "WAV 导出至少需要一个未静音的音频片段。", 422)
+            elif not has_visible_video(tracks):
+                fail("timeline_visible_video_required", "至少需要一个可见的视频片段。", 422)
+            run_id = uuid4().hex
+            sources = snapshot_sources(project_id, run_id, tracks, assets)
+            run = {"id": run_id, "revision": state["revision"], "format": body["format"], "status": "queued", "error": None,
+                   "snapshot": {"settings": settings, "tracks": tracks}, "sources": sources}
+            state["runs"].append(run)
+            save(project_id, state)
+            queue_run(project_id, run_id)
+            return response(project_id, state_for(project_id))
+
+    @router.post("/runs/{run_id}/cancel")
+    def cancel_run(project_id: str, run_id: str, body: Dict[str, Any]):
+        project_for(project_id)
+        if body != {}:
+            fail("timeline_invalid", "取消请求无效。", 422)
+        with lock:
+            state = state_for(project_id)
+            run = find_run(state, run_id)
+            if run["status"] not in ACTIVE_STATUSES:
+                fail("timeline_run_finished", "渲染任务已经结束。")
+            run.update(status="cancelled", error=None)
+            save(project_id, state)
+            return response(project_id, state)
+
+    @router.get("/runs/{run_id}/output")
+    def download_output(project_id: str, run_id: str):
+        project_for(project_id)
+        with lock:
+            state = state_for(project_id)
+            run = find_run(state, run_id)
+            if run["status"] != "completed":
+                fail("timeline_output_unavailable", "渲染结果尚不可用。")
+            try:
+                output = run["output"]
+                validate_storage_id(output)
+                path = store.path(project_id, "outputs", output)
+                _regular_file(path)
+            except (KeyError, OSError, ValueError):
+                fail("timeline_output_unavailable", "渲染结果不可用。")
+        media_type = "audio/wav" if run["format"] == "wav" else "video/mp4"
+        return FileResponse(path, media_type=media_type, filename="timeline" + path.suffix)
+
+    return router
+
+
+def _regular_file(path):
+    descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("不是普通文件")
+    finally:
+        os.close(descriptor)
+
+
+def _copy_regular(source, target):
+    _regular_file(source)
+    descriptor = os.open(str(source), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        with os.fdopen(descriptor, "rb") as stream, target.open("xb") as output:
+            shutil.copyfileobj(stream, output)
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
+
+
+def _safe_error(error):
+    message = str(error)
+    if message and len(message) <= 300 and "/" not in message and "\\" not in message:
+        return message
+    return "渲染失败，请检查时间线和素材。"

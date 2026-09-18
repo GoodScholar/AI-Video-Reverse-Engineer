@@ -114,7 +114,7 @@ it("首次选择前保留视频分辨率边界说明", () => {
   stubDesktop();
   render(<ReferenceMediaPanel project={emptyProject} onProjectUpdated={vi.fn()} upload={vi.fn()} />);
 
-  expect(screen.getByText(/最低 480P/)).toBeVisible();
+  expect(screen.getByText(/低分辨率可能影响分析细节/)).toBeVisible();
   expect(screen.getByText(/最高 UHD 4K/)).toBeVisible();
 });
 
@@ -144,9 +144,9 @@ it("视频继续显示既有元数据并通过统一入口上传", async () => {
   render(<ReferenceMediaPanel project={emptyProject} onProjectUpdated={vi.fn()} upload={upload} />);
 
   expect(screen.getByText(/MP4 或 MOV/)).toBeVisible();
-  expect(screen.getByText(/2～10 秒/)).toBeVisible();
+  expect(screen.getByText(/2～300 秒/)).toBeVisible();
   expect(screen.getByText(/视频最大 200 MB/)).toBeVisible();
-  expect(screen.getByText(/最低 480P/)).toBeVisible();
+  expect(screen.getByText(/低分辨率可能影响分析细节/)).toBeVisible();
   expect(screen.getByText(/最高 UHD 4K/)).toBeVisible();
   await userEvent.upload(screen.getByLabelText("参考素材文件"), new File(["video"], "clip.mp4", { type: "video/mp4" }));
 

@@ -1,0 +1,67 @@
+.shot-preparation-panel { margin-top: 28px; padding: 28px 32px; border-top: 3px solid #343938; border-bottom: 1px solid #c7c6bc; background: #eeece4; }
+.shot-preparation-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.shot-preparation-kicker, .shot-preparation-readonly, .shot-preparation-editor-heading span, .shot-preparation-timeline small, .shot-preparation-preview figcaption { margin: 0 0 6px; color: var(--metadata-text); font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .08em; }
+.shot-preparation-heading h2 { margin: 0 0 9px; font-size: 28px; letter-spacing: -.04em; }
+.shot-preparation-heading p:last-child { max-width: 780px; margin: 0; color: #4c5454; line-height: 1.6; }
+.shot-preparation-loading, .shot-preparation-unsaved { display: flex; align-items: center; gap: 9px; margin: 22px 0 0; color: #4c5454; }
+.shot-preparation-unsaved { padding-top: 12px; border-top: 1px solid #c47f32; }
+.shot-preparation-error { display: flex; align-items: flex-start; gap: 9px; margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--primary-button); color: #8a2c17; line-height: 1.5; }
+.shot-preparation-error .secondary-action { margin: -10px 0 0 auto; }
+.shot-preparation-workbench { display: grid; grid-template-columns: minmax(156px, .55fr) minmax(210px, .85fr) minmax(310px, 1.25fr); gap: 22px; margin-top: 24px; padding: 22px 0; border-top: 1px solid #c7c6bc; border-bottom: 1px solid #c7c6bc; }
+.shot-preparation-workbench h3 { margin: 0; font-size: 17px; }
+.shot-preparation-timeline { min-width: 0; }
+.shot-preparation-timeline ol { margin: 13px 0 0; padding: 0; list-style: none; border-top: 1px solid #c7c6bc; }
+.shot-preparation-timeline li { border-bottom: 1px solid #c7c6bc; }
+.shot-preparation-timeline button { display: grid; width: 100%; min-height: 61px; padding: 10px 8px; border: 0; border-left: 3px solid transparent; background: transparent; color: #202427; text-align: left; }
+.shot-preparation-timeline button:hover, .shot-preparation-timeline button.is-selected { border-left-color: #a83b20; background: #e9e7de; }
+.shot-preparation-timeline button span { font-weight: 750; }
+.shot-preparation-timeline small { margin: 4px 0 0; }
+.shot-preparation-preview { min-width: 0; }
+.shot-preparation-preview figure { margin: 0 0 14px; }
+.shot-preparation-preview img, .shot-preparation-preview video { display: block; width: 100%; aspect-ratio: 16 / 9; border: 1px solid #6a6e69; background: #202427; object-fit: contain; }
+.shot-preparation-preview figcaption { margin: 8px 0 0; }
+.shot-preparation-video-label { display: grid; gap: 8px; color: #4c5454; font-size: 14px; font-weight: 750; }
+.shot-preparation-locate { margin-top: 10px; }
+.shot-preparation-person-preview { margin-top: 14px; }
+.shot-preparation-video-note { margin: 0 0 9px; color: #4c5454; font-size: 12px; line-height: 1.45; }
+.shot-preparation-person-videos { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.shot-preparation-person-videos label { display: grid; gap: 6px; color: #4c5454; font-size: 12px; font-weight: 750; }
+.shot-preparation-person-videos video { display: block; width: 100%; aspect-ratio: 16 / 9; border: 1px solid #6a6e69; background: #202427; object-fit: contain; }
+.shot-preparation-editor { min-width: 0; }
+.shot-preparation-editor-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.shot-preparation-editor-heading span { margin: 0; white-space: nowrap; }
+.shot-preparation-editor label, .shot-preparation-prompt-grid label { display: grid; gap: 7px; color: #202427; font-size: 14px; font-weight: 750; }
+.shot-preparation-editor > label textarea { min-height: 92px; }
+.shot-preparation-editor textarea { width: 100%; min-height: 80px; resize: vertical; padding: 10px 12px; border: 1px solid #797d76; border-radius: 2px; background: #fffdf7; color: #202427; font: 14px/1.5 system-ui, PingFang SC, Hiragino Sans GB, sans-serif; caret-color: #a83b20; }
+.shot-preparation-prompt-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
+.shot-preparation-controls, .shot-preparation-analysis { margin-top: 18px; padding-top: 16px; border-top: 1px solid #c7c6bc; }
+.shot-preparation-controls h3 { margin-bottom: 10px; }
+.shot-preparation-control { margin: 0; padding: 7px 0; color: #4c5454; }
+.shot-preparation-control--available { color: #365d58; }
+.shot-preparation-control--review_required { color: #765b19; }
+.shot-preparation-control--failed { color: #8a2c17; }
+.shot-preparation-control--unavailable { color: var(--metadata-text); }
+.shot-preparation-control--missing, .shot-preparation-control--running { color: #765b19; }
+.shot-preparation-person-action { margin-top: 12px; padding-top: 12px; border-top: 1px dashed #c7c6bc; }
+.shot-preparation-person-action p { margin: 0 0 9px; color: #4c5454; font-size: 13px; line-height: 1.55; }
+.shot-preparation-person-action small { display: block; margin: 0 0 9px; color: #765b19; line-height: 1.45; }
+.shot-preparation-quality-locator { margin-top: 10px; padding-top: 9px; border-top: 1px dashed #c7c6bc; color: #4c5454; font-size: 12px; }
+.shot-preparation-quality-locator p { margin: 5px 0; }
+.shot-preparation-quality-locator button { margin: 0 3px; padding: 0; border: 0; border-bottom: 1px solid currentColor; background: transparent; color: #765b19; font: inherit; cursor: pointer; }
+.shot-preparation-analysis p { margin: 0 0 12px; color: #4c5454; line-height: 1.55; }
+.shot-preparation-analysis small { display: block; margin-top: 8px; color: #765b19; }
+.shot-preparation-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+
+@media (max-width: 1023px) {
+  .shot-preparation-workbench { grid-template-columns: minmax(150px, .7fr) minmax(0, 1.3fr); }
+  .shot-preparation-editor { grid-column: 1 / -1; }
+  .shot-preparation-panel--readonly .shot-preparation-actions, .shot-preparation-panel--readonly .shot-preparation-analysis, .shot-preparation-panel--readonly .shot-preparation-locate { display: none; }
+}
+
+@media (max-width: 720px) {
+  .shot-preparation-panel { padding: 24px 20px; }
+  .shot-preparation-heading { flex-direction: column; gap: 6px; }
+  .shot-preparation-workbench, .shot-preparation-prompt-grid { grid-template-columns: 1fr; }
+  .shot-preparation-editor { grid-column: auto; }
+  .shot-preparation-person-videos { grid-template-columns: 1fr; }
+}

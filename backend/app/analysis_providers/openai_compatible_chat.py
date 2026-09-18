@@ -34,11 +34,19 @@ def build_chat_payload(request: ProviderRequest) -> dict[str, Any]:
     if request.analysisInput is not None:
         content.append({"type": "text", "text": analysis_input_context(request.analysisInput)})
         content.append({"type": "image_url", "image_url": {"url": image_data_url(request.analysisInput)}})
-    return {
+    payload = {
         "model": request.model,
         "messages": [{"role": "user", "content": content}],
-        "response_format": {"type": "json_object"},
     }
+    if request.responseSchema is None:
+        payload["response_format"] = {"type": "json_object"}
+    else:
+        payload["response_format"] = {"type": "json_schema", "json_schema": {
+            "name": request.task,
+            "strict": True,
+            "schema": request.responseSchema,
+        }}
+    return payload
 
 
 def post_chat_completion(

@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { DepthCapturePanel } from "./DepthCapturePanel";
-import type { DepthCapture, DepthCaptureStageName, Project, VideoLocalPreprocessing } from "./models";
+import type { DepthCapture, DepthCaptureStageName, Project } from "./models";
 
 function stubDesktop(matches = true) {
   const listeners = new Set<(event: MediaQueryListEvent) => void>();
@@ -78,11 +78,11 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-it("以参考素材为准，仅在漂移超过 0.08 秒时校正深度预览", () => {
+it("从任意一侧定位时，只在明显漂移后同步另一侧", () => {
   stubDesktop();
   render(<DepthCapturePanel project={project()} onProjectUpdated={vi.fn()} />);
   const reference = screen.getByLabelText("参考视频预览") as HTMLVideoElement;
-  const depth = screen.getByLabelText("深度控制预览") as HTMLVideoElement;
+  const depth = screen.getByLabelText("灰度深度视频预览") as HTMLVideoElement;
   Object.defineProperty(reference, "currentTime", { configurable: true, writable: true, value: 1.25 });
   Object.defineProperty(depth, "currentTime", { configurable: true, writable: true, value: 1.18 });
   fireEvent.timeUpdate(reference);
@@ -100,21 +100,43 @@ it("以参考素材为准，仅在漂移超过 0.08 秒时校正深度预览", (
   Object.defineProperty(depth, "currentTime", { configurable: true, writable: true, value: 1.169 });
   fireEvent.timeUpdate(reference);
   expect(depth.currentTime).toBeCloseTo(1.25, 2);
+
+  Object.defineProperty(reference, "currentTime", { configurable: true, writable: true, value: 0.2 });
+  Object.defineProperty(depth, "currentTime", { configurable: true, writable: true, value: 1.8 });
+  fireEvent.seeking(depth);
+  expect(reference.currentTime).toBeCloseTo(1.8, 2);
 });
 
-it("镜像参考素材的播放和暂停", () => {
+it("从任意一侧播放或暂停时同步另一侧", () => {
   stubDesktop();
   const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue();
   const pause = vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
   render(<DepthCapturePanel project={project()} onProjectUpdated={vi.fn()} />);
   const reference = screen.getByLabelText("参考视频预览");
-  expect(screen.getByLabelText("深度控制预览")).not.toHaveAttribute("controls");
+  const depth = screen.getByLabelText("灰度深度视频预览");
+  expect(depth).toHaveAttribute("controls");
   fireEvent.play(reference);
-  fireEvent.pause(reference);
-  expect(play).toHaveBeenCalledTimes(1);
+  fireEvent.play(depth);
+  fireEvent.pause(depth);
+  expect(play).toHaveBeenCalledTimes(2);
   expect(pause).toHaveBeenCalledTimes(1);
   play.mockRestore();
   pause.mockRestore();
+});
+
+it("从任意一侧调整倍速时同步另一侧", () => {
+  stubDesktop();
+  render(<DepthCapturePanel project={project()} onProjectUpdated={vi.fn()} />);
+  const reference = screen.getByLabelText("参考视频预览") as HTMLVideoElement;
+  const depth = screen.getByLabelText("灰度深度视频预览") as HTMLVideoElement;
+  Object.defineProperty(reference, "playbackRate", { configurable: true, writable: true, value: 1 });
+  Object.defineProperty(depth, "playbackRate", { configurable: true, writable: true, value: 2 });
+  fireEvent.rateChange(depth);
+  expect(reference.playbackRate).toBe(2);
+
+  Object.defineProperty(reference, "playbackRate", { configurable: true, writable: true, value: 0.75 });
+  fireEvent.rateChange(reference);
+  expect(depth.playbackRate).toBe(0.75);
 });
 
 it("呈现状态、最终设备、CPU 慢速提示与六项固定质量检查", () => {
@@ -160,13 +182,14 @@ it("在当前参考下依次选择未解决失败、未确认复核与排队捕�
   expect(screen.getByRole("status", { name: "本地深度捕捉正在排队" })).toBeVisible();
 });
 
-it("缺少可复刻性判断时不允许启动深度捕捉", () => {
+it("当前视频可直接提取，不依赖本地预处理或可复刻性判断", async () => {
   stubDesktop();
-  const incomplete = project([]);
-  incomplete.localPreprocessing = { ...incomplete.localPreprocessing!, reproducibilityAssessment: null };
-  render(<DepthCapturePanel project={incomplete} onProjectUpdated={vi.fn()} />);
-  expect(screen.getByText(/请先完成当前参考视频的本地预处理/)).toBeVisible();
-  expect(screen.queryByRole("button", { name: "开始本地深度捕捉" })).not.toBeInTheDocument();
+  const direct = { ...project([]), localPreprocessing: null };
+  const start = vi.fn().mockResolvedValue(direct);
+  render(<DepthCapturePanel project={direct} onProjectUpdated={vi.fn()} start={start} />);
+  await userEvent.selectOptions(screen.getByLabelText("输出清晰度"), "720p");
+  await userEvent.click(screen.getByRole("button", { name: "提取整段深度视频" }));
+  expect(start).toHaveBeenCalledWith("project-001", "auto", "720p");
 });
 
 it("参考图片不显示视频预览或深度启动动作", () => {
@@ -179,7 +202,7 @@ it("参考图片不显示视频预览或深度启动动作", () => {
   );
 
   expect(screen.queryByLabelText("参考视频预览")).not.toBeInTheDocument();
-  expect(screen.queryByRole("button", { name: "开始本地深度捕捉" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "提取整段深度视频" })).not.toBeInTheDocument();
 });
 
 it("质量失败的已完成任务允许重新生成，并将选择的设备传给请求", async () => {
@@ -189,8 +212,17 @@ it("质量失败的已完成任务允许重新生成，并将选择的设备传�
   render(<DepthCapturePanel project={project([failedQuality])} onProjectUpdated={vi.fn()} start={start} />);
   await userEvent.selectOptions(screen.getByLabelText("深度计算设备"), "cpu");
   expect(screen.getByText(/CPU 慢速路径/)).toBeVisible();
-  await userEvent.click(screen.getByRole("button", { name: "重新生成深度素材" }));
-  expect(start).toHaveBeenCalledWith("project-001", "cpu");
+  await userEvent.click(screen.getByRole("button", { name: "重新提取整段深度视频" }));
+  expect(start).toHaveBeenCalledWith("project-001", "cpu", "480p");
+});
+
+it("完成任务仍可切换清晰度并重新提取整段视频", async () => {
+  stubDesktop();
+  const start = vi.fn().mockResolvedValue(project());
+  render(<DepthCapturePanel project={project()} onProjectUpdated={vi.fn()} start={start} />);
+  await userEvent.selectOptions(screen.getByLabelText("输出清晰度"), "720p");
+  await userEvent.click(screen.getByRole("button", { name: "重新提取整段深度视频" }));
+  expect(start).toHaveBeenCalledWith("project-001", "auto", "720p");
 });
 
 it("参考素材变化后解除提交锁并忽略旧的深度启动响应", async () => {
@@ -200,9 +232,9 @@ it("参考素材变化后解除提交锁并忽略旧的深度启动响应", asyn
   const onMutationPendingChange = vi.fn();
   const initial = project([]);
   const view = render(<DepthCapturePanel project={initial} onProjectUpdated={onProjectUpdated} start={vi.fn().mockReturnValue(pending.promise)} onMutationPendingChange={onMutationPendingChange} />);
-  await userEvent.click(screen.getByRole("button", { name: "开始本地深度捕捉" }));
+  await userEvent.click(screen.getByRole("button", { name: "提取整段深度视频" }));
   expect(onMutationPendingChange).toHaveBeenCalledWith(true);
-  const changedReference = { ...initial, referenceMedia: { ...initial.referenceMedia!, id: "video-002", originalName: "replacement.mp4" }, localPreprocessing: { ...initial.localPreprocessing!, sourceReferenceMediaId: "video-002", mediaType: "video" as const } as VideoLocalPreprocessing };
+  const changedReference = { ...initial, referenceMedia: { ...initial.referenceMedia!, id: "video-002", originalName: "replacement.mp4" } };
   view.rerender(<DepthCapturePanel project={changedReference} onProjectUpdated={onProjectUpdated} start={vi.fn().mockReturnValue(pending.promise)} onMutationPendingChange={onMutationPendingChange} />);
   await act(async () => { pending.resolve(project()); await pending.promise; });
   expect(onProjectUpdated).not.toHaveBeenCalled();
@@ -242,5 +274,36 @@ it("窄屏保留预览和结果，但不提供启动、重试或确认变更", (
   render(<DepthCapturePanel project={project([failed])} onProjectUpdated={vi.fn()} />);
   expect(screen.getByLabelText("参考视频预览")).toBeVisible();
   expect(screen.getByRole("alert")).toHaveTextContent("深度任务失败");
-  expect(screen.queryByRole("button", { name: /开始本地深度捕捉|从失败阶段重试|我已检查/ })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /提取整段深度视频|从失败阶段重试|我已检查/ })).not.toBeInTheDocument();
+});
+
+it("新捕捉成功后显示新结果，不再显示旧检查点错误", () => {
+  stubDesktop();
+  const failed = capture({
+    id: "depth-failed", status: "failed", qualityAssessment: null,
+    updatedAt: "2026-09-12T10:01:00+00:00",
+    error: { code: "depth_input_invalid", message: "模型检查点路径无效。", stage: "preparing", retryable: true },
+  });
+  const completed = capture({ id: "depth-new", updatedAt: "2026-09-12T10:02:00+00:00" });
+  const view = render(<DepthCapturePanel project={project([failed])} onProjectUpdated={vi.fn()} />);
+  expect(screen.getByText("模型检查点路径无效。")).toBeVisible();
+  view.rerender(<DepthCapturePanel project={{ ...project([failed, completed]), activeDepthCaptureId: completed.id }} onProjectUpdated={vi.fn()} />);
+  expect(screen.getByRole("status", { name: "本地深度捕捉已完成" })).toBeVisible();
+  expect(screen.queryByText("模型检查点路径无效。")).not.toBeInTheDocument();
+});
+
+it("预览整段灰度视频，展示实际输出，并提供单文件与完整素材包下载", () => {
+  stubDesktop();
+  render(<DepthCapturePanel project={project()} onProjectUpdated={vi.fn()} />);
+  expect(screen.getByRole("heading", { name: "深度动作捕捉" })).toBeVisible();
+  expect(screen.getByLabelText("灰度深度视频预览")).toHaveAttribute("src", "/api/projects/project-001/depth-captures/depth-001/video");
+  expect(screen.getByText("实际输出：640 × 360 · 2.50 秒")).toBeVisible();
+  expect(screen.getByRole("link", { name: "下载灰度深度视频" })).toHaveAttribute("href", "/api/projects/project-001/depth-captures/depth-001/video?download=true");
+  expect(screen.getByRole("link", { name: "下载完整深度素材包" })).toHaveAttribute("href", "/api/projects/project-001/depth-captures/depth-001/package");
+});
+
+it("运行中不提供灰度视频下载", () => {
+  stubDesktop();
+  render(<DepthCapturePanel project={project([capture({ status: "running" })])} onProjectUpdated={vi.fn()} load={vi.fn().mockResolvedValue(project())} />);
+  expect(screen.queryByRole("link", { name: "下载灰度深度视频" })).not.toBeInTheDocument();
 });

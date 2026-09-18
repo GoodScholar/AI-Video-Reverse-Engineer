@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, CircleAlert, Clock3, LoaderCircle, Play, RotateCcw } from "lucide-react";
 
-import type { DepthCapture, DepthCaptureStageName, DepthDevicePreference, DepthQualityCriterion, Project } from "./models";
-import { confirmDepthReview, depthPreviewUrl, referenceVideoContentUrl, startDepthCapture } from "./depthCaptureApi";
+import type { DepthCapture, DepthCaptureStageName, DepthDevicePreference, DepthOutputResolution, DepthQualityCriterion, Project } from "./models";
+import { confirmDepthReview, depthVideoUrl, referenceVideoContentUrl, startDepthCapture } from "./depthCaptureApi";
 import { getProject } from "./localPreprocessingApi";
 
 const DESKTOP_QUERY = "(min-width: 1024px)";
@@ -80,19 +80,13 @@ function stageStateText(status: DepthCapture["stages"][number]["status"]) {
 
 function StageIcon({ status }: { status: DepthCapture["stages"][number]["status"] }) {
   if (status === "completed") return <Check aria-hidden="true" size={16} />;
-  if (status === "running") return <LoaderCircle aria-hidden="true" size={16} />;
+  if (status === "running") return <LoaderCircle className="loading-spinner" aria-hidden="true" size={16} />;
   if (status === "failed") return <CircleAlert aria-hidden="true" size={16} />;
   return <Clock3 aria-hidden="true" size={16} />;
 }
 
 function mostRecent(captures: DepthCapture[]) {
   return [...captures].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0] ?? null;
-}
-
-function isUnresolved(capture: DepthCapture) {
-  return capture.status === "failed"
-    || capture.qualityAssessment?.status === "failed"
-    || (capture.qualityAssessment?.status === "review_required" && !capture.reviewConfirmedAt);
 }
 
 function currentReferenceVideo(project: Project) {
@@ -104,26 +98,23 @@ function selectDisplayCapture(project: Project): DepthCapture | null {
   const captures = (project.depthCaptures ?? []).filter((capture) => capture.sourceReferenceVideoId === video?.id);
   const active = captures.filter((capture) => isActive(capture.status));
   return mostRecent(active)
-    ?? mostRecent(captures.filter(isUnresolved))
-    ?? captures.find((capture) => capture.id === project.activeDepthCaptureId)
     ?? mostRecent(captures);
 }
 
 function canStartDepthCapture(project: Project) {
-  const video = currentReferenceVideo(project);
-  const preprocessing = project.localPreprocessing;
-  return Boolean(
-    video
-    && preprocessing?.status === "completed"
-    && preprocessing.sourceReferenceMediaId === video.id
-    && preprocessing.mediaType === "video"
-    && preprocessing.reproducibilityAssessment?.status === "pending_semantic_confirmation",
-  );
+  return Boolean(currentReferenceVideo(project));
 }
 
-function synchroniseDepth(reference: HTMLVideoElement, depth: HTMLVideoElement | null) {
-  if (!depth || !Number.isFinite(reference.currentTime) || !Number.isFinite(depth.currentTime)) return;
-  if (Math.abs(reference.currentTime - depth.currentTime) > DRIFT_TOLERANCE_SECONDS + Number.EPSILON * 8) depth.currentTime = reference.currentTime;
+function synchroniseVideo(source: HTMLVideoElement | null, target: HTMLVideoElement | null) {
+  if (!source || !target || !Number.isFinite(source.currentTime) || !Number.isFinite(target.currentTime)) return;
+  if (Math.abs(source.currentTime - target.currentTime) <= DRIFT_TOLERANCE_SECONDS + Number.EPSILON * 8) return;
+  try { target.currentTime = source.currentTime; } catch { /* 媒体元数据尚未就绪。 */ }
+}
+
+function synchronisePlaybackRate(source: HTMLVideoElement | null, target: HTMLVideoElement | null) {
+  if (!source || !target || !Number.isFinite(source.playbackRate) || !Number.isFinite(target.playbackRate)) return;
+  if (Math.abs(source.playbackRate - target.playbackRate) <= Number.EPSILON * 8) return;
+  try { target.playbackRate = source.playbackRate; } catch { /* 浏览器不支持该播放速率。 */ }
 }
 
 function qualityStatusText(status: "passed" | "review_required" | "failed") {
@@ -143,6 +134,21 @@ function DeviceSelector({ value, onChange }: { value: DepthDevicePreference; onC
         <option value="cpu">CPU</option>
       </select>
       <p>{value === "cpu" ? "CPU 慢速路径：开始前请预留更长处理时间。" : value === "auto" ? "自动选择在无 GPU 加速时可能回退到 CPU，处理会明显更慢。" : "若所选设备不可用，任务不会自动改用其他设备。"}</p>
+    </div>
+  );
+}
+
+function OutputResolutionSelector({ value, source, onChange }: { value: DepthOutputResolution; source: NonNullable<Project["referenceMedia"]>; onChange: (value: DepthOutputResolution) => void }) {
+  const requestedShortEdge = Number.parseInt(value, 10);
+  const sourceShortEdge = Math.min(source.width, source.height);
+  return (
+    <div className="depth-capture-device">
+      <label htmlFor="depth-output-resolution">输出清晰度</label>
+      <select id="depth-output-resolution" value={value} onChange={(event) => onChange(event.target.value as DepthOutputResolution)}>
+        <option value="480p">480P（短边）</option>
+        <option value="720p">720P（短边）</option>
+      </select>
+      <p>{sourceShortEdge < requestedShortEdge ? `原视频短边为 ${sourceShortEdge}px；提升到 ${requestedShortEdge}P 只会放大，不会增加画面细节。` : "按短边输出，保持原始画幅比例。"}</p>
     </div>
   );
 }
@@ -173,6 +179,7 @@ export function DepthCapturePanel({
   const currentTaskIdRef = useRef(task?.id ?? null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [devicePreference, setDevicePreference] = useState<DepthDevicePreference>("auto");
+  const [outputResolution, setOutputResolution] = useState<DepthOutputResolution>("480p");
   const [submitError, setSubmitError] = useState("");
   const [refreshError, setRefreshError] = useState("");
   currentProjectIdRef.current = project.id;
@@ -243,21 +250,44 @@ export function DepthCapturePanel({
     };
   }, [canPoll, load, pollIntervalMs, project.id, task?.id, task?.status]);
 
-  function mirrorPlay() {
+  function mirrorPlayFromReference() {
     const reference = referenceRef.current;
     const depth = depthRef.current;
     if (!reference || !depth) return;
-    synchroniseDepth(reference, depth);
+    synchroniseVideo(reference, depth);
     void depth.play().catch(() => undefined);
   }
 
-  function mirrorPause() {
+  function mirrorPlayFromDepth() {
+    const reference = referenceRef.current;
+    const depth = depthRef.current;
+    if (!reference || !depth) return;
+    synchroniseVideo(depth, reference);
+    void reference.play().catch(() => undefined);
+  }
+
+  function mirrorPauseFromReference() {
     depthRef.current?.pause();
   }
 
-  function correctDrift() {
-    const reference = referenceRef.current;
-    if (reference) synchroniseDepth(reference, depthRef.current);
+  function mirrorPauseFromDepth() {
+    referenceRef.current?.pause();
+  }
+
+  function synchroniseFromReference() {
+    synchroniseVideo(referenceRef.current, depthRef.current);
+  }
+
+  function synchroniseFromDepth() {
+    synchroniseVideo(depthRef.current, referenceRef.current);
+  }
+
+  function synchroniseRateFromReference() {
+    synchronisePlaybackRate(referenceRef.current, depthRef.current);
+  }
+
+  function synchroniseRateFromDepth() {
+    synchronisePlaybackRate(depthRef.current, referenceRef.current);
   }
 
   async function submit() {
@@ -275,7 +305,7 @@ export function DepthCapturePanel({
     mutationCallbackRef.current(true);
     setSubmitError("");
     try {
-      const updated = await start(projectId, devicePreference);
+      const updated = await start(projectId, devicePreference, outputResolution);
       if (isCurrent()) callbackRef.current(updated);
     } catch (error) {
       if (isCurrent()) setSubmitError(messageFor(error, "无法启动本地深度捕捉，请重试。"));
@@ -316,14 +346,12 @@ export function DepthCapturePanel({
     }
   }
 
-  if (!project.localPreprocessing) return null;
-
   return (
     <section className={`depth-capture-panel${isDesktop ? "" : " depth-capture-panel--readonly"}`} aria-labelledby="depth-capture-title">
       <div className="depth-capture-heading">
         <div>
           <p className="depth-capture-kicker">本地控制素材</p>
-          <h2 id="depth-capture-title">深度捕捉审查</h2>
+          <h2 id="depth-capture-title">深度动作捕捉</h2>
         </div>
         {!isDesktop && <p className="depth-capture-readonly">移动端仅查看</p>}
       </div>
@@ -332,21 +360,21 @@ export function DepthCapturePanel({
         <div className="depth-preview-grid">
           <figure>
             <figcaption>参考视频 · 时间轴基准</figcaption>
-            <video ref={referenceRef} aria-label="参考视频预览" controls preload="metadata" src={referenceVideoContentUrl(project.id)} onPlay={mirrorPlay} onPause={mirrorPause} onSeeking={correctDrift} onTimeUpdate={correctDrift} />
+            <video ref={referenceRef} aria-label="参考视频预览" controls preload="metadata" src={referenceVideoContentUrl(project.id)} onPlay={mirrorPlayFromReference} onPause={mirrorPauseFromReference} onSeeking={synchroniseFromReference} onTimeUpdate={synchroniseFromReference} onRateChange={synchroniseRateFromReference} />
           </figure>
           <figure>
-            <figcaption>相对深度控制素材</figcaption>
+            <figcaption>灰度深度视频 · 同步预览</figcaption>
             {task?.status === "completed" && sourceIsCurrent ? (
-              <video ref={depthRef} aria-label="深度控制预览" preload="metadata" src={depthPreviewUrl(project.id, task.id)} />
-            ) : <div className="depth-preview-placeholder" aria-label="深度控制预览">{task ? "深度预览将在编码完成后显示" : "尚未生成深度预览"}</div>}
+              <video ref={depthRef} aria-label="灰度深度视频预览" controls preload="metadata" src={depthVideoUrl(project.id, task.id)} onPlay={mirrorPlayFromDepth} onPause={mirrorPauseFromDepth} onSeeking={synchroniseFromDepth} onTimeUpdate={synchroniseFromDepth} onRateChange={synchroniseRateFromDepth} />
+            ) : <div className="depth-preview-placeholder" aria-label="灰度深度视频预览">{isActive(task?.status) && <LoaderCircle className="loading-spinner" aria-hidden="true" size={32} />}<span>{task ? "灰度视频将在编码完成后显示" : "尚未生成灰度深度视频"}</span></div>}
           </figure>
         </div>
       )}
 
       {!task && (
         <div className="depth-capture-empty">
-          {canStart ? <p>参考素材与本地预处理已就绪，可在本机生成相对深度控制素材。</p> : <p>请先完成当前参考视频的本地预处理，并确认它仍在可复刻范围内。</p>}
-          {isDesktop && canStart && <div className="depth-capture-actions"><DeviceSelector value={devicePreference} onChange={setDevicePreference} /><button className="primary-action" type="button" disabled={isSubmitting} onClick={() => void submit()}><Play aria-hidden="true" size={17} />{isSubmitting ? "正在启动深度捕捉…" : "开始本地深度捕捉"}</button></div>}
+          {canStart ? <p>选择输出清晰度后，可从当前参考视频提取整段灰度深度视频。</p> : <p>请先上传一段参考视频。</p>}
+          {isDesktop && canStart && currentVideo && <div className="depth-capture-actions"><OutputResolutionSelector value={outputResolution} source={currentVideo} onChange={setOutputResolution} /><DeviceSelector value={devicePreference} onChange={setDevicePreference} /><button className="primary-action" type="button" disabled={isSubmitting} onClick={() => void submit()}>{isSubmitting ? <LoaderCircle className="loading-spinner" aria-hidden="true" size={17} /> : <Play aria-hidden="true" size={17} />}{isSubmitting ? "正在启动深度捕捉…" : "提取整段深度视频"}</button></div>}
         </div>
       )}
 
@@ -356,14 +384,24 @@ export function DepthCapturePanel({
       {task?.status === "failed" && sourceIsCurrent && task.error && (
         <div className="depth-capture-error" role="alert"><CircleAlert aria-hidden="true" size={17} /><span><strong>{stageLabels[task.error.stage]}失败</strong>{task.error.message}</span></div>
       )}
-      {(task?.status === "failed" || task?.qualityAssessment?.status === "failed") && sourceIsCurrent && isDesktop && canStart && (
-        <div className="depth-capture-actions"><DeviceSelector value={devicePreference} onChange={setDevicePreference} /><button className="secondary-action depth-capture-retry" type="button" disabled={isSubmitting} onClick={() => void submit()}><RotateCcw aria-hidden="true" size={17} />{isSubmitting ? "正在重新启动…" : task?.qualityAssessment?.status === "failed" ? "重新生成深度素材" : "从失败阶段重试"}</button></div>
+      {task?.status === "failed" && sourceIsCurrent && isDesktop && canStart && (
+        <div className="depth-capture-actions">{currentVideo && <OutputResolutionSelector value={outputResolution} source={currentVideo} onChange={setOutputResolution} />}<DeviceSelector value={devicePreference} onChange={setDevicePreference} /><button className="secondary-action depth-capture-retry" type="button" disabled={isSubmitting} onClick={() => void submit()}>{isSubmitting ? <LoaderCircle className="loading-spinner" aria-hidden="true" size={17} /> : <RotateCcw aria-hidden="true" size={17} />}{isSubmitting ? "正在重新启动…" : task?.qualityAssessment?.status === "failed" ? "重新提取整段深度视频" : "从失败阶段重试"}</button></div>
+      )}
+      {task?.status === "completed" && sourceIsCurrent && isDesktop && canStart && currentVideo && (
+        <div className="depth-capture-actions"><OutputResolutionSelector value={outputResolution} source={currentVideo} onChange={setOutputResolution} /><DeviceSelector value={devicePreference} onChange={setDevicePreference} /><button className="secondary-action depth-capture-retry" type="button" disabled={isSubmitting} onClick={() => void submit()}>{isSubmitting ? <LoaderCircle className="loading-spinner" aria-hidden="true" size={17} /> : <RotateCcw aria-hidden="true" size={17} />}{isSubmitting ? "正在重新启动…" : "重新提取整段深度视频"}</button></div>
       )}
       {task?.status === "completed" && sourceIsCurrent && task.qualityAssessment?.status === "review_required" && !task.reviewConfirmedAt && isDesktop && (
-        <button className="primary-action" type="button" disabled={isSubmitting} onClick={() => void confirmReview()}>{isSubmitting ? "正在确认…" : "我已检查，继续实验性生成"}</button>
+        <button className="primary-action" type="button" disabled={isSubmitting} onClick={() => void confirmReview()}>{isSubmitting && <LoaderCircle className="loading-spinner" aria-hidden="true" size={17} />}{isSubmitting ? "正在确认…" : "我已检查，继续实验性生成"}</button>
       )}
       {task?.status === "completed" && sourceIsCurrent && (task.qualityAssessment?.status === "passed" || task.reviewConfirmedAt) && (
         <p className="depth-capture-ready" role="status">{task.reviewConfirmedAt ? "已确认实验性复核；深度素材可用于深度控制工作流。" : "深度素材可用于深度控制工作流。"}</p>
+      )}
+      {task?.status === "completed" && sourceIsCurrent && isDesktop && (
+        <div className="depth-capture-export">
+          <a className="secondary-action" href={depthVideoUrl(project.id, task.id, true)} download>下载灰度深度视频</a>
+          <a className="secondary-action" href={`/api/projects/${encodeURIComponent(project.id)}/depth-captures/${encodeURIComponent(task.id)}/package`} download>下载完整深度素材包</a>
+          <p>下载完整灰度控制视频；素材包同时包含彩色预览、质量报告和版本记录。两种下载都保留整段时间线。</p>
+        </div>
       )}
       {submitError && <p className="depth-capture-error" role="alert"><CircleAlert aria-hidden="true" size={17} />{submitError}</p>}
       {refreshError && canPoll && <p className="depth-capture-refresh-error">暂时无法刷新状态：{refreshError}</p>}
@@ -379,8 +417,10 @@ function TaskDetails({ task }: { task: DepthCapture }) {
       <div className="depth-capture-task-head">
         <h3>{taskTitle(task)}</h3>
         <span>请求设备：{task.devicePreference.toUpperCase()}</span>
+        {task.outputResolution && <span>请求清晰度：短边 {task.outputResolution.toUpperCase()}</span>}
         {task.executionDevice && <span>最终设备：{task.executionDevice.toUpperCase()}</span>}
       </div>
+      {task.outputSummary && <p className="depth-capture-output">实际输出：{task.outputSummary.width} × {task.outputSummary.height} · {task.outputSummary.durationSeconds.toFixed(2)} 秒</p>}
       {task.executionDevice === "cpu" && <p className="depth-capture-cpu-warning">CPU 慢速路径：此设备上的深度估计可能需要较长时间。</p>}
       <ol className="depth-capture-stages" aria-label="深度捕捉阶段">
         {stageNames.map((name) => {

@@ -9,6 +9,7 @@ from typing import Literal, Optional, Union
 from pydantic import BaseModel, Field, field_validator
 
 
+MAX_REFERENCE_VIDEO_DURATION_SECONDS = 300.0
 MAX_REFERENCE_VIDEO_BYTES = 200_000_000
 MAX_MULTIPART_BODY_BYTES = 201_000_000
 DEFAULT_FFPROBE_TIMEOUT_SECONDS = 30.0
@@ -32,7 +33,7 @@ class ReferenceVideo(BaseModel):
     originalName: str = Field(min_length=1)
     format: Literal["mp4", "mov"]
     sizeBytes: int = Field(gt=0)
-    durationSeconds: float = Field(ge=2.0, le=10.0)
+    durationSeconds: float = Field(ge=2.0, le=MAX_REFERENCE_VIDEO_DURATION_SECONDS)
     width: int = Field(gt=0)
     height: int = Field(gt=0)
     frameRate: float = Field(gt=0)
@@ -215,17 +216,11 @@ def _validate_probe_result(
             "video_too_short",
             f"参考视频实测时长为 {duration_seconds:.2f} 秒，最短允许 2.00 秒。",
         )
-    if duration_seconds > 10:
+    if duration_seconds > MAX_REFERENCE_VIDEO_DURATION_SECONDS:
         raise ReferenceVideoError(
             422,
             "video_too_long",
-            f"参考视频实测时长为 {duration_seconds:.2f} 秒，最长允许 10.00 秒。",
-        )
-    if min(width, height) < 480:
-        raise ReferenceVideoError(
-            422,
-            "video_resolution_too_low",
-            f"参考视频旋转后的显示分辨率为 {width}×{height}，短边至少需要 480 像素。",
+            f"参考视频实测时长为 {duration_seconds:.2f} 秒，最长允许 {MAX_REFERENCE_VIDEO_DURATION_SECONDS:.2f} 秒。",
         )
     if _exceeds_maximum_resolution(width, height):
         raise ReferenceVideoError(

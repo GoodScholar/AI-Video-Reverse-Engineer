@@ -1,0 +1,29 @@
+{
+  "info": {
+    "strategy": "wan22_fun_control",
+    "label": "Wan2.2 Fun Control（深度）",
+    "status": "candidate",
+    "requiredModels": ["wan2.2_fun_control_high_noise_14B_fp8_scaled.safetensors", "wan2.2_fun_control_low_noise_14B_fp8_scaled.safetensors", "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "wan_2.1_vae.safetensors"],
+    "requiredNodes": ["LoadImage", "LoadVideo", "GetVideoComponents", "CLIPLoader", "CLIPTextEncode", "VAELoader", "Wan22FunControlToVideo", "UNETLoader", "ModelSamplingSD3", "KSamplerAdvanced", "VAEDecode", "CreateVideo", "SaveVideo"],
+    "provenance": {"repository": "https://github.com/Comfy-Org/workflow_templates", "commit": "f7e38002b6fc9edb21d774e48b49e4cf5c0584a2", "template": "templates/video_wan2_2_14B_fun_control.json", "officialNodeEvidence": "https://github.com/Comfy-Org/ComfyUI/blob/master/comfy_extras/nodes_wan.py#L119-L182", "apiGraph": "从官方 Fun Control 深度模板的原生 Wan22FunControlToVideo 与 LoadVideo 核心节点构建；尚未在本地 Queue 验证。"}
+  },
+  "workflow": {
+    "1": {"class_type": "LoadImage", "inputs": {"image": "$input_image"}},
+    "2": {"class_type": "LoadVideo", "inputs": {"file": "$depth_video"}},
+    "17": {"class_type": "GetVideoComponents", "inputs": {"video": ["2", 0]}},
+    "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default"}},
+    "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "$positive", "clip": ["3", 0]}},
+    "5": {"class_type": "CLIPTextEncode", "inputs": {"text": "$negative", "clip": ["3", 0]}},
+    "6": {"class_type": "VAELoader", "inputs": {"vae_name": "wan_2.1_vae.safetensors"}},
+    "7": {"class_type": "Wan22FunControlToVideo", "inputs": {"positive": ["4", 0], "negative": ["5", 0], "vae": ["6", 0], "width": "$width", "height": "$height", "length": "$frames", "batch_size": 1, "ref_image": ["1", 0], "control_video": ["17", 0]}},
+    "8": {"class_type": "UNETLoader", "inputs": {"unet_name": "wan2.2_fun_control_high_noise_14B_fp8_scaled.safetensors", "weight_dtype": "default"}},
+    "9": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["8", 0], "shift": 8}},
+    "10": {"class_type": "KSamplerAdvanced", "inputs": {"add_noise": "enable", "noise_seed": "$seed", "control_after_generate": "fixed", "steps": 20, "cfg": 3.5, "sampler_name": "euler", "scheduler": "simple", "positive": ["7", 0], "negative": ["7", 1], "latent_image": ["7", 2], "start_at_step": 0, "end_at_step": 10, "return_with_leftover_noise": "enable", "model": ["9", 0]}},
+    "11": {"class_type": "UNETLoader", "inputs": {"unet_name": "wan2.2_fun_control_low_noise_14B_fp8_scaled.safetensors", "weight_dtype": "default"}},
+    "12": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["11", 0], "shift": 8}},
+    "13": {"class_type": "KSamplerAdvanced", "inputs": {"add_noise": "disable", "noise_seed": "$seed", "control_after_generate": "fixed", "steps": 20, "cfg": 3.5, "sampler_name": "euler", "scheduler": "simple", "positive": ["7", 0], "negative": ["7", 1], "latent_image": ["10", 0], "start_at_step": 10, "end_at_step": 10000, "return_with_leftover_noise": "disable", "model": ["12", 0]}},
+    "14": {"class_type": "VAEDecode", "inputs": {"samples": ["13", 0], "vae": ["6", 0]}},
+    "15": {"class_type": "CreateVideo", "inputs": {"images": ["14", 0], "fps": "$fps"}},
+    "16": {"class_type": "SaveVideo", "inputs": {"video": ["15", 0], "filename_prefix": "video/Wan2.2_fun_control", "format": "auto", "codec": "auto"}}
+  }
+}
