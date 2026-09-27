@@ -90,7 +90,7 @@ export function ContentStudioApp(){
     <nav className="sp-global-nav" aria-label="应用导航">{([["projects",FolderOpen],["tools",Clapperboard],["settings",Settings2]] as const).map(([id,Icon])=><button key={id} type="button" aria-current={page===id?"page":undefined} onClick={()=>navigate(id)}><Icon size={18}/>{labels[id]}</button>)}</nav>
     <div className="sp-sidebar-project"><span>当前项目</span><strong><span className="sp-project-dot"/>{project?.name??"请先打开一个项目"}</strong></div>
     <nav className="sp-project-nav" aria-label="项目导航">{projectPages.map(({id,label,icon:Icon})=><button key={id} type="button" disabled={!project} aria-current={page===id?"page":undefined} onClick={()=>navigate(id)}><Icon size={18}/>{label}</button>)}</nav>
-    <div className="sp-sidebar-bottom"><span className="sp-local-dot"/>项目与素材保存在本地<a href="?workspace=legacy">兼容工作台<ArrowRight size={15}/></a></div>
+    <div className="sp-sidebar-bottom"><span className="sp-local-dot"/>项目与素材保存在本地<a href="?workspace=legacy">旧版复刻工作台（兼容）<ArrowRight size={15}/></a></div>
   </aside>{menuOpen&&<button type="button" className="sp-menu-backdrop" aria-label="关闭导航遮罩" onClick={()=>{setMenuOpen(false);navButton.current?.focus();}}/>}
     <div className="sp-shell"><header className="sp-topbar"><button ref={navButton} type="button" className="sp-menu-button sp-icon-button" aria-label="打开导航" onClick={()=>setMenuOpen(true)}><Menu size={20}/></button><div className="sp-breadcrumb"><span>内容工作室</span><ArrowRight size={13}/><h1 ref={heading} tabIndex={-1}>{labels[page]}</h1></div><span className="studio-service-badge">{dirty?"有未保存草稿":provider?`${provider.label??provider.provider} · ${provider.model??"未配置模型"}`:"本地内容工作室"}</span></header>
       <main className={`sp-main studio-page-${page}`}>

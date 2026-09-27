@@ -7,6 +7,8 @@ const response = (body: unknown, status = 200) => new Response(JSON.stringify(bo
 const project = { id: "studio-p1", name: "商品测试项目", createdAt: "2026-09-26T00:00:00Z", updatedAt: "2026-09-26T00:00:00Z", referenceMedia: null, localPreprocessing: null };
 const brief = { revision: 0, productName: "", facts: [], audience: "", sellingPoints: [], callToAction: "", forbiddenPhrases: [], assetIds: [] };
 const workspace = { revision: 0, brief: { theme: "", purpose: "", style: "", duration: 12, aspect: "9:16", mustPreserve: "" }, assets: [], shots: [], checks: [], nodeCatalog: [] };
+const workflow = { stage: "draft", currentStep: 0, completedSteps: [false, false, false, false], activeGenerationId: null, activeBatchId: null,
+  counts: { total: 0, pending: 0, approved: 0, rejected: 0, delivered: 0, failed: 0 }, variants: [], issues: [] };
 beforeEach(() => {
   history.replaceState(null,"","/");
   vi.stubGlobal("fetch",vi.fn((url) => {
@@ -16,11 +18,17 @@ beforeEach(() => {
     if(path.endsWith("/preproduction")) return Promise.resolve(response(workspace));
     if(path.endsWith("/aigc-content")) return Promise.resolve(response({brief,assets:[],candidates:[]}));
     if(path.endsWith("/batch-edits")) return Promise.resolve(response({tasks:[],assets:[]}));
+    if(path.endsWith("/content-workflow")) return Promise.resolve(response(workflow));
     if(path.endsWith("/capabilities")) return Promise.resolve(response({analysisService:{state:"unconfigured",label:"未配置"},localComfyui:{state:"disconnected",label:"未连接"}}));
     return Promise.reject(new Error(`unexpected ${path}`));
   }));
 });
 afterEach(()=>vi.unstubAllGlobals());
+
+it("将历史入口明确标为旧版复刻工作台", async () => {
+  render(<App />);
+  expect(await screen.findByRole("link", { name: "旧版复刻工作台（兼容）" })).toHaveAttribute("href", "?workspace=legacy");
+});
 
 it("正式首页读真实项目并进入四步制作，页面切换保留商品草稿",async()=>{
   render(<App/>);
@@ -32,6 +40,22 @@ it("正式首页读真实项目并进入四步制作，页面切换保留商品�
   await userEvent.click(within(screen.getByRole("navigation",{name:"项目导航"})).getByRole("button",{name:"商品视频制作"}));
   expect(screen.getByLabelText("商品名称")).toHaveValue("保留的商品资料");
   expect(vi.mocked(fetch).mock.calls.every(([,init])=>!init||!("method" in init)||init.method==="GET")).toBe(true);
+});
+
+it("重新打开项目后仍从服务端恢复审核导出步骤", async () => {
+  const original = vi.mocked(fetch).getMockImplementation()!;
+  vi.mocked(fetch).mockImplementation((url, init) => String(url).endsWith("/content-workflow")
+    ? Promise.resolve(response({ ...workflow, stage: "review_pending", currentStep: 3, completedSteps: [true, true, true, false],
+      activeGenerationId: "g1", activeBatchId: "batch-1" }))
+    : original(url, init));
+  const first = render(<App />);
+  await userEvent.click(await screen.findByRole("button", { name: /打开项目 商品测试项目/ }));
+  expect(await screen.findByRole("button", { name: "4 审核导出" })).toHaveAttribute("aria-current", "step");
+
+  first.unmount();
+  render(<App />);
+  await userEvent.click(await screen.findByRole("button", { name: /打开项目 商品测试项目/ }));
+  expect(await screen.findByRole("button", { name: "4 审核导出" })).toHaveAttribute("aria-current", "step");
 });
 
 it("读取失败不伪装演示项目，可重试获得真实列表",async()=>{
@@ -56,6 +80,8 @@ it("脚本草稿切换画面素材后，正式预览立即跟随当前选择", a
     if (path.endsWith("/aigc-content")) return Promise.resolve(response({ brief: { ...brief, revision: 1,
       productName: "商品", facts: [{ id: "f1", text: "商品事实" }], assetIds: ["front", "detail"] }, assets: media, candidates: [candidate] }));
     if (path.endsWith("/batch-edits")) return Promise.resolve(response({ tasks: [], assets: media }));
+    if (path.endsWith("/content-workflow")) return Promise.resolve(response({ ...workflow, stage: "brief_ready", currentStep: 1,
+      completedSteps: [true, false, false, false], activeGenerationId: "g1" }));
     return Promise.reject(new Error(`unexpected ${path}`));
   });
   render(<App />);
