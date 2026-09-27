@@ -1,6 +1,10 @@
 # AI Video Reverse Engineer 产品规格
 
-Status: ready-for-agent
+Status: wontfix
+
+> 本文件保留 2025 年最初 MVP 设想，不再作为可直接实施的总规格。当前产品以 [内容项目与模块业务边界](../module-business-boundaries/spec.md)、[视频创作前置工作台](../preproduction-workbench/spec.md)、[电商商品营销视频创作](../aigc-ecommerce-content/spec.md)、[批量混剪与字幕交付](../batch-short-video-editing/spec.md)及后续增量规格为准。
+>
+> ADR 0007 已取代应用内最终生成边界：下文 52、53、57、58 及所有要求应用发送或追踪本地 ComfyUI Queue 的内容只作为历史记录，不再实施。应用继续导出候选工作流并保留历史运行记录，新的最终 AI 视频生成在外部工具完成。顶层工作单元统一称为“内容项目”，“复刻项目”仅是本历史规格中的旧称。
 
 ## Problem Statement
 
