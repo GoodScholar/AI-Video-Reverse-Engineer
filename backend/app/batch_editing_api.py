@@ -43,6 +43,7 @@ from .durable_runs import LOCAL_RUN_POLICY, freeze_run_input
 from .preproduction import safe_child
 from .project_assets import ProjectAssets
 from .reference_video import validate_storage_id
+from .render_inputs import RenderInputError, RenderInputPreparation
 from .timeline import validate_workspace
 from .video_aspect import PRODUCT_PRESETS, ratio_label, valid_aspect_mode
 
@@ -287,6 +288,7 @@ class BatchStore:
 def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", source_lock=None, renderer=None, voice_service=None):
     store = BatchStore(Path(data_dir))
     project_assets = ProjectAssets(Path(data_dir))
+    render_inputs = RenderInputPreparation(project_assets)
     lock = RLock()
     router = APIRouter(prefix="/api/projects/{project_id}/batch-edits")
     from .batch_voiceover import plan_voiceover, audio_duration, arrange_voiceover
@@ -360,60 +362,22 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         finally:
             os.close(descriptor)
 
-    def copy_source(source: Path, target: Path):
-        descriptor = os.open(str(source), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                raise OSError("素材文件无效")
-            with os.fdopen(descriptor, "rb") as stream, target.open("xb") as output:
-                descriptor = -1
-                shutil.copyfileobj(stream, output)
-        finally:
-            if descriptor != -1:
-                os.close(descriptor)
-
     def snapshot_sources(project_id: str, directory: Path, tracks: list, assets: dict) -> dict:
         try:
-            source_dir = directory / "sources"
-            source_dir.mkdir(parents=True, exist_ok=False)
-            sources = {}
-            for asset_id in {clip["assetId"] for track in tracks for clip in track["clips"]}:
-                source = project_assets.file(project_id, assets[asset_id])
-                copied_name = asset_id + source.suffix.lower()
-                copy_source(source, source_dir / copied_name)
-                sources[asset_id] = copied_name
-            return sources
-        except (OSError, ValueError, KeyError):
-            shutil.rmtree(directory, ignore_errors=True)
+            return render_inputs.freeze_current(project_id, directory, tracks, assets)
+        except RenderInputError:
             raise HTTPException(409, detail={"code": "batch_asset_unavailable", "message": "素材文件不可用。"}) from None
-
-    def same_source_contents(left: Path, right: Path) -> bool:
-        with os.fdopen(os.open(left, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)), "rb") as original, \
-             os.fdopen(os.open(right, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)), "rb") as approved:
-            if not stat.S_ISREG(os.fstat(original.fileno()).st_mode) or not stat.S_ISREG(os.fstat(approved.fileno()).st_mode):
-                raise OSError("素材文件无效")
-            while True:
-                original_bytes, approved_bytes = original.read(1024 * 1024), approved.read(1024 * 1024)
-                if original_bytes != approved_bytes:
-                    return False
-                if not original_bytes:
-                    return True
 
     def snapshot_approved_sources(project_id: str, directory: Path, preview: dict, assets: dict) -> dict:
         try:
-            source_dir = directory / "sources"
-            source_dir.mkdir(parents=True, exist_ok=False)
-            sources = {}
-            for asset_id, preview_name in preview["sources"].items():
-                approved = store.path(project_id, "runs", preview["id"], "sources", preview_name)
-                original = project_assets.file(project_id, assets[asset_id])
-                if not same_source_contents(original, approved):
-                    raise ValueError("素材已变化")
-                copy_source(approved, source_dir / preview_name)
-                sources[asset_id] = preview_name
-            return sources
-        except (OSError, ValueError, KeyError):
-            shutil.rmtree(directory, ignore_errors=True)
+            return render_inputs.freeze_approved(
+                project_id,
+                directory,
+                store.path(project_id, "runs", preview["id"]),
+                preview["sources"],
+                assets,
+            )
+        except (RenderInputError, KeyError, ValueError):
             raise HTTPException(409, detail={"code": "batch_asset_unavailable", "message": "原素材缺失或变化，请重新预览审核。"}) from None
 
     def find_run(variant: dict[str, Any], run_id: str):
@@ -470,10 +434,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 save(project_id, state)
                 snapshot, names, language = run["snapshot"], dict(run["sources"]), run["language"]
             directory = store.path(project_id, "recognitions", run_id)
-            sources = {asset_id: store.path(project_id, "recognitions", run_id, "sources", filename)
-                       for asset_id, filename in names.items()}
-            for source in sources.values():
-                regular_file(source)
+            sources = render_inputs.resolve(directory, names)
             from .timeline_render import inspect_timeline_media, render_timeline
             from .video_toolkit import ToolkitConfig, execute_tool
             assets = {asset_id: {"kind": "video", "name": asset_id, "duration": 1_000_000} for asset_id in names}
@@ -525,11 +486,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 save(project_id, state)
                 snapshot = run["snapshot"]
                 names = dict(run["sources"])
-            sources = {}
-            for asset_id, filename in names.items():
-                source = store.path(project_id, "runs", run_id, "sources", filename)
-                regular_file(source)
-                sources[asset_id] = source
+            sources = render_inputs.resolve(store.path(project_id, "runs", run_id), names)
             staging = store.path(project_id, "runs", run_id, "preview.mp4")
             actual_renderer = renderer
             if actual_renderer is None:
@@ -584,10 +541,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 save(project_id, state)
                 snapshot, names, cues = run["snapshot"], dict(run["sources"]), run["subtitles"]
             directory = store.path(project_id, "exports", run_id)
-            sources = {asset_id: store.path(project_id, "exports", run_id, "sources", filename)
-                       for asset_id, filename in names.items()}
-            for source in sources.values():
-                regular_file(source)
+            sources = render_inputs.resolve(directory, names)
             subtitle_file = None
             if cues:
                 subtitle_file = directory / "subtitles.srt"

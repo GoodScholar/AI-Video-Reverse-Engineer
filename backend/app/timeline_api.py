@@ -5,7 +5,6 @@ import os
 import hashlib
 import json
 import re
-import shutil
 import stat
 from contextlib import nullcontext
 from pathlib import Path
@@ -22,6 +21,7 @@ from .audio_waveform import WaveformCache
 from .preproduction import PreproductionStore
 from .project_assets import ProjectAssets
 from .reference_video import validate_storage_id
+from .render_inputs import RenderInputError, RenderInputPreparation
 from .timeline import TimelineStore, has_audible_audio, has_visible_video, validate_workspace
 
 
@@ -34,6 +34,7 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
     store = TimelineStore(root)
     preproduction = PreproductionStore(root)
     project_assets = ProjectAssets(root)
+    render_inputs = RenderInputPreparation(project_assets)
     lock = RLock()
     waveform_cache = WaveformCache()
     active_workers = set()
@@ -98,27 +99,10 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             fail("timeline_asset_unavailable", "素材文件不可用。", 409)
 
     def snapshot_sources(project_id, run_id, tracks, assets):
-        used = sorted({clip["assetId"] for track in tracks for clip in track["clips"]})
         run_dir = store.path(project_id, "runs", run_id)
-        source_dir = store.path(project_id, "runs", run_id, "sources")
         try:
-            run_dir.mkdir(parents=True, exist_ok=False)
-            source_dir.mkdir()
-            sources = {}
-            for asset_id in used:
-                asset = assets[asset_id]
-                source = source_path(project_id, asset)
-                suffix = source.suffix.lower()
-                filename = asset_id + suffix
-                target = store.path(project_id, "runs", run_id, "sources", filename)
-                _copy_regular(source, target)
-                sources[asset_id] = filename
-            return sources
-        except HTTPException:
-            shutil.rmtree(run_dir, ignore_errors=True)
-            raise
-        except (OSError, ValueError):
-            shutil.rmtree(run_dir, ignore_errors=True)
+            return render_inputs.freeze_current(project_id, run_dir, tracks, assets)
+        except RenderInputError:
             fail("timeline_asset_unavailable", "素材文件不可用。", 409)
 
     def queue_run(project_id, run_id):
@@ -150,11 +134,7 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 active_workers.add((project_id, run_id))
                 snapshot = run["snapshot"]
                 source_names = dict(run["sources"])
-            sources = {}
-            for asset_id, filename in source_names.items():
-                path = store.path(project_id, "runs", run_id, "sources", filename)
-                _regular_file(path)
-                sources[asset_id] = path
+            sources = render_inputs.resolve(store.path(project_id, "runs", run_id), source_names)
             suffix = ".wav" if run["format"] == "wav" else ".mp4"
             staging = store.path(project_id, "runs", run_id, "output" + suffix)
             actual_renderer = renderer
@@ -455,17 +435,6 @@ def _regular_file(path):
             raise OSError("不是普通文件")
     finally:
         os.close(descriptor)
-
-
-def _copy_regular(source, target):
-    _regular_file(source)
-    descriptor = os.open(str(source), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        with os.fdopen(descriptor, "rb") as stream, target.open("xb") as output:
-            shutil.copyfileobj(stream, output)
-    except BaseException:
-        target.unlink(missing_ok=True)
-        raise
 
 
 def _safe_error(error):

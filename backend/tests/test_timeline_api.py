@@ -135,6 +135,21 @@ def test_cancelled_or_failed_run_never_publishes_partial_output(tmp_path):
     assert client.get(BASE + "/runs/" + run_id + "/output").status_code == 409
 
 
+def test_missing_frozen_source_keeps_the_existing_safe_render_error(tmp_path):
+    client, queue = setup(tmp_path, lambda *_args, **_kwargs: None)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    submitted = client.post(BASE + "/runs", json={"revision": 1, "format": "preview"})
+    run_id = submitted.json()["runs"][-1]["id"]
+    frozen_source = tmp_path / "project-files" / PROJECT_ID / "timeline" / "runs" / run_id / "sources" / "video.mp4"
+    frozen_source.unlink()
+
+    queue.run()
+
+    run = client.get(BASE).json()["runs"][-1]
+    assert run["status"] == "failed"
+    assert run["error"] == "渲染失败，请检查时间线和素材。"
+
+
 def test_rejects_symlinked_preproduction_source_and_allows_audible_audio_only_wav(tmp_path):
     client, _ = setup(tmp_path)
     source = tmp_path / "project-files" / PROJECT_ID / "preproduction" / "assets" / "video.mp4"
