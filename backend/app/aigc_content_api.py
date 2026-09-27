@@ -81,7 +81,7 @@ def _path(root, project_id):
     return safe_child(root, "project-files", project_id, "aigc-content", "state.json")
 
 
-def _load(root, project_id):
+def load_aigc_content_state(root, project_id):
     path = _path(root, project_id)
     if not path.exists():
         return _empty_state()
@@ -167,7 +167,7 @@ def _check_candidate(candidate, facts, assets, forbidden):
 
 def load_confirmed_handoff(data_dir, project_id, generation_id):
     """Return five current, validated candidates for batch editing."""
-    content = _load(Path(data_dir), project_id)
+    content = load_aigc_content_state(Path(data_dir), project_id)
     brief = content["brief"]
     candidates = [item for item in content["candidates"] if item.get("generationId") == generation_id]
     if (len(candidates) != 5 or any(item.get("confirmedRevision") != item.get("revision")
@@ -196,7 +196,7 @@ def create_aigc_content_router(data_dir, get_project, script_generator=None, sou
     def workspace(project_id: str):
         get_project(project_id)
         with lock:
-            state = _load(root, project_id)
+            state = load_aigc_content_state(root, project_id)
             assets = [{key: value for key, value in asset.items() if key != "file" and not key.startswith("_")}
                       for asset in PreproductionStore(root).load(project_id)["assets"]
                       if asset.get("kind") in ("image", "video")]
@@ -208,7 +208,7 @@ def create_aigc_content_router(data_dir, get_project, script_generator=None, sou
         if not isinstance(body, dict) or set(body) != {"revision", "brief"} or type(body["revision"]) is not int or not _valid_brief(body["brief"]):
             raise HTTPException(422, detail={"code": "aigc_brief_invalid", "message": "创作简报无效。"})
         with source_lock or nullcontext(), lock:
-            state = _load(root, project_id)
+            state = load_aigc_content_state(root, project_id)
             if body["revision"] != state["brief"]["revision"]:
                 raise HTTPException(409, detail={"code": "aigc_brief_conflict", "message": "创作简报已更新，请刷新后重试。"})
             state["brief"] = {**body["brief"], "aspectMode": body["brief"].get("aspectMode", "9:16"),
@@ -222,7 +222,7 @@ def create_aigc_content_router(data_dir, get_project, script_generator=None, sou
         if not isinstance(body, dict) or set(body) != {"provider", "model"}:
             raise HTTPException(422, detail={"code": "aigc_provider_invalid", "message": "请选择已配置的 AI 服务和模型。"})
         with source_lock or nullcontext(), lock:
-            state = _load(root, project_id)
+            state = load_aigc_content_state(root, project_id)
             return _disclosure(root, project_id, state["brief"], body["provider"], body["model"])
 
     @router.post("/candidates", status_code=201)
@@ -234,7 +234,7 @@ def create_aigc_content_router(data_dir, get_project, script_generator=None, sou
                 or type(body["briefRevision"]) is not int or not isinstance(body["digest"], str)):
             raise HTTPException(422, detail={"code": "aigc_disclosure_invalid", "message": "发送确认无效，请重新预览。"})
         with source_lock or nullcontext(), lock:
-            state = _load(root, project_id)
+            state = load_aigc_content_state(root, project_id)
             disclosure = _disclosure(root, project_id, state["brief"], body["provider"], body["model"])
             if body["briefRevision"] != state["brief"]["revision"] or body["digest"] != disclosure["digest"]:
                 raise HTTPException(409, detail={"code": "aigc_disclosure_stale", "message": "创作简报或素材信息已更新，请重新核对发送内容。"})
@@ -247,7 +247,7 @@ def create_aigc_content_router(data_dir, get_project, script_generator=None, sou
                   "briefRevision": disclosure["briefRevision"], "confirmedRevision": None, "provider": disclosure["provider"],
                   "model": disclosure["model"], "promptDigest": disclosure["digest"]} for candidate in candidates]
         with source_lock or nullcontext(), lock:
-            current = _load(root, project_id)
+            current = load_aigc_content_state(root, project_id)
             fresh = _disclosure(root, project_id, current["brief"], body["provider"], body["model"])
             if current["brief"] != state["brief"] or fresh["digest"] != disclosure["digest"]:
                 raise HTTPException(409, detail={"code": "aigc_disclosure_stale", "message": "创作简报已更新，请重新核对发送内容。"})
@@ -272,7 +272,7 @@ def create_aigc_content_router(data_dir, get_project, script_generator=None, sou
         except ValidationError:
             raise HTTPException(422, detail={"code": "aigc_candidate_invalid", "message": "脚本候选内容无效。"}) from None
         with source_lock or nullcontext(), lock:
-            state = _load(root, project_id)
+            state = load_aigc_content_state(root, project_id)
             candidate = candidate_for(state, candidate_id)
             if candidate["revision"] != body["revision"]:
                 raise HTTPException(409, detail={"code": "aigc_candidate_conflict", "message": "脚本候选已更新，请刷新后重试。"})
@@ -289,7 +289,7 @@ def create_aigc_content_router(data_dir, get_project, script_generator=None, sou
         if not isinstance(body, dict) or set(body) != {"revision"} or type(body["revision"]) is not int:
             raise HTTPException(422, detail={"code": "aigc_candidate_invalid", "message": "脚本候选版本无效。"})
         with source_lock or nullcontext(), lock:
-            state = _load(root, project_id)
+            state = load_aigc_content_state(root, project_id)
             candidate = candidate_for(state, candidate_id)
             if candidate["revision"] != body["revision"]:
                 raise HTTPException(409, detail={"code": "aigc_candidate_conflict", "message": "脚本候选已更新，请刷新后重试。"})

@@ -2717,6 +2717,10 @@ def create_app(
     app.include_router(create_aigc_content_router(data_dir, ensure_project_exists,
                                                    script_generator=generate_marketing_candidates,
                                                    source_lock=project_write_lock))
+    from .content_workflow_api import create_content_workflow_router
+    app.include_router(create_content_workflow_router(
+        data_dir, ensure_project_exists, source_lock=project_write_lock,
+    ))
     from .project_backup import create_backup_router
 
     def register_restored_project(project):
