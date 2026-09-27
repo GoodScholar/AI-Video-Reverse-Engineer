@@ -37,6 +37,22 @@ describe("BatchEditor", () => {
     expect(await screen.findByText(/^比例 16:9 · 1280×720/)).toBeVisible();
   });
 
+  it("保存变体成功后通知刷新服务端阶段", async () => {
+    const changed = { ...task.variant, revision: 1, aspectMode: "16:9", resolvedAspect: "16:9",
+      aspectReason: "单条作品覆盖批次视频比例。", settings: { width: 1280, height: 720, fps: 30 } };
+    const onPersistedChange = vi.fn();
+    vi.mocked(fetch).mockResolvedValueOnce(response({ tasks: [task], assets: [] }))
+      .mockResolvedValueOnce(response({ variant: changed }));
+    render(<BatchEditor projectId="p1" presentation="edit" onPersistedChange={onPersistedChange} />);
+
+    await screen.findByRole("heading", { name: "省时 · 短视频变体" });
+    await userEvent.click(screen.getByRole("radio", { name: "16:9" }));
+    await userEvent.click(screen.getByRole("button", { name: "保存变体" }));
+
+    expect(await screen.findByText(/^比例 16:9 · 1280×720/)).toBeVisible();
+    expect(onPersistedChange).toHaveBeenCalledTimes(1);
+  });
+
   it("选声与审片呈现之间保留同一条精修草稿，不暴露重复脚本录入", async () => {
     vi.mocked(fetch).mockResolvedValue(response({ tasks: [task], assets: [] }));
     const view = render(<BatchEditor projectId="p1" presentation="edit" />);

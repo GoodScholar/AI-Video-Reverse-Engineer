@@ -38,7 +38,7 @@ function reorder(clips: TimelineClip[], index: number, direction: -1 | 1, kind: 
   return next.map((clip, index) => { position += gaps[index]; const moved = { ...clip, start: position }; position += clip.duration; return moved; });
 }
 
-export function BatchEditor({ projectId, onDraftChange, presentation, focusTaskId, onProgress, onOpenEdit, projectAssets, visible = true }: { projectId: string; onDraftChange?: (dirty: boolean) => void;
+export function BatchEditor({ projectId, onDraftChange, onPersistedChange, presentation, focusTaskId, onProgress, onOpenEdit, projectAssets, visible = true }: { projectId: string; onDraftChange?: (dirty: boolean) => void; onPersistedChange?: () => void;
   presentation?: "voice" | "review" | "edit"; focusTaskId?: string; onOpenEdit?: () => void;
   onProgress?: (progress: { hasTasks: boolean; hasPreview: boolean }) => void; projectAssets?: BatchAsset[]; visible?:boolean }) {
   const projectRef = useRef(projectId);
@@ -97,6 +97,7 @@ export function BatchEditor({ projectId, onDraftChange, presentation, focusTaskI
       setTasks((current) => [...current, result.task]);
       setSelectedId(result.task.id);
       setSellingPoint(""); setScript("");
+      onPersistedChange?.();
     } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法创建批量任务。"); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
@@ -205,6 +206,7 @@ export function BatchEditor({ projectId, onDraftChange, presentation, focusTaskI
       const result = await createBulkVariants(projectId, selected.id, items, selectedAssets);
       if (projectRef.current !== projectId) return;
       setTasks((current) => [...current, ...result.tasks]);
+      onPersistedChange?.();
     } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法批量创建变体。"); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
@@ -214,7 +216,7 @@ export function BatchEditor({ projectId, onDraftChange, presentation, focusTaskI
     setBusy(true); setError("");
     try {
       await startGenerationPreviews(projectId, selected.id, generationId);
-      if (projectRef.current === projectId) await refresh();
+      if (projectRef.current === projectId) { onPersistedChange?.(); await refresh(false); }
     } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法批量生成预览。"); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
@@ -235,7 +237,8 @@ export function BatchEditor({ projectId, onDraftChange, presentation, focusTaskI
       }
       if (projectRef.current !== projectId) return;
       setSelectedExportIds([]);
-      await refresh();
+      onPersistedChange?.();
+      await refresh(false);
     } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法提交成片导出。"); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
@@ -246,6 +249,7 @@ export function BatchEditor({ projectId, onDraftChange, presentation, focusTaskI
       const result = await cancelBatchExport(projectId, task.id, runId);
       if (projectRef.current !== projectId) return;
       setTasks((current) => current.map((item) => item.id === task.id ? result.task : item));
+      onPersistedChange?.();
     } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法取消成片导出。"); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
@@ -259,6 +263,7 @@ export function BatchEditor({ projectId, onDraftChange, presentation, focusTaskI
         : await startBatchPreview(projectId, task.id, task.variant.revision);
       if (projectRef.current !== projectId) return;
       setTasks((current) => current.map((item) => item.id === task.id ? { ...item, variant: result.variant } : item));
+      onPersistedChange?.();
     } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法更新预览状态。"); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
@@ -289,12 +294,13 @@ export function BatchEditor({ projectId, onDraftChange, presentation, focusTaskI
       track.id === firstVideo ? { ...track, clips: selected.proposal!.clips } : track) }));
   }
 
-  async function refresh() {
+  async function refresh(notify = true) {
     try {
       const result = await getBatchWorkspace(projectId);
       if (projectRef.current !== projectId) return;
       setTasks(result.tasks); setAssets(result.assets);
       setError("");
+      if (notify) onPersistedChange?.();
     } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法刷新预览状态。"); }
   }
 
@@ -306,6 +312,7 @@ export function BatchEditor({ projectId, onDraftChange, presentation, focusTaskI
       if (projectRef.current !== projectId) return;
       setTasks((current) => current.map((task) => task.id === selected.id ? { ...task,
         variant: { ...task.variant, subtitles: result.subtitles } } : task));
+      onPersistedChange?.();
     } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法识别语音字幕。"); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
@@ -322,6 +329,7 @@ export function BatchEditor({ projectId, onDraftChange, presentation, focusTaskI
         if (JSON.stringify(current[selected.id]) !== JSON.stringify(subtitleDraft)) return current;
         const next = { ...current }; delete next[selected.id]; return next;
       });
+      onPersistedChange?.();
     } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法保存字幕。"); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
@@ -393,6 +401,7 @@ export function BatchEditor({ projectId, onDraftChange, presentation, focusTaskI
         if (JSON.stringify(current[selected.id]) !== JSON.stringify(selectedAspect)) return current;
         const next = { ...current }; delete next[selected.id]; return next;
       });
+      onPersistedChange?.();
     } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法保存变体。"); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
@@ -408,6 +417,7 @@ export function BatchEditor({ projectId, onDraftChange, presentation, focusTaskI
         if (JSON.stringify(current[selected.id]) !== JSON.stringify(contentDraft)) return current;
         const next = { ...current }; delete next[selected.id]; return next;
       });
+      onPersistedChange?.();
     } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法保存卖点与脚本。"); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
@@ -420,6 +430,7 @@ export function BatchEditor({ projectId, onDraftChange, presentation, focusTaskI
       if (projectRef.current !== projectId) return;
       setTasks((current) => current.map((task) => task.id === selected.id ? result.task : task));
       setReviewReasons((current) => ({ ...current, [selected.id]: "" }));
+      onPersistedChange?.();
     } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法保存审核结果。"); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
@@ -431,6 +442,7 @@ export function BatchEditor({ projectId, onDraftChange, presentation, focusTaskI
       const result = await startBatchPreview(projectId, selected.id, selected.variant.revision);
       if (projectRef.current !== projectId) return;
       setTasks((current) => current.map((task) => task.id === selected.id ? { ...task, variant: result.variant } : task));
+      onPersistedChange?.();
     } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法生成预览。"); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
@@ -440,8 +452,8 @@ export function BatchEditor({ projectId, onDraftChange, presentation, focusTaskI
     <p>为每批素材确认卖点与脚本，再编排独立短视频变体。</p>
     {!presentation && <>
     <button type="button" className="secondary-action" onClick={() => { setAigcOpened(true); setShowAigc((current) => !current); }}>AI 商品内容创作</button>
-    {aigcOpened && <div hidden={!showAigc}><AigcCreator projectId={projectId} onDraftChange={setAigcDirty}
-      onBatchCreated={(taskId) => { void refresh().then(() => setSelectedId(taskId)); }} /></div>}
+    {aigcOpened && <div hidden={!showAigc}><AigcCreator projectId={projectId} onDraftChange={setAigcDirty} onPersistedChange={onPersistedChange}
+      onBatchCreated={(taskId) => { void refresh(false).then(() => setSelectedId(taskId)); }} /></div>}
     {error && <p role="alert" className="preproduction-error">{error}</p>}
     <div className="preproduction-form-grid">
       <label>客户卖点<input value={sellingPoint} onChange={(event) => setSellingPoint(event.target.value)} /></label>
@@ -509,6 +521,7 @@ export function BatchEditor({ projectId, onDraftChange, presentation, focusTaskI
           if (projectRef.current !== projectId) return;
           setTasks(current => current.map(task => updated.find(item => item.id === task.id) ?? task));
           setVoicePendingOwners(current => Object.fromEntries(Object.entries(current).map(([owner, ids]) => [owner, ids.filter(id => !updated.some(task => task.id === id))])));
+          onPersistedChange?.();
         }} /></div>
       {(!presentation || presentation === "edit") && <div className="batch-editor-assets"><h5>项目素材</h5>{assets.length ? assets.map((asset) => <div key={asset.id} className="batch-editor-asset">
         <button type="button" className="secondary-action" onClick={() => addAsset(asset)}>添加素材 {asset.name}</button>

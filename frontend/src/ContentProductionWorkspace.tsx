@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import type { Project } from "./models";
 import type { PreproductionWorkspace as Workspace } from "./preproductionApi";
 import { AigcCreator } from "./AigcCreator";
@@ -16,6 +16,7 @@ export function ContentProductionWorkspace({ project, page, tools, onNavigate, o
   const [projection, setProjection] = useState<ContentWorkflowProjection>();
   const [projectionError, setProjectionError] = useState("");
   const [viewStep, setViewStep] = useState(0);
+  const workflowRequestRef = useRef(0);
   const [assets, setAssets] = useState<Workspace["assets"]>();
   const [importedWorkspace, setImportedWorkspace] = useState<{projectId:string;workspace:Workspace}>();
   const onWorkspaceImported = useCallback((workspace:Workspace)=>{setAssets(workspace.assets);setImportedWorkspace({projectId:project.id,workspace});},[project.id]);
@@ -27,15 +28,23 @@ export function ContentProductionWorkspace({ project, page, tools, onNavigate, o
   const [previewAspect, setPreviewAspect] = useState<AspectResolution>({ resolvedAspect: "9:16", width: 720, height: 1280, reason: "商品制作默认比例。" });
   const onPreproductionDirty = useCallback((_id:string,dirty:boolean)=>setPreproductionDirty(dirty),[]);
   useEffect(()=>onDirtyChange(aigcDirty||batchDirty||preproductionDirty),[aigcDirty,batchDirty,preproductionDirty,onDirtyChange]);
-  useEffect(() => {
-    let current = true;
-    setProjection(undefined); setProjectionError(""); setViewStep(0); setTaskId(undefined);
-    void getContentWorkflow(project.id).then((result) => {
-      if (!current) return;
-      setProjection(result); setViewStep(result.currentStep);
-    }).catch((reason) => { if (current) setProjectionError(reason instanceof Error ? reason.message : "无法读取内容制作进度。"); });
-    return () => { current = false; };
+  const refreshWorkflow = useCallback(async (initialize = false) => {
+    const requestId = ++workflowRequestRef.current;
+    try {
+      const result = await getContentWorkflow(project.id);
+      if (requestId !== workflowRequestRef.current) return;
+      setProjection(result); setProjectionError("");
+      setViewStep((current) => initialize ? result.currentStep : Math.min(current, result.currentStep));
+    } catch (reason) {
+      if (requestId === workflowRequestRef.current) setProjectionError(reason instanceof Error ? reason.message : "无法读取内容制作进度。");
+    }
   }, [project.id]);
+  const onPersistedChange = useCallback(() => { void refreshWorkflow(); }, [refreshWorkflow]);
+  useEffect(() => {
+    setProjection(undefined); setProjectionError(""); setViewStep(0); setTaskId(undefined);
+    void refreshWorkflow(true);
+    return () => { workflowRequestRef.current += 1; };
+  }, [project.id, refreshWorkflow]);
   const selectedAsset = assets?.find(asset => asset.id === previewAssetId) ?? assets?.find(asset => asset.kind === "image" || asset.kind === "video");
   const batchVisible = page === "review" || page === "edit" || (page === "create" && viewStep >= 2);
   const oldVisible = page === "assets" || page === "reference" || page === "tools";
@@ -51,6 +60,7 @@ export function ContentProductionWorkspace({ project, page, tools, onNavigate, o
       <div hidden={page !== "create" || viewStep > 1} className="sp-work-panel">
         <AigcCreator projectId={project.id} guidedStep={viewStep === 1 ? 1 : 0} mediaAssets={assets}
           onWorkspaceImported={onWorkspaceImported} onDraftChange={setAigcDirty} onStepChange={setViewStep} onPreviewAsset={setPreviewAssetId} onAspectChange={setPreviewAspect}
+          onPersistedChange={onPersistedChange}
           onOpenAssets={()=>onNavigate("assets")} onBatchCreated={id=>{setTaskId(id);setViewStep(2);}} />
       </div>
       {page === "create" && viewStep < 2 && <aside aria-label="项目素材预览" className="sp-preview studio-live-preview"><div className="sp-preview-title"><span>所选画面</span><span>项目真实素材</span></div>
@@ -61,7 +71,7 @@ export function ContentProductionWorkspace({ project, page, tools, onNavigate, o
       </aside>}
     </div>
     <div hidden={!batchVisible}><BatchEditor projectId={project.id} presentation={mode} focusTaskId={projection?.activeBatchId ?? taskId} projectAssets={assets} visible={active&&batchVisible}
-      onDraftChange={setBatchDirty} onOpenEdit={()=>onNavigate("edit")} />
+      onDraftChange={setBatchDirty} onPersistedChange={onPersistedChange} onOpenEdit={()=>onNavigate("edit")} />
       {page === "create" && viewStep === 2 && <div className="studio-stage-actions"><p>配音与预览就绪后，逐条审核真实成片。</p><button type="button" className="primary-action" disabled={!reviewReady} onClick={()=>{setViewStep(3);onNavigate("review");}}>进入审核导出</button></div>}
     </div>
     <div hidden={!oldVisible} className={`studio-existing studio-existing-${page}`}><PreproductionWorkspace project={project} tools={tools} studioMode

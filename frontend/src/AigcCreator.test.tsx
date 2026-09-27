@@ -148,6 +148,23 @@ it("修改脚本候选后必须保存新版本再确认", async () => {
   expect(JSON.parse(vi.mocked(fetch).mock.calls[3][1]?.body as string)).toEqual({ revision: 1 });
 });
 
+it("确认脚本候选成功后通知刷新服务端阶段", async () => {
+  const brief = { ...emptyBrief, revision: 1, productName: "晴雨杯", facts: [{ id: "f1", text: "杯盖防泼溅" }],
+    assetIds: ["front", "use"] };
+  const candidate = { id: "c1", generationId: "g1", revision: 0, briefRevision: 1, confirmedRevision: null,
+    sellingPoint: "防泼溅", beats: [{ text: "杯盖防泼溅", factIds: ["f1"], assetId: "front" }] };
+  const onPersistedChange = vi.fn();
+  vi.mocked(fetch).mockResolvedValueOnce(response({ brief, candidates: [candidate], assets }))
+    .mockResolvedValueOnce(response([provider]))
+    .mockResolvedValueOnce(response({ candidate: { ...candidate, confirmedRevision: 0 } }));
+  render(<AigcCreator projectId="p1" onPersistedChange={onPersistedChange} />);
+
+  await userEvent.click(await screen.findByRole("button", { name: "确认候选 1" }));
+
+  expect(await screen.findByText("已确认版本 0")).toBeVisible();
+  expect(onPersistedChange).toHaveBeenCalledTimes(1);
+});
+
 it("五条当前已确认候选可交给批量混剪", async () => {
   const brief = { ...emptyBrief, revision: 1, productName: "晴雨杯", facts: [{ id: "f1", text: "杯盖防泼溅" }],
     assetIds: ["front", "use"] };

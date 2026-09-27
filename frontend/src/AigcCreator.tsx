@@ -13,8 +13,8 @@ import { confirmAigcCandidate, discloseAigcRequest, generateAigcCandidates, getA
 function lines(value: string): string[] { return value.split("\n").map((item) => item.trim()).filter(Boolean); }
 function message(reason: unknown): string { return reason instanceof Error ? reason.message : "操作失败，请重试。"; }
 
-export function AigcCreator({ projectId, onDraftChange, onBatchCreated, guidedStep, onStepChange, onProgress, onOpenAssets, mediaAssets, onPreviewAsset, onAspectChange, onWorkspaceImported }: { projectId: string;
-  onDraftChange?: (dirty: boolean) => void; onBatchCreated?: (taskId: string) => void;
+export function AigcCreator({ projectId, onDraftChange, onPersistedChange, onBatchCreated, guidedStep, onStepChange, onProgress, onOpenAssets, mediaAssets, onPreviewAsset, onAspectChange, onWorkspaceImported }: { projectId: string;
+  onDraftChange?: (dirty: boolean) => void; onPersistedChange?: () => void; onBatchCreated?: (taskId: string) => void;
   guidedStep?: 0 | 1; onStepChange?: (step: 0 | 1) => void; onProgress?: (progress: { hasCandidates: boolean; ready: boolean }) => void;
   onOpenAssets?: () => void; mediaAssets?: Array<TimelineAsset & {notes?:string;available?:boolean}>; onPreviewAsset?: (id:string|null)=>void;
   onAspectChange?: (aspect: AspectResolution) => void; onWorkspaceImported?: (workspace:PreproductionWorkspace)=>void }) {
@@ -114,6 +114,7 @@ export function AigcCreator({ projectId, onDraftChange, onBatchCreated, guidedSt
       setFactsText(result.brief.facts.map((item) => item.text).join("\n"));
       setSellingPointsText(result.brief.sellingPoints.join("\n"));
       setForbiddenText(result.brief.forbiddenPhrases.join("\n"));
+      onPersistedChange?.();
     } catch (reason) { if (projectRef.current === projectId) setError(message(reason)); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
@@ -155,6 +156,7 @@ export function AigcCreator({ projectId, onDraftChange, onBatchCreated, guidedSt
         const result = await saveAigcBrief(projectId, { ...prepared, revision: savedBrief.revision });
         if (projectRef.current !== projectId) return;
         setBrief(result.brief); setSavedBrief(result.brief); setFactsText(result.brief.facts.map(item=>item.text).join("\n"));
+        onPersistedChange?.();
       }
       const result = await discloseAigcRequest(projectId, providerId, provider.model);
       if (projectRef.current === projectId) setDisclosure(result);
@@ -187,6 +189,7 @@ export function AigcCreator({ projectId, onDraftChange, onBatchCreated, guidedSt
       setCandidates((current) => [...current, ...result.candidates]);
       setSelectedCandidate(0); onStepChange?.(1);
       setDisclosure(null); setAccepted(false);
+      onPersistedChange?.();
     } catch (reason) { if (projectRef.current === projectId) setError(message(reason)); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
@@ -211,6 +214,7 @@ export function AigcCreator({ projectId, onDraftChange, onBatchCreated, guidedSt
       if (projectRef.current !== projectId) return;
       setCandidates((current) => current.map((item) => item.id === candidate.id ? result.candidate : item));
       setCandidateDrafts((current) => { const next = { ...current }; delete next[candidate.id]; return next; });
+      onPersistedChange?.();
     } catch (reason) { if (projectRef.current === projectId) setError(message(reason)); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
@@ -221,6 +225,7 @@ export function AigcCreator({ projectId, onDraftChange, onBatchCreated, guidedSt
       const result = await confirmAigcCandidate(projectId, candidate);
       if (projectRef.current !== projectId) return;
       setCandidates((current) => current.map((item) => item.id === candidate.id ? result.candidate : item));
+      onPersistedChange?.();
     } catch (reason) { if (projectRef.current === projectId) setError(message(reason)); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
@@ -234,11 +239,13 @@ export function AigcCreator({ projectId, onDraftChange, onBatchCreated, guidedSt
         if (projectRef.current !== projectId) return;
         setCandidates(items => items.map(item => item.id === current.id ? current : item));
         setCandidateDrafts(items => { const next = { ...items }; delete next[current.id]; return next; });
+        onPersistedChange?.();
       }
       const result = await confirmAigcCandidate(projectId, current);
       if (projectRef.current !== projectId) return;
       setCandidates(items => items.map(item => item.id === result.candidate.id ? result.candidate : item));
       setSelectedCandidate(index => Math.min(index + 1, latestGroup.length - 1));
+      onPersistedChange?.();
     } catch (reason) { if (projectRef.current === projectId) setError(message(reason)); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
@@ -250,6 +257,7 @@ export function AigcCreator({ projectId, onDraftChange, onBatchCreated, guidedSt
       if (projectRef.current !== projectId) return;
       setHandoffTaskId(result.task.id);
       setHandoffSkipped(result.skippedTaskIds?.length ?? 0);
+      onPersistedChange?.();
       onBatchCreated?.(result.task.id);
     } catch (reason) { if (projectRef.current === projectId) setError(message(reason)); }
     finally { if (projectRef.current === projectId) setBusy(false); }
