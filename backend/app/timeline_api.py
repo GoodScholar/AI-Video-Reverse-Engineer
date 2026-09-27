@@ -20,6 +20,7 @@ from .durable_runs import LOCAL_RUN_POLICY, freeze_run_input
 from .history_cleanup import inventory, remove_history_files
 from .audio_waveform import WaveformCache
 from .preproduction import PreproductionStore
+from .project_assets import ProjectAssets
 from .reference_video import validate_storage_id
 from .timeline import TimelineStore, has_audible_audio, has_visible_video, validate_workspace
 
@@ -32,6 +33,7 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
     root = Path(data_dir)
     store = TimelineStore(root)
     preproduction = PreproductionStore(root)
+    project_assets = ProjectAssets(root)
     lock = RLock()
     waveform_cache = WaveformCache()
     active_workers = set()
@@ -60,22 +62,15 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
 
     def asset_index(project_id):
         try:
-            state = preproduction.load(project_id)
+            return project_assets.index(project_id)
         except (OSError, ValueError):
             fail("preproduction_storage_invalid", "前置工作台状态无法读取。", 503)
-        result = {}
-        for asset in state.get("assets", []):
-            if isinstance(asset, dict) and isinstance(asset.get("id"), str):
-                result[asset["id"]] = dict(asset)
-        return result
 
     def public_assets(project_id):
-        result = []
-        for asset in asset_index(project_id).values():
-            public = {key: value for key, value in asset.items() if key != "file" and not key.startswith("_")}
-            public["url"] = "/api/projects/{}/preproduction/assets/{}/file".format(project_id, asset["id"])
-            result.append(public)
-        return result
+        try:
+            return project_assets.public(project_id, include_source_reference=True)
+        except (OSError, ValueError):
+            fail("preproduction_storage_invalid", "前置工作台状态无法读取。", 503)
 
     def public_run(project_id, run):
         public = {key: value for key, value in run.items() if key not in ("snapshot", "sources", "output") and not key.startswith("_")}
@@ -98,11 +93,7 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
 
     def source_path(project_id, asset):
         try:
-            filename = asset["file"]
-            validate_storage_id(filename)
-            path = preproduction.path(project_id, "assets", filename)
-            _regular_file(path)
-            return path
+            return project_assets.file(project_id, asset)
         except (KeyError, OSError, ValueError):
             fail("timeline_asset_unavailable", "素材文件不可用。", 409)
 
@@ -117,7 +108,7 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             for asset_id in used:
                 asset = assets[asset_id]
                 source = source_path(project_id, asset)
-                suffix = Path(asset["file"]).suffix.lower()
+                suffix = source.suffix.lower()
                 filename = asset_id + suffix
                 target = store.path(project_id, "runs", run_id, "sources", filename)
                 _copy_regular(source, target)

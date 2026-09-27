@@ -53,7 +53,9 @@ def test_unreadable_timeline_fails_closed(tmp_path):
     path = TimelineStore(tmp_path).path(PROJECT_ID, 'state.json')
     path.parent.mkdir(parents=True)
     path.write_text('broken')
-    assert client.post(BASE + '/assets/' + aid + '/delete', json={'revision': 1}).status_code == 503
+    result = client.post(BASE + '/assets/' + aid + '/delete', json={'revision': 1})
+    assert result.status_code == 503
+    assert result.json()['detail']['code'] == 'asset_references_unavailable'
 
 
 def test_failed_state_write_restores_asset_file(tmp_path, monkeypatch):
@@ -75,3 +77,14 @@ def test_metadata_and_delete_preserve_original_reference(tmp_path):
     result = client.post(BASE + '/assets/' + aid + '/delete', json={'revision': 2})
     assert result.status_code == 200
     assert original.read_bytes() == before
+
+
+def test_delete_keeps_unavailable_file_error_contract(tmp_path):
+    client, state, aid = imported(tmp_path)
+    asset = PreproductionStore(tmp_path).load(PROJECT_ID)['assets'][0]
+    (tmp_path / 'project-files' / PROJECT_ID / 'preproduction' / 'assets' / asset['file']).unlink()
+
+    result = client.post(BASE + '/assets/' + aid + '/delete', json={'revision': 1})
+
+    assert result.status_code == 409
+    assert result.json()['detail']['code'] == 'preproduction_asset_unavailable'

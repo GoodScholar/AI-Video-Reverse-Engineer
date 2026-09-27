@@ -40,7 +40,8 @@ from .batch_production import (
 from .batch_recommendation import RecommendationError, recommend
 from .batch_subtitles import milliseconds, parse_srt, write_srt
 from .durable_runs import LOCAL_RUN_POLICY, freeze_run_input
-from .preproduction import PreproductionStore, safe_child
+from .preproduction import safe_child
+from .project_assets import ProjectAssets
 from .reference_video import validate_storage_id
 from .timeline import validate_workspace
 from .video_aspect import PRODUCT_PRESETS, ratio_label, valid_aspect_mode
@@ -285,7 +286,7 @@ class BatchStore:
 
 def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", source_lock=None, renderer=None, voice_service=None):
     store = BatchStore(Path(data_dir))
-    preproduction = PreproductionStore(Path(data_dir))
+    project_assets = ProjectAssets(Path(data_dir))
     lock = RLock()
     router = APIRouter(prefix="/api/projects/{project_id}/batch-edits")
     from .batch_voiceover import plan_voiceover, audio_duration, arrange_voiceover
@@ -320,10 +321,9 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
 
     def assets_for(project_id: str):
         try:
-            preparation = preproduction.load(project_id)
+            return project_assets.index(project_id)
         except (OSError, ValueError):
             raise HTTPException(503, detail={"code": "batch_assets_unavailable", "message": "项目素材无法读取。"}) from None
-        return {asset["id"]: asset for asset in preparation["assets"] if isinstance(asset, dict) and isinstance(asset.get("id"), str)}
 
     def public_task(project_id: str, task: dict[str, Any]):
         result = {**task, "contentRevision": task.get("contentRevision", 0), "reviews": task.get("reviews", []),
@@ -378,10 +378,9 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             source_dir.mkdir(parents=True, exist_ok=False)
             sources = {}
             for asset_id in {clip["assetId"] for track in tracks for clip in track["clips"]}:
-                filename = assets[asset_id]["file"]
-                validate_storage_id(filename)
-                copied_name = asset_id + Path(filename).suffix.lower()
-                copy_source(preproduction.path(project_id, "assets", filename), source_dir / copied_name)
+                source = project_assets.file(project_id, assets[asset_id])
+                copied_name = asset_id + source.suffix.lower()
+                copy_source(source, source_dir / copied_name)
                 sources[asset_id] = copied_name
             return sources
         except (OSError, ValueError, KeyError):
@@ -406,10 +405,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             source_dir.mkdir(parents=True, exist_ok=False)
             sources = {}
             for asset_id, preview_name in preview["sources"].items():
-                filename = assets[asset_id]["file"]
-                validate_storage_id(filename)
                 approved = store.path(project_id, "runs", preview["id"], "sources", preview_name)
-                original = preproduction.path(project_id, "assets", filename)
+                original = project_assets.file(project_id, assets[asset_id])
                 if not same_source_contents(original, approved):
                     raise ValueError("素材已变化")
                 copy_source(approved, source_dir / preview_name)
@@ -676,9 +673,10 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
     def list_tasks(project_id: str):
         project_for(project_id)
         with lock:
-            assets = [{**{key: value for key, value in asset.items() if key != "file" and not key.startswith("_")},
-                       "url": f"/api/projects/{project_id}/preproduction/assets/{asset['id']}/file"}
-                      for asset in assets_for(project_id).values()]
+            try:
+                assets = project_assets.public(project_id, include_source_reference=True)
+            except (OSError, ValueError):
+                raise HTTPException(503, detail={"code": "batch_assets_unavailable", "message": "项目素材无法读取。"}) from None
             return {"tasks": [public_task(project_id, task) for task in state_for(project_id)["tasks"]], "assets": assets}
 
     @router.post("", status_code=201)
@@ -707,7 +705,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             assets = assets_for(project_id)
             created, parent, children, skipped = apply_aigc_handoff(
                 state, body["generationId"], brief, candidates, assets,
-                ensure_asset=lambda asset: regular_file(preproduction.path(project_id, "assets", asset["file"])),
+                ensure_asset=lambda asset: project_assets.file(project_id, asset),
             )
             save(project_id, state)
             content = {"task": public_task(project_id, parent),
@@ -807,7 +805,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 try:
                     proposal = recommend(task, assets, selected_ids)
                     for asset_id in {clip["assetId"] for clip in proposal["clips"]}:
-                        regular_file(preproduction.path(project_id, "assets", assets[asset_id]["file"]))
+                        project_assets.file(project_id, assets[asset_id])
                 except RecommendationError as error:
                     raise BatchProductionError(error.code, str(error), 422) from None
                 return proposal
@@ -856,8 +854,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 raise HTTPException(422, detail={"code": error.code, "message": str(error)}) from None
             try:
                 for asset_id in {clip["assetId"] for clip in proposal["clips"]}:
-                    filename = assets[asset_id]["file"]
-                    regular_file(preproduction.path(project_id, "assets", filename))
+                    project_assets.file(project_id, assets[asset_id])
             except (OSError, ValueError, KeyError, TypeError):
                 raise HTTPException(422, detail={"code": "batch_asset_unavailable", "message": "推荐素材文件不可用，请检查或重新导入素材。"}) from None
             task["proposal"] = proposal
@@ -882,33 +879,20 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             new_assets = []
             for index, output in enumerate(outputs):
                 regular_file(output)
-                asset_id = uuid4().hex
+                asset_id = project_assets.new_id(None)
                 new_assets.append({"id": asset_id, "file": asset_id+".wav", "kind": "audio", "role": "audio",
                                    "name": f"AI 配音 {voice_id} / 第 {index+1} 段", "duration": audio_duration(output),
                                    "notes": plan["texts"][index], "voiceId": voice_id})
             with source_lock or nullcontext(), lock:
                 state = state_for(project_id)
                 task = task_for(state, task_id)
-                preparation = preproduction.load(project_id)
-                assets = {a["id"]: a for a in preparation["assets"]}
+                assets = assets_for(project_id)
                 tracks, cues = arrange_voiceover(task, plan, new_assets, assets)
                 # Check current visual sources before publishing generated audio.
                 for clip in plan["clips"]:
-                    regular_file(preproduction.path(project_id, "assets", assets[clip["assetId"]]["file"]))
+                    project_assets.file(project_id, assets[clip["assetId"]])
                 def publish_assets():
-                    copied = []
-                    try:
-                        for output, asset in zip(outputs, new_assets):
-                            target = preproduction.path(project_id, "assets", asset["file"])
-                            copy_source(output, target)
-                            copied.append(target)
-                        preparation["assets"].extend(new_assets)
-                        preparation["revision"] += 1
-                        preproduction.save(project_id, preparation)
-                    except Exception:
-                        for target in copied:
-                            target.unlink(missing_ok=True)
-                        raise
+                    project_assets.add_many(project_id, zip(outputs, new_assets))
                 complete_voiceover(
                     task, job_id=job_id, expected_version=review_version(snapshot), tracks=tracks, cues=cues,
                     asset_ids=[asset["id"] for asset in new_assets], publish_assets=publish_assets,
@@ -961,7 +945,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 try:
                     plan = plan_voiceover(task, assets)
                     for clip in plan["clips"]:
-                        regular_file(preproduction.path(project_id, "assets", assets[clip["assetId"]]["file"]))
+                        project_assets.file(project_id, assets[clip["assetId"]])
                 except (ValueError, OSError) as error:
                     raise HTTPException(422, detail={"code": "batch_voiceover_plan", "message": str(error) if isinstance(error, ValueError) else "画面文件不可用。"}) from None
                 targets.append((task, plan))

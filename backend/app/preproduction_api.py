@@ -22,10 +22,16 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.background import BackgroundTask
 
-from .asset_references import asset_references
+from .asset_references import preproduction_asset_references, timeline_asset_references
 from .durable_runs import LOCAL_RUN_POLICY
 from .timeline import TimelineStore
 from .preproduction import NODE_KINDS, PreproductionStore
+from .project_assets import (
+    AssetFileUnavailableError,
+    AssetInUseError,
+    AssetReferencesUnavailableError,
+    ProjectAssets,
+)
 from .preproduction_handoff import render_handoff
 from .preproduction_nodes import FFMPEG_TIMEOUT_SECONDS, MAX_MEDIA_DURATION_SECONDS, MAX_OUTPUT_DIMENSION, MAX_OUTPUT_PIXELS
 from .reference_media_storage import managed_reference_media_is_safe, resolve_reference_media_path
@@ -134,6 +140,10 @@ def create_preproduction_router(
     """Create the router; ``runner`` is a test seam and defaults to execute_node."""
     root = Path(data_dir)
     store = PreproductionStore(root)
+    project_assets = ProjectAssets(root, reference_facts=(
+        lambda project_id, asset_id: preproduction_asset_references(store.load(project_id), asset_id),
+        lambda project_id, asset_id: timeline_asset_references(TimelineStore(root).load(project_id), asset_id),
+    ))
     lock = source_lock or RLock()
     router = APIRouter(prefix="/api/projects/{project_id}/preproduction")
 
@@ -164,11 +174,7 @@ def create_preproduction_router(
 
     def asset_path(project_id: str, asset: dict[str, Any]) -> Path:
         try:
-            name = asset["file"]
-            validate_storage_id(name)
-            path = store.path(project_id, "assets", name)
-            _regular_file(path)
-            return path
+            return project_assets.file(project_id, asset)
         except (KeyError, OSError, ValueError):
             fail("preproduction_asset_unavailable", "素材文件不可用。", 409)
 
@@ -187,8 +193,9 @@ def create_preproduction_router(
             return None
         prefix, _, identifier = input_value.partition(":")
         if prefix == "asset":
-            asset = next((item for item in state["assets"] if item["id"] == identifier), None)
-            if asset is None:
+            try:
+                asset = project_assets.find_in(state, identifier)
+            except (KeyError, TypeError, ValueError):
                 fail("preproduction_input_missing", "节点输入素材不存在。")
             return asset_path(project_id, asset)
         if prefix == "node":
@@ -211,18 +218,16 @@ def create_preproduction_router(
         suffix = "." + str(getattr(reference, "format", "")).lower()
         if suffix not in _MEDIA_SUFFIXES:
             fail("preproduction_reference_unavailable", "当前参考素材格式不可用。")
-        asset_id = "reference-" + uuid4().hex
+        asset_id = project_assets.new_id("reference")
         name = asset_id + suffix
-        target = store.path(project_id, "assets", name)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        _copy_regular(source, target)
         record = {"id": asset_id, "name": _display_name(getattr(reference, "originalName", "参考素材")), "kind": getattr(reference, "type", "video"),
                   "role": "reference", "file": name, "sourceReferenceId": source_id}
         for source_key, target_key in (("durationSeconds", "duration"), ("width", "width"), ("height", "height")):
             value = getattr(reference, source_key, None)
             if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
                 record[target_key] = value
-        state["assets"].append(record)
+        with project_assets.install(project_id, state, source, record):
+            pass
         return record
 
     def validate_shots(incoming: list[ShotUpdate], assets: list[dict[str, Any]]) -> None:
@@ -321,7 +326,7 @@ def create_preproduction_router(
             referenced.update(node["input"].split(":", 1)[1] for node in shot["nodes"] if node["input"].startswith("asset:"))
             for asset_id in referenced:
                 asset = assets.get(asset_id)
-                if asset is None or not _stored_file_available(store, project_id, "assets", asset.get("file")):
+                if asset is None or not project_assets.available(project_id, asset):
                     result.append({"level": "error", "code": "shot_asset_unavailable", "shotId": shot["id"], "message": "镜头引用的素材已不存在。"})
             for node in shot["nodes"]:
                 if node["status"] == "failed":
@@ -337,9 +342,9 @@ def create_preproduction_router(
 
     def response(project_id: str, state: dict[str, Any]) -> dict[str, Any]:
         public = _public_state(project_id, state)
-        by_id = {asset["id"]: asset for asset in state["assets"]}
+        by_id = project_assets.index_from(state)
         for asset in public["assets"]:
-            asset["available"] = _stored_file_available(store, project_id, "assets", by_id[asset["id"]].get("file"))
+            asset["available"] = project_assets.available(project_id, by_id[asset["id"]])
         public["checks"] = checks(project_id, state)
         public["nodeCatalog"] = [{"kind": kind, "label": _node_label(kind)} for kind in NODE_KINDS]
         return public
@@ -392,15 +397,15 @@ def create_preproduction_router(
             return response(project_id, state)
 
     def managed_asset(state, asset_id):
-        asset = next((item for item in state["assets"] if item["id"] == asset_id), None)
-        if asset is None:
+        try:
+            return project_assets.find_in(state, asset_id)
+        except (KeyError, TypeError, ValueError):
             fail("preproduction_asset_missing", "素材不存在。", 404)
-        return asset
 
     def references_for(project_id, state, asset_id):
         try:
-            return asset_references(state, TimelineStore(root).load(project_id), asset_id)
-        except (OSError, ValueError, KeyError, TypeError):
+            return project_assets.references(project_id, asset_id)
+        except (AssetReferencesUnavailableError, OSError, ValueError, KeyError, TypeError):
             fail("asset_references_unavailable", "无法完整读取素材引用，暂不能删除。", 503)
 
     def editable_assets(project_id, revision):
@@ -424,10 +429,11 @@ def create_preproduction_router(
         project_for(project_id)
         with source_lock or nullcontext(), lock:
             state = editable_assets(project_id, body.revision)
-            asset = managed_asset(state, asset_id)
-            asset.update(name=body.name, notes=body.notes)
-            state["revision"] += 1
-            save(project_id, state)
+            managed_asset(state, asset_id)
+            project_assets.update_metadata(
+                state, asset_id, name=body.name, notes=body.notes,
+                save=lambda value: save(project_id, value),
+            )
             return response(project_id, state)
 
     @router.post("/assets/{asset_id}/delete")
@@ -435,23 +441,15 @@ def create_preproduction_router(
         project_for(project_id)
         with source_lock or nullcontext(), lock:
             state = editable_assets(project_id, body.revision)
-            asset = managed_asset(state, asset_id)
-            references = references_for(project_id, state, asset_id)
-            if references:
-                fail("asset_in_use", "素材仍被引用：" + "；".join(item["label"] for item in references[:5]))
-            path = asset_path(project_id, asset)
-            # Stage removal so a failed state write leaves the original file usable.
-            staged = path.with_name(f".delete-{uuid4().hex}.part")
+            managed_asset(state, asset_id)
             try:
-                path.rename(staged)
-                state["assets"] = [item for item in state["assets"] if item["id"] != asset_id]
-                state["revision"] += 1
-                try:
-                    save(project_id, state)
-                except Exception:
-                    staged.rename(path)
-                    raise
-                staged.unlink()
+                project_assets.delete(project_id, state, asset_id, save=lambda value: save(project_id, value))
+            except AssetInUseError as error:
+                fail("asset_in_use", "素材仍被引用：" + "；".join(item["label"] for item in error.references[:5]))
+            except AssetReferencesUnavailableError:
+                fail("asset_references_unavailable", "无法完整读取素材引用，暂不能删除。", 503)
+            except AssetFileUnavailableError:
+                fail("preproduction_asset_unavailable", "素材文件不可用。", 409)
             except OSError:
                 fail("asset_delete_failed", "素材删除未能完成，请刷新检查后重试。", 503)
             return response(project_id, state)
@@ -481,22 +479,20 @@ def create_preproduction_router(
                 metadata = _probe_media(temporary, suffix, ffprobe_path, ffmpeg_path)
                 if shot is not None and metadata["kind"] != "video":
                     fail("preproduction_result_invalid", "镜头结果必须上传视频。", 422)
-                asset_id = "asset-" + uuid4().hex
+                asset_id = project_assets.new_id()
                 name = asset_id + suffix
-                target = store.path(project_id, "assets", name)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(temporary, target)
+                record = {"id": asset_id, "name": _display_name(file.filename), "kind": metadata["kind"], "role": role,
+                          "file": name, **metadata}
+                with project_assets.install(project_id, state, temporary, record, move=True):
+                    if shot is not None:
+                        history = result_history(shot)
+                        history.append({"assetId": asset_id, "signature": result_signature(state["brief"], shot), "reviewed": False,
+                                        "association": result_association(state["brief"], shot, state["assets"], state["revision"] + 1)})
+                        shot["_resultVersions"] = history
+                        shot["resultAssetId"] = asset_id
+                    state["revision"] += 1
+                    save(project_id, state)
                 temporary = None
-                state["assets"].append({"id": asset_id, "name": _display_name(file.filename), "kind": metadata["kind"], "role": role,
-                                        "file": name, **metadata})
-                if shot is not None:
-                    history = result_history(shot)
-                    history.append({"assetId": asset_id, "signature": result_signature(state["brief"], shot), "reviewed": False,
-                                    "association": result_association(state["brief"], shot, state["assets"], state["revision"] + 1)})
-                    shot["_resultVersions"] = history
-                    shot["resultAssetId"] = asset_id
-                state["revision"] += 1
-                save(project_id, state)
                 return response(project_id, state)
         finally:
             if temporary is not None:
@@ -545,8 +541,11 @@ def create_preproduction_router(
             version = next((item for item in history if item["assetId"] == asset_id), None)
             if version is None:
                 fail("preproduction_result_missing", "当前镜头不存在该候选结果。", 404)
-            asset = next((item for item in state["assets"] if item["id"] == asset_id), None)
-            if not asset or asset["kind"] != "video" or not _stored_file_available(store, project_id, "assets", asset.get("file")):
+            try:
+                asset = project_assets.find_in(state, asset_id)
+            except (KeyError, TypeError, ValueError):
+                asset = None
+            if not asset or asset["kind"] != "video" or not project_assets.available(project_id, asset):
                 fail("preproduction_result_missing", "候选视频文件不可用。")
             version.update(signature=result_signature(state["brief"], shot), reviewed=True)
             shot["_resultVersions"] = history
@@ -649,13 +648,12 @@ def create_preproduction_router(
                     metadata = _probe_media(source, suffix, ffprobe_path, ffmpeg_path)
                     if metadata["kind"] != "video":
                         continue
-                    asset_id = "toolkit-" + uuid4().hex
+                    asset_id = project_assets.new_id("toolkit")
                     name = asset_id + suffix
-                    target = store.path(project_id, "assets", name)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    _copy_regular(source, target)
-                    state["assets"].append({"id": asset_id, "name": _display_name(label + suffix), "role": "motion", "file": name,
-                                            "sourceKey": source_key, **metadata})
+                    record = {"id": asset_id, "name": _display_name(label + suffix), "role": "motion", "file": name,
+                              "sourceKey": source_key, **metadata}
+                    with project_assets.install(project_id, state, source, record):
+                        pass
                     existing.add(source_key)
                 except (OSError, ValueError, HTTPException):
                     continue
@@ -753,9 +751,7 @@ def create_preproduction_router(
         validate_storage_id(asset_id)
         with lock:
             state = state_for(project_id)
-            asset = next((item for item in state["assets"] if item["id"] == asset_id), None)
-            if asset is None:
-                fail("preproduction_asset_missing", "素材不存在。", 404)
+            asset = managed_asset(state, asset_id)
             return FileResponse(asset_path(project_id, asset), filename=asset["name"])
 
     @router.get("/artifacts/{shot_id}/{node_id}/{name}")
@@ -1011,17 +1007,6 @@ def _validate_decodable(path: Path, kind: str, ffmpeg_path: str) -> None:
         result = None
     if result is None or result.returncode:
         raise HTTPException(422, detail={"code": "preproduction_asset_invalid", "message": "媒体无法解码有效内容。"})
-
-
-def _copy_regular(source: Path, target: Path) -> None:
-    _regular_file(source)
-    descriptor = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        with os.fdopen(descriptor, "rb") as stream, target.open("xb") as output:
-            shutil.copyfileobj(stream, output)
-    except BaseException:
-        target.unlink(missing_ok=True)
-        raise
 
 
 def _display_name(name: Optional[str]) -> str:

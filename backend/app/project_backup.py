@@ -19,6 +19,7 @@ from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 from .preproduction import PreproductionStore, safe_child
+from .project_assets import ProjectAssets
 from .timeline import TimelineStore, validate_workspace
 
 MAX_BYTES = 4 * 1024**3
@@ -105,7 +106,9 @@ def rebind_managed_json(name, value, old_id, new_id, old_root, new_root):
 
 def validate_core(data_root, project):
     pid = project.id
-    prep = PreproductionStore(data_root).load(pid)
+    prep_store = PreproductionStore(data_root)
+    project_assets = ProjectAssets(data_root)
+    prep = prep_store.load(pid)
     from .preproduction_api import SaveWorkspace, ShotUpdate, NodeUpdate
     shots = []
     for shot in prep['shots']:
@@ -113,15 +116,16 @@ def validate_core(data_root, project):
         editable['nodes'] = [{k: v for k, v in node.items() if k in NodeUpdate.model_fields} for node in shot['nodes']]
         shots.append(editable)
     SaveWorkspace.model_validate({'revision': prep['revision'], 'brief': prep['brief'], 'shots': shots})
-    assets = {a['id']: a for a in prep['assets']}
-    if len(assets) != len(prep['assets']):
+    records = project_assets.records(pid)
+    assets = project_assets.index(pid)
+    if len(assets) != len(records):
         fail('项目素材标识重复。')
     for asset in assets.values():
         if any(not isinstance(asset.get(k), str) or not asset[k] for k in ('id', 'name', 'file', 'role')) or asset.get('kind') not in ('video', 'audio', 'image'):
             fail('项目素材元数据无效。')
         if asset['kind'] in ('video', 'audio') and (not isinstance(asset.get('duration'), (int, float)) or not math.isfinite(asset['duration']) or asset['duration'] <= 0):
             fail('项目素材时长无效。')
-        if not PreproductionStore(data_root).path(pid, 'assets', asset['file']).is_file():
+        if not project_assets.available(pid, asset):
             fail("备份缺少项目素材文件。")
     for shot in prep['shots']:
         if not isinstance(shot, dict) or not isinstance(shot.get('nodes'), list):
@@ -133,7 +137,7 @@ def validate_core(data_root, project):
             fail("镜头方案引用了缺失素材。")
         for node in shot['nodes']:
             for artifact in node.get('artifacts', []):
-                if not PreproductionStore(data_root).path(pid, 'artifacts', shot['id'], node['id'], artifact['name']).is_file():
+                if not prep_store.path(pid, 'artifacts', shot['id'], node['id'], artifact['name']).is_file():
                     fail("备份缺少镜头步骤产物。")
     timeline = TimelineStore(data_root).load(pid)
     validate_workspace({k: timeline[k] for k in ('revision', 'settings', 'tracks')}, assets)

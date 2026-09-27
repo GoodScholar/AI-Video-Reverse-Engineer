@@ -2,7 +2,7 @@
 from typing import Any
 
 
-def asset_references(state: dict[str, Any], timeline: dict[str, Any], asset_id: str) -> list[dict[str, str]]:
+def preproduction_asset_references(state: dict[str, Any], asset_id: str) -> list[dict[str, str]]:
     references = []
 
     def add(kind, label, **location):
@@ -21,6 +21,15 @@ def asset_references(state: dict[str, Any], timeline: dict[str, Any], asset_id: 
             if node.get('input') == f'asset:{asset_id}':
                 add('node', f'镜头「{title}」· 节点 {node["id"]}')
 
+    return references
+
+
+def timeline_asset_references(timeline: dict[str, Any], asset_id: str) -> list[dict[str, str]]:
+    references = []
+
+    def add(kind, label, **location):
+        references.append({'kind': kind, 'label': label, **location})
+
     def track_refs(tracks, kind, prefix, run_id=None):
         for track in tracks:
             for clip in track.get('clips', []):
@@ -35,3 +44,8 @@ def asset_references(state: dict[str, Any], timeline: dict[str, Any], asset_id: 
         if len(references) == before and asset_id in run.get('sources', {}):
             add('timeline_history', f'历史输出 {run["id"]} · 源素材', runId=run['id'])
     return references
+
+
+def asset_references(state: dict[str, Any], timeline: dict[str, Any], asset_id: str) -> list[dict[str, str]]:
+    """Compatibility composition for callers that already hold both workflow states."""
+    return preproduction_asset_references(state, asset_id) + timeline_asset_references(timeline, asset_id)

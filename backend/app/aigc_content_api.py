@@ -12,7 +12,8 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from .preproduction import PreproductionStore, safe_child
+from .preproduction import safe_child
+from .project_assets import ProjectAssets
 from .prompt_generation import _redact_value
 from .provider_models import PROVIDER_IDS
 from .video_aspect import valid_aspect_mode
@@ -116,7 +117,7 @@ def _disclosure(root, project_id, brief, provider, model):
         raise HTTPException(422, detail={"code": "aigc_provider_invalid", "message": "请选择已配置的 AI 服务和模型。"})
     if not brief["productName"].strip() or not brief["facts"] or len(brief["assetIds"]) < 2:
         raise HTTPException(422, detail={"code": "aigc_brief_incomplete", "message": "请填写商品名称、商品事实并选择至少两段画面素材。"})
-    assets = {asset["id"]: asset for asset in PreproductionStore(root).load(project_id)["assets"]}
+    assets = ProjectAssets(root).index(project_id)
     selected = []
     for asset_id in brief["assetIds"]:
         asset = assets.get(asset_id)
@@ -189,6 +190,7 @@ def load_confirmed_handoff(data_dir, project_id, generation_id):
 
 def create_aigc_content_router(data_dir, get_project, script_generator=None, source_lock=None):
     root = Path(data_dir)
+    project_assets = ProjectAssets(root)
     router = APIRouter(prefix="/api/projects/{project_id}/aigc-content")
     lock = RLock()
 
@@ -197,9 +199,10 @@ def create_aigc_content_router(data_dir, get_project, script_generator=None, sou
         get_project(project_id)
         with lock:
             state = load_aigc_content_state(root, project_id)
-            assets = [{key: value for key, value in asset.items() if key != "file" and not key.startswith("_")}
-                      for asset in PreproductionStore(root).load(project_id)["assets"]
-                      if asset.get("kind") in ("image", "video")]
+            assets = project_assets.public(
+                project_id, kinds=("image", "video"), include_url=False,
+                include_source_reference=True,
+            )
         return {"brief": state["brief"], "candidates": state["candidates"], "assets": assets}
 
     @router.put("/brief")

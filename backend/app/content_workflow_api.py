@@ -8,13 +8,13 @@ from fastapi import APIRouter, HTTPException
 from .aigc_content_api import load_aigc_content_state
 from .batch_editing_api import BatchStore
 from .content_workflow import project_content_workflow
-from .preproduction import PreproductionStore
+from .project_assets import ProjectAssets
 
 
 def create_content_workflow_router(data_dir, get_project, source_lock=None) -> APIRouter:
     root = Path(data_dir)
     batches = BatchStore(root)
-    preparation = PreproductionStore(root)
+    project_assets = ProjectAssets(root)
     router = APIRouter(prefix="/api/projects/{project_id}/content-workflow")
 
     @router.get("")
@@ -26,7 +26,7 @@ def create_content_workflow_router(data_dir, get_project, source_lock=None) -> A
                 batch_state = batches.load(project_id)
                 visual_asset_ids = {
                     asset["id"]
-                    for asset in preparation.load(project_id)["assets"]
+                    for asset in project_assets.records(project_id)
                     if asset.get("kind") in ("image", "video")
                 }
                 return project_content_workflow(aigc_state, batch_state, visual_asset_ids)
