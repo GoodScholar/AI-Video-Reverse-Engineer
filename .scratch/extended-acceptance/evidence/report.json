@@ -1,0 +1,116 @@
+{
+  "directory": "/var/folders/jk/nlrws6j16tv20qd4p5ctf6700000gn/T/aivre-extended-5q_eteqv",
+  "sourceSha256": "363ce16637f4d039b9068f66fd5bed5bf7150d455292c5829662d6e024fdf9fa",
+  "source": {
+    "programs": [],
+    "stream_groups": [],
+    "streams": [
+      {
+        "codec_name": "aac",
+        "codec_type": "audio"
+      },
+      {
+        "codec_name": "h264",
+        "codec_type": "video",
+        "width": 320,
+        "height": 568
+      }
+    ],
+    "format": {
+      "duration": "14.533333",
+      "size": "1423714"
+    }
+  },
+  "detectedShots": 1,
+  "real-video": {
+    "seconds": 0.79,
+    "probe": {
+      "programs": [],
+      "stream_groups": [],
+      "streams": [
+        {
+          "codec_name": "h264",
+          "codec_type": "video",
+          "width": 160,
+          "height": 284
+        },
+        {
+          "codec_name": "aac",
+          "codec_type": "audio"
+        }
+      ],
+      "format": {
+        "duration": "14.500000",
+        "size": "517140"
+      }
+    },
+    "output": "/var/folders/jk/nlrws6j16tv20qd4p5ctf6700000gn/T/aivre-extended-5q_eteqv/real-video.mp4"
+  },
+  "300s-8tracks-80clips": {
+    "seconds": 7.1,
+    "probe": {
+      "programs": [],
+      "stream_groups": [],
+      "streams": [
+        {
+          "codec_name": "h264",
+          "codec_type": "video",
+          "width": 160,
+          "height": 284
+        },
+        {
+          "codec_name": "aac",
+          "codec_type": "audio"
+        }
+      ],
+      "format": {
+        "duration": "300.000000",
+        "size": "3791030"
+      }
+    },
+    "output": "/var/folders/jk/nlrws6j16tv20qd4p5ctf6700000gn/T/aivre-extended-5q_eteqv/300s-8tracks-80clips.mp4"
+  },
+  "300s-mix": {
+    "seconds": 4.89,
+    "probe": {
+      "programs": [],
+      "stream_groups": [],
+      "streams": [
+        {
+          "codec_name": "pcm_s16le",
+          "codec_type": "audio"
+        }
+      ],
+      "format": {
+        "duration": "300.000000",
+        "size": "57600078"
+      }
+    },
+    "output": "/var/folders/jk/nlrws6j16tv20qd4p5ctf6700000gn/T/aivre-extended-5q_eteqv/300s-mix.wav"
+  },
+  "backupBytes": 72103213,
+  "originalUnchanged": true,
+  "projectId": "104b33a3-6209-4977-809b-cfa54deb4f2f",
+  "1080p": {
+    "elapsedSeconds": 4.81,
+    "probe": {
+      "programs": [],
+      "stream_groups": [],
+      "streams": [
+        {
+          "codec_type": "video",
+          "width": 1080,
+          "height": 1920
+        },
+        {
+          "codec_type": "audio"
+        }
+      ],
+      "format": {
+        "duration": "14.500000",
+        "size": "5201438"
+      }
+    }
+  },
+  "restartVerified": true
+}

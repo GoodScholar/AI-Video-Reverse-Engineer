@@ -35,6 +35,11 @@ class LocalComputeJobQueue:
         with self._lock:
             return (job_kind, project_id) in self._active
 
+    def is_project_active(self, project_id: str) -> bool:
+        """Includes cancelled jobs until their worker and cleanup have exited."""
+        with self._lock:
+            return any(pid == project_id for _, pid in self._active)
+
     def shutdown(self) -> None:
         with self._lock:
             self._closed = True

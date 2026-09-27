@@ -1,0 +1,74 @@
+[
+  {
+    "id": "vivian",
+    "name": "Vivian · 明亮女声",
+    "description": "中文 / 年轻感女声，明亮、个性鲜明",
+    "useCases": "新品介绍、促销口播、年轻生活方式",
+    "sample": "01-vivian.wav",
+    "group": "chinese"
+  },
+  {
+    "id": "serena",
+    "name": "Serena · 温柔女声",
+    "description": "中文 / 年轻感女声，温暖、柔和",
+    "useCases": "咖啡美食、生活分享、温和品牌介绍",
+    "sample": "02-serena.wav",
+    "group": "chinese"
+  },
+  {
+    "id": "uncle_fu",
+    "name": "Uncle Fu · 沉稳男声",
+    "description": "中文 / 成熟感男声，低沉、圆润",
+    "useCases": "品牌故事、产品讲解、舒缓叙述",
+    "sample": "03-uncle-fu.wav",
+    "group": "chinese"
+  },
+  {
+    "id": "dylan",
+    "name": "Dylan · 自然男声",
+    "description": "中文（北京口音）/ 年轻感男声，清晰、自然",
+    "useCases": "本地商家、日常分享；严格普通话要求先核对口音",
+    "sample": "04-dylan.wav",
+    "group": "chinese"
+  },
+  {
+    "id": "eric",
+    "name": "Eric · 活泼男声",
+    "description": "中文（四川口音）/ 男声，活泼、明亮、略带沙哑",
+    "useCases": "四川本地商家、亲切口播；严格普通话要求先核对口音",
+    "sample": "07-eric.wav",
+    "group": "chinese"
+  },
+  {
+    "id": "ryan",
+    "name": "Ryan · 动感男声",
+    "description": "原生英语 / 男声，动感、节奏感强；当前中文试听",
+    "useCases": "动感广告、英文商品介绍；中文口音需试听核对",
+    "sample": "08-ryan.wav",
+    "group": "other"
+  },
+  {
+    "id": "aiden",
+    "name": "Aiden · 阳光男声",
+    "description": "原生美式英语 / 男声，阳光、中音清晰；当前中文试听",
+    "useCases": "轻松介绍、英文生活方式；中文口音需试听核对",
+    "sample": "09-aiden.wav",
+    "group": "other"
+  },
+  {
+    "id": "ono_anna",
+    "name": "Ono Anna · 俏皮女声",
+    "description": "原生日语 / 女声，俏皮、轻盈灵动；当前中文试听",
+    "useCases": "轻快短片、日语内容；中文口音需试听核对",
+    "sample": "10-ono-anna.wav",
+    "group": "other"
+  },
+  {
+    "id": "sohee",
+    "name": "Sohee · 温暖女声",
+    "description": "原生韩语 / 女声，温暖、情感丰富；当前中文试听",
+    "useCases": "情感叙述、韩语生活分享；中文口音需试听核对",
+    "sample": "11-sohee.wav",
+    "group": "other"
+  }
+]

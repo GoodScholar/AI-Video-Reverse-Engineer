@@ -13,7 +13,7 @@ export type TimelineWorkspace = { revision: number; settings: { width: number; h
 export type TimelineSave = Pick<TimelineWorkspace, "revision" | "settings" | "tracks">;
 
 const connectionError = "无法连接本地服务，请确认应用服务正在运行后重试。";
-const jsonHeaders = { "Content-Type": "application/json", "x-aivre-intent": "timeline-edit" };
+const jsonHeaders = { "Content-Type": "application/json", "x-aivre-intent": "semantic-analysis" };
 
 function timelineBase(projectId: string) { return `/api/projects/${encodeURIComponent(projectId)}/timeline`; }
 
@@ -50,4 +50,20 @@ export function uploadTimelineAudio(projectId: string, file: File): Promise<unkn
   const data = new FormData();
   data.append("file", file);
   return request(`/api/projects/${encodeURIComponent(projectId)}/preproduction/assets?role=audio`, { method: "POST", body: data }, "无法上传录音，请重试。");
+}
+
+export function importShotResults(projectId: string, revision: number, preproductionRevision: number): Promise<TimelineWorkspace> {
+  return request(`${timelineBase(projectId)}/import-shot-results`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ revision, preproductionRevision }) }, "无法导入镜头结果，请检查每个镜头的视频和时长。");
+}
+
+export function validateTimelineDraft(projectId: string, draft: TimelineSave): Promise<TimelineSave> {
+  return request(`${timelineBase(projectId)}/validate-draft`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(draft) }, "无法恢复草稿，请检查片段参数与项目素材。");
+}
+
+export type TimelinePreflight = {
+  revision: number; format: TimelineFormat; ready: boolean;
+  issues: Array<{ level: "error" | "warning"; label: string; message: string; trackId?: string; clipId?: string; assetId?: string }>;
+};
+export function preflightTimeline(projectId: string, revision: number, format: TimelineFormat): Promise<TimelinePreflight> {
+  return request(`${timelineBase(projectId)}/preflight`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ revision, format }) }, "无法完成导出预检，请重试。");
 }

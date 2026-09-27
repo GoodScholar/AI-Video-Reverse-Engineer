@@ -1,0 +1,17 @@
+
+> ai-video-reverse-engineer-web@0.1.0 test
+> vitest run ProjectBackup.test.tsx TimelineEditor.test.tsx PreproductionWorkspace.test.tsx
+
+
+ RUN  v3.0.8 /Users/shen/SZG/AI Agent/AI Video Reverse Engineer/frontend
+
+ ✓ src/ProjectBackup.test.tsx (4 tests) 85ms
+ ✓ src/TimelineEditor.test.tsx (29 tests) 1846ms
+ ✓ src/PreproductionWorkspace.test.tsx (20 tests) 3019ms
+   ✓ PreproductionWorkspace > 保存及晚到轮询回包不会覆盖新草稿或较高 revision 2056ms
+
+ Test Files  3 passed (3)
+      Tests  53 passed (53)
+   Start at  21:51:53
+   Duration  3.87s (transform 209ms, setup 317ms, collect 514ms, tests 4.95s, environment 816ms, prepare 162ms)
+

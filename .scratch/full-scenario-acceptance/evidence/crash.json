@@ -1,0 +1,11 @@
+{
+  "directory": "/var/folders/jk/nlrws6j16tv20qd4p5ctf6700000gn/T/aivre-crash-l9f2c3hy",
+  "interruptedRunStatus": "failed",
+  "partialDownloadStatus": 409,
+  "retry": "completed",
+  "backupRestore": "passed",
+  "remainingPartialFiles": 1,
+  "interruptedHistoryCleanup": "passed",
+  "cleanupBytes": 254,
+  "completedOutputPreserved": true
+}

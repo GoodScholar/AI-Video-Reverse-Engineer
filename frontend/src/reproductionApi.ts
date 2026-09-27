@@ -1,4 +1,5 @@
 import { readApiError } from "./referenceMediaApi";
+import type { AspectMode } from "./videoAspect";
 
 export type ReproductionPrompts = {
   positiveZh: string;
@@ -9,6 +10,7 @@ export type ReproductionPrompts = {
 
 export type ReproductionSettings = {
   strategy: "wan22_i2v" | "wan22_fun_control";
+  aspectMode?: AspectMode;
   width: number;
   height: number;
   frames: number;
@@ -24,6 +26,8 @@ export type ReproductionRun = {
   error: string | null;
   outputs: Array<{ filename: string; url: string }>;
   revision: number;
+  width?: number | null;
+  height?: number | null;
 };
 
 export type ReproductionTemplate = {

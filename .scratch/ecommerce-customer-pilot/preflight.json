@@ -1,0 +1,104 @@
+{
+  "checkedAt": "2026-09-26T22:44:25.336166+08:00",
+  "requests": "仅GET，本轮未生成、配音、渲染、审核或导出",
+  "results": {
+    "projects": {
+      "ok": true,
+      "data": [
+        {
+          "id": "8ff33ebd-3ea4-4c99-b48f-5d7198b21140",
+          "name": "本地配音 · 公开素材技术验收"
+        },
+        {
+          "id": "ab1fc9aa-cc38-4af5-bc57-4e9350d63e80",
+          "name": "视频超分 · 2秒验证片"
+        },
+        {
+          "id": "29d120ab-3d33-4bf1-8ddd-d520b4b84d92",
+          "name": "心有山海 · 深度动作捕捉"
+        },
+        {
+          "id": "607a3f7c-befc-43fb-9cb8-83f931a1a658",
+          "name": "走马人"
+        }
+      ]
+    },
+    "providers": {
+      "ok": true,
+      "data": [
+        {
+          "provider": "bailian",
+          "model": null,
+          "selectedProvider": "chatanywhere",
+          "verificationState": "unverified",
+          "verifiedAt": null,
+          "configurationRevision": null
+        },
+        {
+          "provider": "local_openai_compatible",
+          "model": null,
+          "selectedProvider": "chatanywhere",
+          "verificationState": "unverified",
+          "verifiedAt": null,
+          "configurationRevision": null
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "selectedProvider": "chatanywhere",
+          "verificationState": "unverified",
+          "verifiedAt": null,
+          "configurationRevision": null
+        },
+        {
+          "provider": "doubao",
+          "model": null,
+          "selectedProvider": "chatanywhere",
+          "verificationState": "unverified",
+          "verifiedAt": null,
+          "configurationRevision": null
+        },
+        {
+          "provider": "gemini",
+          "model": null,
+          "selectedProvider": "chatanywhere",
+          "verificationState": "unverified",
+          "verifiedAt": null,
+          "configurationRevision": null
+        },
+        {
+          "provider": "grok",
+          "model": null,
+          "selectedProvider": "chatanywhere",
+          "verificationState": "unverified",
+          "verifiedAt": null,
+          "configurationRevision": null
+        },
+        {
+          "provider": "claude",
+          "model": null,
+          "selectedProvider": "chatanywhere",
+          "verificationState": "unverified",
+          "verifiedAt": null,
+          "configurationRevision": null
+        },
+        {
+          "provider": "chatanywhere",
+          "model": "gpt-4o-mini",
+          "selectedProvider": "chatanywhere",
+          "verificationState": "available",
+          "verifiedAt": "2026-09-14T04:47:08.211511+00:00",
+          "configurationRevision": "96ec32b4-4ad8-46a5-8b52-6efc45424468"
+        }
+      ]
+    },
+    "voices": {
+      "ok": true,
+      "data": {
+        "available": true,
+        "message": "本地 Qwen3-TTS 已就绪；首次生成需要加载模型。",
+        "voiceCount": 9
+      }
+    }
+  }
+}

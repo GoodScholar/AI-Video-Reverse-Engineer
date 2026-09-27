@@ -22,11 +22,14 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.background import BackgroundTask
 
+from .asset_references import asset_references
+from .timeline import TimelineStore
 from .preproduction import NODE_KINDS, PreproductionStore
 from .preproduction_handoff import render_handoff
 from .preproduction_nodes import FFMPEG_TIMEOUT_SECONDS, MAX_MEDIA_DURATION_SECONDS, MAX_OUTPUT_DIMENSION, MAX_OUTPUT_PIXELS
 from .reference_media_storage import managed_reference_media_is_safe, resolve_reference_media_path
 from .reference_video import validate_storage_id
+from .shot_results import MAX_RESULT_VERSIONS, public_result_versions, result_association, result_history, result_signature
 
 
 MAX_ASSET_BYTES = 200_000_000
@@ -38,6 +41,7 @@ _MEDIA_SUFFIXES = _IMAGE_SUFFIXES | {".mp4", ".mov", ".m4a", ".mp3", ".wav", ".a
 
 class Brief(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    inputKind: Literal["reference_video", "depth_video", "white_model_video"] = "reference_video"
     theme: str = Field(default="", max_length=4000)
     purpose: str = Field(default="", max_length=4000)
     style: str = Field(default="", max_length=4000)
@@ -71,6 +75,9 @@ class ShotUpdate(BaseModel):
     duration: float = Field(ge=0, le=36000)
     prompt: str = Field(default="", max_length=12000)
     negativePrompt: str = Field(default="", max_length=12000)
+    resultAssetId: Optional[str] = Field(default=None, max_length=100)
+    # Read-only response metadata; accepted for round-trip editing and discarded.
+    resultVersions: list[dict[str, Any]] = Field(default_factory=list, max_length=MAX_RESULT_VERSIONS)
     assetIds: list[str] = Field(default_factory=list, max_length=100)
     nodes: list[NodeUpdate] = Field(default_factory=list, max_length=MAX_NODES_PER_SHOT)
 
@@ -92,6 +99,27 @@ class RevisionRequest(BaseModel):
     revision: int = Field(ge=0)
 
 
+class ResultNote(RevisionRequest):
+    note: str = Field(default="", max_length=4000)
+
+
+class AdoptionReason(RevisionRequest):
+    reason: str = Field(default="", max_length=1000)
+
+
+class AssetMetadata(RevisionRequest):
+    name: str = Field(min_length=1, max_length=255)
+    notes: str = Field(default="", max_length=4000)
+
+    @field_validator("name")
+    @classmethod
+    def nonempty_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value or any(ord(character) < 32 for character in value):
+            raise ValueError("素材名称不能为空或包含控制字符")
+        return value
+
+
 def create_preproduction_router(
     data_dir: Path,
     get_project: Callable[[str], Any],
@@ -105,7 +133,7 @@ def create_preproduction_router(
     """Create the router; ``runner`` is a test seam and defaults to execute_node."""
     root = Path(data_dir)
     store = PreproductionStore(root)
-    lock = RLock()
+    lock = source_lock or RLock()
     router = APIRouter(prefix="/api/projects/{project_id}/preproduction")
 
     if runner is None:
@@ -201,6 +229,8 @@ def create_preproduction_router(
         if len({shot.id for shot in incoming}) != len(incoming):
             fail("preproduction_shot_invalid", "镜头标识符不能重复。", 422)
         for shot in incoming:
+            if shot.resultAssetId is not None and not any(asset["id"] == shot.resultAssetId and asset["kind"] == "video" for asset in assets):
+                fail("preproduction_result_invalid", "镜头结果必须是本项目的视频素材。", 422)
             if len(set(shot.assetIds)) != len(shot.assetIds) or any(value not in asset_ids for value in shot.assetIds):
                 fail("preproduction_asset_missing", "镜头绑定了不存在的素材。", 422)
             seen: set[str] = set()
@@ -210,7 +240,8 @@ def create_preproduction_router(
                 _validate_node(node, index, seen, set(shot.assetIds), fail)
                 seen.add(node.id)
 
-    def derive_shots(previous: list[dict[str, Any]], incoming: list[ShotUpdate], brief_changed: bool) -> list[dict[str, Any]]:
+    def derive_shots(previous: list[dict[str, Any]], incoming: list[ShotUpdate], brief_changed: bool,
+                     brief: dict[str, Any], assets: list[dict[str, Any]], revision: int) -> list[dict[str, Any]]:
         old_shots = {shot["id"]: shot for shot in previous}
         result: list[dict[str, Any]] = []
         for item in incoming:
@@ -245,7 +276,14 @@ def create_preproduction_router(
                     node.update(status="stale", error=None, artifacts=[])
                     changed.add(node["id"])
             record = {"id": item.id, "title": item.title, "duration": item.duration, "prompt": item.prompt,
-                      "negativePrompt": item.negativePrompt, "assetIds": item.assetIds, "nodes": nodes}
+                      "negativePrompt": item.negativePrompt, "assetIds": item.assetIds, "nodes": nodes, "resultAssetId": item.resultAssetId}
+            history = result_history(old_shot)
+            if item.resultAssetId and not any(version["assetId"] == item.resultAssetId for version in history):
+                if len(history) >= MAX_RESULT_VERSIONS:
+                    fail("preproduction_result_limit", "每个镜头最多保留 100 个候选结果。", 422)
+                history.append({"assetId": item.resultAssetId, "signature": result_signature(brief, record), "reviewed": False,
+                                "association": result_association(brief, record, assets, revision)})
+            record["_resultVersions"] = history
             if "_importKey" in old_shot:
                 record["_importKey"] = old_shot["_importKey"]
             result.append(record)
@@ -264,34 +302,43 @@ def create_preproduction_router(
         if state["shots"] and brief.get("duration", 0) > 0 and not math.isclose(total_duration, brief["duration"], rel_tol=0, abs_tol=0.01):
             result.append({"level": "warning", "code": "duration_mismatch", "message": f"镜头计划总时长 {total_duration:.2f} 秒，与目标 {brief['duration']:.2f} 秒不一致，请核对镜头或需求。"})
         if not state["shots"]:
-            result.append({"level": "error", "message": "尚未添加镜头，无法交付。"})
+            result.append({"level": "error", "code": "shots_missing", "message": "尚未添加镜头，无法交付。"})
         for shot in state["shots"]:
             if not shot["assetIds"]:
                 result.append({"level": "warning", "code": "shot_assets_missing", "shotId": shot["id"], "message": "镜头未绑定素材，请确认是否仅使用文字制作。"})
             if shot["duration"] <= 0:
                 result.append({"level": "warning", "code": "shot_duration_missing", "shotId": shot["id"], "message": "镜头尚未设置有效计划时长。"})
             if not shot["prompt"].strip():
-                result.append({"level": "warning", "shotId": shot["id"], "message": "镜头尚未填写提示词。"})
+                result.append({"level": "warning", "code": "shot_prompt_missing", "shotId": shot["id"], "message": "镜头尚未填写提示词。"})
+            adopted = next((version for version in public_result_versions(brief, shot) if version["assetId"] == shot.get("resultAssetId")), None)
+            if adopted and (adopted["planChanged"] or not adopted["reviewed"]):
+                result.append({"level": "warning", "code": "result_review_required", "shotId": shot["id"], "message": "采用结果的方案已变化或缺少关联记录，请重新检查。" if adopted["planChanged"] else "采用结果尚未按当前方案人工检查。"})
             referenced = set(shot["assetIds"])
+            referenced.update(version["assetId"] for version in result_history(shot))
+            if shot.get("resultAssetId"):
+                referenced.add(shot["resultAssetId"])
             referenced.update(node["input"].split(":", 1)[1] for node in shot["nodes"] if node["input"].startswith("asset:"))
             for asset_id in referenced:
                 asset = assets.get(asset_id)
                 if asset is None or not _stored_file_available(store, project_id, "assets", asset.get("file")):
-                    result.append({"level": "error", "shotId": shot["id"], "message": "镜头引用的素材已不存在。"})
+                    result.append({"level": "error", "code": "shot_asset_unavailable", "shotId": shot["id"], "message": "镜头引用的素材已不存在。"})
             for node in shot["nodes"]:
                 if node["status"] == "failed":
-                    result.append({"level": "error", "shotId": shot["id"], "nodeId": node["id"], "message": "节点执行失败，请重试或修改输入。"})
+                    result.append({"level": "error", "code": "node_failed", "shotId": shot["id"], "nodeId": node["id"], "message": "节点执行失败，请重试或修改输入。"})
                 elif node["status"] in ("pending", "queued", "running", "stale"):
-                    result.append({"level": "error", "shotId": shot["id"], "nodeId": node["id"], "message": "节点尚未生成当前产物。"})
+                    result.append({"level": "error", "code": "node_not_ready", "shotId": shot["id"], "nodeId": node["id"], "message": "节点尚未生成当前产物。"})
                 elif node["status"] == "completed" and (not node["artifacts"] or any(
                     not _stored_file_available(store, project_id, "artifacts", shot["id"], node["id"], artifact.get("name"))
                     for artifact in node["artifacts"]
                 )):
-                    result.append({"level": "error", "shotId": shot["id"], "nodeId": node["id"], "message": "节点当前产物不可用。"})
+                    result.append({"level": "error", "code": "node_output_unavailable", "shotId": shot["id"], "nodeId": node["id"], "message": "节点当前产物不可用。"})
         return result
 
     def response(project_id: str, state: dict[str, Any]) -> dict[str, Any]:
         public = _public_state(project_id, state)
+        by_id = {asset["id"]: asset for asset in state["assets"]}
+        for asset in public["assets"]:
+            asset["available"] = _stored_file_available(store, project_id, "assets", by_id[asset["id"]].get("file"))
         public["checks"] = checks(project_id, state)
         public["nodeCatalog"] = [{"kind": kind, "label": _node_label(kind)} for kind in NODE_KINDS]
         return public
@@ -337,13 +384,78 @@ def create_preproduction_router(
             validate_shots(body.shots, state["assets"])
             brief_changed = state["brief"] != body.brief.model_dump()
             state["brief"] = body.brief.model_dump()
-            state["shots"] = derive_shots(state["shots"], body.shots, brief_changed)
+            state["shots"] = derive_shots(state["shots"], body.shots, brief_changed, state["brief"], state["assets"], state["revision"] + 1)
             state["revision"] += 1
             save(project_id, state)
             return response(project_id, state)
 
+    def managed_asset(state, asset_id):
+        asset = next((item for item in state["assets"] if item["id"] == asset_id), None)
+        if asset is None:
+            fail("preproduction_asset_missing", "素材不存在。", 404)
+        return asset
+
+    def references_for(project_id, state, asset_id):
+        try:
+            return asset_references(state, TimelineStore(root).load(project_id), asset_id)
+        except (OSError, ValueError, KeyError, TypeError):
+            fail("asset_references_unavailable", "无法完整读取素材引用，暂不能删除。", 503)
+
+    def editable_assets(project_id, revision):
+        state = state_for(project_id)
+        if revision != state["revision"]:
+            fail("preproduction_conflict", "前置工作台已被更新，请刷新后重试。")
+        if _has_inflight(state):
+            fail("preproduction_node_running", "有节点正在执行，完成后再修改素材。")
+        return state
+
+    @router.get("/assets/{asset_id}/references")
+    def get_asset_references(project_id: str, asset_id: str):
+        project_for(project_id)
+        with source_lock or nullcontext(), lock:
+            state = state_for(project_id)
+            managed_asset(state, asset_id)
+            return {"references": references_for(project_id, state, asset_id)}
+
+    @router.put("/assets/{asset_id}")
+    def update_asset(project_id: str, asset_id: str, body: AssetMetadata):
+        project_for(project_id)
+        with source_lock or nullcontext(), lock:
+            state = editable_assets(project_id, body.revision)
+            asset = managed_asset(state, asset_id)
+            asset.update(name=body.name, notes=body.notes)
+            state["revision"] += 1
+            save(project_id, state)
+            return response(project_id, state)
+
+    @router.post("/assets/{asset_id}/delete")
+    def delete_asset(project_id: str, asset_id: str, body: RevisionRequest):
+        project_for(project_id)
+        with source_lock or nullcontext(), lock:
+            state = editable_assets(project_id, body.revision)
+            asset = managed_asset(state, asset_id)
+            references = references_for(project_id, state, asset_id)
+            if references:
+                fail("asset_in_use", "素材仍被引用：" + "；".join(item["label"] for item in references[:5]))
+            path = asset_path(project_id, asset)
+            # Stage removal so a failed state write leaves the original file usable.
+            staged = path.with_name(f".delete-{uuid4().hex}.part")
+            try:
+                path.rename(staged)
+                state["assets"] = [item for item in state["assets"] if item["id"] != asset_id]
+                state["revision"] += 1
+                try:
+                    save(project_id, state)
+                except Exception:
+                    staged.rename(path)
+                    raise
+                staged.unlink()
+            except OSError:
+                fail("asset_delete_failed", "素材删除未能完成，请刷新检查后重试。", 503)
+            return response(project_id, state)
+
     @router.post("/assets")
-    async def upload_asset(project_id: str, role: Literal["character", "scene", "motion", "audio", "reference"] = Query(...), file: UploadFile = File(...)):
+    async def upload_asset(project_id: str, role: Literal["character", "scene", "motion", "audio", "reference"] = Query(...), file: UploadFile = File(...), resultForShot: Optional[str] = Query(None), revision: Optional[int] = Query(None)):
         project_for(project_id)
         suffix = Path(file.filename or "").suffix.lower()
         if suffix not in _MEDIA_SUFFIXES:
@@ -352,8 +464,21 @@ def create_preproduction_router(
         try:
             with source_lock or nullcontext(), lock:
                 state = state_for(project_id)
+                shot = None
+                if resultForShot is not None:
+                    if _has_inflight(state):
+                        fail("preproduction_node_running", "有节点正在执行，完成后再关联镜头结果。")
+                    if revision != state["revision"]:
+                        fail("preproduction_conflict", "镜头方案已更新，请重新读取后上传结果。")
+                    shot = next((item for item in state["shots"] if item["id"] == resultForShot), None)
+                    if shot is None:
+                        fail("preproduction_shot_missing", "镜头不存在。", 404)
+                    if len(result_history(shot)) >= MAX_RESULT_VERSIONS:
+                        fail("preproduction_result_limit", "每个镜头最多保留 100 个候选结果。", 422)
                 temporary = _receive_upload(root, file, suffix)
                 metadata = _probe_media(temporary, suffix, ffprobe_path, ffmpeg_path)
+                if shot is not None and metadata["kind"] != "video":
+                    fail("preproduction_result_invalid", "镜头结果必须上传视频。", 422)
                 asset_id = "asset-" + uuid4().hex
                 name = asset_id + suffix
                 target = store.path(project_id, "assets", name)
@@ -362,6 +487,12 @@ def create_preproduction_router(
                 temporary = None
                 state["assets"].append({"id": asset_id, "name": _display_name(file.filename), "kind": metadata["kind"], "role": role,
                                         "file": name, **metadata})
+                if shot is not None:
+                    history = result_history(shot)
+                    history.append({"assetId": asset_id, "signature": result_signature(state["brief"], shot), "reviewed": False,
+                                    "association": result_association(state["brief"], shot, state["assets"], state["revision"] + 1)})
+                    shot["_resultVersions"] = history
+                    shot["resultAssetId"] = asset_id
                 state["revision"] += 1
                 save(project_id, state)
                 return response(project_id, state)
@@ -369,6 +500,89 @@ def create_preproduction_router(
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
             await file.close()
+
+    def removable_candidate(state, shot_id, asset_id):
+        shot = next((item for item in state["shots"] if item["id"] == shot_id), None)
+        if shot is None or not any(item["assetId"] == asset_id for item in result_history(shot)):
+            fail("preproduction_result_missing", "当前镜头不存在该候选结果。", 404)
+        if shot.get("resultAssetId") == asset_id:
+            fail("preproduction_result_adopted", "当前采用的结果不能移出历史，请先采用其他结果并保存。")
+        return shot
+
+    @router.get("/shots/{shot_id}/results/{asset_id}/cleanup-preview")
+    def preview_candidate_removal(project_id: str, shot_id: str, asset_id: str):
+        project_for(project_id)
+        with source_lock or nullcontext(), lock:
+            state = state_for(project_id)
+            shot = removable_candidate(state, shot_id, asset_id)
+            return {"revision": state["revision"], "bytes": 0, "fileCount": 0,
+                    "description": f'仅从镜头「{shot["title"]}」移除这一候选及人工检查记录。素材文件、其他镜头和时间线均保留；如需释放空间，请另行在素材库检查引用后删除。'}
+
+    @router.post("/shots/{shot_id}/results/{asset_id}/remove")
+    def remove_candidate(project_id: str, shot_id: str, asset_id: str, body: RevisionRequest):
+        project_for(project_id)
+        with source_lock or nullcontext(), lock:
+            state = editable_assets(project_id, body.revision)
+            shot = removable_candidate(state, shot_id, asset_id)
+            shot["_resultVersions"] = [item for item in result_history(shot) if item["assetId"] != asset_id]
+            state["revision"] += 1
+            save(project_id, state)
+            return response(project_id, state)
+
+    @router.post("/shots/{shot_id}/results/{asset_id}/review")
+    def review_result(project_id: str, shot_id: str, asset_id: str, body: RevisionRequest):
+        project_for(project_id)
+        with source_lock or nullcontext(), lock:
+            state = state_for(project_id)
+            if body.revision != state["revision"]:
+                fail("preproduction_conflict", "方案已更新，请重新读取后检查。")
+            if _has_inflight(state):
+                fail("preproduction_node_running", "有节点正在执行，完成后再记录检查结果。")
+            shot = next((item for item in state["shots"] if item["id"] == shot_id), None)
+            history = result_history(shot) if shot else []
+            version = next((item for item in history if item["assetId"] == asset_id), None)
+            if version is None:
+                fail("preproduction_result_missing", "当前镜头不存在该候选结果。", 404)
+            asset = next((item for item in state["assets"] if item["id"] == asset_id), None)
+            if not asset or asset["kind"] != "video" or not _stored_file_available(store, project_id, "assets", asset.get("file")):
+                fail("preproduction_result_missing", "候选视频文件不可用。")
+            version.update(signature=result_signature(state["brief"], shot), reviewed=True)
+            shot["_resultVersions"] = history
+            state["revision"] += 1
+            save(project_id, state)
+            return response(project_id, state)
+
+    @router.put("/shots/{shot_id}/results/{asset_id}/note")
+    def update_result_note(project_id: str, shot_id: str, asset_id: str, body: ResultNote):
+        project_for(project_id)
+        with source_lock or nullcontext(), lock:
+            state = editable_assets(project_id, body.revision)
+            shot = next((item for item in state["shots"] if item["id"] == shot_id), None)
+            history = result_history(shot) if shot else []
+            version = next((item for item in history if item["assetId"] == asset_id), None)
+            if version is None:
+                fail("preproduction_result_missing", "当前镜头不存在该候选结果。", 404)
+            version["externalNote"] = body.note.strip()
+            shot["_resultVersions"] = history
+            state["revision"] += 1
+            save(project_id, state)
+            return response(project_id, state)
+
+    @router.put("/shots/{shot_id}/results/{asset_id}/adoption-reason")
+    def update_adoption_reason(project_id: str, shot_id: str, asset_id: str, body: AdoptionReason):
+        project_for(project_id)
+        with source_lock or nullcontext(), lock:
+            state = editable_assets(project_id, body.revision)
+            shot = next((item for item in state["shots"] if item["id"] == shot_id), None)
+            history = result_history(shot) if shot else []
+            version = next((item for item in history if item["assetId"] == asset_id), None)
+            if version is None:
+                fail("preproduction_result_missing", "当前镜头不存在该候选结果。", 404)
+            version["adoptionReason"] = body.reason.strip()
+            shot["_resultVersions"] = history
+            state["revision"] += 1
+            save(project_id, state)
+            return response(project_id, state)
 
     @router.post("/import-reference")
     def import_reference(project_id: str, body: RevisionRequest):
@@ -673,6 +887,7 @@ def _stored_file_available(store: PreproductionStore, project_id: str, *parts: A
 
 def _referenced_assets(state: dict[str, Any]) -> list[dict[str, Any]]:
     ids = {asset_id for shot in state["shots"] for asset_id in shot["assetIds"]}
+    ids.update(version["assetId"] for shot in state["shots"] for version in result_history(shot))
     ids.update(
         node["input"].split(":", 1)[1]
         for shot in state["shots"] for node in shot["nodes"] if node["input"].startswith("asset:")
@@ -813,11 +1028,11 @@ def _display_name(name: Optional[str]) -> str:
 
 
 def _public_state(project_id: str, value: dict[str, Any]) -> dict[str, Any]:
-    result = {"revision": value["revision"], "brief": value["brief"], "assets": [], "shots": []}
+    result = {"revision": value["revision"], "brief": {"inputKind": "reference_video", **value["brief"]}, "assets": [], "shots": []}
     for asset in value["assets"]:
         result["assets"].append({key: item for key, item in asset.items() if key not in ("file", "sourceReferenceId") and not key.startswith("_")} | {"url": f"/api/projects/{project_id}/preproduction/assets/{asset['id']}/file"})
     for shot in value["shots"]:
-        result["shots"].append({key: item for key, item in shot.items() if not key.startswith("_") and key != "nodes"} | {"nodes": [
+        result["shots"].append({key: item for key, item in shot.items() if not key.startswith("_") and key != "nodes"} | {"resultVersions": public_result_versions(value["brief"], shot), "nodes": [
             {key: item for key, item in node.items() if key != "runId" and not key.startswith("_")} for node in shot["nodes"]
         ]})
     return result

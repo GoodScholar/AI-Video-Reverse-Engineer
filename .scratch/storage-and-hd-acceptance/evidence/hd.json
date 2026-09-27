@@ -1,0 +1,27 @@
+{
+  "seconds": 24.06,
+  "probe": {
+    "programs": [],
+    "stream_groups": [],
+    "streams": [
+      {
+        "codec_type": "video",
+        "width": 1920,
+        "height": 1080,
+        "r_frame_rate": "30/1"
+      },
+      {
+        "codec_type": "audio",
+        "r_frame_rate": "0/0"
+      }
+    ],
+    "format": {
+      "duration": "300.000000",
+      "size": "17219966"
+    }
+  },
+  "output": "/var/folders/jk/nlrws6j16tv20qd4p5ctf6700000gn/T/aivre-extended-5q_eteqv/300s-1080p-8tracks-80clips.mp4",
+  "tracks": 8,
+  "clips": 80,
+  "note": "1 video track and 7 audio tracks; includes deliberate gaps"
+}

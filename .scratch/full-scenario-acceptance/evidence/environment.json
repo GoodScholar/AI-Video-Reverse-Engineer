@@ -1,0 +1,28 @@
+{
+  "toolkit": {
+    "scenes": {
+      "available": true,
+      "message": "依赖文件已就绪，执行时验证模型。"
+    },
+    "subtitles": {
+      "available": false,
+      "message": "配置 WHISPER_BINARY 和 WHISPER_MODEL（多语言模型）。 需 FFmpeg。"
+    },
+    "mask": {
+      "available": false,
+      "message": "配置 SAM2_PYTHON、SAM2_CHECKPOINT 和 SAM2_CONFIG。 需 FFmpeg。"
+    },
+    "interpolate": {
+      "available": false,
+      "message": "配置 RIFE_BINARY 和 RIFE_MODELS，使用支持任意时间步的 RIFE v4 模型。 需 FFmpeg。"
+    },
+    "upscale": {
+      "available": true,
+      "message": "本地 Real-ESRGAN 已就绪，运行时检查 GPU。"
+    }
+  },
+  "upscale": {
+    "available": true,
+    "message": "本地 Real-ESRGAN 已就绪，运行时检查 GPU。"
+  }
+}

@@ -5,7 +5,7 @@ import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, Optional
+from typing import ClassVar, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -14,12 +14,22 @@ from .reference_video import validate_storage_id
 
 class OutputSettings(BaseModel):
     model_config = ConfigDict(extra='forbid')
+    ASPECT_PRESETS: ClassVar[dict[str, tuple[int, int]]] = {
+        '21:9': (1120, 480), '16:9': (1024, 576), '4:3': (960, 720),
+        '1:1': (720, 720), '3:4': (720, 960), '9:16': (576, 1024),
+    }
     strategy: Literal['wan22_i2v', 'wan22_fun_control'] = 'wan22_i2v'
+    aspectMode: Literal['21:9', '16:9', '4:3', '1:1', '3:4', '9:16', 'smart'] = 'smart'
     width: int = Field(default=480, ge=256, le=1280)
     height: int = Field(default=832, ge=256, le=1280)
     frames: int = Field(default=81, ge=17, le=161)
     fps: int = Field(default=16, ge=8, le=24)
     seed: int = Field(default=42, ge=0, le=2**53 - 1)
+
+    @classmethod
+    def for_aspect(cls, mode: str, **values):
+        width, height = cls.ASPECT_PRESETS[mode]
+        return cls(aspectMode=mode, width=width, height=height, **values)
 
     @field_validator('width', 'height')
     @classmethod
@@ -52,6 +62,8 @@ class GenerationRun(BaseModel):
     error: Optional[str] = None
     outputs: list[dict] = Field(default_factory=list)
     revision: int
+    width: Optional[int] = None
+    height: Optional[int] = None
     sourceHash: str
     comfyUrl: str
     workflow: dict

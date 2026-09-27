@@ -1,0 +1,11 @@
+.voice-selector { border-top: 1px solid #c7c6bc; padding: 16px 0; }
+.voice-selector-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 12px; margin: 16px 0; }
+.voice-selector-cards article { border: 1px solid #c7c6bc; padding: 12px; }
+.voice-selector-cards h6 { font-size: 14px; margin: 0 0 8px; }
+.voice-selector-cards p { font-size: 13px; line-height: 1.6; }
+.voice-selector-cards article > div { display: flex; flex-wrap: wrap; gap: 8px; }
+.voice-selector-cards [aria-checked="true"] { outline: 2px solid var(--primary-button); outline-offset: 2px; }
+.voice-selector > label { display: flex; align-items: center; gap: 8px; }
+.voice-selector > label input { width: auto; }
+
+.voice-selector-groups { display: flex; flex-wrap: wrap; gap: 8px; }

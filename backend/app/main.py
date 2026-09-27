@@ -11,7 +11,7 @@ import zipfile
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
+from threading import Lock, RLock
 from typing import AsyncIterator, Callable, Literal, Optional, Union
 from uuid import uuid4
 
@@ -105,7 +105,7 @@ from app.analysis_settings import AnalysisProviderConfiguration, AnalysisSetting
 from app.credential_store import CredentialStore
 from app.provider_models import CATALOG_VERSION, PROVIDER_IDS, model_is_allowed, provider_for
 from app.analysis_providers.bailian import BailianAnalysisProvider
-from app.analysis_providers.base import ProviderAnalysisError, ProviderFailure
+from app.analysis_providers.base import ProviderAnalysisError, ProviderFailure, ProviderRequest
 from app.analysis_providers.claude import ClaudeAnalysisProvider
 from app.analysis_providers.chatanywhere import ChatAnywhereAnalysisProvider
 from app.analysis_providers.doubao import DoubaoAnalysisProvider
@@ -170,6 +170,7 @@ _MEDIA_NOT_FOUND_ERRNOS = {errno.ENOENT, errno.ENOTDIR, errno.ELOOP}
 _ALLOWED_ANALYSIS_MUTATION_ORIGINS = frozenset({
     "http://127.0.0.1:5173", "http://localhost:5173",
     "http://127.0.0.1:4173", "http://localhost:4173",
+    "http://127.0.0.1:5188", "http://localhost:5188",
 })
 _ANALYSIS_REQUEST_INTENT = "semantic-analysis"
 
@@ -344,7 +345,7 @@ def create_app(
 ) -> FastAPI:
     app = FastAPI(title="AI 视频复刻分析器")
     analysis_provider_configuration_lock = Lock()
-    project_write_lock = Lock()
+    project_write_lock = RLock()
     dispatching_project_ids: set[str] = set()
     reference_media_path_pattern = re.compile(r"^/api/projects/[^/]+/reference-media$")
     reference_video_path_pattern = re.compile(r"^/api/projects/[^/]+/reference-video$")
@@ -1199,9 +1200,11 @@ def create_app(
 
     def is_sensitive_analysis_mutation(request: Request) -> bool:
         path = request.url.path
+        if request.method == "POST" and path == "/api/project-backups/restore":
+            return True
         return (
             request.method in ("POST", "PUT")
-            and bool(re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|preparation|preproduction|timeline|upscale|character-motion|toolkit)(?:/.*)?", path))
+            and bool(re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|preparation|preproduction|timeline|batch-edits|upscale|character-motion|toolkit|backup)(?:/.*)?", path))
         ) or (
             request.method == "PUT" and bool(re.fullmatch(r"/api/analysis-providers/[^/]+/configuration", path))
         ) or (
@@ -1218,9 +1221,10 @@ def create_app(
             return JSONResponse(status_code=403, content={"detail": {
                 "code": "request_origin_rejected", "message": "请求来源不被本地分析服务允许。",
             }})
-        if content_type != "application/json":
+        expected_type = "application/zip" if request.url.path == "/api/project-backups/restore" else "application/json"
+        if content_type != expected_type:
             return JSONResponse(status_code=403, content={"detail": {
-                "code": "request_intent_rejected", "message": "敏感分析请求必须使用 JSON。",
+                "code": "request_intent_rejected", "message": "请求内容类型不符合该接口要求。",
             }})
         if origin is not None and request.headers.get("x-aivre-intent") != _ANALYSIS_REQUEST_INTENT:
             return JSONResponse(status_code=403, content={"detail": {
@@ -1273,11 +1277,6 @@ def create_app(
 
     @app.middleware("http")
     async def reject_invalid_reference_video_request(request, call_next):
-        if request.method == "POST" and re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|character-motion)/runs", request.url.path):
-            return JSONResponse(status_code=410, content={"detail": {
-                "code": "final_generation_disabled",
-                "message": "当前工作台只准备素材与方案，请导出后在外部工具执行视频生成。",
-            }})
         if is_character_motion_upload_request(request) or (request.method == "POST" and re.fullmatch(r"/api/projects/[^/]+/preproduction/assets", request.url.path)):
             origin = request.headers.get("origin")
             if origin is not None and origin not in _ALLOWED_ANALYSIS_MUTATION_ORIGINS:
@@ -1288,6 +1287,11 @@ def create_app(
             rejection = sensitive_mutation_rejection(request)
             if rejection is not None:
                 return rejection
+        if request.method == "POST" and re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|character-motion)/runs", request.url.path):
+            return JSONResponse(status_code=410, content={"detail": {
+                "code": "final_generation_disabled",
+                "message": "当前工作台只准备素材与方案，请导出后在外部工具执行视频生成。",
+            }})
         if not is_reference_media_request(request):
             return await call_next(request)
 
@@ -2678,12 +2682,52 @@ def create_app(
         data_dir, ensure_project_exists, compute_jobs,
         ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, source_lock=project_write_lock,
     ))
+    from .product_images_api import create_product_images_router
+    app.include_router(create_product_images_router(data_dir, ensure_project_exists, source_lock=project_write_lock))
     from .timeline_api import create_timeline_router
     app.include_router(create_timeline_router(
         data_dir, ensure_project_exists, compute_jobs,
         ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, source_lock=project_write_lock,
     ))
+    from .batch_editing_api import create_batch_editing_router
+    from .local_voice import LocalVoiceService, create_voice_router
+    voice_service = LocalVoiceService()
+    app.include_router(create_voice_router(voice_service))
+    app.include_router(create_batch_editing_router(
+        data_dir, ensure_project_exists, compute_jobs,
+        ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, source_lock=project_write_lock, voice_service=voice_service,
+    ))
+    from .aigc_content_api import create_aigc_content_router
+
+    def generate_marketing_candidates(provider_id, model, prompt, schema):
+        setting, credential, _ = analysis_provider_snapshot(provider_id)
+        if (setting is None or setting.model != model or setting.verificationState != "available"
+                or not analysis_model_is_supported(provider_id, model)
+                or (provider_id != "local_openai_compatible" and credential is None)):
+            raise HTTPException(422, detail={"code": "provider_unconfigured", "message": "请先配置并验证所选 AI 服务。"})
+        provider = analysis_provider_for(provider=provider_id, credential=credential, base_url=setting.baseUrl, model=model)
+        try:
+            return provider.analyze(ProviderRequest(task="prompt_generation", prompt=prompt, model=model,
+                                                    responseSchema=schema)).rawText
+        except ProviderAnalysisError as error:
+            raise HTTPException(422, detail={"code": error.failure.code, "message": error.failure.message}) from None
+        finally:
+            close_default_analysis_provider(provider)
+
+    app.include_router(create_aigc_content_router(data_dir, ensure_project_exists,
+                                                   script_generator=generate_marketing_candidates,
+                                                   source_lock=project_write_lock))
+    from .project_backup import create_backup_router
+
+    def register_restored_project(project):
+        projects = _read_projects(data_dir)
+        projects.append(project)
+        _write_projects(data_dir, projects)
+
+    app.include_router(create_backup_router(data_dir, ensure_project_exists, Project.model_validate, register_restored_project, project_write_lock,
+        is_project_active=getattr(compute_jobs, "is_project_active", None)))
     app.add_event_handler("shutdown", compute_jobs.shutdown)
+    app.add_event_handler("shutdown", voice_service.close)
 
     return app
 

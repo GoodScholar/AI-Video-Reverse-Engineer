@@ -51,6 +51,21 @@ beforeEach(desktop);
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.clearAllMocks(); });
 
 describe("ShotPreparationPanel", () => {
+  it("没有分析前置时仍显示入口和原因，不自动请求", async () => {
+    mockedGet.mockResolvedValue(state({ canAnalyze: false }));
+    render(<ShotPreparationPanel project={project()} />);
+    expect(await screen.findByRole("button", { name: "分析当前镜头并生成提示词" })).toBeDisabled();
+    expect(screen.getByText(/请先配置分析服务并发起语义分析/)).toBeVisible();
+    expect(mockedAnalyze).not.toHaveBeenCalled();
+  });
+  it("已有分析但缺少配置时说明原因并阻止请求", async () => {
+    mockedGet.mockResolvedValue(state());
+    render(<ShotPreparationPanel project={project()} analysisProviders={[]} />);
+    expect(await screen.findByRole("button", { name: "分析当前镜头并生成提示词" })).toBeDisabled();
+    expect(screen.getByText(/分析服务未配置/)).toBeVisible();
+    expect(mockedAnalyze).not.toHaveBeenCalled();
+  });
+
   it("加载中显示检片状态，随后展示控制素材的真实状态", async () => {
     let resolve: (value: ShotPreparationState) => void = () => undefined;
     mockedGet.mockReturnValue(new Promise<ShotPreparationState>((done) => { resolve = done; }));

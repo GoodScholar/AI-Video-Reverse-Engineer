@@ -1,0 +1,213 @@
+{
+  "projectId": "697b8d71-b525-4011-ab90-b7f4563bc8f2",
+  "status": "previews-ready-pending-human-review",
+  "aspectRatio": "9:16",
+  "voiceId": "serena",
+  "sceneAssets": {
+    "A-poster": {
+      "assetId": "asset-50a51b6c2be54c5ca74ba4ad1e988b75",
+      "sourceAssetId": "a6c47931-0789-4e23-91f6-728878521c40",
+      "file": "/Users/shen/SZG/AI Agent/AI Video Reverse Engineer/.scratch/ecommerce-customer-pilot/deliverables/scenes/A-poster.mp4"
+    },
+    "B-table": {
+      "assetId": "asset-64f604b8e47b4afca4b34449020c64b1",
+      "sourceAssetId": "69109a00-2bcc-4f46-9cf0-e514cc23b7f7",
+      "file": "/Users/shen/SZG/AI Agent/AI Video Reverse Engineer/.scratch/ecommerce-customer-pilot/deliverables/scenes/B-table.mp4"
+    },
+    "B-bottle": {
+      "assetId": "asset-855368d3cff34fc98a0aae6801607e5e",
+      "sourceAssetId": "69109a00-2bcc-4f46-9cf0-e514cc23b7f7",
+      "file": "/Users/shen/SZG/AI Agent/AI Video Reverse Engineer/.scratch/ecommerce-customer-pilot/deliverables/scenes/B-bottle.mp4"
+    }
+  },
+  "tasks": [
+    {
+      "number": "01",
+      "title": "给饮料留个位置",
+      "taskId": "66600580ad1d45fa9bafb5bc0e82810d",
+      "script": "这一餐，先把喜欢的菜摆上桌。也给今天的饮料，留个位置。大窑果味汽水。看看商品详情，选一款适合你的餐桌搭配。",
+      "sceneOrder": [
+        "B-table",
+        "B-bottle",
+        "A-poster",
+        "A-poster"
+      ],
+      "voiceoverQueued": true,
+      "voiceover": {
+        "id": "a2cfd0f55e8a48f6955d7b4955fa1ecd",
+        "voiceId": "serena",
+        "status": "completed",
+        "error": null,
+        "contentRevision": 0,
+        "variantRevision": 3,
+        "subtitleRevision": 1,
+        "model": "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit",
+        "modelRevision": "049ef77fe8816b536193c0c25f9a214d17921282",
+        "assetIds": [
+          "f100f5fca7944d2e8428d01680adebab",
+          "f551f5fc639648acbffa25218297fb3f",
+          "22a4b205fb94497aaf93a5acf5373f51",
+          "1ec48e1edde54da481ad2594dcaac7e7"
+        ]
+      },
+      "cues": [
+        {
+          "id": "f31d681505eb44038a75d1d0c4f5f976",
+          "start": 0.0,
+          "end": 3.44,
+          "text": "这一餐，先把喜欢的菜摆上桌"
+        },
+        {
+          "id": "d8c24cc324524191984f862fb5e41f13",
+          "start": 3.44,
+          "end": 5.68,
+          "text": "也给今天的饮料，留个位置"
+        },
+        {
+          "id": "a9525bd399f04ede95b6ef9ec773fbbc",
+          "start": 5.68,
+          "end": 7.68,
+          "text": "大窑果味汽水"
+        },
+        {
+          "id": "d0042d047ac24493bd43aa5881dece4d",
+          "start": 7.68,
+          "end": 12.08,
+          "text": "看看商品详情，选一款适合你的餐桌搭配"
+        }
+      ],
+      "duration": 12.08,
+      "previewRunId": "d25b2cf6fa0145df81050c90e774ea58",
+      "file": "/Users/shen/SZG/AI Agent/AI Video Reverse Engineer/.scratch/ecommerce-customer-pilot/deliverables/dayao-01-preview.mp4",
+      "url": "/api/projects/697b8d71-b525-4011-ab90-b7f4563bc8f2/batch-edits/66600580ad1d45fa9bafb5bc0e82810d/variant/previews/d25b2cf6fa0145df81050c90e774ea58/output",
+      "sha256": "84afe2528065cbfd5d2b3724d80601d48135c50d700b621400b893b455da9d66",
+      "media": {
+        "duration": 12.08,
+        "streams": [
+          {
+            "codec_type": "video",
+            "codec_name": "h264",
+            "width": 640,
+            "height": 1138,
+            "r_frame_rate": "30/1"
+          },
+          {
+            "codec_type": "audio",
+            "codec_name": "aac",
+            "r_frame_rate": "0/0",
+            "sample_rate": "48000",
+            "channels": 2
+          }
+        ]
+      },
+      "fullDecode": "passed",
+      "previousPreviewRunId": "3c74f68f5c2b4f2e8754a23223635875",
+      "variantRevision": 4,
+      "voiceGain": 2,
+      "subtitleRevision": 1,
+      "volumeDb": {
+        "mean_volume": -21.2,
+        "max_volume": -5.1
+      },
+      "technicalStatus": "passed",
+      "reviewStatus": "pending",
+      "asrTranscript": "这一餐,先把喜欢的菜摆上桌,\n也给今天的饮料留个位置。\n大摇果味气水,看看商品详情,\n选一款适合你的餐桌搭配。",
+      "asrScope": "原配音文字核对；增益变化不改变口播内容；识别误字不能代替听审"
+    },
+    {
+      "number": "04",
+      "title": "从瓶身到餐桌",
+      "taskId": "5924e12115c14bca894a82d2fee4d32a",
+      "script": "大窑果味汽水，先看瓶身。再看看它摆上餐桌的样子。打开商品详情，选你喜欢的那款。",
+      "sceneOrder": [
+        "A-poster",
+        "B-bottle",
+        "B-table"
+      ],
+      "voiceoverQueued": true,
+      "voiceover": {
+        "id": "c7d4598bbcbb41c9b06d0c979d2cd317",
+        "voiceId": "serena",
+        "status": "completed",
+        "error": null,
+        "contentRevision": 0,
+        "variantRevision": 3,
+        "subtitleRevision": 1,
+        "model": "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit",
+        "modelRevision": "049ef77fe8816b536193c0c25f9a214d17921282",
+        "assetIds": [
+          "a896b935542c4173a44049f2808ea383",
+          "4f3e4134ebe24664b8ff70bab2871f2c",
+          "729b3476b3f74863a70e82e536c4b98d"
+        ]
+      },
+      "cues": [
+        {
+          "id": "31568fa9414247d4a737f824abcc4ac6",
+          "start": 0.0,
+          "end": 2.88,
+          "text": "大窑果味汽水，先看瓶身"
+        },
+        {
+          "id": "f36343cdfc4340d9b3872a91c7512484",
+          "start": 2.88,
+          "end": 5.84,
+          "text": "再看看它摆上餐桌的样子"
+        },
+        {
+          "id": "8034c0d43d67484cbbbb52c35dd6ffb9",
+          "start": 5.84,
+          "end": 9.52,
+          "text": "打开商品详情，选你喜欢的那款"
+        }
+      ],
+      "duration": 9.52,
+      "previewRunId": "e8a817df468441dd9318e0d6b48cc787",
+      "file": "/Users/shen/SZG/AI Agent/AI Video Reverse Engineer/.scratch/ecommerce-customer-pilot/deliverables/dayao-04-preview.mp4",
+      "url": "/api/projects/697b8d71-b525-4011-ab90-b7f4563bc8f2/batch-edits/5924e12115c14bca894a82d2fee4d32a/variant/previews/e8a817df468441dd9318e0d6b48cc787/output",
+      "sha256": "2d12bc4f90278d9c8883714ad7f705b73330d0ad6dcfec978f03f582d9f1928b",
+      "media": {
+        "duration": 9.533333,
+        "streams": [
+          {
+            "codec_type": "video",
+            "codec_name": "h264",
+            "width": 640,
+            "height": 1138,
+            "r_frame_rate": "30/1"
+          },
+          {
+            "codec_type": "audio",
+            "codec_name": "aac",
+            "r_frame_rate": "0/0",
+            "sample_rate": "48000",
+            "channels": 2
+          }
+        ]
+      },
+      "fullDecode": "passed",
+      "previousPreviewRunId": "008ea24f434746e4828756c8dfd41a3e",
+      "variantRevision": 4,
+      "voiceGain": 2,
+      "subtitleRevision": 1,
+      "volumeDb": {
+        "mean_volume": -23.6,
+        "max_volume": -4.9
+      },
+      "technicalStatus": "passed",
+      "reviewStatus": "pending",
+      "asrTranscript": "大摇鼓为气水,先看平身。\n再看看它板上餐桌的样子。\n打开商品详情,选你喜欢的那款。",
+      "asrScope": "原配音文字核对；增益变化不改变口播内容；识别误字不能代替听审"
+    }
+  ],
+  "previewSize": {
+    "width": 640,
+    "height": 1138,
+    "fps": 30
+  },
+  "workingSize": {
+    "width": 720,
+    "height": 1280,
+    "fps": 30
+  }
+}

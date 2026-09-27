@@ -1,0 +1,15 @@
+{
+  "decoded": [
+    "upscale-1080p/output.mp4",
+    "person/overlay.mp4",
+    "person/mask.mp4",
+    "person/pose.mp4",
+    "upscale-2k/output.mp4",
+    "data/project-files/acceptance/reference-media/source.mp4",
+    "data/project-files/acceptance/depth-captures/depth-720p/depth-control.mp4",
+    "data/project-files/acceptance/depth-captures/depth-720p/depth-preview.mp4",
+    "data/project-files/acceptance/depth-captures/depth-480p/depth-control.mp4",
+    "data/project-files/acceptance/depth-captures/depth-480p/depth-preview.mp4"
+  ],
+  "count": 10
+}

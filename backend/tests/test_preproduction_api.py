@@ -325,6 +325,7 @@ def test_real_delivery_handoff_preserves_other_shot_after_local_revision(tmp_pat
 def test_delivery_warnings_are_actionable_and_do_not_block_export(tmp_path):
     client, _, _ = setup(tmp_path)
     state = client.get(BASE).json()
+    assert any(check.get('code') == 'shots_missing' for check in state['checks'])
     state['brief']['duration'] = 5
     shot = {'id': 'shot-a', 'title': '文字镜头', 'duration': 2, 'prompt': '云海',
             'negativePrompt': '', 'assetIds': [], 'nodes': []}
@@ -363,3 +364,179 @@ def test_browser_style_audio_recording_without_container_duration_is_imported(tm
     asset = response.json()['assets'][0]
     assert asset['kind'] == 'audio' and .45 <= asset['duration'] <= .6
     assert client.get(asset['url']).status_code == 200
+
+
+@pytest.mark.parametrize("input_kind,label", [("reference_video", "参考视频"), ("depth_video", "灰度深度视频"), ("white_model_video", "三维白模渲染视频")])
+def test_input_kind_and_shot_result_upload_are_persisted_and_versioned(tmp_path, input_kind, label):
+    client, _, project = setup(tmp_path)
+    state = client.get(BASE).json()
+    state = client.put(BASE, json={"revision": state["revision"], "brief": {**state["brief"], "inputKind": input_kind},
+        "shots": [{"id": "shot-result", "title": "结果", "duration": 1, "nodes": [], "assetIds": []}]}).json()
+    assert state["brief"]["inputKind"] == input_kind
+    from PIL import Image
+    image = io.BytesIO()
+    Image.new("RGB", (64, 64), "white").save(image, format="PNG")
+    rejected = client.post(BASE + f"/assets?role=motion&resultForShot=shot-result&revision={state['revision']}", files={"file": ("not-video.png", image.getvalue(), "image/png")})
+    assert rejected.status_code == 422
+    unchanged = client.get(BASE).json()
+    assert unchanged["revision"] == state["revision"] and unchanged["assets"] == state["assets"]
+    source = tmp_path / f"project-files/{PROJECT_ID}/reference-media/ref-001.mp4"
+    result = client.post(BASE + f"/assets?role=motion&resultForShot=shot-result&revision={state['revision']}", files={"file": ("result.mp4", source.read_bytes(), "video/mp4")})
+    assert result.status_code == 200, result.text
+    final = result.json()
+    assert final["shots"][0]["resultAssetId"] == final["assets"][-1]["id"]
+    assert project.referenceMedia.id == "ref-001"
+    assert client.post(BASE + f"/assets?role=motion&resultForShot=shot-result&revision={state['revision']}", files={"file": ("result.mp4", source.read_bytes(), "video/mp4")}).status_code == 409
+    invalid = {"revision": final["revision"], "brief": final["brief"], "shots": [{**final["shots"][0], "resultAssetId": "foreign-asset"}]}
+    assert client.put(BASE, json=invalid).status_code == 422
+    assert client.put(BASE, json={**invalid, "brief": {**final["brief"], "inputKind": "arbitrary"}}).status_code == 422
+
+    package = client.post(BASE + "/package", json={"revision": final["revision"]})
+    assert package.status_code == 200, package.text
+    with zipfile.ZipFile(io.BytesIO(package.content)) as archive:
+        exported = json.loads(archive.read("workspace.json"))
+        assert exported["brief"]["inputKind"] == input_kind
+        result_asset = next(asset for asset in exported["assets"] if asset["id"] == final["shots"][0]["resultAssetId"])
+        assert archive.read(result_asset["url"])
+        assert label in archive.read("HANDOFF.md").decode()
+
+
+def test_result_versions_preserve_candidates_and_invalidate_review_on_plan_change(tmp_path):
+    client, _, _ = setup(tmp_path)
+    state = client.get(BASE).json()
+    state = client.put(BASE, json={"revision": state['revision'], "brief": state['brief'], "shots": [
+        {"id": "versions", "duration": 1, "title": "镜头", "prompt": "原提示", "nodes": [], "assetIds": []}]}).json()
+    media = (tmp_path / f"project-files/{PROJECT_ID}/reference-media/ref-001.mp4").read_bytes()
+    for name in ('first.mp4', 'second.mp4'):
+        uploaded = client.post(BASE + f"/assets?role=motion&resultForShot=versions&revision={state['revision']}", files={"file": (name, media, "video/mp4")})
+        assert uploaded.status_code == 200, uploaded.text
+        state = uploaded.json()
+    versions = state['shots'][0]['resultVersions']
+    assert len(versions) == 2
+    first, second = [item['assetId'] for item in versions]
+    assert state['shots'][0]['resultAssetId'] == second
+    assert all(not v['reviewed'] and not v['planChanged'] for v in versions)
+    assert versions[0]['association']['shot']['prompt'] == '原提示'
+    assert versions[0]['association']['revision'] < versions[1]['association']['revision']
+    route = BASE + f'/shots/versions/results/{first}/review'
+    assert client.post(route, json={'revision': 0}).status_code == 409
+    state = client.post(route, json={'revision': state['revision']}).json()
+    assert state['shots'][0]['resultVersions'][0]['reviewed']
+    def put(current):
+        result = client.put(BASE, json={key: current[key] for key in ('revision', 'brief', 'shots')})
+        assert result.status_code == 200, result.text
+        return result.json()
+    state['shots'][0]['resultAssetId'] = first
+    state['shots'][0]['title'] = '只改标题'
+    state['shots'][0]['resultVersions'] = []
+    state = put(state)
+    assert len(state['shots'][0]['resultVersions']) == 2
+    assert state['shots'][0]['resultVersions'][0]['reviewed']
+    state['shots'][0]['prompt'] = '新方案'
+    state = put(state)
+    assert all(v['planChanged'] and not v['reviewed'] for v in state['shots'][0]['resultVersions'])
+    assert all(v['association']['shot']['prompt'] == '原提示' for v in state['shots'][0]['resultVersions'])
+    assert any(check.get('code') == 'result_review_required' for check in state['checks'])
+    # A normal workspace PUT cannot attest human review.
+    state['shots'][0]['resultVersions'] = [{'assetId': first, 'reviewed': True, 'planChanged': False}]
+    state = put(state)
+    assert not state['shots'][0]['resultVersions'][0]['reviewed']
+    state['shots'][0]['resultAssetId'] = None
+    state = put(state)
+    assert len(state['shots'][0]['resultVersions']) == 2
+    package = client.post(BASE + '/package', json={'revision': state['revision']})
+    assert package.status_code == 200, package.text
+    with zipfile.ZipFile(io.BytesIO(package.content)) as archive:
+        public = json.loads(archive.read('workspace.json'))
+        assert {asset['id'] for asset in public['assets']} == {first, second}
+        for asset in public['assets']:
+            assert archive.read(asset['url'])
+        assert '候选 2' in archive.read('HANDOFF.md').decode()
+
+
+def test_legacy_result_requires_review_and_review_rejects_unrelated_asset(tmp_path):
+    client, _, _ = setup(tmp_path)
+    state = client.post(BASE + '/import-reference', json={'revision': 0}).json()
+    asset_id = state['assets'][0]['id']
+    state = client.put(BASE, json={'revision': state['revision'], 'brief': state['brief'], 'shots': [
+        {'id': 'legacy', 'duration': 1, 'prompt': '', 'assetIds': [], 'nodes': [], 'resultAssetId': asset_id}]}).json()
+    assert state['shots'][0]['resultVersions'][0]['association']['shot']['id'] == 'legacy'
+    path = tmp_path / f'project-files/{PROJECT_ID}/preproduction/state.json'
+    raw = json.loads(path.read_text())
+    raw['shots'][0].pop('_resultVersions')
+    path.write_text(json.dumps(raw))
+    legacy = client.get(BASE).json()
+    assert legacy['shots'][0]['resultVersions'] == [{'assetId': asset_id, 'reviewed': False, 'planChanged': True}]
+    assert client.post(BASE + '/shots/legacy/results/foreign/review', json={'revision': legacy['revision']}).status_code == 404
+    checked = client.post(BASE + f'/shots/legacy/results/{asset_id}/review', json={'revision': legacy['revision']}).json()
+    assert checked['shots'][0]['resultVersions'][0]['reviewed']
+    assert 'association' not in checked['shots'][0]['resultVersions'][0]
+
+
+def test_candidate_external_note_is_owned_by_candidate_and_does_not_change_association(tmp_path):
+    client, _, _ = setup(tmp_path)
+    state = client.get(BASE).json()
+    state = client.put(BASE, json={'revision': state['revision'], 'brief': state['brief'], 'shots': [
+        {'id': 'shot-a', 'duration': 1, 'prompt': '雨景', 'assetIds': [], 'nodes': []}]}).json()
+    media = (tmp_path / f'project-files/{PROJECT_ID}/reference-media/ref-001.mp4').read_bytes()
+    state = client.post(BASE + f"/assets?role=motion&resultForShot=shot-a&revision={state['revision']}",
+                        files={'file': ('candidate.mp4', media, 'video/mp4')}).json()
+    version = state['shots'][0]['resultVersions'][0]
+    route = BASE + f"/shots/shot-a/results/{version['assetId']}/note"
+    changed = client.put(route, json={'revision': state['revision'], 'note': '外部工具制作，参数未核实'})
+    assert changed.status_code == 200, changed.text
+    saved = changed.json()['shots'][0]['resultVersions'][0]
+    assert saved['externalNote'] == '外部工具制作，参数未核实'
+    assert saved['association'] == version['association']
+    assert client.put(route, json={'revision': state['revision'], 'note': '旧版本写入'}).status_code == 409
+
+
+def test_candidate_adoption_reason_stays_with_candidate_when_selection_changes(tmp_path):
+    client, _, _ = setup(tmp_path)
+    state = client.get(BASE).json()
+    state = client.put(BASE, json={'revision': state['revision'], 'brief': state['brief'], 'shots': [
+        {'id': 'shot-a', 'duration': 1, 'prompt': '雨景', 'assetIds': [], 'nodes': []}]}).json()
+    media = (tmp_path / f'project-files/{PROJECT_ID}/reference-media/ref-001.mp4').read_bytes()
+    for name in ('a.mp4', 'b.mp4'):
+        state = client.post(BASE + f"/assets?role=motion&resultForShot=shot-a&revision={state['revision']}",
+                            files={'file': (name, media, 'video/mp4')}).json()
+    first, second = [version['assetId'] for version in state['shots'][0]['resultVersions']]
+    route = BASE + f'/shots/shot-a/results/{first}/adoption-reason'
+    saved = client.put(route, json={'revision': state['revision'], 'reason': '动作更自然'})
+    assert saved.status_code == 200, saved.text
+    state = saved.json()
+    assert state['shots'][0]['resultVersions'][0]['adoptionReason'] == '动作更自然'
+    assert 'adoptionReason' not in state['shots'][0]['resultVersions'][1]
+    assert client.put(route, json={'revision': state['revision'] - 1, 'reason': '旧版本'}).status_code == 409
+    state['shots'][0]['resultAssetId'] = first
+    state = client.put(BASE, json={key: state[key] for key in ('revision', 'brief', 'shots')}).json()
+    assert state['shots'][0]['resultVersions'][0]['adoptionReason'] == '动作更自然'
+    state['shots'][0]['resultAssetId'] = second
+    state = client.put(BASE, json={key: state[key] for key in ('revision', 'brief', 'shots')}).json()
+    assert state['shots'][0]['resultVersions'][0]['adoptionReason'] == '动作更自然'
+    state['shots'][0]['resultVersions'][0]['adoptionReason'] = '伪造覆盖'
+    state = client.put(BASE, json={key: state[key] for key in ('revision', 'brief', 'shots')}).json()
+    assert state['shots'][0]['resultVersions'][0]['adoptionReason'] == '动作更自然'
+    package = client.post(BASE + '/package', json={'revision': state['revision']})
+    assert package.status_code == 200, package.text
+    with zipfile.ZipFile(io.BytesIO(package.content)) as archive:
+        assert '采用理由：动作更自然' in archive.read('HANDOFF.md').decode()
+
+
+def test_candidate_historical_asset_remains_named_when_file_unavailable(tmp_path):
+    client, _, _ = setup(tmp_path)
+    state = client.post(BASE + '/import-reference', json={'revision': 0}).json()
+    asset = state['assets'][0]
+    state = client.put(BASE, json={'revision': state['revision'], 'brief': state['brief'], 'shots': [
+        {'id': 'shot-a', 'duration': 1, 'prompt': '旧提示', 'assetIds': [asset['id']], 'nodes': []}]}).json()
+    media = (tmp_path / f'project-files/{PROJECT_ID}/reference-media/ref-001.mp4').read_bytes()
+    state = client.post(BASE + f"/assets?role=motion&resultForShot=shot-a&revision={state['revision']}",
+                        files={'file': ('candidate.mp4', media, 'video/mp4')}).json()
+    association = state['shots'][0]['resultVersions'][0]['association']
+    assert association['assets'][0]['name'] == asset['name']
+    raw = json.loads((tmp_path / f'project-files/{PROJECT_ID}/preproduction/state.json').read_text())
+    filename = next(item['file'] for item in raw['assets'] if item['id'] == asset['id'])
+    (tmp_path / f'project-files/{PROJECT_ID}/preproduction/assets/{filename}').unlink()
+    current = client.get(BASE).json()
+    assert current['shots'][0]['resultVersions'][0]['association'] == association
+    assert next(item for item in current['assets'] if item['id'] == asset['id'])['available'] is False

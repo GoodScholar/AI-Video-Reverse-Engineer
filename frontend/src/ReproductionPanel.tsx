@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, CircleAlert, Clipboard, Download, LoaderCircle, Play, RefreshCw, Save, ServerCog } from "lucide-react";
 
-import type { Project } from "./models";
+import { promptConfigurationIssue } from "./promptAvailability";
+import { AspectRatioPicker } from "./AspectRatioPicker";
+import type { AnalysisProviderConfiguration, Project } from "./models";
+import { ratioLabel, resolveReproductionAspect } from "./videoAspect";
 import {
   checkComfy,
   downloadReproductionPackage,
@@ -22,7 +25,7 @@ import "./reproduction.css";
 const DESKTOP_QUERY = "(min-width: 1024px)";
 const POLL_INTERVAL_MS = 1_500;
 
-type Props = { project: Project; preparationOnly?: boolean };
+type Props = { project: Project; analysisProviders?: AnalysisProviderConfiguration[]; preparationOnly?: boolean };
 type Draft = Pick<ReproductionState, "prompts" | "settings" | "comfyUrl">;
 type CheckedConnection = { result: ComfyCheck; revision: number; comfyUrl: string; fingerprint: string };
 
@@ -89,7 +92,7 @@ function UnknownRunRecovery({
   </div>;
 }
 
-export function ReproductionPanel({ project, preparationOnly = false }: Props) {
+export function ReproductionPanel({ project, analysisProviders, preparationOnly = false }: Props) {
   const isDesktop = useDesktop();
   const projectAnalysisReady = project.semanticAnalysis?.status === "completed";
   const [state, setState] = useState<ReproductionState | null>(null);
@@ -183,8 +186,15 @@ export function ReproductionPanel({ project, preparationOnly = false }: Props) {
   const checkIsCurrent = check !== null && check.revision === currentRevision && check.comfyUrl === draft?.comfyUrl && check.fingerprint === latestPlan.current?.fingerprint;
   const canRun = canUseSavedPlan && checkIsCurrent && check.result.connected && check.result.ready;
   const controlUnavailable = !state?.hasDepth;
-  const canGeneratePrompts = mutationsAllowed && Boolean(state?.canGeneratePrompts) && action === null;
+  const configurationIssue = promptConfigurationIssue(project, analysisProviders);
+  const canGeneratePrompts = !configurationIssue && mutationsAllowed && Boolean(state?.canGeneratePrompts) && action === null;
   const editingLocked = action === "prompts" || action === "save";
+  const selectedReproductionAspect = draft ? resolveReproductionAspect(draft.settings.aspectMode ?? "smart", draft.settings, project.referenceMedia) : null;
+  const reproductionAspect = draft && selectedReproductionAspect ? {
+    resolvedAspect: ratioLabel(draft.settings.width, draft.settings.height), width: draft.settings.width, height: draft.settings.height,
+    reason: draft.settings.width === selectedReproductionAspect.width && draft.settings.height === selectedReproductionAspect.height
+      ? selectedReproductionAspect.reason : "当前为手动调整后的实际输出尺寸。",
+  } : null;
 
   useEffect(() => {
     if (preparationOnly || !state || !hasActiveRuns || action !== null) return undefined;
@@ -231,6 +241,14 @@ export function ReproductionPanel({ project, preparationOnly = false }: Props) {
   function updateSetting<Key extends keyof ReproductionSettings>(key: Key, value: ReproductionSettings[Key]) {
     setCheck(null);
     setDraft((current) => current ? { ...current, settings: { ...current.settings, [key]: value } } : current);
+  }
+
+  function updateAspectMode(aspectMode: NonNullable<ReproductionSettings["aspectMode"]>) {
+    if (!draft) return;
+    const resolution = resolveReproductionAspect(aspectMode, draft.settings, project.referenceMedia);
+    setCheck(null);
+    setDraft((current) => current ? { ...current, settings: { ...current.settings, aspectMode,
+      width: resolution.width, height: resolution.height } } : current);
   }
 
   async function generatePrompts() {
@@ -351,6 +369,8 @@ export function ReproductionPanel({ project, preparationOnly = false }: Props) {
       {!isDesktop && <span className="reproduction-readonly">窄屏仅可查看、复制与预览</span>}
     </div>
 
+    {configurationIssue && <p className="reproduction-prerequisite">{configurationIssue}</p>}
+    {project.semanticAnalysis?.status === "running" || project.semanticAnalysis?.status === "queued" ? <p role="status">正在等待语义分析完成，完成后可生成全片提示词。</p> : null}
     {loading && <p className="reproduction-loading" role="status"><LoaderCircle className="loading-spinner" size={17} aria-hidden="true" />正在读取复刻方案…</p>}
     {loadingError && <div className="reproduction-error" role="alert"><CircleAlert size={17} aria-hidden="true" /><span>{loadingError}</span><button className="secondary-action" type="button" onClick={() => void load()}>重新读取</button></div>}
 
@@ -372,7 +392,7 @@ export function ReproductionPanel({ project, preparationOnly = false }: Props) {
 
       <div className="reproduction-section reproduction-prompts">
         <div className="reproduction-section-heading"><h3>中英文提示词</h3>{isDesktop && <button className="secondary-action" type="button" disabled={!canGeneratePrompts} onClick={() => void generatePrompts()}>{action === "prompts" ? <LoaderCircle className="loading-spinner" size={16} aria-hidden="true" /> : <RefreshCw size={16} aria-hidden="true" />}{state.prompts ? "重新生成提示词" : "生成提示词"}</button>}</div>
-        <p className="reproduction-disclosure">生成提示词时，只会向已配置的分析服务发送已有的结构化分析，不会发送原始参考素材；不会自动调用 ComfyUI。</p>
+        <p className="reproduction-disclosure">{canGeneratePrompts && "已具备生成条件，点击按钮后才会调用分析服务。"}生成提示词时，只会向已配置的分析服务发送已有的结构化分析，不会发送原始参考素材；不会自动调用 ComfyUI。</p>
         {!state.prompts ? <p className="reproduction-empty">{state.analysisReady ? "尚未生成提示词。确认以上数据边界后，可生成一组可继续编辑的建议。" : "完成语义分析后可生成提示词。"}</p> : <div className="reproduction-prompt-grid">
           {([ ["positiveZh", "中文正向提示词"], ["negativeZh", "中文负向提示词"], ["positiveEn", "English positive prompt"], ["negativeEn", "English negative prompt"] ] as Array<[keyof ReproductionPrompts, string]>).map(([key, label]) => <label key={key} className="reproduction-field"><span>{label}</span><textarea readOnly={!isDesktop || editingLocked} value={draft.prompts?.[key] ?? ""} onChange={(event) => updatePrompts(key, event.target.value)} /><button className="copy-action" type="button" onClick={() => void copyPrompt(label, draft.prompts?.[key] ?? "")}><Clipboard size={15} aria-hidden="true" />复制</button></label>)}
         </div>}
@@ -387,6 +407,8 @@ export function ReproductionPanel({ project, preparationOnly = false }: Props) {
             return <label key={strategy} className={`reproduction-strategy${unavailable ? " is-unavailable" : ""}`}><input type="radio" name="strategy" value={strategy} checked={draft.settings.strategy === strategy} disabled={unavailable} onChange={() => updateSetting("strategy", strategy)} /><span><strong>{template?.label ?? (strategy === "wan22_i2v" ? "Wan2.2 I2V" : "Wan2.2 Fun Control")}</strong><small>{unavailable ? "需要当前参考的已确认深度素材" : "候选实验模板，尚未经过本机模型验证"}</small></span></label>;
           })}
         </div></fieldset>
+        {reproductionAspect && <AspectRatioPicker name={`reproduction-aspect-${project.id}`} value={draft.settings.aspectMode ?? "smart"}
+          onChange={updateAspectMode} resolution={reproductionAspect} disabled={!isDesktop || editingLocked || !hasPrompts} />}
         <div className="reproduction-number-fields">
           {([ ["width", "宽度", 64], ["height", "高度", 64], ["frames", "帧数", 1], ["fps", "FPS", 1], ["seed", "随机种子", 0] ] as Array<[keyof ReproductionSettings, string, number]>).map(([key, label, min]) => <label key={key}>{label}<input type="number" min={min} readOnly={!isDesktop || editingLocked || !hasPrompts} value={draft.settings[key]} onChange={(event) => updateSetting(key, Number(event.target.value))} /></label>)}
         </div>
@@ -410,7 +432,7 @@ export function ReproductionPanel({ project, preparationOnly = false }: Props) {
       {actionError && <div className="reproduction-error" role="alert"><CircleAlert size={17} aria-hidden="true" /><span>{actionError}</span></div>}
 
       {!preparationOnly && <div className="reproduction-section reproduction-runs"><div className="reproduction-section-heading"><h3>生成记录与预览</h3><span>{state.runs.length} 次</span></div>
-        {state.runs.length === 0 ? <p className="reproduction-empty">尚未提交生成。保存方案并完成本机检查后，可从这里跟踪队列和预览输出。</p> : <ul className="reproduction-run-list">{state.runs.map((item) => <li key={item.id} className={`reproduction-run reproduction-run--${item.status}`}><div><strong>{activeRun(item) && <LoaderCircle className="loading-spinner" size={16} aria-hidden="true" />}{statusLabel(item.status)}</strong><span>{formatTime(item.createdAt)} · 方案版本 {item.revision}</span>{item.error && <p>{item.error}</p>}{item.status === "unknown" && isDesktop && <UnknownRunRecovery value={resolutionDrafts[item.id] ?? { promptId: "", confirmedNotQueued: false }} disabled={action !== null} onChange={(next) => setResolutionDrafts((current) => ({ ...current, [item.id]: next }))} onResolve={(confirmedNotQueued) => void resolveUnknownRun(item, confirmedNotQueued)} />}</div>{item.outputs.length > 0 && <div className="reproduction-output-list">{item.outputs.map((output) => <figure key={output.url}><video controls preload="metadata" src={output.url} aria-label={`生成结果 ${output.filename}`} /><figcaption>{output.filename}</figcaption></figure>)}</div>}</li>)}</ul>}
+        {state.runs.length === 0 ? <p className="reproduction-empty">尚未提交生成。保存方案并完成本机检查后，可从这里跟踪队列和预览输出。</p> : <ul className="reproduction-run-list">{state.runs.map((item) => <li key={item.id} className={`reproduction-run reproduction-run--${item.status}`}><div><strong>{activeRun(item) && <LoaderCircle className="loading-spinner" size={16} aria-hidden="true" />}{statusLabel(item.status)}</strong><span>{formatTime(item.createdAt)} · 方案版本 {item.revision}</span>{item.error && <p>{item.error}</p>}{item.status === "unknown" && isDesktop && <UnknownRunRecovery value={resolutionDrafts[item.id] ?? { promptId: "", confirmedNotQueued: false }} disabled={action !== null} onChange={(next) => setResolutionDrafts((current) => ({ ...current, [item.id]: next }))} onResolve={(confirmedNotQueued) => void resolveUnknownRun(item, confirmedNotQueued)} />}</div>{item.outputs.length > 0 && <div className="reproduction-output-list">{item.outputs.map((output) => <figure key={output.url}><video controls preload="metadata" src={output.url} aria-label={`生成结果 ${output.filename}`} style={item.width && item.height ? { aspectRatio: `${item.width} / ${item.height}` } : undefined} /><figcaption>{output.filename}</figcaption></figure>)}</div>}</li>)}</ul>}
       </div>}
     </>}
   </section>;

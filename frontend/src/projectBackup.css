@@ -1,0 +1,8 @@
+.project-backup { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 16px 0; border-bottom: 1px solid #c7c6bc; }
+.app-shell > .project-backup { max-width: 1120px; margin: 0 auto; padding: 16px 40px; }
+.project-backup > p { flex: 1 1 280px; margin: 0; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.project-backup > [role="alert"], .project-backup > [role="status"] { flex-basis: 100%; }
+
+@media (max-width: 720px) {
+  .app-shell > .project-backup { padding-right: 20px; padding-left: 20px; }
+}

@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, Response
-from PIL import Image
+from PIL import Image, ImageOps
 from pydantic import BaseModel, ConfigDict, Field
 
 from .reproduction import (GenerationRun, OutputSettings, ReproductionStore, SavedPrompts,
@@ -122,7 +122,12 @@ def create_reproduction_router(data_dir, get_project, generate, *, ffmpeg_path='
         check_source(source)
         image = store.path(project.id, f'inputs-{state.revision}', 'reference.png')
         with Image.open(source) as original:
-            original.convert('RGB').save(image, format='PNG')
+            settings = state.settings
+            fitted = ImageOps.contain(original.convert('RGB'), (settings.width, settings.height),
+                                      method=Image.Resampling.LANCZOS)
+            canvas = Image.new('RGB', (settings.width, settings.height), 'black')
+            canvas.paste(fitted, ((settings.width - fitted.width) // 2, (settings.height - fitted.height) // 2))
+            canvas.save(image, format='PNG')
         assets = {'input/reference.png': image}
         if state.settings.strategy == 'wan22_fun_control':
             capture = current_depth(project)
@@ -132,7 +137,9 @@ def create_reproduction_router(data_dir, get_project, generate, *, ffmpeg_path='
             settings = state.settings
             result = subprocess.run([
                 ffmpeg_path, '-hide_banner', '-nostdin', '-loglevel', 'error', '-y', '-i', str(source),
-                '-an', '-vf', f'fps={settings.fps},scale={settings.width}:{settings.height},tpad=stop_mode=clone:stop_duration={settings.frames / settings.fps}',
+                '-an', '-vf', (f'fps={settings.fps},scale={settings.width}:{settings.height}:force_original_aspect_ratio=decrease,'
+                               f'pad={settings.width}:{settings.height}:(ow-iw)/2:(oh-ih)/2:color=black,'
+                               f'tpad=stop_mode=clone:stop_duration={settings.frames / settings.fps}'),
                 '-frames:v', str(settings.frames), '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(depth),
             ], capture_output=True, timeout=180, check=False)
             if result.returncode != 0:
@@ -267,6 +274,7 @@ def create_reproduction_router(data_dir, get_project, generate, *, ffmpeg_path='
             assets = input_paths(project, state)
             workflow = graph(state)
             run = GenerationRun(id=str(uuid4()), status='submitting', createdAt=utc_now(), revision=state.revision,
+                                width=state.settings.width, height=state.settings.height,
                                 sourceHash=state.sourceHash, comfyUrl=state.comfyUrl, workflow=workflow)
             state.runs.append(run)
             submissions.add(run.id)

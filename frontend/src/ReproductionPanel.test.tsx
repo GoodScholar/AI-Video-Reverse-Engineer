@@ -35,7 +35,7 @@ function project(id = "project-001"): Project {
 function state(overrides: Partial<ReproductionState> = {}): ReproductionState {
   return {
     prompts: { positiveZh: "雨夜人像", negativeZh: "过曝", positiveEn: "portrait in rain", negativeEn: "overexposed" }, revision: 3, sourceHash: "hash-1", stale: false,
-    settings: { strategy: "wan22_i2v", width: 832, height: 480, frames: 81, fps: 24, seed: 7 }, comfyUrl: "http://127.0.0.1:8188", runs: [], canGeneratePrompts: true, hasDepth: false, analysisReady: true, adjustments: [], templates: [{ strategy: "wan22_i2v", label: "Wan2.2 I2V", status: "candidate" }, { strategy: "wan22_fun_control", label: "Wan2.2 Fun Control", status: "candidate" }], ...overrides,
+    settings: { strategy: "wan22_i2v", aspectMode: "smart", width: 832, height: 480, frames: 81, fps: 24, seed: 7 }, comfyUrl: "http://127.0.0.1:8188", runs: [], canGeneratePrompts: true, hasDepth: false, analysisReady: true, adjustments: [], templates: [{ strategy: "wan22_i2v", label: "Wan2.2 I2V", status: "candidate" }, { strategy: "wan22_fun_control", label: "Wan2.2 Fun Control", status: "candidate" }], ...overrides,
   };
 }
 
@@ -47,6 +47,40 @@ beforeEach(() => { desktop(); vi.stubGlobal("navigator", { clipboard: { writeTex
 afterEach(() => { vi.unstubAllGlobals(); vi.clearAllMocks(); });
 
 describe("ReproductionPanel", () => {
+  it("复刻默认智能比例并可选择具体比例保存", async () => {
+    const initial = state();
+    const saved = state({ revision: 4, settings: { ...initial.settings, aspectMode: "3:4", width: 720, height: 960 } });
+    mockedGet.mockResolvedValue(initial);
+    mockedSave.mockResolvedValue(saved);
+    render(<ReproductionPanel project={project()} />);
+
+    expect(await screen.findByRole("radio", { name: "智能" })).toBeChecked();
+    await userEvent.click(screen.getByRole("radio", { name: "3:4" }));
+    expect(screen.getByLabelText("宽度")).toHaveValue(720);
+    expect(screen.getByLabelText("高度")).toHaveValue(960);
+    await userEvent.click(screen.getByRole("button", { name: "保存复刻方案" }));
+    expect(mockedSave).toHaveBeenCalledWith("project-001", expect.objectContaining({
+      settings: expect.objectContaining({ aspectMode: "3:4", width: 720, height: 960 }),
+    }));
+  });
+  it("手动分辨率变化后摘要显示真实输出尺寸", async () => {
+    mockedGet.mockResolvedValue(state());
+    render(<ReproductionPanel project={project()} />);
+
+    await screen.findByText("实际输出 26:15 · 832×480");
+    await userEvent.clear(screen.getByLabelText("宽度"));
+    await userEvent.type(screen.getByLabelText("宽度"), "800");
+
+    expect(screen.getByText("实际输出 5:3 · 800×480")).toBeVisible();
+  });
+  it("已有分析但配置缺失时禁用提示词生成并说明原因", async () => {
+    mockedGet.mockResolvedValue(state());
+    render(<ReproductionPanel project={project()} analysisProviders={[]} preparationOnly />);
+    expect(await screen.findByRole("button", { name: "重新生成提示词" })).toBeDisabled();
+    expect(screen.getByText(/分析服务未配置/)).toBeVisible();
+    expect(generateReproductionPrompts).not.toHaveBeenCalled();
+  });
+
   it("无分析时保留完整前置路径，且不提供生成提示词动作", async () => {
     mockedGet.mockResolvedValue(state({ analysisReady: false, prompts: null, canGeneratePrompts: false }));
     render(<ReproductionPanel project={{ ...project(), semanticAnalysis: null }} />);
@@ -77,7 +111,7 @@ describe("ReproductionPanel", () => {
   it("未手动检查连接时不允许提交，检查就绪后允许提交", async () => {
     mockedGet.mockResolvedValue(state());
     mockedCheck.mockResolvedValue({ connected: true, ready: true, version: "0.3", missingNodes: [], missingModels: [], message: "连接就绪" });
-    mockedStart.mockResolvedValue(state({ runs: [{ id: "run-2", promptId: "p-2", status: "completed", createdAt: "2026-09-14T10:00:00Z", error: null, outputs: [{ filename: "result.mp4", url: "/result.mp4" }], revision: 3 }] }));
+    mockedStart.mockResolvedValue(state({ runs: [{ id: "run-2", promptId: "p-2", status: "completed", createdAt: "2026-09-14T10:00:00Z", error: null, outputs: [{ filename: "result.mp4", url: "/result.mp4" }], revision: 3, width: 720, height: 960 }] }));
     render(<ReproductionPanel project={project()} />);
     await screen.findByText("中英文提示词");
     await userEvent.click(screen.getByText("可选：连接本地 ComfyUI 后继续实验"));
@@ -86,7 +120,7 @@ describe("ReproductionPanel", () => {
     expect(await screen.findByText("连接就绪")).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: "提交实验性生成" }));
     expect(mockedStart).toHaveBeenCalledWith("project-001", 3);
-    expect(await screen.findByLabelText("生成结果 result.mp4")).toBeVisible();
+    expect(await screen.findByLabelText("生成结果 result.mp4")).toHaveStyle({ aspectRatio: "720 / 960" });
   });
 
   it("项目切换时忽略旧项目的迟到读取响应", async () => {

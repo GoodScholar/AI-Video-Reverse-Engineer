@@ -1,3 +1,4 @@
+import { createDraftCache } from "./draftStorage";
 import { type ChangeEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { CircleAlert, Download, FilePlus2, LoaderCircle, PackageCheck, Play, Plus, Save, Trash2, Upload } from "lucide-react";
 
@@ -11,6 +12,8 @@ import {
   runPreproductionNode,
   savePreproductionWorkspace,
   uploadPreproductionAsset,
+  uploadShotResult,
+  reviewShotResult,
   type AssetRole,
   type NodeKind,
   type PreproductionNode,
@@ -18,10 +21,16 @@ import {
   type PreproductionWorkspace as Workspace,
 } from "./preproductionApi";
 import "./preproduction.css";
+import { ReproductionFlow } from "./ReproductionFlow";
+import { AssetManager } from "./AssetManager";
+import { ShotResultVersions } from "./ShotResultVersions";
+import { CandidateResultComparison, ShotResultComparison } from "./ShotResultComparison";
 import { TimelineEditor } from "./TimelineEditor";
+import { BatchEditor } from "./BatchEditor";
 
-type Props = { project: Project; tools: ReactNode };
-type Section = "brief" | "assets" | "shots" | "tools" | "timeline" | "delivery";
+type Props = { project: Project; tools: ReactNode; onDraftChange?: (projectId: string, dirty: boolean) => void;
+  importedWorkspace?: {projectId:string;workspace:Workspace}; sectionOverride?: Section; studioMode?: boolean; onAssetsChanged?: (assets: Workspace["assets"]) => void };
+type Section = "brief" | "assets" | "shots" | "tools" | "timeline" | "batch" | "delivery";
 
 const roleLabels: Record<AssetRole, string> = { character: "角色", scene: "场景", motion: "动作", audio: "音频", reference: "参考" };
 const kindLabels: Record<NodeKind, string> = {
@@ -46,6 +55,17 @@ function editableSnapshot(workspace: Workspace | null) {
   return workspace ? JSON.stringify({ revision: workspace.revision, brief: workspace.brief, shots: workspace.shots }) : "";
 }
 
+function draftKey(projectId: string) { return `aivre:preproduction-draft:${projectId}`; }
+async function readDraft(cache: ReturnType<typeof createDraftCache>): Promise<{ draft: Pick<Workspace, "revision" | "brief" | "shots">; baseline: string } | null> {
+  try {
+    const cached = JSON.parse(await cache.read() ?? "null");
+    if (!cached || typeof cached.baseline !== "string" || !Number.isInteger(cached.draft?.revision)
+      || !cached.draft.brief || !Array.isArray(cached.draft.shots)
+      || !cached.draft.shots.every((shot: PreproductionShot) => shot && Array.isArray(shot.nodes) && Array.isArray(shot.assetIds))) return null;
+    return cached;
+  } catch { return null; }
+}
+
 function updateShot(workspace: Workspace, shotId: string, change: (shot: PreproductionShot) => PreproductionShot): Workspace {
   return { ...workspace, shots: workspace.shots.map((shot) => shot.id === shotId ? change(shot) : shot) };
 }
@@ -68,20 +88,38 @@ function NodeParameters({ node, onChange }: { node: PreproductionNode; onChange:
   return null;
 }
 
-export function PreproductionWorkspace({ project, tools }: Props) {
-  const [section, setSection] = useState<Section>("shots");
+export function PreproductionWorkspace({ project, tools, onDraftChange, sectionOverride, studioMode = false, onAssetsChanged, importedWorkspace }: Props) {
+  const draftCache = useMemo(() => createDraftCache(draftKey(project.id)), [project.id]);
+  const resultInputRef = useRef<HTMLInputElement>(null);
+  const [toolTarget, setToolTarget] = useState<string | null>(null);
+  const [section, setSection] = useState<Section>(sectionOverride ?? "shots");
+  useEffect(() => { if (sectionOverride) setSection(sectionOverride); }, [sectionOverride]);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
+  const [savedWorkspace, setSavedWorkspace] = useState<Workspace | null>(null);
+  useEffect(() => { if(savedWorkspace) onAssetsChanged?.(savedWorkspace.assets); }, [savedWorkspace,onAssetsChanged]);
   const [savedSnapshot, setSavedSnapshot] = useState("");
   const [selectedShotId, setSelectedShotId] = useState<string | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [managedAssetId, setManagedAssetId] = useState<string | null>(null);
   const [roleFilter, setRoleFilter] = useState<AssetRole | "all">("all");
   const [uploadRole, setUploadRole] = useState<AssetRole>("reference");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const uploadInputRef = useRef<HTMLInputElement>(null);
+  const [draftNotice, setDraftNotice] = useState("");
+  const loadedProjectRef = useRef<string | null>(null);
   const mounted = useRef(true);
   const currentProjectId = useRef(project.id);
+  const [timelineDirty, setTimelineDirty] = useState(false);
+  const [timelineOpened, setTimelineOpened] = useState(false);
+  const [batchDirty, setBatchDirty] = useState(false);
+  const [batchOpened, setBatchOpened] = useState(false);
+  const [timelineFocus, setTimelineFocus] = useState<{ trackId: string; clipId: string } | null>(null);
+  useEffect(() => { if (section === "timeline") setTimelineOpened(true); }, [section]);
+  useEffect(() => { if (section === "batch") setBatchOpened(true); }, [section]);
   const dirty = Boolean(workspace && savedSnapshot !== editableSnapshot(workspace));
+  useEffect(() => { onDraftChange?.(project.id, dirty || timelineDirty || batchDirty); }, [project.id, dirty, timelineDirty, batchDirty, onDraftChange]);
   const workspaceRef = useRef<Workspace | null>(null);
   const dirtyRef = useRef(dirty);
   const busyRef = useRef<string | null>(busy);
@@ -99,9 +137,11 @@ export function PreproductionWorkspace({ project, tools }: Props) {
   function accept(next: Workspace, submittedSnapshot?: string) {
     if (!mounted.current || currentProjectId.current !== project.id) return;
     const current = workspaceRef.current;
+    if (current && next.revision < current.revision) return;
     const hasNewerDraft = Boolean(submittedSnapshot && current && editableSnapshot(current) !== submittedSnapshot);
     const accepted = hasNewerDraft && current ? { ...next, brief: current.brief, shots: current.shots } : next;
     setWorkspace(accepted);
+    setSavedWorkspace(next);
     setSavedSnapshot(editableSnapshot(next));
     setSelectedShotId((current) => current && next.shots.some((shot) => shot.id === current) ? current : next.shots[0]?.id ?? null);
     setSelectedNodeId((current) => current && next.shots.some((shot) => shot.nodes.some((node) => node.id === current)) ? current : next.shots[0]?.nodes[0]?.id ?? null);
@@ -110,14 +150,36 @@ export function PreproductionWorkspace({ project, tools }: Props) {
   useEffect(() => {
     mounted.current = true;
     currentProjectId.current = project.id;
-    setLoading(true); setError(""); setWorkspace(null); setSavedSnapshot(""); setSelectedShotId(null); setSelectedNodeId(null);
-    void getPreproductionWorkspace(project.id).then(accept).catch((reason) => {
+    loadedProjectRef.current = null; setDraftNotice("");
+    setLoading(true); setError(""); setWorkspace(null); setSavedWorkspace(null); setTimelineFocus(null); setSavedSnapshot(""); setSelectedShotId(null); setSelectedNodeId(null);
+    void getPreproductionWorkspace(project.id).then(async (next) => {
+      if (!mounted.current || currentProjectId.current !== project.id) return;
+      const cached = await readDraft(draftCache);
+      if (!mounted.current || currentProjectId.current !== project.id) return;
+      loadedProjectRef.current = project.id;
+      if (!cached) { accept(next); return; }
+      setWorkspace({ ...next, ...cached.draft });
+      setSavedWorkspace(next);
+      setSavedSnapshot(cached.baseline);
+      setSelectedShotId(cached.draft.shots[0]?.id ?? null);
+      setSelectedNodeId(cached.draft.shots[0]?.nodes[0]?.id ?? null);
+      setDraftNotice(next.revision === cached.draft.revision
+        ? "已恢复此浏览器保存的未保存草稿，请保存更改。"
+        : "已保存版本已更新；已保留你的旧版草稿，保存时会检查版本冲突。请先复制需要保留的内容，再重新读取已保存版本。");
+    }).catch((reason) => {
       if (mounted.current && currentProjectId.current === project.id) setError(errorMessage(reason, "无法读取前置工作台。"));
     }).finally(() => {
       if (mounted.current && currentProjectId.current === project.id) setLoading(false);
     });
     return () => { mounted.current = false; };
   }, [project.id]);
+
+  useEffect(() => {
+    if (loading || !importedWorkspace || importedWorkspace.projectId !== project.id) return;
+    const next = importedWorkspace.workspace;
+    if (next.revision <= (workspaceRef.current?.revision ?? -1)) return;
+    accept(next, dirtyRef.current ? savedSnapshot : undefined);
+  }, [importedWorkspace, loading, project.id]);
 
   useEffect(() => {
     if (!workspace || dirty || !workspace.shots.some((shot) => shot.nodes.some((node) => activeStatuses.has(node.status)))) return undefined;
@@ -129,6 +191,23 @@ export function PreproductionWorkspace({ project, tools }: Props) {
     }, 2_000);
     return () => window.clearInterval(timer);
   }, [dirty, project.id, workspace]);
+
+  useEffect(() => {
+    if (loading || !workspace || loadedProjectRef.current !== project.id) return;
+    let active = true;
+    void draftCache.write(dirty ? JSON.stringify({
+      draft: { revision: workspace.revision, brief: workspace.brief, shots: workspace.shots }, baseline: savedSnapshot,
+    }) : null).then(() => { if (active && !dirty) setDraftNotice(""); })
+      .catch((reason) => { if (active) setDraftNotice(errorMessage(reason, "浏览器无法缓存草稿，请在离开项目前保存更改。")); });
+    return () => { active = false; };
+  }, [loading, workspace, dirty, savedSnapshot, project.id, draftCache]);
+
+  useEffect(() => {
+    if (!dirty) return;
+    const warnBeforeClose = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
+    window.addEventListener("beforeunload", warnBeforeClose);
+    return () => window.removeEventListener("beforeunload", warnBeforeClose);
+  }, [dirty]);
 
   function edit(change: (current: Workspace) => Workspace) {
     setWorkspace((current) => current ? change(current) : current);
@@ -173,6 +252,24 @@ export function PreproductionWorkspace({ project, tools }: Props) {
     finally { event.target.value = ""; if (mounted.current) setBusy(null); }
   }
 
+  async function uploadResult(event: ChangeEvent<HTMLInputElement>) {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    if (!file || !workspace || !selectedShot || busy || dirty) return;
+    setBusy("result"); setError("");
+    try { accept(await uploadShotResult(project.id, selectedShot.id, workspace.revision, file)); }
+    catch (reason) { if (mounted.current) setError(errorMessage(reason, "无法上传镜头结果。")); }
+    finally { input.value = ""; if (mounted.current) setBusy(null); }
+  }
+
+  async function reviewResult(assetId: string) {
+    if (!workspace || !selectedShot || dirty || busy || hasActiveNodes) return;
+    setBusy("review-result"); setError("");
+    try { accept(await reviewShotResult(project.id, selectedShot.id, assetId, workspace.revision)); }
+    catch (reason) { if (mounted.current) setError(errorMessage(reason, "无法记录检查状态。")); }
+    finally { if (mounted.current) setBusy(null); }
+  }
+
   async function runNode() {
     if (!workspace || !selectedShot || !selectedNode || busy || dirty) return;
     setBusy("run"); setError("");
@@ -197,6 +294,13 @@ export function PreproductionWorkspace({ project, tools }: Props) {
     finally { if (mounted.current) setBusy(null); }
   }
 
+  useEffect(() => {
+    if (section !== "tools" || !toolTarget) return;
+    const target = document.getElementById(toolTarget);
+    if (target) { target.tabIndex = -1; target.focus(); target.scrollIntoView?.({ block: "start" }); }
+    setToolTarget(null);
+  }, [section, toolTarget]);
+
   const visibleAssets = useMemo(() => workspace?.assets.filter((asset) => roleFilter === "all" || asset.role === roleFilter) ?? [], [roleFilter, workspace]);
   const canRun = Boolean(selectedNode && !dirty && !busy && !hasActiveNodes && selectedInputReady);
 
@@ -211,16 +315,22 @@ export function PreproductionWorkspace({ project, tools }: Props) {
         <button type="button" className="secondary-action" disabled={!dirty || Boolean(busy) || hasActiveNodes} onClick={() => void save()}><Save size={16} aria-hidden="true" />{busy === "save" ? "正在保存…" : "保存更改"}</button>
       </div>
     </header>
+    {draftNotice && <p className="preproduction-draft-notice" role="status">{draftNotice}</p>}
     {error && <div className="preproduction-error" role="alert"><CircleAlert size={17} aria-hidden="true" /><span>{error}</span><button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void reloadSavedWorkspace()}>{dirty ? "放弃修改并重新读取" : "重新读取已保存版本"}</button></div>}
 
+    {(!studioMode || sectionOverride === "shots") && <ReproductionFlow project={project} workspace={savedWorkspace ?? workspace} disabled={Boolean(busy) || hasActiveNodes} dirty={dirty} timelineDirty={timelineDirty} draftInputKind={workspace.brief.inputKind} onImportShots={() => { setSection("shots"); void importAction("shots"); }}
+      onKindChange={(inputKind) => edit((current) => ({ ...current, brief: { ...current.brief, inputKind } }))}
+      onNavigate={(next, target) => { setSection(next); setToolTarget(target ?? null); }}
+      onLocateCheck={(check) => { setSelectedShotId(check.shotId ?? null); setSelectedNodeId(check.nodeId ?? null); setSection(check.shotId ? "shots" : check.code === "brief_incomplete" ? "brief" : "shots"); }}
+      onFocusClip={(trackId, clipId) => { setTimelineFocus({ trackId, clipId }); setSection("timeline"); }} />}
     <div className="preproduction-layout">
-      <nav className="preproduction-nav" aria-label="工作台导航">
-        {([ ["brief", "需求"], ["assets", "素材"], ["shots", "镜头"], ["tools", "工具"], ["timeline", "剪辑"], ["delivery", "交付"] ] as const).map(([id, label]) => <button type="button" key={id} className={section === id ? "is-active" : ""} onClick={() => setSection(id)}>{label}</button>)}
-      </nav>
+      {(!studioMode || sectionOverride === "shots") && <nav className="preproduction-nav" aria-label="工作台导航">
+        {([ ["brief", "需求"], ["assets", "素材"], ["shots", "镜头"], ["tools", "工具"], ["timeline", "剪辑"], ["batch", "批量混剪"], ["delivery", "交付"] ] as const).map(([id, label]) => <button type="button" key={id} aria-current={section === id ? "page" : undefined} className={section === id ? "is-active" : ""} onClick={() => setSection(id)}>{label}</button>)}
+      </nav>}
 
-      <fieldset className="preproduction-interactions" disabled={Boolean(busy) || (hasActiveNodes && section !== "tools" && section !== "timeline")}>
+      <fieldset className="preproduction-interactions" disabled={Boolean(busy) || (hasActiveNodes && section !== "tools" && section !== "timeline" && section !== "batch")}>
       <div className="preproduction-main">
-        {section === "brief" && <section className="preproduction-panel" aria-labelledby="preproduction-brief-title">
+        {section === "brief" && <section className="preproduction-panel preproduction-native-form" aria-labelledby="preproduction-brief-title">
           <h3 id="preproduction-brief-title">创作需求</h3>
           <div className="preproduction-form-grid">
             {([ ["theme", "主题"], ["purpose", "用途"], ["style", "风格"], ["aspect", "画幅"], ["mustPreserve", "必须保留"] ] as const).map(([key, label]) => <label key={key}>{label}<input value={workspace.brief[key]} onChange={(event) => edit((current) => ({ ...current, brief: { ...current.brief, [key]: event.target.value } }))} /></label>)}
@@ -228,27 +338,50 @@ export function PreproductionWorkspace({ project, tools }: Props) {
           </div>
         </section>}
 
-        {section === "assets" && <section className="preproduction-panel" aria-labelledby="preproduction-assets-title">
+        {section === "assets" && <section className="preproduction-panel preproduction-native-form" aria-labelledby="preproduction-assets-title">
           <div className="preproduction-panel-heading"><div><h3 id="preproduction-assets-title">素材库</h3><p>上传后按用途标记，镜头可以绑定多份素材。</p></div><div className="preproduction-import-actions"><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("reference")}>导入参考素材</button><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("shots")}>导入已有分镜</button><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("toolkit")}>导入工具产物</button></div></div>
-          <div className="preproduction-upload"><label>标记为<select value={uploadRole} onChange={(event) => setUploadRole(event.target.value as AssetRole)}>{Object.entries(roleLabels).map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label><label className="secondary-action"><Upload size={16} aria-hidden="true" />{busy === "upload" ? "正在上传…" : "上传素材"}<input aria-label="上传素材文件" hidden type="file" accept="image/*,video/*,audio/*" disabled={Boolean(busy) || dirty} onChange={upload} /></label></div>
-          <div className="preproduction-filters" aria-label="素材标签筛选"><button type="button" className={roleFilter === "all" ? "is-active" : ""} onClick={() => setRoleFilter("all")}>全部</button>{(Object.entries(roleLabels) as Array<[AssetRole, string]>).map(([role, label]) => <button type="button" key={role} className={roleFilter === role ? "is-active" : ""} onClick={() => setRoleFilter(role)}>{label}</button>)}</div>
-          {visibleAssets.length ? <ul className="preproduction-assets">{visibleAssets.map((asset) => <li key={asset.id}><span className="preproduction-asset-kind">{asset.kind}</span><div className="preproduction-asset-info"><strong>{asset.name}</strong><span className="preproduction-asset-role">{roleLabels[asset.role]}</span>{asset.width && asset.height ? <small>{asset.width}×{asset.height}</small> : null}<a className="preproduction-asset-download" href={asset.url} download>下载{asset.name}</a><details className="preproduction-asset-preview"><summary>预览</summary>{asset.kind === "image" ? <img src={asset.url} alt={`${asset.name} 预览`} /> : asset.kind === "video" ? <video controls preload="metadata" aria-label={`${asset.name} 预览`} src={asset.url} /> : <audio controls preload="metadata" aria-label={`${asset.name} 预览`} src={asset.url} />}</details></div></li>)}</ul> : <p className="preproduction-empty">还没有匹配的素材。上传素材，或从已有参考和工具结果导入。</p>}
+          <div className="preproduction-upload"><label>标记为<select value={uploadRole} onChange={(event) => setUploadRole(event.target.value as AssetRole)}>{Object.entries(roleLabels).map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label><button type="button" className="secondary-action" disabled={Boolean(busy) || dirty} onClick={() => uploadInputRef.current?.click()}><Upload size={16} aria-hidden="true" />{busy === "upload" ? "正在上传…" : "上传素材"}</button><input ref={uploadInputRef} aria-label="上传素材文件" hidden type="file" accept="image/*,video/*,audio/*" disabled={Boolean(busy) || dirty} onChange={upload} /></div>
+          <div className="preproduction-filters" role="group" aria-label="素材标签筛选"><button type="button" aria-pressed={roleFilter === "all"} className={roleFilter === "all" ? "is-active" : ""} onClick={() => setRoleFilter("all")}>全部</button>{(Object.entries(roleLabels) as Array<[AssetRole, string]>).map(([role, label]) => <button type="button" key={role} aria-pressed={roleFilter === role} className={roleFilter === role ? "is-active" : ""} onClick={() => setRoleFilter(role)}>{label}</button>)}</div>
+          {visibleAssets.length ? <ul className="preproduction-assets">{visibleAssets.map((asset) => <li key={asset.id}><span className="preproduction-asset-kind">{asset.kind}</span><div className="preproduction-asset-info"><strong>{asset.name}</strong>{asset.notes && <p>{asset.notes}</p>}<button type="button" className="secondary-action" aria-label={`管理素材 ${asset.name}`} onClick={() => setManagedAssetId(asset.id)}>管理素材</button><span className="preproduction-asset-role">{roleLabels[asset.role]}</span>{asset.width && asset.height ? <small>{asset.width}×{asset.height}</small> : null}<a className="preproduction-asset-download" href={asset.url} download>下载{asset.name}</a><details className={`preproduction-asset-preview ${studioMode ? "studio-asset-preview" : ""}`} open={studioMode || undefined}><summary>预览</summary>{asset.kind === "image" ? <img src={asset.url} alt={`${asset.name} 预览`} /> : asset.kind === "video" ? <video controls preload="metadata" aria-label={`${asset.name} 预览`} src={asset.url} /> : <audio controls preload="metadata" aria-label={`${asset.name} 预览`} src={asset.url} />}</details></div></li>)}</ul> : <p className="preproduction-empty">还没有匹配的素材。上传素材，或从已有参考和工具结果导入。</p>}
+          {workspace.assets.find((asset) => asset.id === managedAssetId) && (() => {
+            const asset = workspace.assets.find((item) => item.id === managedAssetId)!;
+            return <AssetManager key={`${project.id}:${asset.id}`} projectId={project.id} asset={asset} revision={workspace.revision}
+              blocked={dirty || Boolean(busy) || hasActiveNodes} onBusy={(active) => setBusy(active ? "asset" : null)}
+              onChanged={(next) => accept(next, editableSnapshot(workspace))} />;
+          })()}
         </section>}
 
-        {section === "shots" && <section className="preproduction-shot-editor" aria-label="镜头编辑器">
+        {section === "shots" && <section className="preproduction-shot-editor preproduction-native-form" aria-label="镜头编辑器">
           <aside className="preproduction-shot-list"><div className="preproduction-list-heading"><h3>镜头表</h3><button type="button" aria-label="新建镜头" className="icon-action" onClick={() => { const shot = createShot(); edit((current) => ({ ...current, shots: [...current.shots, shot] })); setSelectedShotId(shot.id); setSelectedNodeId(null); }}><Plus size={17} /></button></div>{workspace.shots.map((shot, index) => <div key={shot.id} className={shot.id === selectedShot?.id ? "preproduction-shot-row is-active" : "preproduction-shot-row"}><button type="button" onClick={() => { setSelectedShotId(shot.id); setSelectedNodeId(shot.nodes[0]?.id ?? null); }}><span>{index + 1}</span>{shot.title}<small>{shot.duration} 秒</small></button><div><button type="button" aria-label={`上移${shot.title}`} disabled={index === 0} onClick={() => edit((current) => { const shots = [...current.shots]; [shots[index - 1], shots[index]] = [shots[index], shots[index - 1]]; return { ...current, shots }; })}>↑</button><button type="button" aria-label={`下移${shot.title}`} disabled={index === workspace.shots.length - 1} onClick={() => edit((current) => { const shots = [...current.shots]; [shots[index + 1], shots[index]] = [shots[index], shots[index + 1]]; return { ...current, shots }; })}>↓</button></div></div>)}</aside>
           <div className="preproduction-editor">{selectedShot ? <><div className="preproduction-editor-heading"><label>镜头名称<input value={selectedShot.title} onChange={(event) => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, title: event.target.value })))} /></label><label>时长（秒）<input type="number" min="0.1" step="0.1" value={selectedShot.duration} onChange={(event) => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, duration: Number(event.target.value) })))} /></label><button type="button" aria-label="删除当前镜头" className="icon-action" onClick={() => edit((current) => ({ ...current, shots: current.shots.filter((shot) => shot.id !== selectedShot.id) }))}><Trash2 size={17} /></button></div>
             <label className="preproduction-full-field">画面提示词<textarea value={selectedShot.prompt} onChange={(event) => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, prompt: event.target.value })))} /></label><label className="preproduction-full-field">负面提示词<textarea value={selectedShot.negativePrompt} onChange={(event) => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, negativePrompt: event.target.value })))} /></label>
-            <div className="preproduction-bindings"><h4>绑定素材</h4>{workspace.assets.length ? workspace.assets.map((asset) => <button type="button" key={asset.id} className={selectedShot.assetIds.includes(asset.id) ? "is-bound" : ""} onClick={() => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, assetIds: shot.assetIds.includes(asset.id) ? shot.assetIds.filter((id) => id !== asset.id) : [...shot.assetIds, asset.id] })))}>{selectedShot.assetIds.includes(asset.id) ? "已绑定 " : "绑定 "}{asset.name}</button>) : <p>先在素材页添加素材。</p>}</div>
+            <div className="preproduction-bindings"><h4>绑定素材</h4>{workspace.assets.length ? workspace.assets.map((asset) => <button type="button" key={asset.id} aria-pressed={selectedShot.assetIds.includes(asset.id)} className={selectedShot.assetIds.includes(asset.id) ? "is-bound" : ""} onClick={() => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, assetIds: shot.assetIds.includes(asset.id) ? shot.assetIds.filter((id) => id !== asset.id) : [...shot.assetIds, asset.id] })))}>{selectedShot.assetIds.includes(asset.id) ? "已绑定 " : "绑定 "}{asset.name}</button>) : <p>先在素材页添加素材。</p>}</div>
+            <div className="preproduction-shot-result"><h4>本镜头生成结果</h4>
+              <p>上传新结果会保留旧候选并采用新视频；选择已有视频后保存也会记录候选。剪辑从采用视频起点取计划时长，切换候选不会替换已有剪辑。</p>
+              <label>结果视频<select value={selectedShot.resultAssetId ?? ""} onChange={(event) => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, resultAssetId: event.target.value || null })))}><option value="">尚未关联</option>{workspace.assets.filter((asset) => asset.kind === "video").map((asset) => <option key={asset.id} value={asset.id}>{asset.name} · {asset.duration ?? "未知"} 秒</option>)}</select></label>
+              <button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => resultInputRef.current?.click()}>上传本镜头结果</button>
+              <input ref={resultInputRef} type="file" accept="video/mp4,video/quicktime,video/webm" hidden aria-label="上传本镜头结果文件" onChange={(event) => void uploadResult(event)} />
+              {dirty && <p>先保存镜头方案，再上传结果。</p>}
+              {selectedShot.resultAssetId && (() => { const asset = workspace.assets.find((item) => item.id === selectedShot.resultAssetId); return asset ? <><a href={asset.url} target="_blank" rel="noreferrer">查看结果视频</a>{(!asset.duration || asset.duration < selectedShot.duration) && <p role="status">视频时长不足以覆盖镜头计划，暂不能按镜头导入剪辑。</p>}</> : <p role="alert">关联的视频不存在，请重新选择。</p>; })()}
+              <ShotResultVersions projectId={project.id} revision={workspace.revision} onBusy={(active) => setBusy(active ? "candidate-cleanup" : null)} onChanged={(next, action) => { accept(next, editableSnapshot(workspace)); setDraftNotice(action === "note" ? "候选备注已保存。" : action === "reason" ? "采用理由已保存。" : "候选已移出历史，素材文件仍保留。"); }} shot={selectedShot} assets={workspace.assets} dirty={dirty} busy={Boolean(busy) || hasActiveNodes}
+                onManage={(assetId) => { setManagedAssetId(assetId); setRoleFilter("all"); setSection("assets"); }}
+                onFocusStep={(nodeId) => { setSelectedNodeId(nodeId); setSection("shots"); }}
+                onFocusClip={(trackId, clipId) => { setTimelineFocus({ trackId, clipId }); setSection("timeline"); }}
+                onSelect={(assetId) => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, resultAssetId: assetId })))} onReview={(assetId) => void reviewResult(assetId)} />
+            </div>
             <div className="preproduction-nodes"><div className="preproduction-list-heading"><h4>有序步骤</h4><select aria-label="添加节点类型" defaultValue="" onChange={(event) => { const kind = event.target.value as NodeKind; if (!kind) return; const node = createNode(kind); edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, nodes: [...shot.nodes, node] }))); setSelectedNodeId(node.id); event.currentTarget.value = ""; }}><option value="">添加节点…</option>{workspace.nodeCatalog.map((node) => <option key={node.kind} value={node.kind}>{node.label}</option>)}</select></div>{selectedShot.nodes.length ? <ol>{selectedShot.nodes.map((node, index) => <li key={node.id} className={node.id === selectedNode?.id ? "is-active" : ""}><button type="button" onClick={() => setSelectedNodeId(node.id)}><span>{index + 1}</span>{kindLabels[node.kind]}<small className={`preproduction-status preproduction-status--${node.status}`}>{statusLabels[node.status]}</small></button></li>)}</ol> : <p>添加步骤以整理镜头输入和产物。</p>}</div>
           </> : <div className="preproduction-empty"><h3>从已有参考或分镜开始</h3><p>导入现有内容，或新建镜头来准备下一步。</p><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("reference")}>导入参考素材</button><button type="button" className="primary-action" onClick={() => { const shot = createShot(); edit((current) => ({ ...current, shots: [shot] })); setSelectedShotId(shot.id); }}>新建镜头</button></div>}</div>
           <aside className="preproduction-node-inspector">{selectedShot && selectedNode ? <><h3>步骤参数</h3><label>节点类型<select value={selectedNode.kind} onChange={(event) => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, nodes: shot.nodes.map((node) => node.id === selectedNode.id ? { ...node, kind: event.target.value as NodeKind, params: event.target.value === "prompt" ? { text: "" } : {}, status: "pending", artifacts: [] } : node) })))}>{workspace.nodeCatalog.map((node) => <option key={node.kind} value={node.kind}>{node.label}</option>)}</select></label>{selectedNode.kind !== "prompt" && <label>输入<select value={selectedNode.input} onChange={(event) => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, nodes: shot.nodes.map((node) => node.id === selectedNode.id ? { ...node, input: event.target.value, status: "pending", artifacts: [] } : node) })))}><InputOptions workspace={workspace} shot={selectedShot} nodeIndex={selectedShot.nodes.findIndex((node) => node.id === selectedNode.id)} /></select></label>}<NodeParameters node={selectedNode} onChange={(params) => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, nodes: shot.nodes.map((node) => node.id === selectedNode.id ? { ...node, params, status: "pending", artifacts: [] } : node) })))} />
             <p className={`preproduction-node-status preproduction-node-status--${selectedNode.status}`}>{statusLabels[selectedNode.status]}{selectedNode.error ? `：${selectedNode.error}` : ""}</p>{selectedNode.artifacts.map((artifact) => <a key={artifact.name} href={artifact.url} download>下载 {artifact.name}</a>)}{!selectedInputReady && <p className="preproduction-save-note">等待所选前序节点完成后才能运行。</p>}<button type="button" className="primary-action" disabled={!canRun} onClick={() => void runNode()}><Play size={16} aria-hidden="true" />{busy === "run" ? "正在提交…" : "运行当前节点"}</button><button type="button" className="icon-action" aria-label="删除当前节点" onClick={deleteSelectedNode}><Trash2 size={17} /></button>{dirty && <p className="preproduction-save-note">先保存更改，才能运行或导出。</p>}</> : <p className="preproduction-empty">选择一个步骤后编辑参数。</p>}</aside>
+          {selectedShot && <CandidateResultComparison shot={selectedShot} assets={workspace.assets} disabled={Boolean(busy) || hasActiveNodes} />}
+          {selectedShot && <ShotResultComparison shot={selectedShot} assets={workspace.assets} disabled={Boolean(busy) || hasActiveNodes} />}
         </section>}
 
         {section === "tools" && <section className="preproduction-panel" aria-labelledby="preproduction-tools-title"><h3 id="preproduction-tools-title">现有工具</h3><p>这些工具沿用原有面板；完成后可在素材页导入其产物并绑定镜头。</p>{tools}</section>}
 
-        {section === "timeline" && <TimelineEditor projectId={project.id} />}
+        {(section === "timeline" || timelineOpened) && <div hidden={section !== "timeline"}><TimelineEditor onDraftChange={setTimelineDirty} focusClip={timelineFocus} projectId={project.id} preproductionRevision={workspace.revision} preparationDirty={dirty} shotResults={workspace.shots} /></div>}
+
+        {(section === "batch" || batchOpened) && <div hidden={section !== "batch"}><BatchEditor projectId={project.id} onDraftChange={setBatchDirty} /></div>}
 
         {section === "delivery" && <section className="preproduction-panel" aria-labelledby="preproduction-delivery-title">
           <div className="preproduction-panel-heading">

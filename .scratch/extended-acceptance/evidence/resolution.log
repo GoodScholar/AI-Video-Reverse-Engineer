@@ -1,0 +1,2 @@
+{"elapsedSeconds": 4.81, "probe": {"programs": [], "stream_groups": [], "streams": [{"codec_type": "video", "width": 1080, "height": 1920}, {"codec_type": "audio"}], "format": {"duration": "14.500000", "size": "5201438"}}}
+RESTART_AND_LIMIT_CHECK_PASSED

@@ -1,0 +1,92 @@
+{
+  "directory": "/var/folders/jk/nlrws6j16tv20qd4p5ctf6700000gn/T/aivre-real-models-cvbcb69y",
+  "input": "2-second 160x284 8fps excerpt of user cat video",
+  "results": {
+    "person-cat-negative": {
+      "status": "executed",
+      "seconds": 1.69,
+      "result": {
+        "quality": {
+          "status": "review_required",
+          "frameCount": 16,
+          "detectedFrameCount": 3,
+          "missingTimesSeconds": [
+            0.375,
+            0.5,
+            0.625,
+            0.75,
+            0.875,
+            1.0,
+            1.125,
+            1.25,
+            1.375,
+            1.5,
+            1.625,
+            1.75,
+            1.875
+          ],
+          "multiplePersonTimesSeconds": [],
+          "lowConfidenceTimesSeconds": [],
+          "invalidLandmarkTimesSeconds": [],
+          "unusableMaskTimesSeconds": [],
+          "message": "检测到缺失、多人或不可靠姿态/遮罩帧，需要人工检查。"
+        },
+        "files": [
+          "overlay.mp4",
+          "landmarks.jsonl",
+          "mask.mp4",
+          "quality.json",
+          "worker.log",
+          "metadata.json",
+          "pose.mp4"
+        ]
+      }
+    },
+    "depth-480p": {
+      "status": "executed",
+      "seconds": 12.44,
+      "result": {
+        "directory": "/private/var/folders/jk/nlrws6j16tv20qd4p5ctf6700000gn/T/aivre-real-models-cvbcb69y/data/project-files/acceptance/depth-captures/depth-480p",
+        "executionDevice": "cpu",
+        "frameCount": 16,
+        "width": 480,
+        "height": 854,
+        "frameRate": 8.0,
+        "qualityAssessment": "status='passed' checks=[DepthQualityCheck(criterion='completeness', status='passed', message='深度张量尺寸与编码时长完整。', evidence='张量长度精确匹配，时长误差不超过一帧。', metric=0.0, threshold=1.0, sampleTimestamps=[]), DepthQualityCheck(criterion='dynamicRange', status='passed', message='深度动态范围足够。', evidence='整段有界均匀样本 P2=0.000000，P98=0.996471。', metric=0.9964705882352938, threshold=0.08, sampleTimestamps=[]), DepthQualityCheck(criterion='temporalFlicker', status='passed', message='深度帧间变化与来源运动一致。', evidence='最大帧间深度变化/运动幅度比，分母下限=0.01。', metric=1.4814876111933633, threshold=3.0, sampleTimestamps=[0.375]), DepthQualityCheck(criterion='directionStability', status='passed', message='相邻深度帧方向稳定。', evidence='采样相邻帧 Pearson 相关系数；退化帧按 0.0 处理。', metric=0.7837939338808813, threshold=-0.65, sampleTimestamps=[0.375]), DepthQualityCheck(criterion='edgeContinuity', status='passed', message='深度边缘连续。', evidence='V1 相邻像素深度差阈值=0.25；统计有界水平和垂直邻居。', metric=0.001968503937007874, threshold=0.2, sampleTimestamps=[1.75]), DepthQualityCheck(criterion='timelineAlignment', status='passed', message='来源运动时间线与深度帧对齐。', evidence='每个转换样本均在一个输出帧间隔内。', metric=0.0, threshold=1.0, sampleTimestamps=[])] thresholdVersion=1"
+      }
+    },
+    "depth-720p": {
+      "status": "executed",
+      "seconds": 26.83,
+      "result": {
+        "directory": "/private/var/folders/jk/nlrws6j16tv20qd4p5ctf6700000gn/T/aivre-real-models-cvbcb69y/data/project-files/acceptance/depth-captures/depth-720p",
+        "executionDevice": "cpu",
+        "frameCount": 16,
+        "width": 720,
+        "height": 1276,
+        "frameRate": 8.0,
+        "qualityAssessment": "status='passed' checks=[DepthQualityCheck(criterion='completeness', status='passed', message='深度张量尺寸与编码时长完整。', evidence='张量长度精确匹配，时长误差不超过一帧。', metric=0.0, threshold=1.0, sampleTimestamps=[]), DepthQualityCheck(criterion='dynamicRange', status='passed', message='深度动态范围足够。', evidence='整段有界均匀样本 P2=0.000000，P98=1.000000。', metric=1.0, threshold=0.08, sampleTimestamps=[]), DepthQualityCheck(criterion='temporalFlicker', status='passed', message='深度帧间变化与来源运动一致。', evidence='最大帧间深度变化/运动幅度比，分母下限=0.01。', metric=1.8622182533601783, threshold=3.0, sampleTimestamps=[0.25]), DepthQualityCheck(criterion='directionStability', status='passed', message='相邻深度帧方向稳定。', evidence='采样相邻帧 Pearson 相关系数；退化帧按 0.0 处理。', metric=0.7797843721613376, threshold=-0.65, sampleTimestamps=[0.625]), DepthQualityCheck(criterion='edgeContinuity', status='passed', message='深度边缘连续。', evidence='V1 相邻像素深度差阈值=0.25；统计有界水平和垂直邻居。', metric=0.0009784735812133072, threshold=0.2, sampleTimestamps=[0.375, 1.25]), DepthQualityCheck(criterion='timelineAlignment', status='passed', message='来源运动时间线与深度帧对齐。', evidence='每个转换样本均在一个输出帧间隔内。', metric=0.0, threshold=1.0, sampleTimestamps=[])] thresholdVersion=1"
+      }
+    },
+    "upscale-1080p": {
+      "status": "executed",
+      "seconds": 18.1,
+      "result": {
+        "width": 1080,
+        "height": 1918,
+        "frameRate": 8.0,
+        "durationSeconds": 2.0
+      }
+    },
+    "upscale-2k": {
+      "status": "executed",
+      "seconds": 16.84,
+      "result": {
+        "width": 1440,
+        "height": 2556,
+        "frameRate": 8.0,
+        "durationSeconds": 2.0
+      }
+    }
+  }
+}

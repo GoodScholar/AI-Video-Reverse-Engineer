@@ -34,7 +34,178 @@ function deferred<T>() {
 }
 
 describe("PreproductionWorkspace", () => {
-  beforeEach(() => vi.stubGlobal("fetch", vi.fn()));
+  beforeEach(() => { sessionStorage.clear(); localStorage.clear(); vi.stubGlobal("fetch", vi.fn()); vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined); });
+
+  it("正式全站导航能直接打开素材与工具，切换时保留未保存需求", async () => {
+    vi.mocked(fetch).mockResolvedValue(response(workspace()));
+    const view = render(<PreproductionWorkspace project={project} tools={<p>真实项目工具</p>} sectionOverride="brief" studioMode />);
+    await userEvent.clear(await screen.findByLabelText("主题"));
+    await userEvent.type(screen.getByLabelText("主题"), "保留的草稿");
+    view.rerender(<PreproductionWorkspace project={project} tools={<p>真实项目工具</p>} sectionOverride="assets" studioMode />);
+    expect(await screen.findByRole("heading", { name: "素材库" })).toBeVisible();
+    expect(screen.queryByRole("navigation", { name: "工作台导航" })).not.toBeInTheDocument();
+    view.rerender(<PreproductionWorkspace project={project} tools={<p>真实项目工具</p>} sectionOverride="brief" studioMode />);
+    expect(await screen.findByLabelText("主题")).toHaveValue("保留的草稿");
+  });
+
+  it("网络图片导入同步素材并保留未保存需求，后续保存使用新版本", async () => {
+    const current = workspace();
+    const imported = workspace({revision:4,assets:[...current.assets,{id:"web-image",name:"商品正面",kind:"image",role:"reference",url:"/web.png"}]});
+    vi.mocked(fetch).mockResolvedValueOnce(response(current))
+      .mockImplementationOnce(async (_url,init)=>response({...imported,...JSON.parse(String(init?.body)),revision:5}));
+    const onAssetsChanged=vi.fn();
+    const view=render(<PreproductionWorkspace project={project} tools={null} sectionOverride="brief" studioMode onAssetsChanged={onAssetsChanged} />);
+    await userEvent.clear(await screen.findByLabelText("主题"));
+    await userEvent.type(screen.getByLabelText("主题"),"保留本地需求");
+    view.rerender(<PreproductionWorkspace project={project} tools={null} sectionOverride="brief" studioMode onAssetsChanged={onAssetsChanged} importedWorkspace={{projectId:project.id,workspace:imported}} />);
+    await waitFor(()=>expect(onAssetsChanged).toHaveBeenLastCalledWith(imported.assets));
+    expect(screen.getByLabelText("主题")).toHaveValue("保留本地需求");
+    await userEvent.click(screen.getByRole("button",{name:"保存更改"}));
+    const saved=JSON.parse(String(vi.mocked(fetch).mock.calls[1][1]?.body));
+    expect(saved.revision).toBe(4);expect(saved.brief.theme).toBe("保留本地需求");
+  });
+
+  it("迟到的旧保存响应不会覆盖新导入图片和版本", async () => {
+    const pending=deferred<Response>();
+    const current=workspace();
+    vi.mocked(fetch).mockResolvedValueOnce(response(current)).mockReturnValueOnce(pending.promise);
+    const onAssetsChanged=vi.fn();
+    const view=render(<PreproductionWorkspace project={project} tools={null} sectionOverride="brief" studioMode onAssetsChanged={onAssetsChanged} />);
+    await userEvent.clear(await screen.findByLabelText("主题"));
+    await userEvent.type(screen.getByLabelText("主题"),"已保存新需求");
+    await userEvent.click(screen.getByRole("button",{name:"保存更改"}));
+    const saved=workspace({revision:4,brief:{...current.brief,theme:"已保存新需求"}});
+    const imported={...saved,revision:5,assets:[...saved.assets,{id:"web-image",name:"商品正面",kind:"image" as const,role:"reference" as const,url:"/web.png"}]};
+    view.rerender(<PreproductionWorkspace project={project} tools={null} sectionOverride="brief" studioMode onAssetsChanged={onAssetsChanged} importedWorkspace={{projectId:project.id,workspace:imported}} />);
+    await waitFor(()=>expect(onAssetsChanged).toHaveBeenLastCalledWith(imported.assets));
+    await act(async()=>pending.resolve(response(saved)));
+    await waitFor(()=>expect(onAssetsChanged).toHaveBeenLastCalledWith(imported.assets));
+    expect(screen.getByLabelText("主题")).toHaveValue("已保存新需求");
+  });
+
+  it("从现有工作台进入批量混剪任务", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(response(workspace()));
+    vi.mocked(fetch).mockResolvedValueOnce(response({ tasks: [], assets: [] }));
+    render(<PreproductionWorkspace project={project} tools={<p>工具</p>} />);
+    await userEvent.click(await screen.findByRole("button", { name: "批量混剪" }));
+    expect(screen.getByRole("heading", { name: "批量混剪" })).toBeVisible();
+  });
+
+  it("切换工作台页面时保留未保存的混剪片段编辑", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(response(workspace()));
+    vi.mocked(fetch).mockResolvedValueOnce(response({ tasks: [{ id: "batch-a", sellingPoint: "省时", script: "操作演示",
+      variant: { id: "variant-a", revision: 0, settings: { width: 720, height: 1280, fps: 30 },
+        tracks: [{ id: "video", name: "画面", kind: "video", muted: false, hidden: false, clips: [] },
+          { id: "audio", name: "声音", kind: "audio", muted: false, hidden: false, clips: [] }], runs: [] },
+    }], assets: [{ id: "shot", name: "开场", kind: "video", duration: 4, url: "/shot.mp4" }] }));
+    const onDraftChange = vi.fn();
+    render(<PreproductionWorkspace project={project} tools={<p>工具</p>} onDraftChange={onDraftChange} />);
+    await userEvent.click(await screen.findByRole("button", { name: "批量混剪" }));
+    await userEvent.click(await screen.findByRole("button", { name: "编辑 省时" }));
+    await userEvent.click(screen.getByRole("button", { name: "添加素材 开场" }));
+    expect(onDraftChange).toHaveBeenLastCalledWith(project.id, true);
+    await userEvent.click(screen.getByRole("button", { name: "素材" }));
+    await userEvent.click(screen.getByRole("button", { name: "批量混剪" }));
+    expect(screen.getByLabelText("开场 入点（秒）")).toBeVisible();
+  });
+
+  it("离开后恢复未保存镜头，并保留原版本以防覆盖新版本", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(response(workspace()));
+    const first = render(<PreproductionWorkspace project={project} tools={<p>工具</p>} />);
+    fireEvent.change(await screen.findByLabelText("镜头名称"), { target: { value: "未保存镜头" } });
+    first.unmount(); sessionStorage.clear();
+    vi.mocked(fetch).mockResolvedValueOnce(response(workspace({ revision: 4 })));
+    render(<PreproductionWorkspace project={project} tools={<p>工具</p>} />);
+    expect(await screen.findByDisplayValue("未保存镜头")).toBeVisible();
+    expect(screen.getByText(/已保存版本已更新/)).toBeVisible();
+    vi.mocked(fetch).mockResolvedValueOnce(response({ detail: "版本冲突" }, 409));
+    await userEvent.click(screen.getByRole("button", { name: "保存更改" }));
+    const body = JSON.parse(vi.mocked(fetch).mock.calls[2][1]?.body as string);
+    expect(body.revision).toBe(3);
+    expect(body.shots[0].title).toBe("未保存镜头");
+  });
+
+  it("恢复草稿按项目隔离，保存成功后清除缓存", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(response(workspace()));
+    const first = render(<PreproductionWorkspace project={project} tools={<p>工具</p>} />);
+    fireEvent.change(await screen.findByLabelText("镜头名称"), { target: { value: "我的草稿" } });
+    first.unmount();
+    vi.mocked(fetch).mockResolvedValueOnce(response(workspace()));
+    const other = render(<PreproductionWorkspace project={{ ...project, id: "other" }} tools={<p>工具</p>} />);
+    expect(await screen.findByLabelText("镜头名称")).toHaveValue("镜头一");
+    other.unmount();
+    vi.mocked(fetch).mockResolvedValueOnce(response(workspace()));
+    render(<PreproductionWorkspace project={project} tools={<p>工具</p>} />);
+    expect(await screen.findByLabelText("镜头名称")).toHaveValue("我的草稿");
+    vi.mocked(fetch).mockResolvedValueOnce(response(workspace({ revision: 4, shots: [{ ...workspace().shots[0], title: "我的草稿" }] })));
+    await userEvent.click(screen.getByRole("button", { name: "保存更改" }));
+    expect(sessionStorage.getItem("aivre:preproduction-draft:project-001")).toBeNull();
+  });
+
+  it("上传按钮支持键盘触发，导航和筛选暴露选中状态", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(response(workspace()));
+    render(<PreproductionWorkspace project={project} tools={<p>工具</p>} />);
+    await screen.findByLabelText("镜头名称");
+    await userEvent.click(screen.getByRole("button", { name: "素材" }));
+    expect(screen.getByRole("button", { name: "素材" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("button", { name: "全部" })).toHaveAttribute("aria-pressed", "true");
+    const inputClick = vi.spyOn(screen.getByLabelText("上传素材文件"), "click");
+    screen.getByRole("button", { name: "上传素材" }).focus();
+    await userEvent.keyboard("{Enter}");
+    expect(inputClick).toHaveBeenCalledOnce();
+  });
+
+  it("保存三类输入选择，深度入口复用已有素材且白模显示渲染说明", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(response(workspace()));
+    render(<PreproductionWorkspace project={project} tools={<h2 id="reference-media-title">参考素材工具</h2>} />);
+    await userEvent.click(await screen.findByRole("radio", { name: "灰度深度视频" }));
+    expect(screen.getByText(/无需再次估计深度/)).toBeVisible();
+    vi.mocked(fetch).mockResolvedValueOnce(response(workspace({ revision: 4, brief: { ...workspace().brief, inputKind: "depth_video" } })));
+    await userEvent.click(screen.getByRole("button", { name: "保存更改" }));
+    expect(JSON.parse(vi.mocked(fetch).mock.calls[1][1]?.body as string).brief.inputKind).toBe("depth_video");
+    await userEvent.click(screen.getByRole("button", { name: "导入并绑定深度素材" }));
+    expect(screen.getByRole("button", { name: "素材" })).toHaveAttribute("aria-current", "page");
+    await userEvent.click(screen.getByRole("radio", { name: "三维白模渲染视频" }));
+    expect(screen.getByText(/这里不接收三维工程文件/)).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "上传或查看源视频" }));
+    expect(screen.getByText("参考素材工具")).toHaveFocus();
+  });
+
+  it("将上传视频关联到指定镜头并携带方案版本，草稿未保存时禁用上传", async () => {
+    const initial = workspace({ shots: [{ ...workspace().shots[0], nodes: [] }] });
+    vi.mocked(fetch).mockResolvedValueOnce(response(initial));
+    render(<PreproductionWorkspace project={project} tools={<p>工具</p>} />);
+    await screen.findByLabelText("镜头名称");
+    const result = { id: "generated", name: "结果.mp4", kind: "video" as const, role: "motion" as const, url: "/result.mp4", duration: 4 };
+    vi.mocked(fetch).mockResolvedValueOnce(response({ ...initial, revision: 4, assets: [...initial.assets, result], shots: [{ ...initial.shots[0], resultAssetId: "generated" }] }));
+    fireEvent.change(screen.getByLabelText("上传本镜头结果文件"), { target: { files: [new File(["video"], "结果.mp4", { type: "video/mp4" })] } });
+    expect(await screen.findByRole("link", { name: "查看结果视频" })).toHaveAttribute("href", "/result.mp4");
+    expect(vi.mocked(fetch).mock.calls[1][0]).toContain("resultForShot=shot-001&revision=3");
+    expect(screen.getByText(/已回传 1 \/ 1.*时长合格 1.*已人工复核 0/)).toBeVisible();
+    fireEvent.change(screen.getByLabelText("镜头名称"), { target: { value: "更改" } });
+    expect(screen.getByRole("button", { name: "上传本镜头结果" })).toBeDisabled();
+  });
+
+  it("候选检查提交当前版本，切换采用后仍需保存方案", async () => {
+    const versions = [{ assetId: "v1", reviewed: false, planChanged: false }, { assetId: "v2", reviewed: false, planChanged: true }];
+    const initial = workspace({ assets: ["v1", "v2"].map((id) => ({ id, name: id + ".mp4", kind: "video", role: "motion", duration: 3, url: "/" + id })), shots: [{ ...workspace().shots[0], nodes: [], resultAssetId: "v2", resultVersions: versions }] });
+    vi.mocked(fetch).mockResolvedValueOnce(response(initial));
+    render(<PreproductionWorkspace project={project} tools={<p>工具</p>} />);
+    const reviewed = { ...initial, revision: 4, shots: [{ ...initial.shots[0], resultVersions: [versions[0], { ...versions[1], reviewed: true, planChanged: false }] }] };
+    vi.mocked(fetch).mockResolvedValueOnce(response(reviewed));
+    await userEvent.click(await screen.findByRole("button", { name: "确认已检查候选 2" }));
+    expect(await screen.findByText("已按当前方案人工检查")).toBeVisible();
+    expect(vi.mocked(fetch).mock.calls[1][0]).toContain("/shots/shot-001/results/v2/review");
+    expect(JSON.parse(vi.mocked(fetch).mock.calls[1][1]?.body as string)).toEqual({ revision: 3 });
+    await userEvent.click(screen.getByRole("button", { name: "采用候选 1" }));
+    expect(screen.getByRole("button", { name: "确认已检查候选 1" })).toBeDisabled();
+    vi.mocked(fetch).mockResolvedValueOnce(response({ ...reviewed, revision: 5, shots: [{ ...reviewed.shots[0], resultAssetId: "v1" }] }));
+    await userEvent.click(screen.getByRole("button", { name: "保存更改" }));
+    const body = JSON.parse(vi.mocked(fetch).mock.calls[2][1]?.body as string);
+    expect(body.revision).toBe(4);
+    expect(body.shots[0].resultAssetId).toBe("v1");
+    expect(screen.getByText("候选版本 · 2")).toBeVisible();
+  });
 
   it("初始空态提供导入和创建镜头入口", async () => {
     vi.mocked(fetch).mockResolvedValueOnce(response(workspace({ assets: [], shots: [] })));
@@ -242,4 +413,16 @@ describe("PreproductionWorkspace", () => {
     expect(screen.getByLabelText("主题")).toHaveValue("雨夜");
   });
 
+});
+
+it("正式素材页直接展示图片、视频与音频核对控件", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(workspace({ assets: [
+    { id: "image", name: "商品图片", kind: "image", role: "reference", url: "/product.png" },
+    { id: "video", name: "商品视频", kind: "video", role: "reference", url: "/product.mp4" },
+    { id: "audio", name: "商品配音", kind: "audio", role: "audio", url: "/voice.wav" },
+  ] }))));
+  render(<PreproductionWorkspace project={project} tools={null} sectionOverride="assets" studioMode />);
+  expect(await screen.findByAltText("商品图片 预览")).toBeVisible();
+  expect(screen.getByLabelText("商品视频 预览")).toBeVisible();
+  expect(screen.getByLabelText("商品配音 预览")).toBeVisible();
 });

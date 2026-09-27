@@ -56,6 +56,24 @@ def test_plan_generates_edits_exports_and_becomes_stale(tmp_path):
     assert client.get(BASE).json()['prompts']['positiveEn']=='A person walking'
 
 
+def test_package_contains_reference_fitted_to_selected_canvas(tmp_path):
+    client,_=setup(tmp_path)
+    source=tmp_path/'project-files/project-1/local-preprocessing/pre-1/normalized.png'
+    Image.new('RGB',(100,100),(0,255,0)).save(source)
+    state=client.post(BASE+'/prompts',json={'revision':0,'disclosureAccepted':True}).json()
+    state['settings'].update({'aspectMode':'16:9','width':1024,'height':576})
+    saved=client.put(BASE,json={key:state[key] for key in ['revision','prompts','settings','comfyUrl']})
+    assert saved.status_code==200,saved.text
+
+    package=client.get(BASE+'/package')
+    assert package.status_code==200,package.text
+    with zipfile.ZipFile(io.BytesIO(package.content)) as archive:
+        with Image.open(io.BytesIO(archive.read('input/reference.png'))) as reference:
+            assert reference.size==(1024,576)
+            assert reference.getpixel((0,288))==(0,0,0)
+            assert reference.getpixel((512,288))==(0,255,0)
+
+
 def test_revision_conflict_does_not_overwrite_edits(tmp_path):
     client,_=setup(tmp_path)
     state=client.post(BASE+'/prompts',json={'revision':0,'disclosureAccepted':True}).json()
@@ -268,6 +286,8 @@ def test_depth_package_contains_time_matched_control_video(tmp_path):
     client,p=setup(tmp_path)
     p.referenceMedia.type='video'
     p.referenceMedia.durationSeconds=2.0
+    p.referenceMedia.width=640
+    p.referenceMedia.height=360
     pre=tmp_path/'project-files/project-1/local-preprocessing/pre-1'
     (pre/'keyframes').mkdir()
     Image.new('RGB',(64,64)).save(pre/'keyframes/frame-0001.jpg')
@@ -288,5 +308,10 @@ def test_depth_package_contains_time_matched_control_video(tmp_path):
     probed=subprocess.run(['ffprobe','-v','error','-show_streams','-of','json',str(target)],
         check=True,capture_output=True,text=True)
     stream=json.loads(probed.stdout)['streams'][0]
+    assert (int(stream['width']),int(stream['height']))==(848,480)
     assert int(stream['nb_frames'])==81
     assert stream['r_frame_rate']=='16/1'
+    frame=subprocess.check_output(['ffmpeg','-v','error','-i',str(target),'-frames:v','1',
+        '-f','rawvideo','-pix_fmt','gray','-'])
+    assert frame[240*848] < 20
+    assert 80 < frame[240*848+424] < 180

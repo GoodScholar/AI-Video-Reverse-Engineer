@@ -1,0 +1,13 @@
+.shot-comparison { display: grid; gap: 12px; border-top: 1px solid #c7c6bc; padding-top: 16px; min-width: 0; }
+.shot-comparison h4, .shot-comparison p { margin: 0; }
+.shot-comparison p { font-size: 13px; line-height: 1.6; }
+.shot-comparison-videos { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 12px; }
+.shot-comparison-videos figure { margin: 0; min-width: 0; }
+.shot-comparison-videos video { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: contain; background: #202427; }
+.shot-comparison-videos figcaption { padding: 8px 0; font-size: 12px; overflow-wrap: anywhere; }
+.shot-comparison-range { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.shot-comparison-controls { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.preproduction-shot-editor > .shot-comparison { grid-column: 1 / -1; padding: 24px; }
+.shot-comparison input[type="range"] { accent-color: #9b462f; }
+@media (max-width: 600px) { .preproduction-shot-editor > .shot-comparison { padding: 16px; } }

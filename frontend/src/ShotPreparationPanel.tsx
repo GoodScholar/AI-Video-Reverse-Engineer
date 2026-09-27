@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { CircleAlert, Download, LoaderCircle, Play, Save, Sparkles } from "lucide-react";
 
-import type { Project } from "./models";
+import { promptConfigurationIssue } from "./promptAvailability";
+import type { AnalysisProviderConfiguration, Project } from "./models";
 import {
   applyToolkitTimeline,
   analyzePreparationShot,
@@ -22,7 +23,7 @@ import "./shotPreparation.css";
 const DESKTOP_QUERY = "(min-width: 1024px)";
 const noopMutationPendingChange = () => undefined;
 
-type Props = { project: Project; onMutationPendingChange?: (pending: boolean) => void };
+type Props = { project: Project; analysisProviders?: AnalysisProviderConfiguration[]; onMutationPendingChange?: (pending: boolean) => void };
 type Draft = Pick<ShotPreparationState, "sourceId" | "preprocessingId" | "revision" | "shots">;
 type Action = "save" | "package" | "analyze" | "timeline" | null;
 
@@ -186,7 +187,7 @@ function personQualityText(personControl: PersonControl | undefined) {
   return `${quality.status === "passed" ? "质量通过" : quality.status === "failed" ? "质量失败" : "需要复核"} · ${parts.join("；")}。${quality.message}`;
 }
 
-export function ShotPreparationPanel({ project, onMutationPendingChange = noopMutationPendingChange }: Props) {
+export function ShotPreparationPanel({ project, analysisProviders, onMutationPendingChange = noopMutationPendingChange }: Props) {
   const desktop = useDesktop();
   const identity = sourceIdentity(project);
   const depthIdentity = controlsIdentity(project);
@@ -326,7 +327,8 @@ export function ShotPreparationPanel({ project, onMutationPendingChange = noopMu
   const selectedShot = useMemo(() => draft?.shots.find((shot) => shot.id === selectedShotId) ?? draft?.shots[0] ?? null, [draft?.shots, selectedShotId]);
   const dirty = !sameDraft(draft, savedDraft);
   const editingLocked = !desktop || action !== null;
-  const canAnalyze = Boolean(state?.canAnalyze && selectedShot && desktop && action === null);
+  const configurationIssue = promptConfigurationIssue(project, analysisProviders);
+  const canAnalyze = !configurationIssue && Boolean(state?.canAnalyze && selectedShot && desktop && action === null);
   const canExtractPersonControl = Boolean(desktop && state?.personControlEnvironment?.ready && selectedShot && !dirty && action === null && !personAction && !personControlActive);
   const selectedToolkitRun = state?.toolkitScenes.find((run) => run.toolkitRunId === selectedToolkitRunId) ?? null;
   const appliedTimelineLabel = state?.timelineOverride
@@ -486,7 +488,7 @@ export function ShotPreparationPanel({ project, onMutationPendingChange = noopMu
           <div className="shot-preparation-editor-heading"><h3>镜头 {String(draft.shots.findIndex((shot) => shot.id === selectedShot.id) + 1).padStart(2, "0")}</h3><span>{timecode(selectedShot.startSeconds)} — {timecode(selectedShot.endSeconds)}</span></div>
           <label>镜头备注<textarea aria-label="镜头备注" readOnly={editingLocked} value={selectedShot.notes} placeholder="需要手动填写：镜头内容、运动和制作注意事项" onChange={(event) => updateShot((shot) => ({ ...shot, notes: event.target.value }))} /></label>
           <div className="shot-preparation-prompt-grid">
-            {([ ["positiveZh", "中文正向提示词"], ["negativeZh", "中文负向提示词"], ["positiveEn", "English positive prompt"], ["negativeEn", "English negative prompt"] ] as Array<[keyof ShotPrompts, string]>).map(([key, label]) => <label key={key}>{label}<textarea readOnly={editingLocked} value={selectedShot.prompts[key]} placeholder="需要手动填写，不是自动分析" onChange={(event) => updateShot((shot) => ({ ...shot, prompts: { ...shot.prompts, [key]: event.target.value } }))} /></label>)}
+            {([ ["positiveZh", "中文正向提示词"], ["negativeZh", "中文负向提示词"], ["positiveEn", "English positive prompt"], ["negativeEn", "English negative prompt"] ] as Array<[keyof ShotPrompts, string]>).map(([key, label]) => <label key={key}>{label}<textarea readOnly={editingLocked} value={selectedShot.prompts[key]} placeholder="可手动填写，或使用下方分析入口生成" onChange={(event) => updateShot((shot) => ({ ...shot, prompts: { ...shot.prompts, [key]: event.target.value } }))} /></label>)}
           </div>
           <div className="shot-preparation-controls" aria-label="控制素材状态">
             <h3>控制素材检查</h3>
@@ -502,7 +504,7 @@ export function ShotPreparationPanel({ project, onMutationPendingChange = noopMu
               <button className="secondary-action" type="button" disabled={!canExtractPersonControl} onClick={() => void extractPersonControl()}>{personAction ? <LoaderCircle className="loading-spinner" size={16} aria-hidden="true" /> : <Play size={16} aria-hidden="true" />}{personAction ? "正在提交人物控制提取…" : "提取当前镜头的人物控制素材"}</button>
             </div>}
           </div>
-          {desktop && state.canAnalyze && <div className="shot-preparation-analysis"><p>仅在你点击后，才会将该镜头 4 张采样帧拼图和时间信息发送至当前分析服务，可能产生费用；不会上传完整视频，也不会自动调用付费模型。</p><button className="secondary-action" type="button" disabled={!canAnalyze} onClick={() => void analyze()}>{action === "analyze" ? <LoaderCircle className="loading-spinner" size={16} aria-hidden="true" /> : <Sparkles size={16} aria-hidden="true" />}{action === "analyze" ? "正在分析当前镜头…" : "分析当前镜头并生成提示词"}</button>{dirty && <small>分析前会先保存当前修改。</small>}</div>}
+          {desktop && <div className="shot-preparation-analysis"><p>{configurationIssue || (!state.canAnalyze ? "请先配置分析服务并发起语义分析，以确定本次使用的服务与模型。" : action === null ? "已具备生成条件，可分析当前镜头并生成提示词。" : "正在处理当前操作，请稍候。")}</p><p>仅在你点击后，才会将该镜头 4 张采样帧拼图和时间信息发送至当前分析服务，可能产生费用；不会上传完整视频，也不会自动调用付费模型。</p><button className="secondary-action" type="button" disabled={!canAnalyze} onClick={() => void analyze()}>{action === "analyze" ? <LoaderCircle className="loading-spinner" size={16} aria-hidden="true" /> : <Sparkles size={16} aria-hidden="true" />}{action === "analyze" ? "正在分析当前镜头…" : "分析当前镜头并生成提示词"}</button>{dirty && <small>分析前会先保存当前修改。</small>}</div>}
         </div>
       </div>
       {desktop && <div className="shot-preparation-actions"><button className="primary-action" type="button" disabled={!dirty || action !== null} onClick={() => void save()}>{action === "save" ? <LoaderCircle className="loading-spinner" size={17} aria-hidden="true" /> : <Save size={17} aria-hidden="true" />}{action === "save" ? "正在保存…" : "保存逐镜头准备"}</button><button className="secondary-action" type="button" disabled={dirty || action !== null} onClick={() => void downloadPackage()}>{action === "package" ? <LoaderCircle className="loading-spinner" size={16} aria-hidden="true" /> : <Download size={16} aria-hidden="true" />}{action === "package" ? "正在导出…" : "导出逐镜头准备包"}</button></div>}

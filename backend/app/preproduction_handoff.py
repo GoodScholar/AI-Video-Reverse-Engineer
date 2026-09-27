@@ -32,6 +32,7 @@ def render_handoff(workspace: dict) -> str:
     for key, label in (("theme", "主题"), ("purpose", "用途"), ("style", "风格"),
                        ("duration", "目标时长（秒）"), ("aspect", "画面比例"), ("mustPreserve", "必须保留")):
         lines.append(f"- {label}：{_text(brief.get(key) or '未填写')}")
+    lines.append("- 输入类型：" + {"reference_video": "参考视频", "depth_video": "灰度深度视频", "white_model_video": "三维白模渲染视频"}.get(brief.get("inputKind", "reference_video"), "参考视频"))
     lines += ["", "## 按镜头接续制作", "",
               "解压整个目录后使用下列相对链接。各镜头时长为计划值；处理参数和实际媒体时长需分别核对。", ""]
     for index, shot in enumerate(workspace["shots"], 1):
@@ -44,6 +45,16 @@ def render_handoff(workspace: dict) -> str:
             lines.append(f"- {roles.get(asset['role'], asset['role'])}：{_link(asset['name'], asset['url'])}")
         if not shot["assetIds"]:
             lines.append("- 未绑定素材，请在外部制作前确认输入。")
+        result = assets.get(shot.get("resultAssetId"))
+        if result:
+            lines.append("- 已关联生成结果（效果待验收）：" + _link(result["name"], result["url"]))
+        for index, version in enumerate(shot.get("resultVersions", []), 1):
+            asset = assets[version["assetId"]]
+            status = "方案已变化或关联记录缺失，待复查" if version["planChanged"] else "已按当前方案人工检查" if version["reviewed"] else "尚未人工检查"
+            adopted = " · 当前采用" if version["assetId"] == shot.get("resultAssetId") else ""
+            lines.append(f"- 候选 {index}{adopted}：" + _link(asset["name"], asset["url"]) + "；" + status)
+            if version.get("adoptionReason"):
+                lines.append("  - 采用理由：" + _text(version["adoptionReason"]))
         for node in shot["nodes"]:
             lines += ["", f"步骤 {_text(node['id'])}：{_text(labels[node['kind']])}", ""]
             source = node["input"]
@@ -64,6 +75,6 @@ def render_handoff(workspace: dict) -> str:
     lines += ["", "1. 按镜头导入角色、场景、动作及声音素材，确认采用原素材还是对应步骤产物。",
               "2. 根据目标工具绑定输入和提示词；需要 ComfyUI 专用工作流时，从准备工具另行导出并验证候选模板。",
               "3. 先验证一个短镜头的外观、动作、背景和时长，再继续其他镜头。",
-              "4. 修改项目后重新运行过期步骤并重新导出，避免混用不同版本；声音合成、剪辑和成片检查在外部完成。",
+              "4. 修改项目后重新运行过期步骤并重新导出，避免混用不同版本；将生成视频关联到对应镜头，在本地剪辑页按镜头导入结果，再完成音频编辑和成片检查。",
               "", "结构化数据：[完整方案](workspace.json) · [镜头](shots.json) · [检查报告](delivery-checks.json)", ""]
     return "\n".join(lines)

@@ -16,6 +16,7 @@ def project():
 
 def test_generation_dimensions_preserve_portrait_and_explain_duration_adjustment():
     settings, adjustments = default_settings(project())
+    assert settings.aspectMode == 'smart'
     assert settings.height > settings.width
     assert settings.width % 16 == settings.height % 16 == 0
     assert settings.frames == 81 and settings.fps == 16
@@ -48,3 +49,14 @@ def test_store_roundtrip_and_rejects_symlink(tmp_path):
 def test_output_settings_reject_unsupported_values(change):
     with pytest.raises(ValueError):
         OutputSettings(**change)
+
+
+@pytest.mark.parametrize(('mode', 'dimensions'), [
+    ('21:9', (1120, 480)), ('16:9', (1024, 576)), ('4:3', (960, 720)),
+    ('1:1', (720, 720)), ('3:4', (720, 960)), ('9:16', (576, 1024)),
+])
+def test_output_settings_resolve_each_explicit_aspect(mode, dimensions):
+    settings = OutputSettings.for_aspect(mode)
+
+    assert settings.aspectMode == mode
+    assert (settings.width, settings.height) == dimensions

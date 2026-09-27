@@ -6,8 +6,10 @@ import wave
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
-from app.timeline_render import TimelineRenderError, render_timeline
+from app.batch_subtitles import write_srt
+from app.timeline_render import TimelineRenderError, _output_size, render_timeline
 
 
 pytestmark = pytest.mark.skipif(
@@ -188,6 +190,47 @@ def test_preview_scales_to_at_most_640_pixels_wide_and_keeps_aspect_ratio(tmp_pa
 
     video = next(stream for stream in _probe(output)["streams"] if stream["codec_type"] == "video")
     assert (int(video["width"]), int(video["height"])) == (640, 320)
+
+
+@pytest.mark.parametrize(("width", "height", "preview"), [
+    (1680, 720, (630, 270)), (1280, 720, (640, 360)), (960, 720, (640, 480)),
+    (720, 720, (640, 640)), (720, 960, (636, 848)), (720, 1280, (630, 1120)),
+])
+def test_preview_downscaling_preserves_supported_ratios_exactly(width, height, preview):
+    assert _output_size(width, height, "preview") == preview
+
+
+def test_long_horizontal_caption_fits_inside_preview_safe_area(tmp_path):
+    image = _image(tmp_path / "green.png", "green")
+    subtitles = tmp_path / "subtitles.srt"
+    write_srt(subtitles, [{"id": "long", "start": 0, "end": 0.5, "text": "横屏字幕安全区" * 15}])
+    output = tmp_path / "wide-preview.mp4"
+
+    render_timeline(
+        _timeline(width=1680, height=720, tracks=[_track("video", [_clip("green", 0, 0.5)])]),
+        {"green": image}, output, format="preview", subtitles_path=subtitles,
+    )
+
+    video = next(stream for stream in _probe(output)["streams"] if stream["codec_type"] == "video")
+    assert (int(video["width"]), int(video["height"])) == (630, 270)
+    with Image.open(tmp_path / "caption-1.png") as caption:
+        assert caption.height <= round(270 * 0.45)
+
+
+@pytest.mark.parametrize(('width', 'height'), [
+    (1680, 720), (1280, 720), (960, 720), (720, 720), (720, 960), (720, 1280),
+])
+def test_mp4_preserves_each_supported_output_ratio(tmp_path, width, height):
+    image = _image(tmp_path / "green.png", "green")
+    output = tmp_path / f"ratio-{width}x{height}.mp4"
+
+    render_timeline(
+        _timeline(width=width, height=height, tracks=[_track("video", [_clip("green", 0, 0.5)])]),
+        {"green": image}, output, format="mp4",
+    )
+
+    video = next(stream for stream in _probe(output)["streams"] if stream["codec_type"] == "video")
+    assert (int(video["width"]), int(video["height"])) == (width, height)
 
 
 def test_png_with_faster_speed_remains_visible_for_the_whole_output_clip(tmp_path):

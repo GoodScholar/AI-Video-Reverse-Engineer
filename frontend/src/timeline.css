@@ -27,8 +27,8 @@
 .timeline-track-label { display: grid; align-content: center; gap: 6px; padding: 7px 8px; border-right: 1px solid #b8bdb4; background: #eeece4; }
 .timeline-track-label > button { display: grid; gap: 2px; padding: 0; border: 0; background: transparent; color: #202427; text-align: left; font-weight: 700; }
 .timeline-track-label small { color: #5f655d; font-weight: 400; }
-.timeline-track-label div { display: flex; gap: 4px; }
-.timeline-track-label div button { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; padding: 0; border: 0; background: transparent; color: #4c5454; }
+.timeline-track-label div { display: grid; grid-template-columns: repeat(2, 44px); gap: 4px; }
+.timeline-track-label div button { display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; padding: 0; border: 0; background: transparent; color: #4c5454; }
 .timeline-track-canvas { position: relative; min-height: 66px; background: repeating-linear-gradient(90deg, transparent 0, transparent calc(100% / 20 - 1px), rgba(91, 99, 91, .18) calc(100% / 20 - 1px), rgba(91, 99, 91, .18) calc(100% / 20)); }
 .timeline-clip { position: absolute; top: 11px; height: 43px; overflow: hidden; padding: 0 9px; border: 1px solid #536360; border-radius: 2px; background: #bdcec5; color: #202427; cursor: grab; text-align: left; text-overflow: ellipsis; white-space: nowrap; touch-action: none; }
 .timeline-track:nth-child(even) .timeline-clip { background: #d5c9b1; border-color: #786d55; }
@@ -51,3 +51,35 @@
 @media (prefers-reduced-motion: reduce) { .timeline-editor * { scroll-behavior: auto; } }
 @media (max-width: 1050px) { .timeline-layout { grid-template-columns: 180px minmax(340px, 1fr); }.timeline-inspector { grid-column: span 2; border-top: 1px solid #c7c6bc; border-left: 0; }.timeline-form-grid { grid-template-columns: repeat(4, minmax(100px, 1fr)); } }
 @media (max-width: 720px) { .timeline-header, .timeline-toolbar, .timeline-render { align-items: flex-start; flex-direction: column; padding-left: 16px; padding-right: 16px; }.timeline-layout { display: block; }.timeline-assets, .timeline-inspector { border: 0; border-bottom: 1px solid #c7c6bc; }.timeline-workarea { min-height: 240px; }.timeline-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }.timeline-header-actions, .timeline-render-actions { width: 100%; }.timeline-header-actions button, .timeline-render-actions button { flex: 1 1 130px; } }
+
+.timeline-editor input:not([type="file"]), .timeline-editor select { box-sizing: border-box; min-height: 44px; padding: 9px 10px; border: 1px solid #797d76; border-radius: 2px; background: #fffdf7; color: #202427; font: inherit; }
+
+.timeline-results-import { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 16px 0; }
+.timeline-results-import p { flex: 1 1 260px; margin: 0; }
+
+.timeline-draft-conflict { padding: 24px; }
+.timeline-draft-conflict h2 { margin: 0 0 12px; font-size: 20px; }
+.timeline-draft-conflict p { line-height: 1.6; overflow-wrap: anywhere; }
+.timeline-draft-conflict .timeline-header-actions { margin-top: 20px; }
+@media (max-width: 600px) { .timeline-draft-conflict { padding: 16px; } }
+
+.timeline-import-notice { margin: 0; padding: 12px 24px; border-bottom: 1px solid #c7c6bc; color: #33423f; background: #eeece4; line-height: 1.6; }
+
+.timeline-draft-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 16px 24px; border-bottom: 1px solid #c7c6bc; }
+.timeline-draft-actions p { flex: 1 1 260px; margin: 0; line-height: 1.6; }
+
+.timeline-replacement { display: grid; gap: 10px; margin: 0 0 18px; padding-bottom: 16px; border-bottom: 1px solid #c7c6bc; }
+.timeline-replacement label { display: grid; gap: 6px; min-width: 0; }
+.timeline-replacement select { width: 100%; min-width: 0; }
+.timeline-replacement p { margin: 0; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+
+.timeline-preflight { padding: 16px; border: 1px solid var(--border-color, #d9d4cb); border-radius: 12px; margin: 16px 0; overflow-wrap: anywhere; }
+.timeline-preflight label { display: inline-flex; align-items: center; gap: 8px; margin: 4px 12px 4px 0; }
+.timeline-preflight li { margin: 12px 0; }
+.timeline-preflight p { line-height: 1.6; }
+
+.timeline-clip-name { position: absolute; top: 3px; left: 8px; right: 4px; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+.timeline-waveform { position: absolute; left: 0; bottom: 1px; pointer-events: none; opacity: .8; }
+.timeline-waveform-state { position: absolute; left: 8px; bottom: 2px; font-size: 10px; pointer-events: none; }
+.timeline-waveform-help { font-size: 12px; line-height: 1.6; }
+.timeline-waveform-help button { margin-left: 8px; }

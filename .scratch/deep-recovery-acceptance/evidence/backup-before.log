@@ -1,0 +1,34 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_______ test_damaged_compression_is_rejected_without_creating_a_project ________
+
+tmp_path = PosixPath('/private/var/folders/jk/nlrws6j16tv20qd4p5ctf6700000gn/T/pytest-of-shen/pytest-1489/test_damaged_compression_is_re0')
+
+    def test_damaged_compression_is_rejected_without_creating_a_project(tmp_path):
+        """Bad compressed streams must be input errors, not unhandled server errors."""
+        import struct
+    
+        with TestClient(create_app(data_dir=tmp_path), raise_server_exceptions=False) as client:
+            create(client)
+            output = io.BytesIO()
+            with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr('manifest.json', json.dumps({'format': 'aivre-project', 'version': 1}))
+            original = output.getvalue()
+            unsupported = bytearray(original)
+            struct.pack_into('<H', unsupported, 8, 99)
+            central = unsupported.index(b'PK\x01\x02')
+            struct.pack_into('<H', unsupported, central + 10, 99)
+            broken = bytearray(original)
+            name_length, extra_length = struct.unpack_from('<HH', broken, 26)
+            broken[30 + name_length + extra_length] = 7  # Invalid DEFLATE block type.
+            for payload in (unsupported, broken):
+                response = client.post('/api/project-backups/restore', content=bytes(payload), headers={'Content-Type': 'application/zip'})
+>               assert response.status_code == 422, response.text
+E               AssertionError: Internal Server Error
+E               assert 500 == 422
+E                +  where 500 = <Response [500 Internal Server Error]>.status_code
+
+backend/tests/test_project_backup.py:269: AssertionError
+=========================== short test summary info ============================
+FAILED backend/tests/test_project_backup.py::test_damaged_compression_is_rejected_without_creating_a_project
+1 failed in 0.38s

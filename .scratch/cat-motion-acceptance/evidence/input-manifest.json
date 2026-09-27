@@ -1,0 +1,19 @@
+{
+  "source": "/Users/shen/Downloads/微信视频2026-09-12_132435_269.mp4",
+  "sourceSha256": "363ce16637f4d039b9068f66fd5bed5bf7150d455292c5829662d6e024fdf9fa",
+  "rangeSeconds": [
+    1,
+    5
+  ],
+  "clip": "/Users/shen/SZG/AI Agent/AI Video Reverse Engineer/.scratch/cat-motion-acceptance/evidence/reference-01-05.mp4",
+  "clipSha256": "54c0c58b85759f9db6a8067cd577ec5d81a372c80252612339a60228793da0ca",
+  "duration": 4,
+  "frames": 120,
+  "fps": 30,
+  "width": 320,
+  "height": 568,
+  "audio": "omitted for visual motion test; original unchanged",
+  "generationStatus": "not_started",
+  "environmentCheck": "http://127.0.0.1:8188/system_stats and /object_info: connection refused",
+  "workflowStatus": "not_selected; existing Animate template uses human DW pose/face preprocessing, animal applicability unverified"
+}

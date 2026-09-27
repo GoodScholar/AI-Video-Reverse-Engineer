@@ -1,0 +1,25 @@
+[
+  {
+    "antipattern": "side-tab",
+    "name": "Side-tab accent border",
+    "description": "Thick colored border on one side of a card — the most recognizable tell of AI-generated UIs. Use a subtler accent or remove it entirely.",
+    "severity": "warning",
+    "category": "slop",
+    "file": "/Users/shen/SZG/AI Agent/AI Video Reverse Engineer/frontend/src/preproduction.css",
+    "line": 58,
+    "snippet": "border-left: 3px solid #a83b20"
+  },
+  {
+    "antipattern": "side-tab",
+    "name": "Side-tab accent border",
+    "description": "Thick colored border on one side of a card — the most recognizable tell of AI-generated UIs. Use a subtler accent or remove it entirely.",
+    "severity": "warning",
+    "category": "slop",
+    "file": "/Users/shen/SZG/AI Agent/AI Video Reverse Engineer/frontend/src/videoToolkit.css",
+    "line": 1,
+    "snippet": "border-left:3px solid #a83b20",
+    "importedBy": [
+      "VideoToolkitPanel.tsx"
+    ]
+  }
+]

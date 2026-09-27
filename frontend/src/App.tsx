@@ -1,4 +1,5 @@
-import { type FormEvent, useEffect, useRef, useState } from "react";
+import { ProjectBackup } from "./ProjectBackup";
+import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowLeft,
   CircleAlert,
@@ -24,6 +25,7 @@ import { LocalPreprocessingPanel } from "./LocalPreprocessingPanel";
 import { SemanticAnalysisPanel } from "./SemanticAnalysisPanel";
 import { ReferenceMediaPanel } from "./ReferenceMediaPanel";
 import { uploadReferenceMedia } from "./referenceMediaApi";
+import { ContentStudioApp } from "./ContentStudioApp";
 
 const defaultCapabilities: Capabilities = {
   analysisService: { state: "checking", label: "检查中" },
@@ -109,7 +111,7 @@ function ProjectMark() {
   );
 }
 
-export function App() {
+export function LegacyApp() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [capabilities, setCapabilities] = useState<Capabilities>(defaultCapabilities);
   const [analysisProviders, setAnalysisProviders] = useState<AnalysisProviderConfiguration[]>([]);
@@ -117,6 +119,8 @@ export function App() {
   const [isLoadingAnalysisProviders, setIsLoadingAnalysisProviders] = useState(false);
   const [analysisProviderError, setAnalysisProviderError] = useState("");
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
+  const [draftState, setDraftState] = useState<{ projectId: string; dirty: boolean } | null>(null);
+  const onDraftChange = useCallback((projectId: string, dirty: boolean) => setDraftState({ projectId, dirty }), []);
   const [isCreating, setIsCreating] = useState(false);
   const [projectName, setProjectName] = useState("");
   const [isLoading, setIsLoading] = useState(true);
@@ -256,7 +260,8 @@ export function App() {
               <p className="muted">创建于 {formatTime(selectedProject.createdAt)} · 仅保存在本地</p>
             </div>
           </div>
-          <PreproductionWorkspace key={selectedProject.id} project={selectedProject} tools={<>
+          <ProjectBackup key={`backup-${selectedProject.id}`} projectId={selectedProject.id} hasUnsavedDraft={draftState?.projectId === selectedProject.id && draftState.dirty} />
+          <PreproductionWorkspace onDraftChange={onDraftChange} key={selectedProject.id} project={selectedProject} tools={<>
           <ReferenceMediaPanel
             project={selectedProject}
             onProjectUpdated={updateProject}
@@ -275,8 +280,8 @@ export function App() {
           {analysisSettingsOpen && <AnalysisProviderSettings providers={analysisProviders} onProvidersChanged={setAnalysisProviders} />}
           <SemanticAnalysisPanel project={selectedProject} provider={selectedAnalysisProvider(analysisProviders)} onProjectUpdated={updateProject} />
           <DepthCapturePanel project={selectedProject} onProjectUpdated={updateProject} onMutationPendingChange={setDepthMutationPending} />
-          <ShotPreparationPanel project={selectedProject} onMutationPendingChange={setPersonMutationPending} />
-          <ReproductionPanel project={selectedProject} preparationOnly />
+          <ShotPreparationPanel analysisProviders={analysisProviders} project={selectedProject} onMutationPendingChange={setPersonMutationPending} />
+          <ReproductionPanel analysisProviders={analysisProviders} project={selectedProject} preparationOnly />
           <CharacterMotionPanel key={`${selectedProject.id}:${selectedProject.referenceMedia?.id ?? ""}`} project={selectedProject} preparationOnly />
           <VideoUpscalePanel project={selectedProject} />
           <VideoToolkitPanel project={selectedProject} />
@@ -314,6 +319,8 @@ export function App() {
           <Plus size={18} aria-hidden="true" /> 新建复刻项目
         </button>
       </section>
+
+      <ProjectBackup onRestored={(project) => { setProjects((current) => [project, ...current]); setSelectedProject(project); }} />
 
       {isCreating && (
         <section className="create-panel" aria-labelledby="create-project-title">
@@ -394,4 +401,8 @@ export function App() {
 
     </main>
   );
+}
+
+export function App() {
+  return new URLSearchParams(location.search).get("workspace") === "legacy" ? <LegacyApp /> : <ContentStudioApp />;
 }
