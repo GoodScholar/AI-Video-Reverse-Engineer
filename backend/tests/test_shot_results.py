@@ -1,6 +1,6 @@
 from copy import deepcopy
 import pytest
-from app.shot_results import result_signature
+from app.shot_production import result_signature
 
 
 @pytest.mark.parametrize('change', ['brief', 'prompt', 'negativePrompt', 'duration', 'assets', 'node'])

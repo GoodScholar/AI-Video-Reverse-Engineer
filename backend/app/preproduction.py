@@ -10,7 +10,6 @@ from typing import Any
 from .reference_video import validate_storage_id
 
 
-NODE_KINDS = ("reference", "trim", "first_frame", "last_frame", "crop", "resize", "prompt")
 NODE_STATUSES = ("pending", "queued", "running", "completed", "failed", "stale")
 ASSET_ROLES = ("character", "scene", "motion", "audio", "reference")
 

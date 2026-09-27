@@ -141,6 +141,19 @@ def test_upload_validates_real_media_and_serves_only_owned_asset(tmp_path):
     assert client.get(BASE + "/assets/../state/file").status_code == 404
 
 
+def test_result_upload_validates_its_target_before_reading_invalid_media(tmp_path):
+    client, _, _ = setup(tmp_path)
+    state = client.get(BASE).json()
+
+    response = client.post(
+        BASE + f"/assets?role=motion&resultForShot=missing&revision={state['revision']}",
+        files={"file": ("bad.mp4", b"not-a-video", "video/mp4")},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "preproduction_shot_missing"
+
+
 def test_run_waits_for_input_then_publishes_current_artifact_and_restart_fails_inflight(tmp_path):
     def runner(kind, source, destination, params, **_):
         assert source.is_file()

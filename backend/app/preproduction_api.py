@@ -25,7 +25,7 @@ from starlette.background import BackgroundTask
 from .asset_references import preproduction_asset_references, timeline_asset_references
 from .durable_runs import LOCAL_RUN_POLICY
 from .timeline import TimelineStore
-from .preproduction import NODE_KINDS, PreproductionStore
+from .preproduction import PreproductionStore
 from .project_assets import (
     AssetFileUnavailableError,
     AssetInUseError,
@@ -36,7 +36,7 @@ from .preproduction_handoff import render_handoff
 from .preproduction_nodes import FFMPEG_TIMEOUT_SECONDS, MAX_MEDIA_DURATION_SECONDS, MAX_OUTPUT_DIMENSION, MAX_OUTPUT_PIXELS
 from .reference_media_storage import managed_reference_media_is_safe, resolve_reference_media_path
 from .reference_video import validate_storage_id
-from .shot_results import MAX_RESULT_VERSIONS, public_result_versions, result_association, result_history, result_signature
+from .shot_production import MAX_RESULT_VERSIONS, NODE_KINDS, ShotProduction, ShotProductionError, StepSource, public_result_versions
 
 
 MAX_ASSET_BYTES = 200_000_000
@@ -187,22 +187,32 @@ def create_preproduction_router(
         except (OSError, ValueError):
             fail("preproduction_artifact_unavailable", "节点产物不可用。", 409)
 
-    def node_source(project_id: str, state: dict[str, Any], shot: dict[str, Any], node: dict[str, Any]) -> Optional[Path]:
-        input_value = node["input"]
-        if not input_value:
+    def production_for(project_id: str, state: dict[str, Any]) -> ShotProduction:
+        return ShotProduction(
+            state,
+            asset_available=lambda asset: project_assets.available(project_id, asset),
+            artifact_available=lambda shot, step, artifact: _stored_file_available(
+                store, project_id, "artifacts", shot["id"], step["id"], artifact.get("name"),
+            ),
+        )
+
+    def decide(operation, *args, **kwargs):
+        try:
+            return operation(*args, **kwargs)
+        except ShotProductionError as error:
+            fail(error.code, error.message, error.status)
+
+    def step_source_path(project_id: str, state: dict[str, Any], shot_id: str, source: StepSource | None) -> Optional[Path]:
+        if source is None:
             return None
-        prefix, _, identifier = input_value.partition(":")
-        if prefix == "asset":
+        if source.kind == "asset":
             try:
-                asset = project_assets.find_in(state, identifier)
+                asset = project_assets.find_in(state, source.asset_id)
             except (KeyError, TypeError, ValueError):
                 fail("preproduction_input_missing", "节点输入素材不存在。")
             return asset_path(project_id, asset)
-        if prefix == "node":
-            upstream = next((item for item in shot["nodes"] if item["id"] == identifier), None)
-            if upstream is None or upstream["status"] != "completed" or not upstream["artifacts"]:
-                fail("preproduction_input_not_ready", "上游节点尚未生成当前产物。")
-            return artifact_path(project_id, shot["id"], upstream["id"], upstream["artifacts"][0]["name"])
+        if source.kind == "artifact":
+            return artifact_path(project_id, shot_id, source.step_id, source.artifact_name)
         fail("preproduction_input_invalid", "节点输入无效。", 422)
 
     def ensure_reference_asset(project_id: str, project: Any, state: dict[str, Any]) -> dict[str, Any]:
@@ -230,122 +240,12 @@ def create_preproduction_router(
             pass
         return record
 
-    def validate_shots(incoming: list[ShotUpdate], assets: list[dict[str, Any]]) -> None:
-        asset_ids = {asset["id"] for asset in assets}
-        if len({shot.id for shot in incoming}) != len(incoming):
-            fail("preproduction_shot_invalid", "镜头标识符不能重复。", 422)
-        for shot in incoming:
-            if shot.resultAssetId is not None and not any(asset["id"] == shot.resultAssetId and asset["kind"] == "video" for asset in assets):
-                fail("preproduction_result_invalid", "镜头结果必须是本项目的视频素材。", 422)
-            if len(set(shot.assetIds)) != len(shot.assetIds) or any(value not in asset_ids for value in shot.assetIds):
-                fail("preproduction_asset_missing", "镜头绑定了不存在的素材。", 422)
-            seen: set[str] = set()
-            for index, node in enumerate(shot.nodes):
-                if node.id in seen:
-                    fail("preproduction_node_invalid", "同一镜头中的节点标识符不能重复。", 422)
-                _validate_node(node, index, seen, set(shot.assetIds), fail)
-                seen.add(node.id)
-
-    def derive_shots(previous: list[dict[str, Any]], incoming: list[ShotUpdate], brief_changed: bool,
-                     brief: dict[str, Any], assets: list[dict[str, Any]], revision: int) -> list[dict[str, Any]]:
-        old_shots = {shot["id"]: shot for shot in previous}
-        result: list[dict[str, Any]] = []
-        for item in incoming:
-            old_shot = old_shots.get(item.id, {})
-            old_nodes = {node["id"]: node for node in old_shot.get("nodes", [])}
-            changed: set[str] = set()
-            nodes: list[dict[str, Any]] = []
-            for node in item.nodes:
-                value = {"id": node.id, "kind": node.kind, "input": node.input, "params": node.params}
-                old = old_nodes.get(node.id)
-                same = old is not None and all(old.get(key) == value[key] for key in ("kind", "input", "params"))
-                if same:
-                    value.update(status=old["status"], error=old.get("error"), artifacts=old.get("artifacts", []))
-                else:
-                    if old and old.get("status") == "running":
-                        fail("preproduction_node_running", "运行中的节点不能修改。")
-                    value.update(status="stale" if old else "pending", error=None, artifacts=[])
-                    changed.add(node.id)
-                nodes.append(value)
-            if brief_changed or old_shot.get("prompt") != item.prompt or old_shot.get("negativePrompt") != item.negativePrompt:
-                for node in nodes:
-                    if node["kind"] == "prompt":
-                        if node["status"] == "running":
-                            fail("preproduction_node_running", "运行中的节点依赖不能修改。")
-                        node.update(status="stale", error=None, artifacts=[])
-                        changed.add(node["id"])
-            for index, node in enumerate(nodes):
-                upstream = node["input"].removeprefix("node:") if node["input"].startswith("node:") else None
-                if upstream in changed:
-                    if node["status"] == "running":
-                        fail("preproduction_node_running", "运行中的节点依赖不能修改。")
-                    node.update(status="stale", error=None, artifacts=[])
-                    changed.add(node["id"])
-            record = {"id": item.id, "title": item.title, "duration": item.duration, "prompt": item.prompt,
-                      "negativePrompt": item.negativePrompt, "assetIds": item.assetIds, "nodes": nodes, "resultAssetId": item.resultAssetId}
-            history = result_history(old_shot)
-            if item.resultAssetId and not any(version["assetId"] == item.resultAssetId for version in history):
-                if len(history) >= MAX_RESULT_VERSIONS:
-                    fail("preproduction_result_limit", "每个镜头最多保留 100 个候选结果。", 422)
-                history.append({"assetId": item.resultAssetId, "signature": result_signature(brief, record), "reviewed": False,
-                                "association": result_association(brief, record, assets, revision)})
-            record["_resultVersions"] = history
-            if "_importKey" in old_shot:
-                record["_importKey"] = old_shot["_importKey"]
-            result.append(record)
-        return result
-
-    def checks(project_id: str, state: dict[str, Any]) -> list[dict[str, Any]]:
-        result: list[dict[str, Any]] = []
-        assets = {asset["id"]: asset for asset in state["assets"]}
-        brief = state["brief"]
-        missing = [label for key, label in (("theme", "主题"), ("aspect", "画幅")) if not brief.get(key, "").strip()]
-        if not brief.get("duration"):
-            missing.append("目标时长")
-        if missing:
-            result.append({"level": "warning", "code": "brief_incomplete", "message": "创作需求尚未填写：" + "、".join(missing) + "。"})
-        total_duration = sum(shot["duration"] for shot in state["shots"])
-        if state["shots"] and brief.get("duration", 0) > 0 and not math.isclose(total_duration, brief["duration"], rel_tol=0, abs_tol=0.01):
-            result.append({"level": "warning", "code": "duration_mismatch", "message": f"镜头计划总时长 {total_duration:.2f} 秒，与目标 {brief['duration']:.2f} 秒不一致，请核对镜头或需求。"})
-        if not state["shots"]:
-            result.append({"level": "error", "code": "shots_missing", "message": "尚未添加镜头，无法交付。"})
-        for shot in state["shots"]:
-            if not shot["assetIds"]:
-                result.append({"level": "warning", "code": "shot_assets_missing", "shotId": shot["id"], "message": "镜头未绑定素材，请确认是否仅使用文字制作。"})
-            if shot["duration"] <= 0:
-                result.append({"level": "warning", "code": "shot_duration_missing", "shotId": shot["id"], "message": "镜头尚未设置有效计划时长。"})
-            if not shot["prompt"].strip():
-                result.append({"level": "warning", "code": "shot_prompt_missing", "shotId": shot["id"], "message": "镜头尚未填写提示词。"})
-            adopted = next((version for version in public_result_versions(brief, shot) if version["assetId"] == shot.get("resultAssetId")), None)
-            if adopted and (adopted["planChanged"] or not adopted["reviewed"]):
-                result.append({"level": "warning", "code": "result_review_required", "shotId": shot["id"], "message": "采用结果的方案已变化或缺少关联记录，请重新检查。" if adopted["planChanged"] else "采用结果尚未按当前方案人工检查。"})
-            referenced = set(shot["assetIds"])
-            referenced.update(version["assetId"] for version in result_history(shot))
-            if shot.get("resultAssetId"):
-                referenced.add(shot["resultAssetId"])
-            referenced.update(node["input"].split(":", 1)[1] for node in shot["nodes"] if node["input"].startswith("asset:"))
-            for asset_id in referenced:
-                asset = assets.get(asset_id)
-                if asset is None or not project_assets.available(project_id, asset):
-                    result.append({"level": "error", "code": "shot_asset_unavailable", "shotId": shot["id"], "message": "镜头引用的素材已不存在。"})
-            for node in shot["nodes"]:
-                if node["status"] == "failed":
-                    result.append({"level": "error", "code": "node_failed", "shotId": shot["id"], "nodeId": node["id"], "message": "节点执行失败，请重试或修改输入。"})
-                elif node["status"] in ("pending", "queued", "running", "stale"):
-                    result.append({"level": "error", "code": "node_not_ready", "shotId": shot["id"], "nodeId": node["id"], "message": "节点尚未生成当前产物。"})
-                elif node["status"] == "completed" and (not node["artifacts"] or any(
-                    not _stored_file_available(store, project_id, "artifacts", shot["id"], node["id"], artifact.get("name"))
-                    for artifact in node["artifacts"]
-                )):
-                    result.append({"level": "error", "code": "node_output_unavailable", "shotId": shot["id"], "nodeId": node["id"], "message": "节点当前产物不可用。"})
-        return result
-
     def response(project_id: str, state: dict[str, Any]) -> dict[str, Any]:
         public = _public_state(project_id, state)
         by_id = project_assets.index_from(state)
         for asset in public["assets"]:
             asset["available"] = project_assets.available(project_id, by_id[asset["id"]])
-        public["checks"] = checks(project_id, state)
+        public["checks"] = production_for(project_id, state).delivery_checks()
         public["nodeCatalog"] = [{"kind": kind, "label": _node_label(kind)} for kind in NODE_KINDS]
         return public
 
@@ -386,13 +286,8 @@ def create_preproduction_router(
             state = state_for(project_id)
             if body.revision != state["revision"]:
                 fail("preproduction_conflict", "前置工作台已被更新，请刷新后重试。")
-            if _has_inflight(state):
-                fail("preproduction_node_running", "有节点正在执行，完成后再修改工作台。")
-            validate_shots(body.shots, state["assets"])
-            brief_changed = state["brief"] != body.brief.model_dump()
-            state["brief"] = body.brief.model_dump()
-            state["shots"] = derive_shots(state["shots"], body.shots, brief_changed, state["brief"], state["assets"], state["revision"] + 1)
-            state["revision"] += 1
+            production = production_for(project_id, state)
+            decide(production.edit, body.brief.model_dump(), [shot.model_dump() for shot in body.shots])
             save(project_id, state)
             return response(project_id, state)
 
@@ -412,7 +307,7 @@ def create_preproduction_router(
         state = state_for(project_id)
         if revision != state["revision"]:
             fail("preproduction_conflict", "前置工作台已被更新，请刷新后重试。")
-        if _has_inflight(state):
+        if production_for(project_id, state).has_inflight():
             fail("preproduction_node_running", "有节点正在执行，完成后再修改素材。")
         return state
 
@@ -464,33 +359,22 @@ def create_preproduction_router(
         try:
             with source_lock or nullcontext(), lock:
                 state = state_for(project_id)
-                shot = None
+                production = production_for(project_id, state)
                 if resultForShot is not None:
-                    if _has_inflight(state):
-                        fail("preproduction_node_running", "有节点正在执行，完成后再关联镜头结果。")
-                    if revision != state["revision"]:
-                        fail("preproduction_conflict", "镜头方案已更新，请重新读取后上传结果。")
-                    shot = next((item for item in state["shots"] if item["id"] == resultForShot), None)
-                    if shot is None:
-                        fail("preproduction_shot_missing", "镜头不存在。", 404)
-                    if len(result_history(shot)) >= MAX_RESULT_VERSIONS:
-                        fail("preproduction_result_limit", "每个镜头最多保留 100 个候选结果。", 422)
+                    decide(production.prepare_result_attachment, resultForShot, revision)
                 temporary = _receive_upload(root, file, suffix)
                 metadata = _probe_media(temporary, suffix, ffprobe_path, ffmpeg_path)
-                if shot is not None and metadata["kind"] != "video":
+                if resultForShot is not None and metadata["kind"] != "video":
                     fail("preproduction_result_invalid", "镜头结果必须上传视频。", 422)
                 asset_id = project_assets.new_id()
                 name = asset_id + suffix
                 record = {"id": asset_id, "name": _display_name(file.filename), "kind": metadata["kind"], "role": role,
                           "file": name, **metadata}
                 with project_assets.install(project_id, state, temporary, record, move=True):
-                    if shot is not None:
-                        history = result_history(shot)
-                        history.append({"assetId": asset_id, "signature": result_signature(state["brief"], shot), "reviewed": False,
-                                        "association": result_association(state["brief"], shot, state["assets"], state["revision"] + 1)})
-                        shot["_resultVersions"] = history
-                        shot["resultAssetId"] = asset_id
-                    state["revision"] += 1
+                    if resultForShot is not None:
+                        decide(production.attach_result, resultForShot, asset_id)
+                    else:
+                        state["revision"] += 1
                     save(project_id, state)
                 temporary = None
                 return response(project_id, state)
@@ -499,20 +383,13 @@ def create_preproduction_router(
                 temporary.unlink(missing_ok=True)
             await file.close()
 
-    def removable_candidate(state, shot_id, asset_id):
-        shot = next((item for item in state["shots"] if item["id"] == shot_id), None)
-        if shot is None or not any(item["assetId"] == asset_id for item in result_history(shot)):
-            fail("preproduction_result_missing", "当前镜头不存在该候选结果。", 404)
-        if shot.get("resultAssetId") == asset_id:
-            fail("preproduction_result_adopted", "当前采用的结果不能移出历史，请先采用其他结果并保存。")
-        return shot
-
     @router.get("/shots/{shot_id}/results/{asset_id}/cleanup-preview")
     def preview_candidate_removal(project_id: str, shot_id: str, asset_id: str):
         project_for(project_id)
         with source_lock or nullcontext(), lock:
             state = state_for(project_id)
-            shot = removable_candidate(state, shot_id, asset_id)
+            production = production_for(project_id, state)
+            shot = decide(production.result_for_removal, shot_id, asset_id)
             return {"revision": state["revision"], "bytes": 0, "fileCount": 0,
                     "description": f'仅从镜头「{shot["title"]}」移除这一候选及人工检查记录。素材文件、其他镜头和时间线均保留；如需释放空间，请另行在素材库检查引用后删除。'}
 
@@ -520,10 +397,10 @@ def create_preproduction_router(
     def remove_candidate(project_id: str, shot_id: str, asset_id: str, body: RevisionRequest):
         project_for(project_id)
         with source_lock or nullcontext(), lock:
-            state = editable_assets(project_id, body.revision)
-            shot = removable_candidate(state, shot_id, asset_id)
-            shot["_resultVersions"] = [item for item in result_history(shot) if item["assetId"] != asset_id]
-            state["revision"] += 1
+            state = state_for(project_id)
+            if body.revision != state["revision"]:
+                fail("preproduction_conflict", "前置工作台已被更新，请刷新后重试。")
+            decide(production_for(project_id, state).remove_result, shot_id, asset_id)
             save(project_id, state)
             return response(project_id, state)
 
@@ -534,22 +411,8 @@ def create_preproduction_router(
             state = state_for(project_id)
             if body.revision != state["revision"]:
                 fail("preproduction_conflict", "方案已更新，请重新读取后检查。")
-            if _has_inflight(state):
-                fail("preproduction_node_running", "有节点正在执行，完成后再记录检查结果。")
-            shot = next((item for item in state["shots"] if item["id"] == shot_id), None)
-            history = result_history(shot) if shot else []
-            version = next((item for item in history if item["assetId"] == asset_id), None)
-            if version is None:
-                fail("preproduction_result_missing", "当前镜头不存在该候选结果。", 404)
-            try:
-                asset = project_assets.find_in(state, asset_id)
-            except (KeyError, TypeError, ValueError):
-                asset = None
-            if not asset or asset["kind"] != "video" or not project_assets.available(project_id, asset):
-                fail("preproduction_result_missing", "候选视频文件不可用。")
-            version.update(signature=result_signature(state["brief"], shot), reviewed=True)
-            shot["_resultVersions"] = history
-            state["revision"] += 1
+            production = production_for(project_id, state)
+            decide(production.review_result, shot_id, asset_id)
             save(project_id, state)
             return response(project_id, state)
 
@@ -557,15 +420,10 @@ def create_preproduction_router(
     def update_result_note(project_id: str, shot_id: str, asset_id: str, body: ResultNote):
         project_for(project_id)
         with source_lock or nullcontext(), lock:
-            state = editable_assets(project_id, body.revision)
-            shot = next((item for item in state["shots"] if item["id"] == shot_id), None)
-            history = result_history(shot) if shot else []
-            version = next((item for item in history if item["assetId"] == asset_id), None)
-            if version is None:
-                fail("preproduction_result_missing", "当前镜头不存在该候选结果。", 404)
-            version["externalNote"] = body.note.strip()
-            shot["_resultVersions"] = history
-            state["revision"] += 1
+            state = state_for(project_id)
+            if body.revision != state["revision"]:
+                fail("preproduction_conflict", "前置工作台已被更新，请刷新后重试。")
+            decide(production_for(project_id, state).set_result_note, shot_id, asset_id, body.note.strip())
             save(project_id, state)
             return response(project_id, state)
 
@@ -573,15 +431,10 @@ def create_preproduction_router(
     def update_adoption_reason(project_id: str, shot_id: str, asset_id: str, body: AdoptionReason):
         project_for(project_id)
         with source_lock or nullcontext(), lock:
-            state = editable_assets(project_id, body.revision)
-            shot = next((item for item in state["shots"] if item["id"] == shot_id), None)
-            history = result_history(shot) if shot else []
-            version = next((item for item in history if item["assetId"] == asset_id), None)
-            if version is None:
-                fail("preproduction_result_missing", "当前镜头不存在该候选结果。", 404)
-            version["adoptionReason"] = body.reason.strip()
-            shot["_resultVersions"] = history
-            state["revision"] += 1
+            state = state_for(project_id)
+            if body.revision != state["revision"]:
+                fail("preproduction_conflict", "前置工作台已被更新，请刷新后重试。")
+            decide(production_for(project_id, state).set_adoption_reason, shot_id, asset_id, body.reason.strip())
             save(project_id, state)
             return response(project_id, state)
 
@@ -606,7 +459,7 @@ def create_preproduction_router(
             state = state_for(project_id)
             if body.revision != state["revision"]:
                 fail("preproduction_conflict", "前置工作台已被更新，请刷新后重试。")
-            if _has_inflight(state):
+            if production_for(project_id, state).has_inflight():
                 fail("preproduction_node_running", "有节点正在执行，完成后再启动其他节点。")
             source_shots = _preparation_shots(root, project_id, project)
             before = (len(state["assets"]), len(state["shots"]))
@@ -669,49 +522,40 @@ def create_preproduction_router(
             state = state_for(project_id)
             if body.revision != state["revision"]:
                 fail("preproduction_conflict", "前置工作台已被更新，请刷新后重试。")
-            if _has_inflight(state):
-                fail("preproduction_node_running", "有节点正在执行，完成后再启动其他节点。")
-            shot, node = _find_node(state, shot_id, node_id, fail)
-            if node["status"] in ("queued", "running"):
-                fail("preproduction_node_running", "节点正在执行。")
-            source = node_source(project_id, state, shot, node)
+            production = production_for(project_id, state)
             run_id = uuid4().hex
-            node.update(status="queued", error=None, artifacts=[], runId=run_id)
-            _invalidate_descendants(shot, node_id)
-            state["revision"] += 1
+            prepared = decide(production.prepare_run, shot_id, node_id, run_id)
+            source = step_source_path(project_id, state, shot_id, prepared.source)
             save(project_id, state)
-            if not compute_queue.submit("preproduction:" + run_id, project_id, lambda pid: process(pid, shot_id, node_id, run_id, source)):
+            if not compute_queue.submit(
+                "preproduction:" + run_id,
+                project_id,
+                lambda pid: process(pid, shot_id, node_id, run_id, source, prepared.kind, prepared.params),
+            ):
                 state = state_for(project_id)
-                _, fresh = _find_node(state, shot_id, node_id, fail)
-                if fresh.get("runId") == run_id:
-                    fresh.update(status="failed", error="本地处理队列不可用，请重试。", artifacts=[])
-                    state["revision"] += 1
+                if decide(production_for(project_id, state).fail_run, shot_id, node_id, run_id, "本地处理队列不可用，请重试。"):
                     save(project_id, state)
             return response(project_id, state_for(project_id))
 
-    def process(project_id: str, shot_id: str, node_id: str, run_id: str, source: Optional[Path]) -> None:
+    def process(
+        project_id: str,
+        shot_id: str,
+        node_id: str,
+        run_id: str,
+        source: Optional[Path],
+        kind: str,
+        params: dict[str, Any],
+    ) -> None:
         run_dir: Optional[Path] = None
         try:
             with lock:
                 state = state_for(project_id)
-                shot, node = _find_node(state, shot_id, node_id, fail)
-                if node.get("runId") != run_id or node["status"] != "queued":
+                if production_for(project_id, state).start_run(shot_id, node_id, run_id) is None:
                     return
-                node["status"] = "running"
                 save(project_id, state)
             run_dir = store.path(project_id, "runs", run_id)
             run_dir.mkdir(parents=True, exist_ok=False)
-            params = dict(node["params"])
-            if node["kind"] == "prompt":
-                sections = (
-                    ("主题", state["brief"].get("theme", "")), ("用途", state["brief"].get("purpose", "")),
-                    ("风格", state["brief"].get("style", "")), ("时长", state["brief"].get("duration", "")),
-                    ("画幅", state["brief"].get("aspect", "")), ("必须保留", state["brief"].get("mustPreserve", "")),
-                    ("镜头提示词", shot.get("prompt", "")), ("镜头负面提示词", shot.get("negativePrompt", "")),
-                    ("节点文本", params.get("text", "")),
-                )
-                params["text"] = "\n".join(f"{label}: {value}" for label, value in sections if str(value).strip())
-            names = runner(node["kind"], source, run_dir, params, ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path)
+            names = runner(kind, source, run_dir, params, ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path)
             if not isinstance(names, list) or not names or any(not isinstance(name, str) for name in names):
                 raise ValueError("节点未生成有效产物")
             for name in names:
@@ -719,8 +563,9 @@ def create_preproduction_router(
                 _regular_file(run_dir / name)
             with lock:
                 state = state_for(project_id)
-                shot, node = _find_node(state, shot_id, node_id, fail)
-                if node.get("runId") != run_id or node["status"] != "running":
+                artifacts = [{"name": name, "url": f"/api/projects/{project_id}/preproduction/artifacts/{shot_id}/{node_id}/{name}"} for name in names]
+                production = production_for(project_id, state)
+                if not production.complete_run(shot_id, node_id, run_id, artifacts):
                     return
                 destination = store.path(project_id, "artifacts", shot_id, node_id)
                 if destination.exists():
@@ -728,17 +573,12 @@ def create_preproduction_router(
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(run_dir, destination)
                 run_dir = None
-                node.update(status="completed", error=None, artifacts=[{"name": name, "url": f"/api/projects/{project_id}/preproduction/artifacts/{shot_id}/{node_id}/{name}"} for name in names])
-                state["revision"] += 1
                 save(project_id, state)
         except Exception as error:
             with lock:
                 try:
                     state = state_for(project_id)
-                    _, node = _find_node(state, shot_id, node_id, fail)
-                    if node.get("runId") == run_id:
-                        node.update(status="failed", error=_safe_error(error), artifacts=[])
-                        state["revision"] += 1
+                    if production_for(project_id, state).fail_run(shot_id, node_id, run_id, _safe_error(error)):
                         save(project_id, state)
                 except Exception:
                     pass
@@ -771,11 +611,12 @@ def create_preproduction_router(
             state = state_for(project_id)
             if body.revision != state["revision"]:
                 fail("preproduction_conflict", "前置工作台已被更新，请刷新后重试。")
-            report = checks(project_id, state)
+            production = production_for(project_id, state)
+            report = production.delivery_checks()
             if any(item["level"] == "error" for item in report):
                 fail("preproduction_delivery_blocked", "交付检查存在错误，请先修复。")
             public = response(project_id, state)
-            referenced = _referenced_assets(state)
+            referenced = production.referenced_assets()
             included_ids = {asset["id"] for asset in referenced}
             public["assets"] = [asset for asset in public["assets"] if asset["id"] in included_ids]
             for asset in public["assets"]:
@@ -811,46 +652,6 @@ def create_preproduction_router(
     return router
 
 
-def _validate_node(node: NodeUpdate, index: int, seen: set[str], asset_ids: set[str], fail: Callable[..., None]) -> None:
-    value = node.input
-    if node.kind == "prompt":
-        if value and not _valid_input(value, index, seen, asset_ids):
-            fail("preproduction_input_invalid", "提示词节点输入无效。", 422)
-        if not isinstance(node.params.get("text", ""), str) or len(node.params.get("text", "")) > 12000:
-            fail("preproduction_node_invalid", "提示词节点参数无效。", 422)
-        return
-    if not _valid_input(value, index, seen, asset_ids):
-        fail("preproduction_input_invalid", "节点输入必须是本镜头的素材或更早节点。", 422)
-    if node.kind == "trim":
-        _numbers(node.params, ("start", "end"), fail)
-        if not node.params["start"] < node.params["end"]:
-            fail("preproduction_node_invalid", "截取起止时间无效。", 422)
-    elif node.kind == "crop":
-        _numbers(node.params, ("x", "y", "width", "height"), fail)
-        if any(not 0 <= node.params[key] <= 1 for key in ("x", "y", "width", "height")) or node.params["x"] + node.params["width"] > 1 or node.params["y"] + node.params["height"] > 1 or not node.params["width"] or not node.params["height"]:
-            fail("preproduction_node_invalid", "裁切参数必须在 0 到 1 的范围内。", 422)
-    elif node.kind == "resize":
-        _numbers(node.params, ("width", "height"), fail)
-        if any(int(node.params[key]) != node.params[key] or not 1 <= node.params[key] <= 8192 for key in ("width", "height")):
-            fail("preproduction_node_invalid", "缩放尺寸无效。", 422)
-    elif node.params:
-        fail("preproduction_node_invalid", "该节点不接受参数。", 422)
-
-
-def _valid_input(value: str, index: int, seen: set[str], asset_ids: set[str]) -> bool:
-    prefix, separator, identifier = value.partition(":")
-    return bool(separator and identifier and ((prefix == "asset" and identifier in asset_ids) or (prefix == "node" and identifier in seen)))
-
-
-def _numbers(params: dict[str, Any], names: tuple[str, ...], fail: Callable[..., None]) -> None:
-    if set(params) != set(names):
-        fail("preproduction_node_invalid", "节点参数无效。", 422)
-    for name in names:
-        value = params.get(name)
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
-            fail("preproduction_node_invalid", "节点参数必须是有限数值。", 422)
-
-
 def _find_node(state: dict[str, Any], shot_id: str, node_id: str, fail: Callable[..., None]) -> tuple[dict[str, Any], dict[str, Any]]:
     shot = next((item for item in state["shots"] if item["id"] == shot_id), None)
     if shot is None:
@@ -861,18 +662,6 @@ def _find_node(state: dict[str, Any], shot_id: str, node_id: str, fail: Callable
     return shot, node
 
 
-def _has_inflight(state: dict[str, Any]) -> bool:
-    return any(node["status"] in ("queued", "running") for shot in state["shots"] for node in shot["nodes"])
-
-
-def _invalidate_descendants(shot: dict[str, Any], source_id: str) -> None:
-    stale = {source_id}
-    for node in shot["nodes"]:
-        if node["input"].startswith("node:") and node["input"].split(":", 1)[1] in stale:
-            node.update(status="stale", error=None, artifacts=[])
-            stale.add(node["id"])
-
-
 def _stored_file_available(store: PreproductionStore, project_id: str, *parts: Any) -> bool:
     try:
         if any(not isinstance(part, str) for part in parts):
@@ -881,16 +670,6 @@ def _stored_file_available(store: PreproductionStore, project_id: str, *parts: A
         return True
     except (OSError, ValueError):
         return False
-
-
-def _referenced_assets(state: dict[str, Any]) -> list[dict[str, Any]]:
-    ids = {asset_id for shot in state["shots"] for asset_id in shot["assetIds"]}
-    ids.update(version["assetId"] for shot in state["shots"] for version in result_history(shot))
-    ids.update(
-        node["input"].split(":", 1)[1]
-        for shot in state["shots"] for node in shot["nodes"] if node["input"].startswith("asset:")
-    )
-    return [asset for asset in state["assets"] if asset["id"] in ids]
 
 
 def _regular_file(path: Path) -> None:
