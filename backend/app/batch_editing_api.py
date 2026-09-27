@@ -1017,7 +1017,6 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             children = [task for task in state["tasks"] if task.get("batchId") == task_id and task.get("generationId") == generation_id]
             if not children:
                 raise HTTPException(404, detail={"code": "batch_generation_missing", "message": "批量生成记录不存在。"})
-            children = [public_task(project_id, task) for task in children]
         results = []
         for child in children:
             if child["generation"]["status"] == "failed":

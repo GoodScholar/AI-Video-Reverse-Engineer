@@ -333,3 +333,13 @@ def test_reusable_preview_preserves_legacy_revision_defaults():
     reusable = production.reusable_preview(task)
 
     assert reusable["id"] == "preview"
+
+
+def test_reusable_preview_rejects_completed_run_with_stale_frozen_inputs():
+    task = create_batch("省时", "操作演示", id_factory=ids("task", "variant"))
+    preview = completed_preview(task)
+    preview["subtitleCues"] = [{"id": "old", "start": 0, "end": 1, "text": "旧字幕"}]
+    task["variant"]["runs"].append(preview)
+
+    assert production.inspect_variant(task).preview.status == "stale"
+    assert production.reusable_preview(task) is None

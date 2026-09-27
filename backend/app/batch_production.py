@@ -160,10 +160,14 @@ def reusable_preview(task: dict[str, Any]) -> dict[str, Any] | None:
     if not runs:
         return None
     latest = runs[-1]
-    if (latest.get("status") in ("queued", "running", "completed")
+    if (latest.get("status") in ("queued", "running")
             and (latest.get("contentRevision", 0), latest.get("revision"),
                  latest.get("subtitleRevision", 0)) == current_version(task)):
         return latest
+    if latest.get("status") == "completed":
+        preview = inspect_variant(task).preview
+        if preview.status == "current" and preview.record is latest:
+            return latest
     return None
 
 
