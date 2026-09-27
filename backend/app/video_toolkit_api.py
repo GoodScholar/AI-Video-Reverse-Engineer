@@ -19,6 +19,7 @@ from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.background import BackgroundTask
 
+from .durable_runs import LOCAL_RUN_POLICY
 from .person_controls import PersonArtifactStream, parse_single_byte_range, stream_person_artifact
 from .video_toolkit import ARTIFACTS, ToolkitCancelled, ToolkitConfig, ToolkitError, asset_paths, execute_tool, list_assets, safe_child, validate_cuts
 
@@ -163,15 +164,17 @@ def create_toolkit_router(data_dir, get_project, compute_queue, *, config=None, 
             try:
                 pid,rid=file.parents[2].name,file.parent.name
                 run=load(pid,rid)
-                if run['status'] in ('running','queued'):
-                    run.update(status='failed',error='服务重启中断了处理，可重试。');save(pid,run)
+                recovery = LOCAL_RUN_POLICY.recover_after_restart(run['status'])
+                if recovery.reason == 'interrupted':
+                    run.update(status=recovery.status,error='服务重启中断了处理，可重试。');save(pid,run)
             except (HTTPException,OSError): continue
         for file in base.glob('*/toolkit/pipelines/*/state.json'):
             try:
                 pid, pipeline_id = file.parents[3].name, file.parent.name
                 pipeline = load_pipeline(pid, pipeline_id)
                 recovered_in_flight = any(step.pop('inFlight', False) for step in pipeline['steps'])
-                if pipeline['status'] in ('queued', 'running'):
+                recovery = LOCAL_RUN_POLICY.recover_after_restart(pipeline['status'])
+                if recovery.reason == 'interrupted':
                     for index, step in enumerate(pipeline['steps']):
                         if step['status'] in ('queued', 'running'):
                             step.update(status='failed', error='服务重启中断了处理，可重试。', inFlight=False)
@@ -179,7 +182,7 @@ def create_toolkit_router(data_dir, get_project, compute_queue, *, config=None, 
                             break
                     for step in pipeline['steps']:
                         step['inFlight'] = False
-                    pipeline.update(status='failed', error='服务重启中断了处理，可重试。')
+                    pipeline.update(status=recovery.status, error='服务重启中断了处理，可重试。')
                     save_pipeline(pid, pipeline)
                 elif recovered_in_flight:
                     save_pipeline(pid, pipeline)
@@ -194,21 +197,21 @@ def create_toolkit_router(data_dir, get_project, compute_queue, *, config=None, 
                     try:
                         pid,rid=file.parents[2].name,file.parent.name
                         run=load(pid,rid)
-                        if run['status'] in ('queued','running'):
-                            run.update(status='cancelled',stage='cancelled',error='服务关闭，处理已取消，可重试。')
+                        if LOCAL_RUN_POLICY.active(run['status']):
+                            run.update(status=LOCAL_RUN_POLICY.cancel(run['status']),stage='cancelled',error='服务关闭，处理已取消，可重试。')
                             save(pid,run)
                     except (HTTPException,OSError):continue
                 for file in base.glob('*/toolkit/pipelines/*/state.json'):
                     try:
                         pid, pipeline_id = file.parents[3].name, file.parent.name
                         pipeline = load_pipeline(pid, pipeline_id)
-                        if pipeline['status'] in ('queued', 'running'):
+                        if LOCAL_RUN_POLICY.active(pipeline['status']):
                             for index, step in enumerate(pipeline['steps']):
                                 if step['status'] in ('queued', 'running'):
                                     step.update(status='cancelled', error='服务关闭，处理已取消，可重试。')
                                     block_downstream(pipeline, index)
                                     break
-                            pipeline.update(status='cancelled', error='服务关闭，处理已取消，可重试。')
+                            pipeline.update(status=LOCAL_RUN_POLICY.cancel(pipeline['status']), error='服务关闭，处理已取消，可重试。')
                             save_pipeline(pid, pipeline)
                     except (HTTPException, OSError):
                         continue

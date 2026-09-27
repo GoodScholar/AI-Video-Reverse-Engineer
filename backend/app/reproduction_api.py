@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse, Response
 from PIL import Image, ImageOps
 from pydantic import BaseModel, ConfigDict, Field
 
+from .durable_runs import EXTERNAL_RUN_POLICY
 from .reproduction import (GenerationRun, OutputSettings, ReproductionStore, SavedPrompts,
                            analysis_ready, current_depth, default_settings, source_hash, utc_now)
 
@@ -68,7 +69,7 @@ def create_reproduction_router(data_dir, get_project, generate, *, ffmpeg_path='
             interrupted = False
             for run in state.runs:
                 if run.status == "submitting" and run.id not in submissions:
-                    run.status = "unknown"
+                    run.status = EXTERNAL_RUN_POLICY.recover_after_restart(run.status).status
                     run.error = "上次提交被中断，请在 ComfyUI 中核对是否已排队。"
                     interrupted = True
             if interrupted:
@@ -269,11 +270,11 @@ def create_reproduction_router(data_dir, get_project, generate, *, ffmpeg_path='
             project, state = load(project_id)
             revision_matches(state, body.revision)
             ready(project, state)
-            if any(run.status in ('submitting', 'queued', 'running', 'unknown') for run in state.runs):
+            if any(EXTERNAL_RUN_POLICY.active(run.status) for run in state.runs):
                 fail('generation_in_progress', '已有生成运行未结束；请先刷新其状态，避免重复提交。')
             assets = input_paths(project, state)
             workflow = graph(state)
-            run = GenerationRun(id=str(uuid4()), status='submitting', createdAt=utc_now(), revision=state.revision,
+            run = GenerationRun(id=str(uuid4()), status=EXTERNAL_RUN_POLICY.initial_status, createdAt=utc_now(), revision=state.revision,
                                 width=state.settings.width, height=state.settings.height,
                                 sourceHash=state.sourceHash, comfyUrl=state.comfyUrl, workflow=workflow)
             state.runs.append(run)
@@ -298,7 +299,9 @@ def create_reproduction_router(data_dir, get_project, generate, *, ffmpeg_path='
             with lock:
                 project, state = load(project_id)
                 saved = next(item for item in state.runs if item.id == run.id)
-                saved.promptId, saved.status, saved.workflow = prompt_id, 'queued', workflow
+                saved.promptId = prompt_id
+                saved.status = EXTERNAL_RUN_POLICY.validate('queued')
+                saved.workflow = workflow
                 save(project_id, state)
                 return view(project, state)
         except HTTPException as error:
@@ -306,7 +309,8 @@ def create_reproduction_router(data_dir, get_project, generate, *, ffmpeg_path='
                 project, state = load(project_id)
                 saved = next(item for item in state.runs if item.id == run.id)
                 uncertain = submitted and error.detail.get('outcomeUnknown', True)
-                saved.status = 'unknown' if uncertain else 'failed'
+                saved.status = (EXTERNAL_RUN_POLICY.mark_outcome_unknown(saved.status) if uncertain
+                                else EXTERNAL_RUN_POLICY.fail(saved.status))
                 saved.error = ('提交响应不确定，请在 ComfyUI 中核对，避免重复生成。' if uncertain
                                else error.detail.get('message', '生成提交失败。'))
                 save(project_id, state)
@@ -374,7 +378,7 @@ def create_reproduction_router(data_dir, get_project, generate, *, ffmpeg_path='
             saved = next(item for item in state.runs if item.id == run_id)
             if saved.status in ('completed', 'failed') or saved.promptId != run.promptId:
                 return view(project, state)
-            saved.status = result['status']
+            saved.status = EXTERNAL_RUN_POLICY.validate(result['status'])
             saved.error = result.get('error') or ('ComfyUI 中已找不到此运行，请核对其状态。' if result['status'] == 'unknown' else None)
             saved.outputs = outputs
             save(project_id, state)

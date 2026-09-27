@@ -25,7 +25,6 @@ from .batch_production import (
     create_batch_variants,
     current_version as review_version,
     export_approved_versions,
-    record_render_result,
     review_current_version,
     review_status,
     queue_voiceover,
@@ -39,6 +38,7 @@ from .batch_production import (
 )
 from .batch_recommendation import RecommendationError, recommend
 from .batch_subtitles import milliseconds, parse_srt, write_srt
+from .durable_runs import LOCAL_RUN_POLICY, freeze_run_input
 from .preproduction import PreproductionStore, safe_child
 from .reference_video import validate_storage_id
 from .timeline import validate_workspace
@@ -51,6 +51,22 @@ def _valid_id(value: Any) -> bool:
         return True
     except (TypeError, ValueError):
         return False
+
+
+def _run_input(run: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "contentRevision", "variantRevision", "subtitleRevision", "timelineRevision",
+        "snapshot", "subtitleCues", "subtitles", "sources", "language",
+    )
+    return {key: deepcopy(run[key]) for key in keys if key in run}
+
+
+def _complete_local_run(run: dict[str, Any], result: dict[str, Any]) -> None:
+    frozen = freeze_run_input(_run_input(run))
+    completion = LOCAL_RUN_POLICY.complete(
+        run["status"], frozen_input=frozen, current_input=_run_input(run), result=result,
+    )
+    run.update(status=completion.status, error=None, **completion.result)
 
 
 def _validate_timeline_shape(revision: int, settings: Any, tracks: Any) -> None:
@@ -452,7 +468,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 run = recognition_for(task_for(state, task_id)["variant"], run_id)
                 if run["status"] != "queued":
                     return
-                run["status"] = "running"
+                run["status"] = LOCAL_RUN_POLICY.start(run["status"])
                 save(project_id, state)
                 snapshot, names, language = run["snapshot"], dict(run["sources"]), run["language"]
             directory = store.path(project_id, "recognitions", run_id)
@@ -485,15 +501,15 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 state = state_for(project_id)
                 run = recognition_for(task_for(state, task_id)["variant"], run_id)
                 if run["status"] == "running":
-                    run.update(status="completed", error=None, cues=cues)
+                    _complete_local_run(run, {"cues": cues})
                     save(project_id, state)
         except Exception as error:
             with lock:
                 try:
                     state = state_for(project_id)
                     run = recognition_for(task_for(state, task_id)["variant"], run_id)
-                    if run["status"] in ("queued", "running"):
-                        run.update(status="failed", error=str(error) or "字幕识别失败。")
+                    if LOCAL_RUN_POLICY.active(run["status"]):
+                        run.update(status=LOCAL_RUN_POLICY.fail(run["status"]), error=str(error) or "字幕识别失败。")
                         save(project_id, state)
                 except HTTPException:
                     pass
@@ -507,7 +523,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 run = find_run(task["variant"], run_id)
                 if run["status"] != "queued":
                     return
-                run["status"] = "running"
+                run["status"] = LOCAL_RUN_POLICY.start(run["status"])
                 save(project_id, state)
                 snapshot = run["snapshot"]
                 names = dict(run["sources"])
@@ -538,17 +554,19 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 output = store.path(project_id, "outputs", run_id + ".mp4")
                 output.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(staging, output)
-                run.update(status="completed", error=None, output=output.name)
-                record_render_result(run, media)
+                result = {"output": output.name}
+                if isinstance(media, dict):
+                    result["media"] = media
+                _complete_local_run(run, result)
                 save(project_id, state)
         except BaseException as error:
             with lock:
                 try:
                     state = state_for(project_id)
                     run = find_run(task_for(state, task_id)["variant"], run_id)
-                    if run["status"] in ("queued", "running"):
+                    if LOCAL_RUN_POLICY.active(run["status"]):
                         message = str(error)
-                        run.update(status="failed", error=message if message and len(message) <= 300 and "/" not in message and "\\" not in message else "预览失败，请检查素材与片段。")
+                        run.update(status=LOCAL_RUN_POLICY.fail(run["status"]), error=message if message and len(message) <= 300 and "/" not in message and "\\" not in message else "预览失败，请检查素材与片段。")
                         save(project_id, state)
                 except HTTPException:
                     pass
@@ -564,7 +582,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 run = find_export(task_for(state, task_id)["variant"], run_id)
                 if run["status"] != "queued":
                     return
-                run["status"] = "running"
+                run["status"] = LOCAL_RUN_POLICY.start(run["status"])
                 save(project_id, state)
                 snapshot, names, cues = run["snapshot"], dict(run["sources"]), run["subtitles"]
             directory = store.path(project_id, "exports", run_id)
@@ -593,17 +611,19 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 output = store.path(project_id, "deliverables", run_id + ".mp4")
                 output.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(staging, output)
-                run.update(status="completed", error=None, output=output.name)
-                record_render_result(run, media)
+                result = {"output": output.name}
+                if isinstance(media, dict):
+                    result["media"] = media
+                _complete_local_run(run, result)
                 save(project_id, state)
         except BaseException as error:
             with lock:
                 try:
                     state = state_for(project_id)
                     run = find_export(task_for(state, task_id)["variant"], run_id)
-                    if run["status"] in ("queued", "running"):
+                    if LOCAL_RUN_POLICY.active(run["status"]):
                         message = str(error)
-                        run.update(status="failed", error=message if message and len(message) <= 300 and "/" not in message and "\\" not in message else "成片导出失败，请检查素材与片段。")
+                        run.update(status=LOCAL_RUN_POLICY.fail(run["status"]), error=message if message and len(message) <= 300 and "/" not in message and "\\" not in message else "成片导出失败，请检查素材与片段。")
                         save(project_id, state)
                 except HTTPException:
                     pass
@@ -623,21 +643,26 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 changed = False
                 for task in state["tasks"]:
                     voice = task.get("voiceover")
-                    if voice and voice["status"] in ("queued", "running"):
-                        voice.update(status="failed", error="服务已重启，请重新生成配音。")
-                        voice.pop("plan", None)
-                        changed = True
+                    if voice:
+                        recovery = LOCAL_RUN_POLICY.recover_after_restart(voice["status"])
+                        if recovery.reason == "interrupted":
+                            voice.update(status=recovery.status, error="服务已重启，请重新生成配音。")
+                            voice.pop("plan", None)
+                            changed = True
                     for run in task["variant"]["runs"]:
-                        if run["status"] in ("queued", "running"):
-                            run.update(status="failed", error="服务重启中断了预览，可重新提交。")
+                        recovery = LOCAL_RUN_POLICY.recover_after_restart(run["status"])
+                        if recovery.reason == "interrupted":
+                            run.update(status=recovery.status, error="服务重启中断了预览，可重新提交。")
                             changed = True
                     for run in task["variant"].get("subtitles", {}).get("recognitions", []):
-                        if run["status"] in ("queued", "running"):
-                            run.update(status="failed", error="服务重启中断了字幕识别，可重新提交。")
+                        recovery = LOCAL_RUN_POLICY.recover_after_restart(run["status"])
+                        if recovery.reason == "interrupted":
+                            run.update(status=recovery.status, error="服务重启中断了字幕识别，可重新提交。")
                             changed = True
                     for run in task["variant"].get("exports", []):
-                        if run["status"] in ("queued", "running"):
-                            run.update(status="failed", error="服务重启中断了成片导出，可重新提交。")
+                        recovery = LOCAL_RUN_POLICY.recover_after_restart(run["status"])
+                        if recovery.reason == "interrupted":
+                            run.update(status=recovery.status, error="服务重启中断了成片导出，可重新提交。")
                             changed = True
                 if changed:
                     store.save(project_dir.name, state)
@@ -739,7 +764,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             state = state_for(project_id)
             variant = task_for(state, task_id)["variant"]
             subtitles = _subtitles(variant)
-            if any(run["status"] in ("queued", "running") for run in subtitles["recognitions"]):
+            if any(LOCAL_RUN_POLICY.active(run["status"]) for run in subtitles["recognitions"]):
                 raise HTTPException(409, detail={"code": "batch_recognition_active", "message": "已有字幕识别任务正在运行。"})
             if not any(track["kind"] == "video" and not track["hidden"] and track["clips"] for track in variant["tracks"]):
                 raise HTTPException(422, detail={"code": "batch_video_required", "message": "请先保存包含画面的变体。"})
@@ -747,14 +772,14 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             directory = store.path(project_id, "recognitions", run_id)
             snapshot = {"settings": variant["settings"], "tracks": variant["tracks"]}
             sources = snapshot_sources(project_id, directory, variant["tracks"], assets_for(project_id))
-            run = {"id": run_id, "status": "queued", "error": None, "timelineRevision": variant["revision"],
+            run = {"id": run_id, "status": LOCAL_RUN_POLICY.initial_status, "error": None, "timelineRevision": variant["revision"],
                    "subtitleRevision": subtitles["revision"], "language": body["language"], "cues": [],
                    "snapshot": snapshot, "sources": sources}
             subtitles["recognitions"].append(run)
             save(project_id, state)
             if not compute_queue.submit("batch-recognition:" + run_id, project_id,
                                         lambda pid: process_recognition(pid, task_id, run_id)):
-                run.update(status="failed", error="本地处理队列不可用。")
+                run.update(status=LOCAL_RUN_POLICY.fail(run["status"]), error="本地处理队列不可用。")
                 save(project_id, state)
             return {"subtitles": public_task(project_id, task_for(state, task_id))["variant"]["subtitles"]}
 
@@ -893,9 +918,9 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 try:
                     state = state_for(project_id)
                     voice = task_for(state, task_id).get("voiceover")
-                    if voice and voice["id"] == job_id and voice["status"] in ("queued", "running"):
+                    if voice and voice["id"] == job_id and LOCAL_RUN_POLICY.active(voice["status"]):
                         message = str(error) if isinstance(error, ValueError) else "本地配音失败，请检查环境、素材与脚本后重试。"
-                        voice.update(status="failed", error=message)
+                        voice.update(status=LOCAL_RUN_POLICY.fail(voice["status"]), error=message)
                         voice.pop("plan", None)
                         save(project_id, state)
                 except HTTPException:
@@ -952,7 +977,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     process_voiceover(pid, target_id, job_id)
             if not compute_queue.submit("batch-voiceover:"+job_id, project_id, process_batch):
                 for task, _ in targets:
-                    task["voiceover"].update(status="failed", error="本地处理队列不可用。")
+                    voice = task["voiceover"]
+                    voice.update(status=LOCAL_RUN_POLICY.fail(voice["status"]), error="本地处理队列不可用。")
                     task["voiceover"].pop("plan", None)
                 save(project_id, state)
             return {"tasks":[public_task(project_id, task) for task, _ in targets]}
@@ -974,7 +1000,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             save(project_id, state)
             run_id = run["id"]
             if not compute_queue.submit("batch-preview:" + run_id, project_id, lambda pid: process(pid, task_id, run_id)):
-                run["status"] = "failed"
+                run["status"] = LOCAL_RUN_POLICY.fail(run["status"])
                 run["error"] = "本地处理队列不可用。"
                 save(project_id, state)
             return {"variant": public_task(project_id, task)["variant"]}
@@ -1087,7 +1113,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 save(project_id, state)
                 if run["status"] == "queued" and not compute_queue.submit("batch-export:" + run["id"], project_id,
                                                                           lambda pid, cid=child["id"], rid=run["id"]: process_export(pid, cid, rid)):
-                    run.update(status="failed", error="本地处理队列不可用。")
+                    run.update(status=LOCAL_RUN_POLICY.fail(run["status"]), error="本地处理队列不可用。")
                     save(project_id, state)
                 results.append({"taskId": child["id"], "runId": run["id"], "status": run["status"], "error": run["error"]})
             return {"results": results}
@@ -1099,8 +1125,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             state = state_for(project_id)
             task = task_for(state, task_id)
             run = find_export(task["variant"], run_id)
-            if run["status"] in ("queued", "running"):
-                run.update(status="cancelled", error="成片导出已取消。")
+            if LOCAL_RUN_POLICY.active(run["status"]):
+                run.update(status=LOCAL_RUN_POLICY.cancel(run["status"]), error="成片导出已取消。")
                 save(project_id, state)
             elif run["status"] != "cancelled":
                 raise HTTPException(409, detail={"code": "batch_export_not_active", "message": "此成片任务已结束，无法取消。"})
@@ -1129,8 +1155,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             state = state_for(project_id)
             task = task_for(state, task_id)
             run = find_run(task["variant"], run_id)
-            if run["status"] in ("queued", "running"):
-                run.update(status="cancelled", error="预览已取消。")
+            if LOCAL_RUN_POLICY.active(run["status"]):
+                run.update(status=LOCAL_RUN_POLICY.cancel(run["status"]), error="预览已取消。")
                 save(project_id, state)
             elif run["status"] != "cancelled":
                 raise HTTPException(409, detail={"code": "batch_preview_not_active", "message": "此预览已结束，无法取消。"})

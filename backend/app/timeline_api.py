@@ -16,6 +16,7 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
+from .durable_runs import LOCAL_RUN_POLICY, freeze_run_input
 from .history_cleanup import inventory, remove_history_files
 from .audio_waveform import WaveformCache
 from .preproduction import PreproductionStore
@@ -23,8 +24,8 @@ from .reference_video import validate_storage_id
 from .timeline import TimelineStore, has_audible_audio, has_visible_video, validate_workspace
 
 
-ACTIVE_STATUSES = ("queued", "running")
-TERMINAL_STATUSES = ("completed", "failed", "cancelled")
+ACTIVE_STATUSES = LOCAL_RUN_POLICY.active_statuses
+TERMINAL_STATUSES = LOCAL_RUN_POLICY.allowed_statuses - ACTIVE_STATUSES
 
 
 def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", source_lock=None, renderer=None):
@@ -136,7 +137,7 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
         state = state_for(project_id)
         run = find_run(state, run_id)
         if run["status"] == "queued":
-            run.update(status="failed", error="本地处理队列不可用。")
+            run.update(status=LOCAL_RUN_POLICY.fail(run["status"]), error="本地处理队列不可用。")
             save(project_id, state)
 
     def cancelled(project_id, run_id):
@@ -153,7 +154,7 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 run = next((item for item in state["runs"] if item["id"] == run_id), None)
                 if run is None or run["status"] != "queued":
                     return
-                run["status"] = "running"
+                run["status"] = LOCAL_RUN_POLICY.start(run["status"])
                 save(project_id, state)
                 active_workers.add((project_id, run_id))
                 snapshot = run["snapshot"]
@@ -179,7 +180,13 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 output = store.path(project_id, "outputs", run_id + suffix)
                 output.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(str(staging), str(output))
-                run.update(status="completed", error=None, output=output.name)
+                completion = LOCAL_RUN_POLICY.complete(
+                    run["status"],
+                    frozen_input=freeze_run_input(run["snapshot"]),
+                    current_input=run["snapshot"],
+                    result={"output": output.name},
+                )
+                run.update(status=completion.status, error=None, **completion.result)
                 save(project_id, state)
         except HTTPException:
             raise
@@ -188,7 +195,7 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 state = state_for(project_id)
                 run = find_run(state, run_id)
                 if run["status"] == "running":
-                    run.update(status="failed", error=_safe_error(error))
+                    run.update(status=LOCAL_RUN_POLICY.fail(run["status"]), error=_safe_error(error))
                     save(project_id, state)
         finally:
             try:
@@ -209,8 +216,9 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 state = store.load(project_dir.name)
                 changed = False
                 for run in state["runs"]:
-                    if run.get("status") in ACTIVE_STATUSES:
-                        run.update(status="failed", error="服务重启中断了渲染，可重新提交。")
+                    recovery = LOCAL_RUN_POLICY.recover_after_restart(run.get("status"))
+                    if recovery.reason == "interrupted":
+                        run.update(status=recovery.status, error="服务重启中断了渲染，可重新提交。")
                         changed = True
                 if changed:
                     store.save(project_dir.name, state)
@@ -361,7 +369,7 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 fail("timeline_visible_video_required", "至少需要一个可见的视频片段。", 422)
             run_id = uuid4().hex
             sources = snapshot_sources(project_id, run_id, tracks, assets)
-            run = {"id": run_id, "revision": state["revision"], "format": body["format"], "status": "queued", "error": None,
+            run = {"id": run_id, "revision": state["revision"], "format": body["format"], "status": LOCAL_RUN_POLICY.initial_status, "error": None,
                    "snapshot": {"settings": settings, "tracks": tracks}, "sources": sources}
             state["runs"].append(run)
             save(project_id, state)
@@ -378,7 +386,7 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             run = find_run(state, run_id)
             if run["status"] not in ACTIVE_STATUSES:
                 fail("timeline_run_finished", "渲染任务已经结束。")
-            run.update(status="cancelled", error=None)
+            run.update(status=LOCAL_RUN_POLICY.cancel(run["status"]), error=None)
             save(project_id, state)
             return response(project_id, state)
 

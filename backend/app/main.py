@@ -64,7 +64,6 @@ from app.local_preprocessing import (
     new_local_preprocessing,
     stage_order_for,
 )
-from app.local_preprocessing_jobs import LocalPreprocessingJobQueue
 from app.image_preprocessing_runner import run_image_preprocessing
 from app.local_preprocessing_runner import LocalPreprocessingFailure, run_local_preprocessing
 from app.local_preprocessing_storage import (
@@ -83,12 +82,13 @@ from app.depth_capture import (
     new_depth_capture,
     select_execution_device,
 )
-from app.depth_capture_jobs import LocalComputeJobQueue, LocalPreprocessingQueueAdapter
+from app.depth_capture_jobs import LocalPreprocessingQueueAdapter
+from app.durable_runs import LOCAL_RUN_POLICY, LocalComputeJobQueue
 from app.depth_capture_runner import DepthCaptureFailure, DepthCaptureRequest, run_depth_capture
 from app.depth_capture_storage import DEPTH_ARTIFACTS, open_validated_depth_artifact, inspect_depth_artifacts
 from app.depth_capture_storage import DepthPreviewUnavailableError, open_validated_depth_preview
 from app.semantic_analysis import SemanticAnalysis, SemanticAnalysisError
-from app.semantic_analysis_jobs import SemanticAnalysisJobQueue
+from app.semantic_analysis_jobs import SemanticAnalysisQueueAdapter
 from app.semantic_analysis_runner import run_semantic_analysis
 from app.semantic_analysis_storage import (
     SCHEMA_VERSION,
@@ -635,7 +635,7 @@ def create_app(
         )
         task = preprocessing.model_copy(deep=True)
         reset_stages_from(task, stage)
-        task.status = "failed"
+        task.status = LOCAL_RUN_POLICY.recover_after_restart(task.status).status
         task.currentStage = stage
         task.updatedAt = datetime.now(timezone.utc).isoformat()
         task.error = preprocessing_error(
@@ -652,7 +652,7 @@ def create_app(
                 changed = False
                 for index, project in enumerate(projects):
                     preprocessing = project.localPreprocessing
-                    if preprocessing is None or preprocessing.status not in {"queued", "running"}:
+                    if preprocessing is None or not LOCAL_RUN_POLICY.active(preprocessing.status):
                         continue
                     task = interrupted_preprocessing(project, preprocessing)
                     projects[index] = project.model_copy(
@@ -909,7 +909,7 @@ def create_app(
                     project_changed = False
                     captures = [capture.model_copy(deep=True) for capture in project.depthCaptures]
                     for capture in captures:
-                        if capture.status in {"queued", "running"}:
+                        if LOCAL_RUN_POLICY.active(capture.status):
                             failed_depth_capture(
                                 capture,
                                 "depth_capture_interrupted",
@@ -1156,7 +1156,7 @@ def create_app(
                 changed = False
                 for index, project in enumerate(projects):
                     task = project.semanticAnalysis
-                    if task is None or task.status not in {"queued", "running"}:
+                    if task is None or not LOCAL_RUN_POLICY.active(task.status):
                         continue
                     interrupted = interrupted_semantic_analysis(task, now_utc())
                     projects[index] = project.model_copy(update={
@@ -1181,7 +1181,7 @@ def create_app(
         app.add_event_handler("shutdown", preprocessing_jobs.shutdown)
 
     if semantic_analysis_queue_factory is None:
-        semantic_analysis_jobs = SemanticAnalysisJobQueue(run_semantic_analysis_job)
+        semantic_analysis_jobs = SemanticAnalysisQueueAdapter(compute_jobs, run_semantic_analysis_job)
     else:
         semantic_analysis_jobs = semantic_analysis_queue_factory(run_semantic_analysis_job)
     app.add_event_handler("shutdown", semantic_analysis_jobs.shutdown)

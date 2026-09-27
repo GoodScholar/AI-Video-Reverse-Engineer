@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 from uuid import uuid4
 
+from .durable_runs import LOCAL_RUN_POLICY
 from .reference_video import validate_storage_id
 
 
@@ -148,8 +149,9 @@ class PersonControlStore:
                     continue
                 changed = False
                 for run in state["runs"]:
-                    if run["status"] in {"queued", "running"}:
-                        run.update(status="failed", error="服务重启导致任务中断，请重试。")
+                    recovery = LOCAL_RUN_POLICY.recover_after_restart(run["status"])
+                    if recovery.reason == "interrupted":
+                        run.update(status=recovery.status, error="服务重启导致任务中断，请重试。")
                         changed = True
                 if changed:
                     self.save(project_id, source_id, preprocessing_id, shot_id, state)
@@ -172,9 +174,9 @@ def environment_status(worker_python: str, worker_script: Path, model: Path) -> 
 
 def append_queued_run(state: dict[str, Any]) -> dict[str, Any]:
     current = latest_run(state)
-    if current is not None and current["status"] in {"queued", "running"}:
+    if current is not None and LOCAL_RUN_POLICY.active(current["status"]):
         raise PersonControlError("该镜头的人物控制正在处理中")
-    run = {"runId": str(uuid4()), "status": "queued", "error": None, "quality": None}
+    run = {"runId": str(uuid4()), "status": LOCAL_RUN_POLICY.initial_status, "error": None, "quality": None}
     state["runs"].append(run)
     return run
 
@@ -207,7 +209,7 @@ def control_status(state: dict[str, Any] | None, environment: dict[str, Any]) ->
         return "failed"
     if not environment["ready"]:
         return "unavailable"
-    if run is not None and run["status"] in {"queued", "running"}:
+    if run is not None and LOCAL_RUN_POLICY.active(run["status"]):
         return "running"
     if run is not None and run["status"] == "failed":
         return "failed"

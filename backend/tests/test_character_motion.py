@@ -169,6 +169,26 @@ def test_definite_environment_failure_is_retryable_not_unknown(tmp_path):
     assert client.get(BASE).json()['runs'][0]['status']=='failed'
 
 
+def test_failure_before_submission_does_not_create_an_unknown_run(tmp_path):
+    class CheckFailed(_Comfy):
+        def check(self, workflow):
+            raise TimeoutError('environment check failed')
+
+    client, _ = _setup(tmp_path, CheckFailed)
+    state = _ready_plan(client)
+    response = client.post(
+        BASE + '/runs',
+        json={
+            'revision': state['revision'],
+            'disclosureAccepted': True,
+            'preprocessorConfirmed': True,
+        },
+    )
+
+    assert response.status_code == 502
+    assert client.get(BASE).json()['runs'][0]['status'] == 'failed'
+
+
 def test_package_symlink_does_not_overwrite_outside_file(tmp_path):
     client,_=_setup(tmp_path);state=_ready_plan(client)
     assert client.get(BASE+'/package').status_code==200

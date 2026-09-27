@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.background import BackgroundTask
 
 from .asset_references import asset_references
+from .durable_runs import LOCAL_RUN_POLICY
 from .timeline import TimelineStore
 from .preproduction import NODE_KINDS, PreproductionStore
 from .preproduction_handoff import render_handoff
@@ -356,8 +357,9 @@ def create_preproduction_router(
                 changed = False
                 for shot in state["shots"]:
                     for node in shot["nodes"]:
-                        if node["status"] in ("queued", "running"):
-                            node.update(status="failed", error="服务重启中断了节点执行，可重试。", artifacts=[])
+                        if node["status"] in LOCAL_RUN_POLICY.active_statuses:
+                            recovery = LOCAL_RUN_POLICY.recover_after_restart(node["status"])
+                            node.update(status=recovery.status, error="服务重启中断了节点执行，可重试。", artifacts=[])
                             changed = True
                 if changed:
                     store.save(project_id, state)

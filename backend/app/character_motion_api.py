@@ -19,6 +19,7 @@ from .character_motion import (CharacterImage, CharacterMotionState, CharacterMo
                                MotionSettings, OFFICIAL_TEMPLATE, driver_for, source_hash, utc_now)
 from .character_motion_templates import build_workflow, template_info
 from .character_motion_media import normalize_driver, validate_video
+from .durable_runs import EXTERNAL_RUN_POLICY
 from .reference_media_storage import managed_reference_media_is_safe, resolve_reference_media_path
 
 MAX_CHARACTER_BYTES = 20 * 1024 * 1024
@@ -65,7 +66,8 @@ def create_character_motion_router(data_dir, get_project, *, client_factory=None
         changed = False
         for run in state.runs:
             if run.status == "submitting" and run.id not in submissions:
-                run.status, run.error, changed = "unknown", "上次提交被中断，请在 ComfyUI 中核对是否已排队。", True
+                run.status = EXTERNAL_RUN_POLICY.recover_after_restart(run.status).status
+                run.error, changed = "上次提交被中断，请在 ComfyUI 中核对是否已排队。", True
         if changed:
             store.save(project_id, state)
         return project, state
@@ -262,14 +264,15 @@ def create_character_motion_router(data_dir, get_project, *, client_factory=None
             project, state = load(project_id)
             checked_revision(state, body.revision)
             ready(project, state)
-            if any(run.status in {"submitting", "queued", "running", "unknown"} for run in state.runs):
+            if any(EXTERNAL_RUN_POLICY.active(run.status) for run in state.runs):
                 _fail("motion_generation_in_progress", "已有未结束或状态未知的生成，请先刷新或人工恢复。")
             asset_paths = assets(project, state)
             driver_key = next(name for name in asset_paths if name.startswith("input/driver."))
             workflow = graph(state, "character.png", driver_key[6:])
-            run = MotionRun(id=str(uuid4()), status="submitting", createdAt=utc_now(), revision=state.revision,
+            run = MotionRun(id=str(uuid4()), status=EXTERNAL_RUN_POLICY.initial_status, createdAt=utc_now(), revision=state.revision,
                             sourceHash=state.sourceHash or "", comfyUrl=state.comfyUrl, workflow=workflow)
             state.runs.append(run); submissions.add(run.id); save(project_id, state)
+        submission_attempted = False
         try:
             with client_for(run.comfyUrl) as client:
                 check = client.check(workflow)
@@ -277,18 +280,22 @@ def create_character_motion_router(data_dir, get_project, *, client_factory=None
                     _fail("comfy_not_ready", "ComfyUI 环境不完整，请先检查缺失模型和节点。", 422)
                 names = {name: client.upload_image(path, f"{run.id}-{path.name}") for name, path in asset_paths.items()}
                 run.workflow = graph(state, names["input/character.png"], names[driver_key])
+                submission_attempted = True
                 prompt_id = client.submit(run.workflow)
             with lock:
                 project, current = load(project_id)
                 saved = next(item for item in current.runs if item.id == run.id)
-                saved.status, saved.promptId, saved.workflow, saved.error = "queued", prompt_id, run.workflow, None
+                saved.status = EXTERNAL_RUN_POLICY.validate("queued")
+                saved.promptId, saved.workflow, saved.error = prompt_id, run.workflow, None
                 save(project_id, current)
                 return view(project, current)
         except HTTPException as error:
             with lock:
                 project, current = load(project_id)
                 saved = next(item for item in current.runs if item.id == run.id)
-                saved.status = "unknown" if error.detail.get("outcomeUnknown") is True else "failed"
+                uncertain = submission_attempted and error.detail.get("outcomeUnknown") is True
+                saved.status = (EXTERNAL_RUN_POLICY.mark_outcome_unknown(saved.status) if uncertain
+                                else EXTERNAL_RUN_POLICY.fail(saved.status))
                 saved.error = error.detail.get("message")
                 save(project_id, current)
             raise
@@ -296,9 +303,17 @@ def create_character_motion_router(data_dir, get_project, *, client_factory=None
             with lock:
                 project, current = load(project_id)
                 saved = next(item for item in current.runs if item.id == run.id)
-                saved.status, saved.error = "unknown", "无法确认请求是否进入 ComfyUI 队列。"
+                if submission_attempted:
+                    saved.status = EXTERNAL_RUN_POLICY.mark_outcome_unknown(saved.status)
+                    saved.error = "无法确认请求是否进入 ComfyUI 队列。"
+                else:
+                    saved.status = EXTERNAL_RUN_POLICY.fail(saved.status)
+                    saved.error = "连接或准备 ComfyUI 请求失败。"
                 save(project_id, current)
-            raise HTTPException(status_code=502, detail={"code": "comfy_request_failed", "message": "无法确认 ComfyUI 是否已接收工作流。", "outcomeUnknown": True}) from None
+            message = ("无法确认 ComfyUI 是否已接收工作流。" if submission_attempted
+                       else "连接或准备 ComfyUI 请求失败。")
+            raise HTTPException(status_code=502, detail={"code": "comfy_request_failed", "message": message,
+                                                         "outcomeUnknown": submission_attempted}) from None
         finally:
             submissions.discard(run.id)
 
@@ -343,7 +358,8 @@ def create_character_motion_router(data_dir, get_project, *, client_factory=None
             saved = next(item for item in state.runs if item.id == run_id)
             if saved.promptId != prompt_id or saved.status in {"completed", "failed"}:
                 return view(project, state)
-            saved.status, saved.error, saved.outputs = result["status"], result.get("error"), outputs
+            saved.status = EXTERNAL_RUN_POLICY.validate(result["status"])
+            saved.error, saved.outputs = result.get("error"), outputs
             save(project_id, state)
             return view(project, state)
 

@@ -6,6 +6,7 @@ from copy import deepcopy
 from typing import Any, Callable
 from uuid import uuid4
 
+from .durable_runs import LOCAL_RUN_POLICY, RunConflict, freeze_run_input
 from .timeline import validate_workspace
 from .video_aspect import PRODUCT_PRESETS, ratio_label, resolve_product_aspect, valid_aspect_mode
 
@@ -280,7 +281,7 @@ def queue_voiceover(task: dict[str, Any], *, job_id: str, voice_id: str, plan: d
     variant = task["variant"]
     variant["revision"] += 1
     voiceover = {
-        "id": job_id, "voiceId": voice_id, "status": "queued", "error": None,
+        "id": job_id, "voiceId": voice_id, "status": LOCAL_RUN_POLICY.initial_status, "error": None,
         "contentRevision": task.get("contentRevision", 0), "variantRevision": variant["revision"],
         "subtitleRevision": subtitles_for(variant)["revision"],
         "model": "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit", "modelRevision": model_revision,
@@ -296,7 +297,8 @@ def validate_voiceover_target(owner: dict[str, Any], task: dict[str, Any],
         raise BatchProductionError("batch_voiceover_scope", "只能处理当前任务或它的批量变体。", 422)
     if current_version(task) != requested_version:
         raise BatchProductionError("batch_voiceover_conflict", "脚本、镜头或字幕已更新，请保存或刷新后重新确认。")
-    if task.get("voiceover", {}).get("status") in ("queued", "running"):
+    voice_status = task.get("voiceover", {}).get("status")
+    if voice_status is not None and LOCAL_RUN_POLICY.active(voice_status):
         raise BatchProductionError("batch_voiceover_active", "配音正在处理中。")
 
 
@@ -307,7 +309,7 @@ def start_voiceover(task: dict[str, Any], job_id: str) -> dict[str, Any] | None:
     if current_version(task) != (voice["contentRevision"], voice["variantRevision"], voice["subtitleRevision"]):
         raise BatchProductionError(
             "batch_voiceover_stale", "脚本、镜头或字幕已修改，未覆盖新内容，请重新生成配音。")
-    voice["status"] = "running"
+    voice["status"] = LOCAL_RUN_POLICY.start(voice["status"])
     return voice
 
 
@@ -315,10 +317,19 @@ def complete_voiceover(task: dict[str, Any], *, job_id: str, expected_version: t
                        tracks: list[dict[str, Any]], cues: list[dict[str, Any]], asset_ids: list[str],
                        publish_assets: Callable[[], None]) -> dict[str, Any]:
     voice = task.get("voiceover")
-    if (not voice or voice["id"] != job_id or voice["status"] != "running"
-            or current_version(task) != expected_version):
+    if not voice or voice["id"] != job_id:
         raise BatchProductionError(
             "batch_voiceover_stale", "脚本、镜头或字幕已修改，未覆盖新内容，请重新生成配音。")
+    try:
+        completion = LOCAL_RUN_POLICY.complete(
+            voice["status"],
+            frozen_input=freeze_run_input(expected_version),
+            current_input=current_version(task),
+            result={"assetIds": asset_ids},
+        )
+    except RunConflict:
+        raise BatchProductionError(
+            "batch_voiceover_stale", "脚本、镜头或字幕已修改，未覆盖新内容，请重新生成配音。") from None
     publish_assets()
     variant = task["variant"]
     variant["tracks"] = tracks
@@ -326,8 +337,8 @@ def complete_voiceover(task: dict[str, Any], *, job_id: str, expected_version: t
     subtitles = subtitles_for(variant)
     subtitles["cues"] = cues
     subtitles["revision"] += 1
-    voice.update(status="completed", error=None, variantRevision=variant["revision"],
-                 subtitleRevision=subtitles["revision"], assetIds=asset_ids)
+    voice.update(status=completion.status, error=None, variantRevision=variant["revision"],
+                 subtitleRevision=subtitles["revision"], assetIds=completion.result["assetIds"])
     voice.pop("plan", None)
     task.pop("proposal", None)
     return voice
@@ -387,7 +398,7 @@ def submit_preview(task: dict[str, Any], *, expected_revision: int, assets: dict
         raise BatchProductionError("batch_voiceover_stale", "配音未完成或脚本已修改，请按当前脚本重新生成配音。")
     if expected_revision != variant["revision"]:
         raise BatchProductionError("batch_variant_conflict", "请先保存当前变体。")
-    if any(run["status"] in ("queued", "running") for run in variant["runs"]):
+    if any(LOCAL_RUN_POLICY.active(run["status"]) for run in variant["runs"]):
         raise BatchProductionError("batch_preview_active", "此变体已有预览任务。")
     try:
         settings, tracks = validate_workspace(
@@ -403,7 +414,7 @@ def submit_preview(task: dict[str, Any], *, expected_revision: int, assets: dict
         "id": run_id, "revision": frozen["variantRevision"],
         "contentRevision": frozen["contentRevision"], "subtitleRevision": frozen["subtitleRevision"],
         "subtitleCues": frozen["subtitleCues"], "snapshot": frozen["snapshot"],
-        "status": "queued", "error": None,
+        "status": LOCAL_RUN_POLICY.initial_status, "error": None,
         "sources": snapshot_sources(run_id, tracks, assets),
     }
     variant["runs"].append(run)
@@ -467,7 +478,7 @@ def export_approved_version(task: dict[str, Any], *, assets: dict[str, dict[str,
     manifest = [{"id": asset_id, "name": assets.get(asset_id, {}).get("name", asset_id),
                  "kind": assets.get(asset_id, {}).get("kind", "unknown")} for asset_id in sorted(asset_ids)]
     run = {
-        "id": run_id, "status": "queued", "error": None,
+        "id": run_id, "status": LOCAL_RUN_POLICY.initial_status, "error": None,
         "contentRevision": version[0], "variantRevision": version[1], "subtitleRevision": version[2],
         "previewRunId": preview["id"], "review": dict(review),
         "sellingPoint": task["sellingPoint"], "script": task["script"],
@@ -507,8 +518,3 @@ def export_approved_versions(parent: dict[str, Any], selected: list[dict[str, An
         )
         results.append((task, run, created))
     return results
-
-
-def record_render_result(run: dict[str, Any], media: Any) -> None:
-    if isinstance(media, dict):
-        run["media"] = dict(media)

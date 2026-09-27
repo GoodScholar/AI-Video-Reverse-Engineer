@@ -18,6 +18,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.background import BackgroundTask
 
+from .durable_runs import LOCAL_RUN_POLICY
 from .person_controls import PersonArtifactStream, parse_single_byte_range, stream_person_artifact
 from .reference_media_storage import managed_reference_media_is_safe, resolve_reference_media_path
 from .reference_video import validate_storage_id
@@ -130,8 +131,9 @@ def create_upscale_router(data_dir, get_project, compute_queue, *, config=None, 
             pid, rid = state.parents[2].name, state.parent.name
             try:
                 run = load(pid, rid)
-                if run['status'] in ('queued', 'running'):
-                    run.update(status='failed', error='服务重启导致超分任务中断，请重新开始。')
+                recovery = LOCAL_RUN_POLICY.recover_after_restart(run['status'])
+                if recovery.reason == 'interrupted':
+                    run.update(status=recovery.status, error='服务重启导致超分任务中断，请重新开始。')
                     save(pid, run)
                     clean_temporary(pid, rid)
             except (OSError, HTTPException):
@@ -176,7 +178,7 @@ def create_upscale_router(data_dir, get_project, compute_queue, *, config=None, 
                 fail('请刷新页面并选择当前参考视频。')
             if not config.environment()['available']:
                 fail(config.environment()['message'])
-            if any(r['status'] in ('queued', 'running') for r in runs(project_id)):
+            if any(LOCAL_RUN_POLICY.active(r['status']) for r in runs(project_id)):
                 fail('此项目已有超分任务正在排队或运行。')
             try:
                 target_dimensions(reference.width, reference.height, body.scale or body.outputResolution)
@@ -186,7 +188,7 @@ def create_upscale_router(data_dir, get_project, compute_queue, *, config=None, 
                 fail('参考视频文件不可用。')
             run = UpscaleRun(id=str(uuid4()), sourceId=body.sourceId, scale=body.scale,
                 outputResolution=body.outputResolution if body.scale is None else None,
-                status='queued', stage='queued', progress=0, createdAt=datetime.now(timezone.utc).isoformat()).model_dump()
+                status=LOCAL_RUN_POLICY.initial_status, stage='queued', progress=0, createdAt=datetime.now(timezone.utc).isoformat()).model_dump()
             directory = safe_path(project_id, run['id'])
             try:
                 directory.mkdir(parents=True)
@@ -196,7 +198,7 @@ def create_upscale_router(data_dir, get_project, compute_queue, *, config=None, 
                 shutil.rmtree(directory, ignore_errors=True)
                 fail('无法保存超分任务或输入快照，请检查磁盘空间。', 503)
             if not compute_queue.submit('video_upscale', project_id, lambda pid: process(pid, run['id'])):
-                run.update(status='failed', error='本地计算队列不可用，请重试。')
+                run.update(status=LOCAL_RUN_POLICY.fail(run['status']), error='本地计算队列不可用，请重试。')
                 save(project_id, run); clean_temporary(project_id, run['id'])
                 fail(run['error'], 503)
             return run
