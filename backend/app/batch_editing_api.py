@@ -27,6 +27,7 @@ from .batch_production import (
     export_approved_versions,
     review_current_version,
     review_status,
+    reusable_preview,
     queue_voiceover,
     save_content as save_batch_content,
     save_subtitles as save_batch_subtitles,
@@ -1022,11 +1023,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             if child["generation"]["status"] == "failed":
                 results.append({"taskId": child["id"], "status": "failed", "error": child["generation"]["error"]})
                 continue
-            latest = child["variant"]["runs"][-1] if child["variant"]["runs"] else None
-            if (latest and latest["revision"] == child["variant"]["revision"]
-                    and latest.get("contentRevision", 0) == child.get("contentRevision", 0)
-                    and latest.get("subtitleRevision", 0) == child["variant"].get("subtitles", {}).get("revision", 0)
-                    and latest["status"] in ("queued", "running", "completed")):
+            latest = reusable_preview(child)
+            if latest is not None:
                 results.append({"taskId": child["id"], "status": latest["status"], "runId": latest["id"]})
                 continue
             try:

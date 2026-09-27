@@ -261,7 +261,7 @@ def test_export_reuses_the_current_version_delivery_without_copying_sources_agai
     task["reviews"].append({"id": "review", "runId": "preview", "decision": "approved", "reason": "确认",
                             "contentRevision": 0, "variantRevision": 2, "subtitleRevision": 0})
     task["variant"]["exports"].append({"id": "delivery", "status": "completed", "contentRevision": 0,
-        "variantRevision": 2, "subtitleRevision": 0})
+        "variantRevision": 2, "subtitleRevision": 0, "previewRunId": "preview"})
 
     delivery, created = export_approved_version(
         task, assets={"shot": {"id": "shot", "name": "镜头", "kind": "video"}},
@@ -269,3 +269,67 @@ def test_export_reuses_the_current_version_delivery_without_copying_sources_agai
     )
 
     assert delivery["id"] == "delivery" and created is False
+
+
+def test_export_does_not_reuse_a_delivery_from_an_older_preview():
+    task = create_batch("省时", "操作演示", id_factory=ids("task", "variant"))
+    task["variant"].update(revision=2, tracks=video_tracks())
+    first_preview = completed_preview(task, "preview-1")
+    first_review = approved_review(task, first_preview, "review-1")
+    task["variant"]["runs"].append(first_preview)
+    task["reviews"].append(first_review)
+    task["variant"]["exports"].append({
+        "id": "delivery-1", "status": "completed", "contentRevision": 0,
+        "variantRevision": 2, "subtitleRevision": 0, "previewRunId": "preview-1",
+        "review": first_review, "output": "delivery-1.mp4",
+    })
+    current_preview = completed_preview(task, "preview-2")
+    task["variant"]["runs"].append(current_preview)
+    task["reviews"].append(approved_review(task, current_preview, "review-2"))
+
+    delivery, created = export_approved_version(
+        task,
+        assets={"shot": {"id": "shot", "name": "镜头", "kind": "video"}},
+        snapshot_sources=lambda *_: {"shot": "shot.mp4"},
+        id_factory=ids("delivery-2"),
+    )
+
+    assert created is True
+    assert delivery["id"] == "delivery-2"
+    assert delivery["previewRunId"] == "preview-2"
+
+
+def test_export_reuses_delivery_after_same_preview_is_reapproved():
+    task = create_batch("省时", "操作演示", id_factory=ids("task", "variant"))
+    task["variant"].update(revision=2, tracks=video_tracks())
+    preview = completed_preview(task)
+    first_review = approved_review(task, preview, "review-1")
+    task["variant"]["runs"].append(preview)
+    task["reviews"].extend([first_review, approved_review(task, preview, "review-2")])
+    task["variant"]["exports"].append({
+        "id": "delivery", "status": "completed", "contentRevision": 0,
+        "variantRevision": 2, "subtitleRevision": 0, "previewRunId": "preview",
+        "review": first_review, "output": "delivery.mp4",
+    })
+
+    delivery, created = export_approved_version(
+        task,
+        assets={"shot": {"id": "shot", "name": "镜头", "kind": "video"}},
+        snapshot_sources=lambda *_: pytest.fail("同一预览重新批准不应重新复制素材"),
+        id_factory=ids("unused"),
+    )
+
+    assert delivery["id"] == "delivery"
+    assert created is False
+
+
+def test_reusable_preview_preserves_legacy_revision_defaults():
+    task = create_batch("省时", "操作演示", id_factory=ids("task", "variant"))
+    preview = completed_preview(task)
+    preview.pop("contentRevision")
+    preview.pop("subtitleRevision")
+    task["variant"]["runs"].append(preview)
+
+    reusable = production.reusable_preview(task)
+
+    assert reusable["id"] == "preview"

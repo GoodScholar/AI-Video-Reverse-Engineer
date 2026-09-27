@@ -154,6 +154,19 @@ def inspect_variant(task: dict[str, Any]) -> VariantLifecycle:
     return VariantLifecycle(voice=voice, preview=preview, review=review, delivery=delivery)
 
 
+def reusable_preview(task: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the latest preview that the bulk command may reuse."""
+    runs = task["variant"].get("runs", [])
+    if not runs:
+        return None
+    latest = runs[-1]
+    if (latest.get("status") in ("queued", "running", "completed")
+            and (latest.get("contentRevision", 0), latest.get("revision"),
+                 latest.get("subtitleRevision", 0)) == current_version(task)):
+        return latest
+    return None
+
+
 def review_status(task: dict[str, Any]) -> str:
     return inspect_variant(task).review.status
 
@@ -513,8 +526,8 @@ def review_current_version(task: dict[str, Any], *, run_id: str, decision: str, 
     if run is None:
         raise BatchProductionError("batch_preview_missing", "预览不存在。", 404)
     version = current_version(task)
-    if (run is not variant["runs"][-1] or run["status"] != "completed"
-            or (run.get("contentRevision", 0), run["revision"], run.get("subtitleRevision", 0)) != version):
+    current_preview = inspect_variant(task).preview
+    if current_preview.status != "current" or current_preview.record is not run:
         raise BatchProductionError("batch_review_preview_stale", "请先完成当前版本的预览。")
     if not preview_available(run):
         raise BatchProductionError("batch_review_preview_unavailable", "预览文件不可用，请重新生成。")
@@ -529,10 +542,11 @@ def review_current_version(task: dict[str, Any], *, run_id: str, decision: str, 
 def _approved_export_context(task: dict[str, Any], preview_available: Callable[[dict[str, Any]], bool]):
     variant = task["variant"]
     version = current_version(task)
-    review = task.get("reviews", [])[-1] if task.get("reviews") else None
-    preview = variant["runs"][-1] if variant["runs"] else None
+    lifecycle = inspect_variant(task)
+    review = lifecycle.review.record
+    preview = lifecycle.preview.record
     frozen = frozen_edit_snapshot(task)
-    if (review_status(task) != "approved" or review is None or preview is None
+    if (lifecycle.review.status != "approved" or review is None or preview is None
             or preview["status"] != "completed" or variant["settings"].get("fps") != 30
             or preview["snapshot"] != frozen["snapshot"]
             or preview.get("subtitleCues", []) != frozen["subtitleCues"]
@@ -540,9 +554,12 @@ def _approved_export_context(task: dict[str, Any], preview_available: Callable[[
         raise BatchProductionError("batch_export_not_approved", "仅能导出当前版本已预览并通过审核的变体。")
     if not preview_available(preview):
         raise BatchProductionError("batch_export_preview_unavailable", "当前预览文件不可用，请重新生成。")
-    previous = exports_for(variant)[-1] if exports_for(variant) else None
-    if (previous and previous["status"] in ("queued", "running", "completed")
-            and (previous["contentRevision"], previous["variantRevision"], previous["subtitleRevision"]) == version):
+    previous = next((delivery for delivery in reversed(exports_for(variant))
+                     if delivery.get("status") in ("queued", "running", "completed")
+                     and (delivery.get("contentRevision", 0), delivery.get("variantRevision", 0),
+                          delivery.get("subtitleRevision", 0)) == version
+                     and delivery.get("previewRunId") == preview["id"]), None)
+    if previous is not None:
         return version, review, preview, frozen, previous
     return version, review, preview, frozen, None
 
