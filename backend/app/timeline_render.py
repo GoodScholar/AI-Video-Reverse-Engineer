@@ -11,6 +11,7 @@ import signal
 import subprocess
 import time
 import uuid
+from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -33,6 +34,9 @@ class _Media:
         has_video: bool,
         has_audio: bool,
         image: bool,
+        width: Optional[int],
+        height: Optional[int],
+        fps: Optional[float],
     ):
         self.duration = duration
         self.video_duration = video_duration
@@ -40,6 +44,9 @@ class _Media:
         self.has_video = has_video
         self.has_audio = has_audio
         self.image = image
+        self.width = width
+        self.height = height
+        self.fps = fps
 
 
 def render_timeline(
@@ -52,7 +59,7 @@ def render_timeline(
     ffprobe_path: str = "ffprobe",
     cancelled: Callable[[], bool] = lambda: False,
     subtitles_path: Optional[Path] = None,
-) -> None:
+) -> dict:
     """将已校验的时间线渲染为 MP4、预览 MP4 或 PCM WAV。
 
     输出在同目录临时文件中生成，只有编码完成、未取消且经过 ffprobe
@@ -94,10 +101,11 @@ def render_timeline(
         _run_ffmpeg(command, cancelled, cwd=Path(subtitles_path).parent if subtitles_path is not None else None)
         if cancelled():
             raise TimelineRenderError("时间线渲染已取消。")
-        _verify_output(temporary, format, expected, ffprobe_path)
+        media = _verify_output(temporary, format, expected, ffprobe_path)
         if cancelled():
             raise TimelineRenderError("时间线渲染已取消。")
         temporary.replace(output)
+        return media
     except TimelineRenderError:
         _remove_file(temporary)
         raise
@@ -220,7 +228,8 @@ def _collect_clips(tracks: list, sources: Dict[str, Path], ffprobe_path: str, fo
 def _probe_media(source: Path, ffprobe_path: str) -> _Media:
     command = [
         ffprobe_path, "-v", "error", "-show_entries",
-        "format=duration,format_name:stream=codec_type,duration", "-of", "json", str(source),
+        "format=duration,format_name:stream=codec_type,duration,width,height,avg_frame_rate,r_frame_rate",
+        "-of", "json", str(source),
     ]
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=_PROBE_TIMEOUT_SECONDS)
@@ -246,6 +255,14 @@ def _probe_media(source: Path, ffprobe_path: str) -> _Media:
         duration = None
     format_name = str(metadata.get("format_name") or "")
     image = has_video and not has_audio and (duration is None or duration <= 0.001 or "image2" in format_name)
+    video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), {})
+    width = video_stream.get("width") if type(video_stream.get("width")) is int else None
+    height = video_stream.get("height") if type(video_stream.get("height")) is int else None
+    try:
+        frame_rate = video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate")
+        fps = float(Fraction(frame_rate)) if frame_rate not in (None, "0/0") else None
+    except (ValueError, ZeroDivisionError):
+        fps = None
     return _Media(
         duration,
         _first_stream_duration(streams, "video"),
@@ -253,6 +270,9 @@ def _probe_media(source: Path, ffprobe_path: str) -> _Media:
         has_video,
         has_audio,
         image,
+        width,
+        height,
+        fps,
     )
 
 
@@ -459,7 +479,7 @@ def _terminate(process: subprocess.Popen) -> None:
         process.wait()
 
 
-def _verify_output(output: Path, format: str, expected: dict, ffprobe_path: str) -> None:
+def _verify_output(output: Path, format: str, expected: dict, ffprobe_path: str) -> dict:
     media = _probe_media(output, ffprobe_path)
     if format == "wav":
         if not media.has_audio:
@@ -470,6 +490,10 @@ def _verify_output(output: Path, format: str, expected: dict, ffprobe_path: str)
         raise TimelineRenderError("渲染输出时长无效。")
     if abs(media.duration - expected["duration"]) > 0.12:
         raise TimelineRenderError("渲染输出时长与时间线不一致。")
+    result = {"duration": media.duration}
+    if format != "wav":
+        result.update(width=media.width, height=media.height, fps=media.fps)
+    return result
 
 
 def _output_size(width: int, height: int, format: str) -> Tuple[int, int]:

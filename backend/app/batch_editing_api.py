@@ -17,12 +17,32 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 
+from .batch_production import (
+    BatchProductionError,
+    apply_aigc_handoff,
+    complete_voiceover,
+    create_batch as new_task,
+    create_batch_variants,
+    current_version as review_version,
+    export_approved_versions,
+    record_render_result,
+    review_current_version,
+    review_status,
+    queue_voiceover,
+    save_content as save_batch_content,
+    save_subtitles as save_batch_subtitles,
+    save_variant as save_batch_variant,
+    submit_preview as submit_batch_preview,
+    subtitles_for as _subtitles,
+    start_voiceover,
+    validate_voiceover_target,
+)
 from .batch_recommendation import RecommendationError, recommend
 from .batch_subtitles import milliseconds, parse_srt, write_srt
 from .preproduction import PreproductionStore, safe_child
 from .reference_video import validate_storage_id
 from .timeline import validate_workspace
-from .video_aspect import PRODUCT_PRESETS, ratio_label, resolve_product_aspect, valid_aspect_mode
+from .video_aspect import PRODUCT_PRESETS, ratio_label, valid_aspect_mode
 
 
 def _valid_id(value: Any) -> bool:
@@ -67,34 +87,13 @@ def _validate_cues(cues: Any, tracks: list) -> list:
     return cues
 
 
-def _subtitles(variant: dict) -> dict:
-    return variant.setdefault("subtitles", {"revision": 0, "cues": [], "recognitions": []})
-
-
-def _exports(variant: dict) -> list:
-    return variant.setdefault("exports", [])
-
-
-def review_version(task: dict) -> tuple[int, int, int]:
-    variant = task["variant"]
-    return (task.get("contentRevision", 0), variant["revision"], variant.get("subtitles", {}).get("revision", 0))
-
-
-def review_status(task: dict) -> str:
-    reviews = task.get("reviews", [])
-    if not reviews:
-        return "pending"
-    voice = task.get("voiceover")
-    if voice is not None and (voice["status"] != "completed" or voice["contentRevision"] != task.get("contentRevision", 0)):
-        return "stale"
-    latest = reviews[-1]
-    variant = task["variant"]
-    reviewed_run = next((run for run in variant["runs"] if run["id"] == latest["runId"]), None)
-    if ((latest["contentRevision"], latest["variantRevision"], latest["subtitleRevision"]) != review_version(task)
-            or reviewed_run is None or reviewed_run["snapshot"] != {"settings": variant["settings"], "tracks": variant["tracks"]}
-            or reviewed_run.get("subtitleCues", []) != variant.get("subtitles", {}).get("cues", [])):
-        return "stale"
-    return latest["decision"]
+def _validate_media_properties(media: Any, message: str) -> None:
+    if (not isinstance(media, dict)
+            or type(media.get("width")) is not int or media["width"] <= 0
+            or type(media.get("height")) is not int or media["height"] <= 0
+            or type(media.get("fps")) not in (int, float) or media["fps"] <= 0
+            or type(media.get("duration")) not in (int, float) or media["duration"] <= 0):
+        raise ValueError(message)
 
 
 def _validate_state(value: Any) -> None:
@@ -186,6 +185,8 @@ def _validate_state(value: Any) -> None:
                 _validate_cues(run.get("subtitleCues"), run["snapshot"]["tracks"])
             if type(run.get("contentRevision", 0)) is not int or run.get("contentRevision", 0) < 0:
                 raise ValueError("预览脚本版本无效")
+            if "media" in run:
+                _validate_media_properties(run["media"], "预览媒体属性无效")
         exports = variant.get("exports", [])
         if not isinstance(exports, list):
             raise ValueError("成片记录无效")
@@ -210,6 +211,8 @@ def _validate_state(value: Any) -> None:
                 raise ValueError("成片素材快照无效")
             if delivery["status"] == "completed" and delivery.get("output") != delivery["id"] + ".mp4":
                 raise ValueError("成片文件关联无效")
+            if "media" in delivery:
+                _validate_media_properties(delivery["media"], "成片媒体属性无效")
         reviews = task.get("reviews", [])
         if not isinstance(reviews, list):
             raise ValueError("审核记录无效")
@@ -263,20 +266,6 @@ class BatchStore:
                 temporary.unlink(missing_ok=True)
 
 
-def new_task(selling_point: str, script: str, aspect: dict | None = None):
-    aspect = aspect or {"mode": "9:16", "resolvedAspect": "9:16", "width": 720, "height": 1280,
-                        "reason": "商品制作默认使用 9:16。"}
-    return {"id": uuid4().hex, "sellingPoint": selling_point.strip(), "script": script.strip(),
-            "contentRevision": 0, "reviews": [],
-            "variant": {"id": uuid4().hex, "revision": 0,
-                        "aspectMode": aspect["mode"], "resolvedAspect": aspect["resolvedAspect"],
-                        "aspectReason": aspect["reason"],
-                        "settings": {"width": aspect["width"], "height": aspect["height"], "fps": 30},
-                        "tracks": [{"id": "video", "name": "画面", "kind": "video", "muted": False, "hidden": False, "clips": []},
-                                   {"id": "audio", "name": "声音", "kind": "audio", "muted": False, "hidden": False, "clips": []}],
-                        "subtitles": {"revision": 0, "cues": [], "recognitions": []}, "runs": [], "exports": []}}
-
-
 def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", source_lock=None, renderer=None, voice_service=None):
     store = BatchStore(Path(data_dir))
     preproduction = PreproductionStore(Path(data_dir))
@@ -284,11 +273,11 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
     router = APIRouter(prefix="/api/projects/{project_id}/batch-edits")
     from .batch_voiceover import plan_voiceover, audio_duration, arrange_voiceover
 
-    def voice_current(task):
-        voice = task.get("voiceover")
-        if voice is not None and (voice["status"] != "completed" or voice["contentRevision"] != task.get("contentRevision", 0)):
-            raise HTTPException(409, detail={"code": "batch_voiceover_stale", "message": "配音未完成或脚本已修改，请按当前脚本重新生成配音。"})
-
+    def production_call(command, *args, **kwargs):
+        try:
+            return command(*args, **kwargs)
+        except BatchProductionError as error:
+            raise HTTPException(error.status_code, detail={"code": error.code, "message": error.message}) from None
 
     def project_for(project_id: str):
         if get_project(project_id) is None:
@@ -353,33 +342,6 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 raise OSError("不是普通文件")
         finally:
             os.close(descriptor)
-
-    def arrange_aigc_candidate(project_id: str, task: dict, item: dict, assets: dict):
-        try:
-            clips = []
-            cues = []
-            position = 0.0
-            for beat in item["beats"]:
-                asset = assets[beat["assetId"]]
-                if asset["kind"] not in ("image", "video"):
-                    raise ValueError("画面素材类型无效")
-                regular_file(preproduction.path(project_id, "assets", asset["file"]))
-                duration = min(3.0, asset["duration"]) if asset["kind"] == "video" else 3.0
-                clips.append({"id": uuid4().hex, "assetId": beat["assetId"], "start": position,
-                              "inPoint": 0, "duration": duration, "speed": 1, "volume": 1,
-                              "fadeIn": 0, "fadeOut": 0})
-                cues.append({"id": uuid4().hex, "start": position, "end": position + duration, "text": beat["text"]})
-                position += duration
-            validate_workspace({"revision": 0, "settings": task["variant"]["settings"],
-                                "tracks": [{**task["variant"]["tracks"][0], "clips": clips},
-                                           *task["variant"]["tracks"][1:]]}, assets)
-            task["variant"]["tracks"][0]["clips"] = clips
-            task["variant"]["subtitles"]["cues"] = cues
-            task["generation"] = {"status": "ready", "error": None}
-        except (OSError, ValueError, KeyError, TypeError):
-            task["variant"]["tracks"][0]["clips"] = []
-            task["variant"]["subtitles"]["cues"] = []
-            task["generation"] = {"status": "failed", "error": "镜头素材不可用或超出时间线限制，请检查该候选的素材与镜头安排。"}
 
     def copy_source(source: Path, target: Path):
         descriptor = os.open(str(source), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -565,8 +527,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 subtitle_file = store.path(project_id, "runs", run_id, "subtitles.srt")
                 write_srt(subtitle_file, subtitle_cues)
             render_options = {"subtitles_path": subtitle_file} if subtitle_file else {}
-            actual_renderer(snapshot, sources, staging, format="preview", ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
-                            cancelled=lambda: run_cancelled(project_id, task_id, run_id), **render_options)
+            media = actual_renderer(snapshot, sources, staging, format="preview", ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
+                                    cancelled=lambda: run_cancelled(project_id, task_id, run_id), **render_options)
             regular_file(staging)
             with lock:
                 state = state_for(project_id)
@@ -577,6 +539,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 output.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(staging, output)
                 run.update(status="completed", error=None, output=output.name)
+                record_render_result(run, media)
                 save(project_id, state)
         except BaseException as error:
             with lock:
@@ -618,9 +581,9 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             if actual_renderer is None:
                 from .timeline_render import render_timeline
                 actual_renderer = render_timeline
-            actual_renderer(snapshot, sources, staging, format="mp4", ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
-                            cancelled=lambda: export_cancelled(project_id, task_id, run_id),
-                            **({"subtitles_path": subtitle_file} if subtitle_file else {}))
+            media = actual_renderer(snapshot, sources, staging, format="mp4", ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
+                                    cancelled=lambda: export_cancelled(project_id, task_id, run_id),
+                                    **({"subtitles_path": subtitle_file} if subtitle_file else {}))
             regular_file(staging)
             with lock:
                 state = state_for(project_id)
@@ -631,6 +594,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 output.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(staging, output)
                 run.update(status="completed", error=None, output=output.name)
+                record_render_result(run, media)
                 save(project_id, state)
         except BaseException as error:
             with lock:
@@ -713,79 +677,19 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         from .aigc_content_api import load_confirmed_handoff
         with source_lock or nullcontext(), lock:
             brief, candidates = load_confirmed_handoff(data_dir, project_id, body["generationId"])
-            handoff_key = json.dumps([body["generationId"], brief["revision"],
-                                      [(item["id"], item["revision"]) for item in candidates]], separators=(",", ":"))
             state = state_for(project_id)
             assets = assets_for(project_id)
-            selected_assets = [assets[asset_id] for asset_id in brief["assetIds"] if asset_id in assets]
-            aspect = resolve_product_aspect(brief.get("aspectMode", "9:16"), selected_assets)
-
-            def source_for(item):
-                used_ids = list(dict.fromkeys(beat["assetId"] for beat in item["beats"]))
-                fact_ids = {fact_id for beat in item["beats"] for fact_id in beat["factIds"]}
-                return {"candidateId": item["id"], "candidateRevision": item["revision"],
-                        "briefRevision": brief["revision"], "generationId": body["generationId"],
-                        "screenCopySource": "script", "sellingPoint": item["sellingPoint"],
-                        "brief": deepcopy(brief),
-                        "beats": deepcopy(item["beats"]),
-                        "facts": deepcopy([fact for fact in brief["facts"] if fact["id"] in fact_ids]),
-                        "assets": [{"id": asset_id, "name": assets[asset_id]["name"], "kind": assets[asset_id]["kind"]}
-                                   for asset_id in used_ids if asset_id in assets]}
-
-            existing = next((task for task in state["tasks"] if task.get("aigcHandoffKey") == handoff_key), None)
-            if existing is None:
-                for parent in reversed(state["tasks"]):
-                    if parent.get("aigcGroup") != {"generationId": body["generationId"], "briefRevision": brief["revision"]}:
-                        continue
-                    children = [task for task in state["tasks"] if task.get("batchId") == parent["id"]]
-                    by_candidate = {task.get("aigcSource", {}).get("candidateId"): task for task in children}
-                    if len(children) == 5 and all(
-                        item["id"] in by_candidate and (by_candidate[item["id"]]["generation"]["status"] == "failed"
-                        or by_candidate[item["id"]]["aigcSource"]["candidateRevision"] == item["revision"])
-                        for item in candidates
-                    ):
-                        existing = parent
-                        break
-            if existing is not None:
-                children = [task for task in state["tasks"] if task.get("batchId") == existing["id"]]
-                children_by_candidate = {task["aigcSource"]["candidateId"]: task for task in children}
-                skipped = []
-                for item in candidates:
-                    child = children_by_candidate[item["id"]]
-                    if child["generation"]["status"] != "failed":
-                        continue
-                    if (child.get("contentRevision", 0) > 0 or child["variant"]["revision"] > 0
-                            or child["variant"]["subtitles"]["revision"] > 0
-                            or child["variant"]["runs"] or child["variant"].get("exports") or child.get("reviews")):
-                        skipped.append(child["id"])
-                        continue
-                    child["sellingPoint"] = item["sellingPoint"]
-                    child["script"] = "。".join(beat["text"] for beat in item["beats"])
-                    child["aigcSource"] = source_for(item)
-                    arrange_aigc_candidate(project_id, child, item, assets)
-                if all(children_by_candidate[item["id"]]["aigcSource"]["candidateRevision"] == item["revision"]
-                       for item in candidates):
-                    existing["aigcHandoffKey"] = handoff_key
-                save(project_id, state)
-                return JSONResponse(status_code=200, content={"task": public_task(project_id, existing),
-                                                              "tasks": [public_task(project_id, task) for task in children],
-                                                              "skippedTaskIds": skipped})
-            parent = new_task(brief["productName"] + "营销视频", "。".join(beat["text"] for beat in candidates[0]["beats"]), aspect)
-            parent["aigcHandoffKey"] = handoff_key
-            parent["aigcGroup"] = {"generationId": body["generationId"], "briefRevision": brief["revision"]}
-            generation_id = uuid4().hex
-            children = []
-            for item in candidates:
-                script = "。".join(beat["text"] for beat in item["beats"])
-                task = new_task(item["sellingPoint"], script, aspect)
-                task.update(batchId=parent["id"], generationId=generation_id,
-                            generation={"status": "ready", "error": None},
-                            aigcSource=source_for(item))
-                arrange_aigc_candidate(project_id, task, item, assets)
-                children.append(task)
-            state["tasks"].extend([parent, *children])
+            created, parent, children, skipped = apply_aigc_handoff(
+                state, body["generationId"], brief, candidates, assets,
+                ensure_asset=lambda asset: regular_file(preproduction.path(project_id, "assets", asset["file"])),
+            )
             save(project_id, state)
-            return {"task": public_task(project_id, parent), "tasks": [public_task(project_id, item) for item in children]}
+            content = {"task": public_task(project_id, parent),
+                       "tasks": [public_task(project_id, task) for task in children]}
+            if not created:
+                content["skippedTaskIds"] = skipped
+                return JSONResponse(status_code=200, content=content)
+            return content
 
     @router.put("/{task_id}/content")
     def save_content(project_id: str, task_id: str, body: dict[str, Any]):
@@ -798,12 +702,11 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         with lock:
             state = state_for(project_id)
             task = task_for(state, task_id)
-            if body["revision"] != task.get("contentRevision", 0):
-                raise HTTPException(409, detail={"code": "batch_content_conflict", "message": "脚本已更新，请刷新后重试。"})
-            if (body["sellingPoint"].strip(), body["script"].strip()) != (task["sellingPoint"], task["script"]):
-                task.update(sellingPoint=body["sellingPoint"].strip(), script=body["script"].strip(),
-                            contentRevision=task.get("contentRevision", 0) + 1)
-                task.pop("proposal", None)
+            changed = production_call(
+                save_batch_content, task, expected_revision=body["revision"],
+                selling_point=body["sellingPoint"], script=body["script"],
+            )
+            if changed:
                 save(project_id, state)
             return {"task": public_task(project_id, task)}
 
@@ -815,20 +718,13 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             raise HTTPException(422, detail={"code": "batch_subtitles_invalid", "message": "字幕请求无效。"})
         with lock:
             state = state_for(project_id)
-            variant = task_for(state, task_id)["variant"]
-            subtitles = _subtitles(variant)
-            if body["timelineRevision"] != variant["revision"]:
-                raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "时间线已更新，请刷新后再保存字幕。"})
-            if body["revision"] != subtitles["revision"]:
-                raise HTTPException(409, detail={"code": "batch_subtitles_conflict", "message": "字幕已更新，请刷新后重试。"})
-            try:
-                cues = _validate_cues(body["cues"], variant["tracks"])
-            except ValueError as error:
-                raise HTTPException(422, detail={"code": "batch_subtitles_invalid", "message": str(error)}) from None
-            subtitles["cues"] = cues
-            subtitles["revision"] += 1
+            task = task_for(state, task_id)
+            production_call(
+                save_batch_subtitles, task, expected_revision=body["revision"],
+                timeline_revision=body["timelineRevision"], cues=body["cues"], validate_cues=_validate_cues,
+            )
             save(project_id, state)
-            return {"subtitles": public_task(project_id, task_for(state, task_id))["variant"]["subtitles"]}
+            return {"subtitles": public_task(project_id, task)["variant"]["subtitles"]}
 
     @router.post("/{task_id}/subtitles/recognitions", status_code=202)
     def recognize_subtitles(project_id: str, task_id: str, body: dict[str, Any]):
@@ -880,38 +776,18 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         with source_lock or nullcontext(), lock:
             state = state_for(project_id)
             parent = task_for(state, task_id)
-            if parent.get("batchId") is not None:
-                raise HTTPException(422, detail={"code": "batch_bulk_parent_invalid", "message": "请在原批量任务中创建变体。"})
             assets = assets_for(project_id)
-            if sum(assets.get(asset_id, {}).get("kind") in ("video", "image") for asset_id in asset_ids) < 2:
-                raise HTTPException(422, detail={"code": "batch_assets_insufficient", "message": "至少选择两段画面素材，再批量生成。"})
-            generation_id = uuid4().hex
-            created = []
-            signatures = set()
-            for item in items:
-                inherited = parent["variant"]
-                task = new_task(item["sellingPoint"], item["script"], {
-                    "mode": inherited.get("aspectMode", "9:16"),
-                    "resolvedAspect": inherited.get("resolvedAspect", ratio_label(inherited["settings"]["width"], inherited["settings"]["height"])),
-                    "reason": "继承批次已保存的视频比例。",
-                    "width": inherited["settings"]["width"], "height": inherited["settings"]["height"],
-                })
-                task.update(batchId=task_id, generationId=generation_id, generation={"status": "ready", "error": None})
+            def build_proposal(task, selected_ids):
                 try:
-                    proposal = recommend(task, assets, asset_ids)
-                    signature = tuple(clip["assetId"] for clip in proposal["clips"])
-                    if signature in signatures:
-                        raise RecommendationError("batch_duplicate_recommendation", "推荐镜头与本批另一条相同，请补充不同的脚本或素材描述。")
-                    for asset_id in signature:
+                    proposal = recommend(task, assets, selected_ids)
+                    for asset_id in {clip["assetId"] for clip in proposal["clips"]}:
                         regular_file(preproduction.path(project_id, "assets", assets[asset_id]["file"]))
-                    task["proposal"] = proposal
-                    task["variant"]["tracks"][0]["clips"] = proposal["clips"]
-                    signatures.add(signature)
                 except RecommendationError as error:
-                    task["generation"] = {"status": "failed", "error": str(error)}
-                except (OSError, ValueError, KeyError, TypeError):
-                    task["generation"] = {"status": "failed", "error": "推荐素材文件不可用，请检查或重新导入素材。"}
-                created.append(task)
+                    raise BatchProductionError(error.code, str(error), 422) from None
+                return proposal
+            generation_id, created = production_call(
+                create_batch_variants, parent, items, asset_ids, assets=assets, build_proposal=build_proposal,
+            )
             state["tasks"].extend(created)
             save(project_id, state)
             return {"generationId": generation_id, "tasks": [public_task(project_id, task) for task in created]}
@@ -925,46 +801,12 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             state = state_for(project_id)
             task = task_for(state, task_id)
             variant = task["variant"]
-            if type(body["revision"]) is not int or body["revision"] != variant["revision"]:
-                raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "变体已更新，请刷新后重试。"})
-            try:
-                settings, tracks = validate_workspace({"revision": variant["revision"], "settings": body.get("settings", variant["settings"]), "tracks": body["tracks"]}, assets_for(project_id))
-                if settings["fps"] != 30:
-                    raise ValueError("批量成片使用 30 帧/秒")
-                mode = body.get("aspectMode", variant.get("aspectMode"))
-                if mode is None:
-                    saved_ratio = ratio_label(settings["width"], settings["height"])
-                    mode = saved_ratio if saved_ratio in PRODUCT_PRESETS else "smart"
-                if not valid_aspect_mode(mode):
-                    raise ValueError("视频比例无效")
-                resolution = None
-                if mode == "smart":
-                    used_ids = {clip["assetId"] for track in tracks if track["kind"] == "video" and not track["hidden"]
-                                for clip in track["clips"]}
-                    assets = assets_for(project_id)
-                    resolution = resolve_product_aspect(mode, [assets[asset_id] for asset_id in used_ids if asset_id in assets])
-                    if (settings["width"], settings["height"]) != (resolution["width"], resolution["height"]):
-                        raise ValueError("输出尺寸与智能解析结果不一致")
-                    resolved = resolution["resolvedAspect"]
-                else:
-                    resolved = ratio_label(settings["width"], settings["height"])
-                    expected_width, expected_height = PRODUCT_PRESETS[mode]
-                    if (settings["width"], settings["height"]) != (expected_width, expected_height):
-                        raise ValueError("输出尺寸与所选视频比例不一致")
-                _validate_cues(_subtitles(variant)["cues"], tracks)
-            except ValueError as error:
-                raise HTTPException(422, detail={"code": "batch_variant_invalid", "message": str(error)}) from None
-            variant["tracks"] = tracks
-            variant["settings"] = settings
-            variant["aspectMode"] = mode
-            variant["resolvedAspect"] = resolved
-            variant["aspectReason"] = resolution["reason"] if resolution else (
-                "单条作品覆盖批次视频比例。" if "aspectMode" in body else variant.get("aspectReason", "沿用作品已保存的输出尺寸。"))
-            variant["revision"] += 1
-            if task.get("generation", {}).get("status") == "failed" and any(
-                track["kind"] == "video" and not track["hidden"] and track["clips"] for track in tracks
-            ):
-                task["generation"] = {"status": "ready", "error": None}
+            production_call(
+                save_batch_variant, task, expected_revision=body["revision"], tracks=body["tracks"],
+                settings=body.get("settings", variant["settings"]),
+                aspect_mode=body.get("aspectMode", variant.get("aspectMode")), assets=assets_for(project_id),
+                validate_subtitles=_validate_cues, aspect_was_explicit="aspectMode" in body,
+            )
             save(project_id, state)
             return {"variant": public_task(project_id, task)["variant"]}
 
@@ -1002,12 +844,9 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             with lock:
                 state = state_for(project_id)
                 task = task_for(state, task_id)
-                voice = task.get("voiceover")
-                if not voice or voice["id"] != job_id or voice["status"] != "queued":
+                voice = start_voiceover(task, job_id)
+                if voice is None:
                     return
-                if review_version(task) != (voice["contentRevision"], voice["variantRevision"], voice["subtitleRevision"]):
-                    raise ValueError("脚本、镜头或字幕已修改，未覆盖新内容，请重新生成配音。")
-                voice["status"] = "running"
                 save(project_id, state)
                 snapshot, plan, voice_id = deepcopy(task), deepcopy(voice["plan"]), voice["voiceId"]
             directory.mkdir(parents=True, exist_ok=True)
@@ -1024,38 +863,30 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             with source_lock or nullcontext(), lock:
                 state = state_for(project_id)
                 task = task_for(state, task_id)
-                voice = task.get("voiceover")
-                if (not voice or voice["id"] != job_id or voice["status"] != "running"
-                        or review_version(task) != review_version(snapshot)):
-                    raise ValueError("脚本、镜头或字幕已修改，未覆盖新内容，请重新生成配音。")
                 preparation = preproduction.load(project_id)
                 assets = {a["id"]: a for a in preparation["assets"]}
                 tracks, cues = arrange_voiceover(task, plan, new_assets, assets)
                 # Check current visual sources before publishing generated audio.
                 for clip in plan["clips"]:
                     regular_file(preproduction.path(project_id, "assets", assets[clip["assetId"]]["file"]))
-                copied = []
-                try:
-                    for output, asset in zip(outputs, new_assets):
-                        target = preproduction.path(project_id, "assets", asset["file"])
-                        copy_source(output, target)
-                        copied.append(target)
-                    preparation["assets"].extend(new_assets)
-                    preparation["revision"] += 1
-                    preproduction.save(project_id, preparation)
-                except Exception:
-                    for target in copied:
-                        target.unlink(missing_ok=True)
-                    raise
-                task["variant"]["tracks"] = tracks
-                task["variant"]["revision"] += 1
-                subtitles = _subtitles(task["variant"])
-                subtitles["cues"] = cues
-                subtitles["revision"] += 1
-                voice.update(status="completed", error=None, variantRevision=task["variant"]["revision"], subtitleRevision=subtitles["revision"],
-                             assetIds=[asset["id"] for asset in new_assets])
-                voice.pop("plan", None)
-                task.pop("proposal", None)
+                def publish_assets():
+                    copied = []
+                    try:
+                        for output, asset in zip(outputs, new_assets):
+                            target = preproduction.path(project_id, "assets", asset["file"])
+                            copy_source(output, target)
+                            copied.append(target)
+                        preparation["assets"].extend(new_assets)
+                        preparation["revision"] += 1
+                        preproduction.save(project_id, preparation)
+                    except Exception:
+                        for target in copied:
+                            target.unlink(missing_ok=True)
+                        raise
+                complete_voiceover(
+                    task, job_id=job_id, expected_version=review_version(snapshot), tracks=tracks, cues=cues,
+                    asset_ids=[asset["id"] for asset in new_assets], publish_assets=publish_assets,
+                )
                 save(project_id, state)
         except Exception as error:
             with lock:
@@ -1097,12 +928,10 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     raise HTTPException(422, detail={"code": "batch_voiceover_invalid", "message": "配音任务或版本无效。"})
                 seen.add(requested["taskId"])
                 task = task_for(state, requested["taskId"])
-                if task["id"] != owner["id"] and task.get("batchId") != owner["id"]:
-                    raise HTTPException(422, detail={"code": "batch_voiceover_scope", "message": "只能处理当前任务或它的批量变体。"})
-                if review_version(task) != (requested["contentRevision"], requested["variantRevision"], requested["subtitleRevision"]):
-                    raise HTTPException(409, detail={"code": "batch_voiceover_conflict", "message": "脚本、镜头或字幕已更新，请保存或刷新后重新确认。"})
-                if task.get("voiceover", {}).get("status") in ("queued", "running"):
-                    raise HTTPException(409, detail={"code": "batch_voiceover_active", "message": "配音正在处理中。"})
+                production_call(
+                    validate_voiceover_target, owner, task,
+                    (requested["contentRevision"], requested["variantRevision"], requested["subtitleRevision"]),
+                )
                 try:
                     plan = plan_voiceover(task, assets)
                     for clip in plan["clips"]:
@@ -1112,11 +941,10 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 targets.append((task, plan))
             job_id = uuid4().hex
             for task, plan in targets:
-                task["variant"]["revision"] += 1
-                task["voiceover"] = {"id":job_id, "voiceId":body["voiceId"], "status":"queued", "error":None,
-                                     "contentRevision":task.get("contentRevision", 0), "variantRevision":task["variant"]["revision"], "subtitleRevision":_subtitles(task["variant"])["revision"],
-                                     "model":"Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit", "modelRevision":catalog.get("modelRevision", "unverified-local-directory"),
-                                     "plan":plan, "assetIds":[]}
+                queue_voiceover(
+                    task, job_id=job_id, voice_id=body["voiceId"], plan=plan,
+                    model_revision=catalog.get("modelRevision", "unverified-local-directory"),
+                )
             save(project_id, state)
             task_ids = [task["id"] for task, _ in targets]
             def process_batch(pid):
@@ -1137,27 +965,14 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         with source_lock or nullcontext(), lock:
             state = state_for(project_id)
             task = task_for(state, task_id)
-            variant = task["variant"]
-            voice_current(task)
-            if body["revision"] != variant["revision"]:
-                raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "请先保存当前变体。"})
-            if any(run["status"] in ("queued", "running") for run in variant["runs"]):
-                raise HTTPException(409, detail={"code": "batch_preview_active", "message": "此变体已有预览任务。"})
             assets = assets_for(project_id)
-            try:
-                settings, tracks = validate_workspace({"revision": variant["revision"], "settings": variant["settings"], "tracks": variant["tracks"]}, assets)
-            except ValueError as error:
-                raise HTTPException(422, detail={"code": "batch_variant_invalid", "message": str(error)}) from None
-            if not any(track["kind"] == "video" and not track["hidden"] and track["clips"] for track in tracks):
-                raise HTTPException(422, detail={"code": "batch_video_required", "message": "请先添加画面片段。"})
-            run_id = uuid4().hex
-            run_dir = store.path(project_id, "runs", run_id)
-            sources = snapshot_sources(project_id, run_dir, tracks, assets)
-            run = {"id": run_id, "revision": variant["revision"], "contentRevision": task.get("contentRevision", 0), "status": "queued", "error": None,
-                   "subtitleRevision": _subtitles(variant)["revision"], "subtitleCues": list(_subtitles(variant)["cues"]),
-                   "snapshot": {"settings": settings, "tracks": tracks}, "sources": sources}
-            variant["runs"].append(run)
+            run = production_call(
+                submit_batch_preview, task, expected_revision=body["revision"], assets=assets,
+                snapshot_sources=lambda run_id, tracks, available:
+                    snapshot_sources(project_id, store.path(project_id, "runs", run_id), tracks, available),
+            )
             save(project_id, state)
+            run_id = run["id"]
             if not compute_queue.submit("batch-preview:" + run_id, project_id, lambda pid: process(pid, task_id, run_id)):
                 run["status"] = "failed"
                 run["error"] = "本地处理队列不可用。"
@@ -1218,19 +1033,16 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         with lock:
             state = state_for(project_id)
             task = task_for(state, task_id)
-            voice_current(task)
-            run = find_run(task["variant"], body["runId"])
-            version = review_version(task)
-            if (run is not task["variant"]["runs"][-1] or run["status"] != "completed"
-                    or (run.get("contentRevision", 0), run["revision"], run.get("subtitleRevision", 0)) != version):
-                raise HTTPException(409, detail={"code": "batch_review_preview_stale", "message": "请先完成当前版本的预览。"})
-            try:
-                regular_file(store.path(project_id, "outputs", run["output"]))
-            except (OSError, ValueError, KeyError):
-                raise HTTPException(409, detail={"code": "batch_review_preview_unavailable", "message": "预览文件不可用，请重新生成。"}) from None
-            review = {"id": uuid4().hex, "runId": run["id"], "decision": body["decision"], "reason": body["reason"].strip(),
-                      "contentRevision": version[0], "variantRevision": version[1], "subtitleRevision": version[2]}
-            task.setdefault("reviews", []).append(review)
+            def preview_available(run):
+                try:
+                    regular_file(store.path(project_id, "outputs", run["output"]))
+                    return True
+                except (OSError, ValueError, KeyError):
+                    return False
+            production_call(
+                review_current_version, task, run_id=body["runId"], decision=body["decision"],
+                reason=body["reason"], preview_available=preview_available,
+            )
             save(project_id, state)
             return {"task": public_task(project_id, task)}
 
@@ -1244,60 +1056,40 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         with source_lock or nullcontext(), lock:
             state = state_for(project_id)
             parent = task_for(state, task_id)
-            if "batchId" in parent:
-                raise HTTPException(422, detail={"code": "batch_export_parent_invalid", "message": "请从批量任务选择变体。"})
-            children = []
-            for child_id in body["taskIds"]:
-                child = task_for(state, child_id)
-                if child.get("batchId") != task_id:
-                    raise HTTPException(422, detail={"code": "batch_export_selection_invalid", "message": "所选变体不属于此批量任务。"})
-                version = review_version(child)
-                review = child.get("reviews", [])[-1] if child.get("reviews") else None
-                preview = child["variant"]["runs"][-1] if child["variant"]["runs"] else None
-                if (review_status(child) != "approved" or review is None or preview is None
-                        or preview["status"] != "completed"
-                        or child["variant"]["settings"].get("fps") != 30
-                        or preview["snapshot"] != {"settings": child["variant"]["settings"], "tracks": child["variant"]["tracks"]}
-                        or preview.get("subtitleCues", []) != child["variant"].get("subtitles", {}).get("cues", [])
-                        or (preview.get("contentRevision", 0), preview["revision"], preview.get("subtitleRevision", 0)) != version):
-                    raise HTTPException(409, detail={"code": "batch_export_not_approved", "message": "仅能导出当前版本已预览并通过审核的变体。"})
+            children = [task_for(state, child_id) for child_id in body["taskIds"]]
+
+            def preview_available(child, preview):
                 try:
                     if preview["output"] != preview["id"] + ".mp4":
                         raise ValueError("预览文件关联无效")
                     regular_file(store.path(project_id, "outputs", preview["output"]))
+                    return True
                 except (OSError, ValueError, KeyError):
-                    raise HTTPException(409, detail={"code": "batch_export_preview_unavailable", "message": "当前预览文件不可用，请重新生成。"}) from None
-                children.append((child, review, preview, version))
-            assets = assets_for(project_id)
-            results = []
-            for child, review, preview, version in children:
-                variant = child["variant"]
-                previous = _exports(variant)[-1] if _exports(variant) else None
-                if (previous and previous["status"] in ("queued", "running", "completed")
-                        and (previous["contentRevision"], previous["variantRevision"], previous["subtitleRevision"]) == version):
-                    results.append({"taskId": child["id"], "runId": previous["id"], "status": previous["status"]})
-                    continue
-                run_id = uuid4().hex
-                snapshot = {"settings": variant["settings"], "tracks": variant["tracks"]}
-                asset_ids = {clip["assetId"] for track in variant["tracks"] for clip in track["clips"]}
-                manifest = [{"id": asset_id, "name": assets.get(asset_id, {}).get("name", asset_id),
-                             "kind": assets.get(asset_id, {}).get("kind", "unknown")} for asset_id in sorted(asset_ids)]
-                run = {"id": run_id, "status": "queued", "error": None, "contentRevision": version[0],
-                       "variantRevision": version[1], "subtitleRevision": version[2], "previewRunId": preview["id"],
-                       "review": dict(review), "sellingPoint": child["sellingPoint"], "script": child["script"],
-                       "snapshot": snapshot, "subtitles": list(_subtitles(variant)["cues"]), "assets": manifest, "sources": {}}
+                    return False
+
+            def export_sources(run_id, child, preview, assets):
                 try:
-                    run["sources"] = snapshot_approved_sources(project_id, store.path(project_id, "exports", run_id),
-                                                                preview, assets)
+                    return snapshot_approved_sources(
+                        project_id, store.path(project_id, "exports", run_id), preview, assets)
                 except HTTPException:
-                    run.update(status="failed", error="原素材不可用，无法重新导出。")
-                _exports(variant).append(run)
+                    raise BatchProductionError("batch_asset_unavailable", "原素材缺失或变化，请重新预览审核。") from None
+
+            assets = assets_for(project_id)
+            prepared = production_call(
+                export_approved_versions, parent, children, assets=assets,
+                snapshot_sources=export_sources, preview_available=preview_available,
+            )
+            results = []
+            for child, run, created in prepared:
+                if not created:
+                    results.append({"taskId": child["id"], "runId": run["id"], "status": run["status"]})
+                    continue
                 save(project_id, state)
-                if run["status"] == "queued" and not compute_queue.submit("batch-export:" + run_id, project_id,
-                                                                          lambda pid, cid=child["id"], rid=run_id: process_export(pid, cid, rid)):
+                if run["status"] == "queued" and not compute_queue.submit("batch-export:" + run["id"], project_id,
+                                                                          lambda pid, cid=child["id"], rid=run["id"]: process_export(pid, cid, rid)):
                     run.update(status="failed", error="本地处理队列不可用。")
                     save(project_id, state)
-                results.append({"taskId": child["id"], "runId": run_id, "status": run["status"], "error": run["error"]})
+                results.append({"taskId": child["id"], "runId": run["id"], "status": run["status"], "error": run["error"]})
             return {"results": results}
 
     @router.post("/{task_id}/exports/{run_id}/cancel")

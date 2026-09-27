@@ -119,7 +119,7 @@ def test_mp4_renders_black_gaps_and_later_video_tracks_cover_earlier_tracks(tmp_
     blue = _video(tmp_path / "blue.mp4", "blue", 880)
     output = tmp_path / "timeline.mp4"
 
-    render_timeline(
+    media = render_timeline(
         _timeline(tracks=[
             _track("video", [_clip("red", 0.25, 0.75)]),
             _track("video", [_clip("blue", 0.65, 0.35)]),
@@ -128,6 +128,7 @@ def test_mp4_renders_black_gaps_and_later_video_tracks_cover_earlier_tracks(tmp_
     )
 
     assert output.is_file()
+    assert media == {"width": 64, "height": 48, "fps": 24.0, "duration": pytest.approx(1.0, abs=0.12)}
     assert max(_rgb_at(output, 0.10)) < 12
     red_pixel = _rgb_at(output, 0.40)
     blue_pixel = _rgb_at(output, 0.80)

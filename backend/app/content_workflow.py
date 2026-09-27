@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
-from .batch_editing_api import review_status, review_version
+from .batch_production import current_version as review_version, review_status
 
 
 ContentWorkflowStage = Literal[

@@ -68,6 +68,10 @@ def test_variant_edits_keep_other_tasks_and_project_timeline_unchanged(tmp_path)
         assert reopened[1]["id"] == second["id"] and reopened[1]["variant"]["revision"] == 0
         assert client.get(f"/api/projects/{project_id}/timeline").json()["revision"] == 0
         assert client.put(path, json={"revision": 0, "tracks": tracks}, headers=INTENT).status_code == 409
+        for revision in ("0", False, 0.0):
+            invalid_revision = client.put(path, json={"revision": revision, "tracks": tracks}, headers=INTENT)
+            assert invalid_revision.status_code == 409
+            assert invalid_revision.json()["detail"]["code"] == "batch_variant_conflict"
         tracks[0]["clips"][0]["assetId"] = "missing"
         assert client.put(path, json={"revision": 1, "tracks": tracks}, headers=INTENT).status_code == 422
 

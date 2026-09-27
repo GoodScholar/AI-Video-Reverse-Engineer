@@ -217,6 +217,8 @@ def test_export_uses_real_horizontal_mp4_with_saved_subtitles(tmp_path):
         handler(project_id)
         delivery = next(task for task in api.get(base).json()["tasks"] if task["id"] == child["id"])["variant"]["exports"][-1]
         assert delivery["status"] == "completed", delivery
+        assert delivery["media"]["width"] == 1280 and delivery["media"]["height"] == 720
+        assert delivery["media"]["fps"] == 30.0
         assert delivery["subtitles"] == cues
         subtitle_file = tmp_path / "project-files" / "p1" / "batch-edits" / "exports" / delivery["id"] / "subtitles.srt"
         assert "人工确认字幕" in subtitle_file.read_text(encoding="utf-8")
