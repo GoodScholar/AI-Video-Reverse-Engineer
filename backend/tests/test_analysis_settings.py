@@ -1,5 +1,6 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 import json
 import threading
 
@@ -7,8 +8,14 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from app.analysis_providers.base import ProviderAnalysisError, ProviderFailure
 from app.analysis_service_secrets import SecureStorageUnavailable
-from app.analysis_settings import AnalysisSettings, validate_loopback_base_url
+from app.analysis_settings import (
+    AnalysisProviderConfigurationChangedError,
+    AnalysisProviderConfigurations,
+    AnalysisSettings,
+    validate_loopback_base_url,
+)
 from app.main import create_app
 from app.provider_models import CATALOG_VERSION
 
@@ -88,6 +95,131 @@ class SingleReadCredentials(RecordingCredentials):
 class CommitFailingSettings(AnalysisSettings):
     def commit(self, settings):
         raise OSError("配置文件写入失败")
+
+
+def configuration_module(settings, credentials, provider_factory):
+    return AnalysisProviderConfigurations(
+        settings=settings,
+        credential_store=lambda: credentials,
+        provider_factory=provider_factory,
+        provider_closer=lambda _provider: None,
+        clock=lambda: datetime(2026, 9, 27, tzinfo=timezone.utc),
+    )
+
+
+def test_configuration_module_uses_one_authoritative_snapshot_for_verification_and_analysis(tmp_path):
+    credentials = InMemoryCredentials()
+    created = []
+
+    class Provider:
+        def test_connection(self, model):
+            assert model == "gpt-5.6-luna"
+
+    def provider_factory(**kwargs):
+        created.append(kwargs)
+        return Provider()
+
+    configurations = configuration_module(
+        AnalysisSettings(tmp_path / "analysis-providers.json"), credentials, provider_factory,
+    )
+    saved = configurations.save(
+        provider="openai", model="gpt-5.6-luna", base_url=None, api_key="stored-secret",
+    )
+
+    used_model = configurations.use_provider(
+        provider="openai",
+        model="gpt-5.6-luna",
+        operation=lambda _provider, configured_model: configured_model,
+    )
+    verified = configurations.verify("openai")
+
+    assert used_model == "gpt-5.6-luna"
+    assert verified.verificationState == "available"
+    assert verified.configurationRevision == saved.configurationRevision
+    assert created == [
+        {
+            "provider": "openai",
+            "credential": "stored-secret",
+            "base_url": None,
+            "model": "gpt-5.6-luna",
+        },
+        {
+            "provider": "openai",
+            "credential": "stored-secret",
+            "base_url": None,
+            "model": "gpt-5.6-luna",
+        },
+    ]
+
+
+def test_configuration_module_rolls_back_credential_when_settings_commit_fails(tmp_path):
+    credentials = InMemoryCredentials()
+    credentials.values["openai"] = "previous-secret"
+    configurations = configuration_module(
+        CommitFailingSettings(tmp_path / "analysis-providers.json"),
+        credentials,
+        lambda **_: pytest.fail("provider factory must not be used while saving"),
+    )
+
+    with pytest.raises(OSError, match="配置文件写入失败"):
+        configurations.save(
+            provider="openai",
+            model="gpt-5.6-luna",
+            base_url=None,
+            api_key="replacement-secret",
+        )
+
+    assert credentials.values == {"openai": "previous-secret"}
+
+
+@pytest.mark.parametrize("probe_failure", [None, "timeout"])
+def test_configuration_module_rejects_late_verification_results_through_its_interface(
+    tmp_path, probe_failure,
+):
+    started = threading.Event()
+    release = threading.Event()
+    credentials = InMemoryCredentials()
+
+    class Provider:
+        def test_connection(self, model):
+            started.set()
+            assert release.wait(timeout=2)
+            if probe_failure is not None:
+                raise ProviderAnalysisError(ProviderFailure.for_code(probe_failure))
+
+    configurations = configuration_module(
+        AnalysisSettings(tmp_path / "analysis-providers.json"),
+        credentials,
+        lambda **_: Provider(),
+    )
+    first = configurations.save(
+        provider="openai", model="gpt-5.6-luna", base_url=None, api_key="first-secret",
+    )
+    errors = []
+
+    def verify():
+        try:
+            configurations.verify("openai")
+        except Exception as error:
+            errors.append(error)
+
+    verifier = threading.Thread(target=verify)
+    verifier.start()
+    assert started.wait(timeout=2)
+    second = configurations.save(
+        provider="openai", model="gpt-5.6-luna", base_url=None, api_key="second-secret",
+    )
+    release.set()
+    verifier.join(timeout=2)
+
+    assert not verifier.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], AnalysisProviderConfigurationChangedError)
+    assert second.configurationRevision != first.configurationRevision
+    current = configurations.require_configured("openai", "gpt-5.6-luna")
+    assert current.configurationRevision == second.configurationRevision
+    assert current.verificationState == "unverified"
+    assert credentials.values == {"openai": "second-secret"}
 
 
 @pytest.mark.parametrize(
@@ -326,7 +458,7 @@ def test_configuration_save_is_not_bound_to_a_destroyed_event_loop(tmp_path):
     assert credentials.values["openai"] == "second-secret"
 
 
-def test_concurrent_complete_configuration_requests_keep_later_credential_bound_to_its_revision(tmp_path):
+def test_concurrent_configuration_saves_keep_later_credential_bound_to_its_revision(tmp_path):
     first_write_started = threading.Event()
     release_first_write = threading.Event()
     second_request_started = threading.Event()
@@ -339,48 +471,41 @@ def test_concurrent_complete_configuration_requests_keep_later_credential_bound_
             super().set(provider, secret)
 
     credentials = FirstWriteBlockingCredentials()
-    settings = AnalysisSettings(tmp_path / "analysis-providers.json")
-    app = create_app(
-        data_dir=tmp_path,
-        credential_store=credentials,
-        analysis_settings=settings,
+    configurations = configuration_module(
+        AnalysisSettings(tmp_path / "analysis-providers.json"),
+        credentials,
+        lambda **kwargs: kwargs,
     )
 
-    def put_configuration(api_key):
+    def save_configuration(api_key):
         if api_key == "b-secret":
             second_request_started.set()
-        with TestClient(app) as client:
-            return client.put("/api/analysis-providers/openai/configuration", json={
-                "apiKey": api_key, "model": "gpt-5.6-luna",
-            })
+        return configurations.save(
+            provider="openai", model="gpt-5.6-luna", base_url=None, api_key=api_key,
+        )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        first = executor.submit(put_configuration, "a-secret")
+        first = executor.submit(save_configuration, "a-secret")
         assert first_write_started.wait(timeout=5)
-        second = executor.submit(put_configuration, "b-secret")
+        second = executor.submit(save_configuration, "b-secret")
         assert second_request_started.wait(timeout=5)
         release_first_write.set()
         first, second = first.result(timeout=5), second.result(timeout=5)
 
-    assert first.status_code == 200
-    assert second.status_code == 200
-    assert first.json()["configurationRevision"] != second.json()["configurationRevision"]
-    assert second.json()["credentialState"] == "configured"
+    runtime = configurations.use_provider(
+        provider="openai", model="gpt-5.6-luna", operation=lambda provider, _model: provider,
+    )
+
+    assert first.configurationRevision != second.configurationRevision
+    assert second.credentialState == "configured"
     assert credentials.operations == [
         ("get", "openai"), ("set", "openai"),
         ("get", "openai"), ("set", "openai"),
+        ("get", "openai"),
     ]
-    persisted = settings.get("openai")
-    assert persisted.configurationRevision == second.json()["configurationRevision"]
+    assert runtime["credential"] == "b-secret"
+    assert runtime["model"] == "gpt-5.6-luna"
     assert credentials.values["openai"] == "b-secret"
-    assert settings.record_verification(
-        provider="openai",
-        configuration_revision=persisted.configurationRevision,
-        catalog_version=persisted.catalogVersion,
-        state="available",
-        now="2026-09-14T00:00:00+00:00",
-    )
-    assert settings.get("openai").verificationState == "available"
 
 
 def test_configuration_response_uses_selected_provider_from_the_committed_settings(tmp_path):
@@ -610,6 +735,78 @@ def test_listing_configurations_maps_settings_read_failures_to_a_stable_error(tm
         "code": "analysis_settings_unavailable",
         "message": "分析供应商设置不可用。",
     }}
+
+
+def test_connection_test_preserves_initial_settings_read_error_contract(tmp_path):
+    settings_path = tmp_path / "analysis-providers.json"
+    settings_path.mkdir()
+    client = TestClient(create_app(
+        data_dir=tmp_path,
+        credential_store=InMemoryCredentials(),
+        analysis_settings=AnalysisSettings(settings_path),
+    ))
+
+    response = client.post("/api/analysis-providers/openai/test-connection", json={})
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": {
+        "code": "invalid_analysis_provider",
+        "message": "分析供应商无效。",
+    }}
+
+
+@pytest.mark.parametrize("probe_error", [OSError("network failed"), ValueError("bad response")])
+def test_connection_test_maps_unexpected_probe_errors_to_provider_error(tmp_path, probe_error):
+    class FailingProvider:
+        def test_connection(self, model):
+            raise probe_error
+
+    settings = AnalysisSettings(tmp_path / "analysis-providers.json")
+    credentials = InMemoryCredentials()
+    credentials.values["openai"] = "stored-secret"
+    settings.save(
+        provider="openai", model="gpt-5.6-luna", base_url=None, selected_provider="openai",
+    )
+    client = TestClient(create_app(
+        data_dir=tmp_path,
+        credential_store=credentials,
+        analysis_settings=settings,
+        provider_registry=lambda **_: FailingProvider(),
+    ))
+
+    response = client.post("/api/analysis-providers/openai/test-connection", json={})
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "provider_error"
+    assert settings.get("openai").verificationState == "failed"
+    assert settings.get("openai").errorCode == "provider_error"
+
+
+def test_failed_connection_test_does_not_reread_credentials_after_persisting_failure(tmp_path):
+    class FailingProvider:
+        def test_connection(self, model):
+            raise ProviderAnalysisError(ProviderFailure.for_code("timeout"))
+
+    settings = AnalysisSettings(tmp_path / "analysis-providers.json")
+    settings.save(
+        provider="openai", model="gpt-5.6-luna", base_url=None, selected_provider="openai",
+    )
+    credentials = SingleReadCredentials()
+    credentials.values["openai"] = "stored-secret"
+    client = TestClient(create_app(
+        data_dir=tmp_path,
+        credential_store=credentials,
+        analysis_settings=settings,
+        provider_registry=lambda **_: FailingProvider(),
+    ))
+
+    response = client.post("/api/analysis-providers/openai/test-connection", json={})
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "timeout"
+    assert settings.get("openai").verificationState == "failed"
+    assert settings.get("openai").errorCode == "timeout"
+    assert credentials.operations == [("get", "openai")]
 
 
 def test_unknown_provider_is_rejected_before_any_credential_store_access(tmp_path):
@@ -951,53 +1148,6 @@ def test_legacy_raw_configuration_without_revision_or_catalog_is_migrated_once(t
     assert second.catalogVersion == first.catalogVersion
     assert persisted["configurationRevision"] == first.configurationRevision
     assert persisted["catalogVersion"] == first.catalogVersion
-
-
-def test_concurrent_old_verification_cannot_overwrite_a_newer_configuration(tmp_path):
-    entered = threading.Event()
-    release = threading.Event()
-
-    class PausingSettings(AnalysisSettings):
-        def _read(self):
-            value = super()._read()
-            if threading.current_thread().name == "verification":
-                entered.set()
-                assert release.wait(timeout=2)
-            return value
-
-    settings = PausingSettings(tmp_path / "analysis-providers.json")
-    old = settings.save(
-        provider="local_openai_compatible", model="old", base_url="http://127.0.0.1:8080",
-        selected_provider="local_openai_compatible",
-    )
-    result = []
-    verifier = threading.Thread(name="verification", target=lambda: result.append(settings.record_verification(
-        provider="local_openai_compatible", configuration_revision=old.configurationRevision,
-        catalog_version=old.catalogVersion, state="available", now="2026-09-13T00:00:00+00:00",
-    )))
-    verifier.start()
-    assert entered.wait(timeout=2)
-    writer_finished = threading.Event()
-
-    def save_newer_configuration():
-        settings.save(
-            provider="local_openai_compatible", model="new", base_url="http://127.0.0.1:8080",
-            selected_provider="local_openai_compatible",
-        )
-        writer_finished.set()
-
-    writer = threading.Thread(target=save_newer_configuration)
-    writer.start()
-    assert not writer_finished.wait(timeout=0.1)
-    release.set()
-    verifier.join(timeout=2)
-    writer.join(timeout=2)
-
-    current = settings.get("local_openai_compatible")
-    assert result == [True]
-    assert current.model == "new"
-    assert current.configurationRevision != old.configurationRevision
-    assert current.verificationState == "unverified"
 
 
 def test_default_credential_store_initialization_failure_is_reported_safely(tmp_path, monkeypatch):

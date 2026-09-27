@@ -11,7 +11,7 @@ import zipfile
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock, RLock
+from threading import RLock
 from typing import AsyncIterator, Callable, Literal, Optional, Union
 from uuid import uuid4
 
@@ -101,9 +101,17 @@ from app.semantic_analysis_storage import (
 )
 from app.analysis_prompt import PROMPT_VERSION
 from app.analysis_service_secrets import SecureStorageUnavailable
-from app.analysis_settings import AnalysisProviderConfiguration, AnalysisSettings, AnalysisSettingsConflictError
+from app.analysis_settings import (
+    AnalysisProviderConfiguration,
+    AnalysisProviderConfigurationChangedError,
+    AnalysisProviderConfigurations,
+    AnalysisProviderVerificationPersistenceError,
+    AnalysisProviderUnconfiguredError,
+    AnalysisSettings,
+    AnalysisSettingsConflictError,
+)
 from app.credential_store import CredentialStore
-from app.provider_models import CATALOG_VERSION, PROVIDER_IDS, model_is_allowed, provider_for
+from app.provider_models import PROVIDER_IDS, model_is_allowed
 from app.analysis_providers.bailian import BailianAnalysisProvider
 from app.analysis_providers.base import ProviderAnalysisError, ProviderFailure, ProviderRequest
 from app.analysis_providers.claude import ClaudeAnalysisProvider
@@ -344,7 +352,6 @@ def create_app(
     clock: Optional[Callable[[], datetime]] = None,
 ) -> FastAPI:
     app = FastAPI(title="AI 视频复刻分析器")
-    analysis_provider_configuration_lock = Lock()
     project_write_lock = RLock()
     dispatching_project_ids: set[str] = set()
     reference_media_path_pattern = re.compile(r"^/api/projects/[^/]+/reference-media$")
@@ -367,50 +374,6 @@ def create_app(
                 "code": "secure_storage_unavailable",
                 "message": "系统安全存储不可用。",
             },
-        )
-
-    def _analysis_provider_snapshot_locked(provider: str):
-        return (
-            configured_analysis_settings.get(provider),
-            credentials().get(provider),
-            configured_analysis_settings.selected_provider(),
-        )
-
-    def analysis_provider_snapshot(provider: str):
-        with analysis_provider_configuration_lock:
-            return _analysis_provider_snapshot_locked(provider)
-
-    def _analysis_provider_configuration_locked(provider: str) -> AnalysisProviderConfiguration:
-        setting, credential, selected_provider = _analysis_provider_snapshot_locked(provider)
-        return analysis_provider_configuration_snapshot(
-            provider=provider,
-            setting=setting,
-            credential_configured=credential is not None,
-            selected_provider=selected_provider,
-        )
-
-    def analysis_provider_configuration_snapshot(
-        *,
-        provider: str,
-        setting,
-        credential_configured: bool,
-        selected_provider: Optional[str],
-    ) -> AnalysisProviderConfiguration:
-        catalog = provider_for(provider)
-        return AnalysisProviderConfiguration(
-            provider=provider,
-            label=catalog.label,
-            models=tuple(model.model_dump() for model in catalog.models),
-            model=setting.model if setting is not None else None,
-            baseUrl=setting.baseUrl if setting is not None else None,
-            credentialState="configured" if credential_configured else "unconfigured",
-            selectedProvider=selected_provider,
-            configurationRevision=setting.configurationRevision if setting is not None else None,
-            catalogVersion=setting.catalogVersion if setting is not None else CATALOG_VERSION,
-            verificationState=setting.verificationState if setting is not None else "unverified",
-            verifiedAt=setting.verifiedAt if setting is not None else None,
-            failedAt=setting.failedAt if setting is not None else None,
-            errorCode=setting.errorCode if setting is not None else None,
         )
 
     def storage_error(error: OSError) -> HTTPException:
@@ -1029,6 +992,14 @@ def create_app(
         if isinstance(client, httpx.Client):
             client.close()
 
+    analysis_provider_configurations = AnalysisProviderConfigurations(
+        settings=configured_analysis_settings,
+        credential_store=credentials,
+        provider_factory=analysis_provider_for,
+        provider_closer=close_default_analysis_provider,
+        clock=now_utc,
+    )
+
     def fail_semantic_analysis(
         project_id: str,
         expected: SemanticAnalysis,
@@ -1076,29 +1047,17 @@ def create_app(
             if expected is None or project_for_run is None:
                 return
             task = expected
-            setting, credential, _ = analysis_provider_snapshot(task.provider)
-            if (
-                setting is None
-                or setting.model != task.model
-                or task.provider != "local_openai_compatible" and credential is None
-            ):
-                raise ProviderAnalysisError(ProviderFailure.for_code("provider_unconfigured"))
-            provider = analysis_provider_for(
+            runner = semantic_analysis_runner or run_semantic_analysis
+            result = analysis_provider_configurations.use_provider(
                 provider=task.provider,
-                credential=credential,
-                base_url=setting.baseUrl,
                 model=task.model,
-            )
-            try:
-                runner = semantic_analysis_runner or run_semantic_analysis
-                result = runner(
+                operation=lambda provider, _model: runner(
                     data_dir=data_dir,
                     project=project_for_run,
                     provider=provider,
                     model=task.model,
-                )
-            finally:
-                close_default_analysis_provider(provider)
+                ),
+            )
             now = now_utc().isoformat()
 
             def complete(current: SemanticAnalysis) -> SemanticAnalysis:
@@ -1109,6 +1068,16 @@ def create_app(
                 current.error = None
                 return current
             persist_semantic_analysis_change(project_id, task, complete)
+        except AnalysisProviderUnconfiguredError:
+            if expected is not None:
+                fail_semantic_analysis(
+                    project_id, expected,
+                    semantic_analysis_error(
+                        "provider_unconfigured",
+                        ProviderFailure.for_code("provider_unconfigured").message,
+                        False,
+                    ),
+                )
         except ProviderAnalysisError as error:
             if expected is not None:
                 fail_semantic_analysis(
@@ -1486,8 +1455,7 @@ def create_app(
     @app.get("/api/analysis-providers", response_model=list[AnalysisProviderConfiguration])
     def get_analysis_provider_configurations() -> list[AnalysisProviderConfiguration]:
         try:
-            with analysis_provider_configuration_lock:
-                return [_analysis_provider_configuration_locked(provider) for provider in PROVIDER_IDS]
+            return analysis_provider_configurations.list()
         except SecureStorageUnavailable as error:
             raise secure_storage_unavailable() from error
         except (OSError, ValueError) as error:
@@ -1498,101 +1466,6 @@ def create_app(
                     "message": "分析供应商设置不可用。",
                 },
             ) from error
-
-    def save_analysis_provider_configuration(
-        provider: str,
-        model: str,
-        base_url: Optional[str],
-        api_key: Optional[str],
-    ):
-        with analysis_provider_configuration_lock:
-            try:
-                candidate, prepared_settings = configured_analysis_settings.prepare_save(
-                    provider=provider,
-                    model=model,
-                    base_url=base_url,
-                    selected_provider=provider,
-                )
-            except (OSError, ValueError) as error:
-                if isinstance(error, OSError):
-                    raise HTTPException(
-                        status_code=503,
-                        detail={
-                            "code": "analysis_settings_unavailable", "message": "分析供应商设置不可用。"},
-                    ) from error
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
-                ) from error
-
-            try:
-                credential_store_for_update = credentials()
-                previous_credential = credential_store_for_update.get(provider)
-            except SecureStorageUnavailable as error:
-                raise secure_storage_unavailable() from error
-
-            if provider != "local_openai_compatible" and not (api_key or previous_credential):
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
-                )
-            if api_key is not None and api_key != previous_credential:
-                try:
-                    candidate, prepared_settings = configured_analysis_settings.prepare_save(
-                        provider=provider,
-                        model=model,
-                        base_url=base_url,
-                        selected_provider=provider,
-                        credential_changed=True,
-                    )
-                except (OSError, ValueError) as error:
-                    if isinstance(error, OSError):
-                        raise HTTPException(
-                            status_code=503,
-                            detail={"code": "analysis_settings_unavailable", "message": "分析供应商设置不可用。"},
-                        ) from error
-                    raise HTTPException(
-                        status_code=400,
-                        detail={"code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
-                    ) from error
-
-            credential_write_succeeded = False
-            credential_state = previous_credential is not None
-            try:
-                if api_key is not None:
-                    credential_store_for_update.set(provider, api_key)
-                    credential_write_succeeded = True
-                    credential_state = True
-                committed_settings = configured_analysis_settings.commit(prepared_settings)
-                candidate = next(item for item in committed_settings.providers if item.provider == provider)
-            except (OSError, SecureStorageUnavailable, AnalysisSettingsConflictError) as error:
-                if credential_write_succeeded:
-                    try:
-                        if previous_credential is None:
-                            credential_store_for_update.delete(provider)
-                        else:
-                            credential_store_for_update.set(provider, previous_credential)
-                    except SecureStorageUnavailable as rollback_error:
-                        logging.getLogger(__name__).warning("无法回退分析供应商凭据：%s", provider)
-                        raise secure_storage_unavailable() from rollback_error
-                if isinstance(error, SecureStorageUnavailable):
-                    raise secure_storage_unavailable() from error
-                if isinstance(error, AnalysisSettingsConflictError):
-                    raise HTTPException(
-                        status_code=409,
-                        detail={
-                            "code": "analysis_provider_configuration_changed",
-                            "message": "分析供应商配置已变化，请重新保存。",
-                        },
-                    ) from error
-                raise HTTPException(
-                    status_code=503,
-                    detail={
-                        "code": "analysis_settings_unavailable", "message": "分析供应商设置不可用。"},
-                ) from error
-            return candidate, committed_settings, credential_state
 
     @app.put(
         "/api/analysis-providers/{provider}/configuration",
@@ -1642,141 +1515,86 @@ def create_app(
                 detail={
                     "code": "invalid_analysis_model", "message": "所选模型不在该分析供应商的可用清单中。"},
             )
-        candidate, committed_settings, credential_state = await run_in_threadpool(
-            save_analysis_provider_configuration,
-            provider,
-            model,
-            base_url,
-            api_key,
-        )
-
-        catalog = provider_for(provider)
-        return AnalysisProviderConfiguration(
-            provider=provider,
-            label=catalog.label,
-            models=tuple(model.model_dump() for model in catalog.models),
-            model=candidate.model,
-            baseUrl=candidate.baseUrl,
-            credentialState="configured" if credential_state else "unconfigured",
-            selectedProvider=committed_settings.selectedProvider,
-            configurationRevision=candidate.configurationRevision,
-            catalogVersion=candidate.catalogVersion,
-            verificationState=candidate.verificationState,
-            verifiedAt=candidate.verifiedAt,
-            failedAt=candidate.failedAt,
-            errorCode=candidate.errorCode,
-        )
+        try:
+            return await run_in_threadpool(
+                analysis_provider_configurations.save,
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+            )
+        except SecureStorageUnavailable as error:
+            raise secure_storage_unavailable() from error
+        except AnalysisSettingsConflictError as error:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "analysis_provider_configuration_changed",
+                    "message": "分析供应商配置已变化，请重新保存。",
+                },
+            ) from error
+        except OSError as error:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "analysis_settings_unavailable", "message": "分析供应商设置不可用。"},
+            ) from error
+        except ValueError as error:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_analysis_provider_configuration", "message": "分析供应商配置无效。"},
+            ) from error
 
     @app.post("/api/analysis-providers/{provider}/test-connection", response_model=None)
     @app.post("/api/analysis-providers/{provider}/connection-test", response_model=None)
     def test_analysis_provider_connection(provider: str) -> dict[str, str]:
         try:
-            setting, credential, _ = analysis_provider_snapshot(provider)
+            verified = analysis_provider_configurations.verify(provider)
         except SecureStorageUnavailable as error:
             raise secure_storage_unavailable() from error
-        except (OSError, ValueError) as error:
-            raise HTTPException(
-                status_code=400,
-                detail={"code": "invalid_analysis_provider", "message": "分析供应商无效。"},
-            ) from error
-        if (
-            setting is None
-            or provider != "local_openai_compatible" and credential is None
-            or not analysis_model_is_supported(provider, setting.model)
-        ):
+        except AnalysisProviderUnconfiguredError as error:
             raise HTTPException(
                 status_code=409,
                 detail={
                     "code": "analysis_provider_unconfigured",
                     "message": "所选分析供应商或模型尚未配置。",
                 },
-            )
-        configured_provider = None
-        configuration_revision = setting.configurationRevision
-        catalog_version = setting.catalogVersion
-
-        def persist_verification(
-            *, state: Literal["available", "failed"], error_code: Optional[str] = None,
-        ) -> None:
-            try:
-                persisted = configured_analysis_settings.record_verification(
-                    provider=provider,
-                    configuration_revision=configuration_revision,
-                    catalog_version=catalog_version,
-                    state=state,
-                    error_code=error_code,
-                    now=now_utc().isoformat(),
-                )
-            except (OSError, ValueError) as error:
-                raise HTTPException(
-                    status_code=503,
-                    detail={
-                        "code": "analysis_settings_unavailable",
-                        "message": "分析供应商设置不可用。",
-                    },
-                ) from error
-            if not persisted:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "analysis_provider_configuration_changed",
-                        "message": "分析供应商配置已变化，请重新测试连接。",
-                    },
-                )
-
-        try:
-            configured_provider = analysis_provider_for(
-                provider=provider,
-                credential=credential,
-                base_url=setting.baseUrl,
-                model=setting.model,
-            )
-            configured_provider.test_connection(setting.model)
+            ) from error
+        except AnalysisProviderConfigurationChangedError as error:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "analysis_provider_configuration_changed",
+                    "message": "分析供应商配置已变化，请重新测试连接。",
+                },
+            ) from error
         except ProviderAnalysisError as error:
-            persist_verification(state="failed", error_code=error.failure.code)
             raise HTTPException(
                 status_code=502,
                 detail=error.failure.model_dump(),
             ) from None
+        except AnalysisProviderVerificationPersistenceError as error:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "analysis_settings_unavailable",
+                    "message": "分析供应商设置不可用。",
+                },
+            ) from error
+        except (OSError, ValueError) as error:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "invalid_analysis_provider", "message": "分析供应商无效。"},
+            ) from error
         except Exception:
-            persist_verification(state="failed", error_code="provider_error")
             raise HTTPException(
                 status_code=502,
                 detail=semantic_analysis_error(
                     "provider_error", "分析服务暂时不可用，请稍后重试。", True,
                 ).model_dump(),
             ) from None
-        finally:
-            if configured_provider is not None:
-                close_default_analysis_provider(configured_provider)
-        persist_verification(state="available")
-        try:
-            verified, current_credential, selected_provider = analysis_provider_snapshot(provider)
-        except SecureStorageUnavailable as error:
-            raise secure_storage_unavailable() from error
-        except (OSError, ValueError) as error:
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "code": "analysis_settings_unavailable", "message": "分析供应商设置不可用。"},
-            ) from error
-        if (
-            verified is None
-            or verified.configurationRevision != configuration_revision
-            or verified.catalogVersion != catalog_version
-            or verified.verificationState != "available"
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "analysis_provider_configuration_changed", "message": "分析供应商配置已变化，请重新测试连接。"},
-            )
-        return analysis_provider_configuration_snapshot(
-            provider=provider,
-            setting=verified,
-            credential_configured=current_credential is not None,
-            selected_provider=selected_provider,
-        ).model_dump() | {"status": "connected"}
+        return verified.model_dump() | {"status": "connected"}
 
     @app.post("/api/projects/{project_id}/semantic-analysis", response_model=None)
     def start_semantic_analysis(
@@ -1859,19 +1677,6 @@ def create_app(
                         "semanticAnalysis": checkpoint,
                         "updatedAt": checkpoint.updatedAt,
                     })
-            try:
-                setting, credential, _ = analysis_provider_snapshot(payload.provider)
-                has_credential = credential is not None
-            except SecureStorageUnavailable as error:
-                raise secure_storage_unavailable() from error
-            except (OSError, ValueError) as error:
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "code": "invalid_analysis_provider",
-                        "message": "分析供应商或模型无效。",
-                    },
-                ) from error
             if not analysis_model_is_supported(payload.provider, payload.model):
                 raise HTTPException(
                     status_code=400,
@@ -1880,11 +1685,13 @@ def create_app(
                         "message": "所选模型不在该分析供应商的可用清单中。",
                     },
                 )
-            if (
-                setting is None
-                or payload.provider != "local_openai_compatible" and not has_credential
-                or setting.model != payload.model
-            ):
+            try:
+                analysis_provider_configurations.require_configured(
+                    payload.provider, payload.model,
+                )
+            except SecureStorageUnavailable as error:
+                raise secure_storage_unavailable() from error
+            except AnalysisProviderUnconfiguredError:
                 raise HTTPException(
                     status_code=409,
                     detail={
@@ -1892,6 +1699,14 @@ def create_app(
                         "message": "所选分析供应商或模型尚未配置。",
                     },
                 )
+            except (OSError, ValueError) as error:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "invalid_analysis_provider",
+                        "message": "分析供应商或模型无效。",
+                    },
+                ) from error
             if (
                 existing is not None
                 and existing.status == "completed"
@@ -2610,22 +2425,20 @@ def create_app(
 
     def generate_reproduction_prompts(project):
         task = project.semanticAnalysis
-        setting, credential, _ = analysis_provider_snapshot(task.provider)
-        if setting is None or setting.model != task.model or (task.provider != "local_openai_compatible" and credential is None):
+        try:
+            return analysis_provider_configurations.use_provider(
+                provider=task.provider,
+                model=task.model,
+                operation=lambda provider, model: generate_prompts(task.result, provider, model),
+            )
+        except AnalysisProviderUnconfiguredError:
             raise HTTPException(status_code=422, detail={
                 "code": "provider_unconfigured", "message": "原分析服务配置已变更或缺少凭据，请先重新配置并完成语义分析。",
-            })
-        provider = analysis_provider_for(
-            provider=task.provider, credential=credential, base_url=setting.baseUrl, model=task.model,
-        )
-        try:
-            return generate_prompts(task.result, provider, task.model)
+            }) from None
         except ProviderAnalysisError as error:
             raise HTTPException(status_code=422, detail={
                 "code": error.failure.code, "message": error.failure.message,
             }) from None
-        finally:
-            close_default_analysis_provider(provider)
 
     def analyze_shot(project, shot):
         task = project.semanticAnalysis
@@ -2633,16 +2446,18 @@ def create_app(
             raise HTTPException(status_code=422, detail={
                 "code": "provider_unconfigured", "message": "请先在语义分析中选择并配置分析服务。",
             })
-        setting, credential, _ = analysis_provider_snapshot(task.provider)
-        if setting is None or setting.model != task.model or (task.provider != "local_openai_compatible" and credential is None):
+        try:
+            return analysis_provider_configurations.use_provider(
+                provider=task.provider,
+                model=task.model,
+                operation=lambda provider, model: analyze_preparation_shot(
+                    data_dir, project, shot, provider, model, ffmpeg_path, ffprobe_path,
+                ),
+            )
+        except AnalysisProviderUnconfiguredError:
             raise HTTPException(status_code=422, detail={
                 "code": "provider_unconfigured", "message": "分析服务配置已变更或缺少凭据，请先更新分析服务。",
-            })
-        provider = analysis_provider_for(
-            provider=task.provider, credential=credential, base_url=setting.baseUrl, model=task.model,
-        )
-        try:
-            return analyze_preparation_shot(data_dir, project, shot, provider, task.model, ffmpeg_path, ffprobe_path)
+            }) from None
         except ProviderAnalysisError as error:
             raise HTTPException(status_code=422, detail={
                 "code": error.failure.code, "message": error.failure.message,
@@ -2651,8 +2466,6 @@ def create_app(
             raise HTTPException(status_code=422, detail={
                 "code": "shot_analysis_input_failed", "message": "镜头采样帧无法读取，请检查本地视频和 FFmpeg 后重试。",
             }) from None
-        finally:
-            close_default_analysis_provider(provider)
 
     app.include_router(create_shot_preparation_router(
         data_dir, ensure_project_exists, ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
@@ -2700,19 +2513,22 @@ def create_app(
     from .aigc_content_api import create_aigc_content_router
 
     def generate_marketing_candidates(provider_id, model, prompt, schema):
-        setting, credential, _ = analysis_provider_snapshot(provider_id)
-        if (setting is None or setting.model != model or setting.verificationState != "available"
-                or not analysis_model_is_supported(provider_id, model)
-                or (provider_id != "local_openai_compatible" and credential is None)):
+        if not analysis_model_is_supported(provider_id, model):
             raise HTTPException(422, detail={"code": "provider_unconfigured", "message": "请先配置并验证所选 AI 服务。"})
-        provider = analysis_provider_for(provider=provider_id, credential=credential, base_url=setting.baseUrl, model=model)
         try:
-            return provider.analyze(ProviderRequest(task="prompt_generation", prompt=prompt, model=model,
-                                                    responseSchema=schema)).rawText
+            return analysis_provider_configurations.use_provider(
+                provider=provider_id,
+                model=model,
+                require_verified=True,
+                operation=lambda provider, configured_model: provider.analyze(ProviderRequest(
+                    task="prompt_generation", prompt=prompt, model=configured_model,
+                    responseSchema=schema,
+                )).rawText,
+            )
+        except AnalysisProviderUnconfiguredError:
+            raise HTTPException(422, detail={"code": "provider_unconfigured", "message": "请先配置并验证所选 AI 服务。"}) from None
         except ProviderAnalysisError as error:
             raise HTTPException(422, detail={"code": error.failure.code, "message": error.failure.message}) from None
-        finally:
-            close_default_analysis_provider(provider)
 
     app.include_router(create_aigc_content_router(data_dir, ensure_project_exists,
                                                    script_generator=generate_marketing_candidates,

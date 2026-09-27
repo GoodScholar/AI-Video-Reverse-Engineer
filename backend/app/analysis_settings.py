@@ -1,18 +1,22 @@
 import json
+import logging
 import os
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from threading import RLock
-from typing import Literal, Optional
+from typing import Any, Callable, Literal, Optional, TypeVar
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from .analysis_providers.base import ProviderAnalysisError
+from .analysis_service_secrets import SecureStorageUnavailable
 from .credential_store import ANALYSIS_PROVIDER_IDS
-from .provider_models import CATALOG_VERSION, ProviderId, model_is_allowed
+from .provider_models import CATALOG_VERSION, PROVIDER_IDS, ProviderId, model_is_allowed, provider_for
 
 
 # These are the stable, user-safe codes emitted by ProviderFailure.  Keep the
@@ -32,6 +36,22 @@ _PREVIOUS_CATALOG_VERSION = "2026-09-14.1"
 
 class AnalysisSettingsConflictError(Exception):
     """A prepared provider configuration was superseded before it could commit."""
+
+
+class AnalysisProviderConfigurationChangedError(Exception):
+    """A result belongs to a provider configuration that is no longer current."""
+
+
+class AnalysisProviderUnconfiguredError(Exception):
+    """The requested provider snapshot is incomplete or no longer usable."""
+
+
+class AnalysisProviderProbeError(Exception):
+    """A provider probe failed outside the stable provider failure contract."""
+
+
+class AnalysisProviderVerificationPersistenceError(Exception):
+    """A provider verification result could not be persisted or reloaded."""
 
 
 class _StrictModel(BaseModel):
@@ -414,3 +434,258 @@ class AnalysisSettings:
             except OSError:
                 Path(temporary_path).unlink(missing_ok=True)
                 raise
+
+
+_Result = TypeVar("_Result")
+
+
+@dataclass(frozen=True)
+class _ConfiguredProviderSnapshot:
+    setting: _StoredProviderConfiguration
+    credential: Optional[str]
+    selected_provider: Optional[ProviderId]
+
+
+class AnalysisProviderConfigurations:
+    """Owns provider settings, credentials, runtime binding, and verification CAS."""
+
+    def __init__(
+        self,
+        *,
+        settings: AnalysisSettings,
+        credential_store: Callable[[], Any],
+        provider_factory: Callable[..., Any],
+        provider_closer: Callable[[Any], None],
+        clock: Callable[[], datetime],
+    ):
+        self._settings = settings
+        self._credential_store = credential_store
+        self._provider_factory = provider_factory
+        self._provider_closer = provider_closer
+        self._clock = clock
+        self._lock = RLock()
+
+    def list(self) -> list[AnalysisProviderConfiguration]:
+        with self._lock:
+            settings = {item.provider: item for item in self._settings.providers()}
+            selected_provider = self._settings.selected_provider()
+            credentials = self._credential_store()
+            return [
+                self._public_configuration(
+                    provider=provider,
+                    setting=settings.get(provider),
+                    credential_configured=credentials.get(provider) is not None,
+                    selected_provider=selected_provider,
+                )
+                for provider in PROVIDER_IDS
+            ]
+
+    def save(
+        self,
+        *,
+        provider: str,
+        model: str,
+        base_url: Optional[str],
+        api_key: Optional[str],
+    ) -> AnalysisProviderConfiguration:
+        with self._lock:
+            if not model_is_allowed(provider, model):
+                raise ValueError("所选模型不在该分析供应商的可用清单中。")
+            candidate, prepared = self._settings.prepare_save(
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                selected_provider=provider,
+            )
+            credentials = self._credential_store()
+            previous_credential = credentials.get(provider)
+            if provider != "local_openai_compatible" and not (api_key or previous_credential):
+                raise ValueError("分析供应商配置无效。")
+            if api_key is not None and api_key != previous_credential:
+                candidate, prepared = self._settings.prepare_save(
+                    provider=provider,
+                    model=model,
+                    base_url=base_url,
+                    selected_provider=provider,
+                    credential_changed=True,
+                )
+
+            credential_write_succeeded = False
+            credential_configured = previous_credential is not None
+            try:
+                if api_key is not None:
+                    credentials.set(provider, api_key)
+                    credential_write_succeeded = True
+                    credential_configured = True
+                committed = self._settings.commit(prepared)
+            except (OSError, SecureStorageUnavailable, AnalysisSettingsConflictError):
+                if credential_write_succeeded:
+                    try:
+                        if previous_credential is None:
+                            credentials.delete(provider)
+                        else:
+                            credentials.set(provider, previous_credential)
+                    except SecureStorageUnavailable as rollback_error:
+                        logging.getLogger(__name__).warning(
+                            "无法回退分析供应商凭据：%s", provider,
+                        )
+                        raise rollback_error
+                raise
+
+            setting = next(item for item in committed.providers if item.provider == candidate.provider)
+            return self._public_configuration(
+                provider=provider,
+                setting=setting,
+                credential_configured=credential_configured,
+                selected_provider=committed.selectedProvider,
+            )
+
+    def require_configured(
+        self,
+        provider: str,
+        model: Optional[str] = None,
+        *,
+        require_verified: bool = False,
+    ) -> AnalysisProviderConfiguration:
+        with self._lock:
+            snapshot = self._configured_snapshot_locked(
+                provider, model, require_verified=require_verified,
+            )
+            return self._public_configuration(
+                provider=provider,
+                setting=snapshot.setting,
+                credential_configured=snapshot.credential is not None,
+                selected_provider=snapshot.selected_provider,
+            )
+
+    def use_provider(
+        self,
+        *,
+        provider: str,
+        model: Optional[str],
+        operation: Callable[[Any, str], _Result],
+        require_verified: bool = False,
+    ) -> _Result:
+        with self._lock:
+            snapshot = self._configured_snapshot_locked(
+                provider, model, require_verified=require_verified,
+            )
+        configured_provider = self._provider_factory(
+            provider=provider,
+            credential=snapshot.credential,
+            base_url=snapshot.setting.baseUrl,
+            model=snapshot.setting.model,
+        )
+        try:
+            return operation(configured_provider, snapshot.setting.model)
+        finally:
+            self._provider_closer(configured_provider)
+
+    def verify(self, provider: str) -> AnalysisProviderConfiguration:
+        with self._lock:
+            snapshot = self._configured_snapshot_locked(provider, None)
+
+        configured_provider = None
+        probe_error: Optional[Exception] = None
+        probe_cause: Optional[Exception] = None
+        error_code: Optional[str] = None
+        try:
+            configured_provider = self._provider_factory(
+                provider=provider,
+                credential=snapshot.credential,
+                base_url=snapshot.setting.baseUrl,
+                model=snapshot.setting.model,
+            )
+            configured_provider.test_connection(snapshot.setting.model)
+        except ProviderAnalysisError as error:
+            probe_error = error
+            error_code = error.failure.code
+        except Exception as error:
+            probe_error = AnalysisProviderProbeError()
+            probe_cause = error
+            error_code = "provider_error"
+        finally:
+            if configured_provider is not None:
+                self._provider_closer(configured_provider)
+
+        try:
+            with self._lock:
+                persisted = self._settings.record_verification(
+                    provider=provider,
+                    configuration_revision=snapshot.setting.configurationRevision,
+                    catalog_version=snapshot.setting.catalogVersion,
+                    state="failed" if probe_error is not None else "available",
+                    error_code=error_code,
+                    now=self._clock().isoformat(),
+                )
+                if not persisted:
+                    raise AnalysisProviderConfigurationChangedError()
+                if probe_error is None:
+                    current = self._configured_snapshot_locked(provider, snapshot.setting.model)
+                    if (
+                        current.setting.configurationRevision != snapshot.setting.configurationRevision
+                        or current.setting.catalogVersion != snapshot.setting.catalogVersion
+                    ):
+                        raise AnalysisProviderConfigurationChangedError()
+                    result = self._public_configuration(
+                        provider=provider,
+                        setting=current.setting,
+                        credential_configured=current.credential is not None,
+                        selected_provider=current.selected_provider,
+                    )
+        except (OSError, ValueError) as error:
+            raise AnalysisProviderVerificationPersistenceError() from error
+
+        if probe_error is not None:
+            if probe_cause is not None:
+                raise probe_error from probe_cause
+            raise probe_error
+        return result
+
+    def _configured_snapshot_locked(
+        self,
+        provider: str,
+        model: Optional[str],
+        *,
+        require_verified: bool = False,
+    ) -> _ConfiguredProviderSnapshot:
+        setting = self._settings.get(provider)
+        credential = self._credential_store().get(provider)
+        if (
+            setting is None
+            or model is not None and setting.model != model
+            or provider != "local_openai_compatible" and credential is None
+            or not model_is_allowed(provider, setting.model)
+            or require_verified and setting.verificationState != "available"
+        ):
+            raise AnalysisProviderUnconfiguredError()
+        return _ConfiguredProviderSnapshot(
+            setting=setting,
+            credential=credential,
+            selected_provider=self._settings.selected_provider(),
+        )
+
+    @staticmethod
+    def _public_configuration(
+        *,
+        provider: str,
+        setting: Optional[_StoredProviderConfiguration],
+        credential_configured: bool,
+        selected_provider: Optional[ProviderId],
+    ) -> AnalysisProviderConfiguration:
+        catalog = provider_for(provider)
+        return AnalysisProviderConfiguration(
+            provider=provider,
+            label=catalog.label,
+            models=tuple(model.model_dump() for model in catalog.models),
+            model=setting.model if setting is not None else None,
+            baseUrl=setting.baseUrl if setting is not None else None,
+            credentialState="configured" if credential_configured else "unconfigured",
+            selectedProvider=selected_provider,
+            configurationRevision=setting.configurationRevision if setting is not None else None,
+            catalogVersion=setting.catalogVersion if setting is not None else CATALOG_VERSION,
+            verificationState=setting.verificationState if setting is not None else "unverified",
+            verifiedAt=setting.verifiedAt if setting is not None else None,
+            failedAt=setting.failedAt if setting is not None else None,
+            errorCode=setting.errorCode if setting is not None else None,
+        )
