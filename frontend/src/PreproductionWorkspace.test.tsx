@@ -13,13 +13,17 @@ const project: Project = {
 
 function workspace(overrides: Partial<Workspace> = {}): Workspace {
   return {
+    schemaVersion: 2,
     revision: 3,
     brief: { theme: "雨夜", purpose: "预告", style: "电影", duration: 12, aspect: "16:9", mustPreserve: "服装" },
     assets: [{ id: "asset-001", name: "主角.png", kind: "image", role: "character", url: "/asset.png" }],
+    scenes: [{ id: "scene-default", title: "未分场", rank: "00000001", description: "" }],
     shots: [{
-      id: "shot-001", title: "镜头一", duration: 3, prompt: "雨夜街头", negativePrompt: "模糊", assetIds: [],
+      id: "shot-001", sceneId: "scene-default", rank: "00000001", title: "镜头一", duration: 3, prompt: "雨夜街头", negativePrompt: "模糊", assetIds: [],
       nodes: [{ id: "node-001", kind: "reference", input: "asset:asset-001", params: {}, status: "pending", artifacts: [] }],
     }],
+    workflow: { nodes: [], edges: [] },
+    canvasLayout: { scope: { type: "project", id: project.id }, layoutRevision: 0, nodes: {} },
     checks: [], nodeCatalog: [{ kind: "reference", label: "引用素材" }, { kind: "crop", label: "裁切" }, { kind: "prompt", label: "提示词" }],
     ...overrides,
   };

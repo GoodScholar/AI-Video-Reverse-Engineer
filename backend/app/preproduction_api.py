@@ -15,6 +15,7 @@ from pathlib import Path
 from threading import RLock
 from types import SimpleNamespace
 from typing import Any, Callable, Literal, Optional
+from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
@@ -78,6 +79,10 @@ class NodeUpdate(BaseModel):
 class ShotUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     id: str = Field(min_length=1, max_length=100)
+    # Read-only v2 identity metadata; accepted for old whole-workspace clients and
+    # preserved by ShotProduction rather than trusted from the request.
+    sceneId: Optional[str] = Field(default=None, max_length=100)
+    rank: Optional[str] = Field(default=None, max_length=100)
     title: str = Field(default="", max_length=1000)
     duration: float = Field(ge=0, le=36000)
     prompt: str = Field(default="", max_length=12000)
@@ -794,14 +799,103 @@ def _display_name(name: Optional[str]) -> str:
 
 
 def _public_state(project_id: str, value: dict[str, Any]) -> dict[str, Any]:
-    result = {"revision": value["revision"], "brief": {"inputKind": "reference_video", **value["brief"]}, "assets": [], "shots": []}
+    result = {
+        "schemaVersion": value["schemaVersion"],
+        "revision": value["revision"],
+        "brief": {"inputKind": "reference_video", **value["brief"]},
+        "assets": [],
+        "scenes": [dict(scene) for scene in value["scenes"]],
+        "shots": [],
+    }
     for asset in value["assets"]:
         result["assets"].append({key: item for key, item in asset.items() if key not in ("file", "sourceReferenceId") and not key.startswith("_")} | {"url": f"/api/projects/{project_id}/preproduction/assets/{asset['id']}/file"})
     for shot in value["shots"]:
         result["shots"].append({key: item for key, item in shot.items() if not key.startswith("_") and key != "nodes"} | {"resultVersions": public_result_versions(value["brief"], shot), "nodes": [
             {key: item for key, item in node.items() if key != "runId" and not key.startswith("_")} for node in shot["nodes"]
         ]})
+    result["workflow"] = _workflow_projection(value)
+    result["canvasLayout"] = _initial_canvas_layout(project_id, value)
     return result
+
+
+def _workflow_projection(value: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    assets = {asset["id"]: asset for asset in value["assets"]}
+    for shot in value["shots"]:
+        shot_node_id = _workflow_id("shot", shot["id"])
+        nodes.append({"id": shot_node_id, "type": "shot", "shotId": shot["id"]})
+        asset_ids = list(dict.fromkeys([
+            *shot.get("assetIds", []),
+            *(step["input"].split(":", 1)[1] for step in shot["nodes"] if step["input"].startswith("asset:")),
+        ]))
+        for asset_id in asset_ids:
+            asset = assets.get(asset_id, {})
+            nodes.append({
+                "id": _workflow_id("asset", shot["id"], asset_id),
+                "type": "asset",
+                "assetId": asset_id,
+                "ownerShotId": shot["id"],
+                "role": asset.get("role", "reference"),
+            })
+        for step in shot["nodes"]:
+            process_id = _workflow_id("process", shot["id"], step["id"])
+            nodes.append({
+                "id": process_id,
+                "type": "process",
+                "ownerShotId": shot["id"],
+                "processKind": step["kind"],
+                "config": {"input": step["input"], "params": step["params"]},
+                "status": step["status"],
+                "error": step.get("error"),
+                "artifacts": step.get("artifacts", []),
+            })
+            if step["input"].startswith("asset:"):
+                source_id = _workflow_id("asset", shot["id"], step["input"].split(":", 1)[1])
+                source_port = "asset"
+            elif step["input"].startswith("node:"):
+                source_id = _workflow_id("process", shot["id"], step["input"].split(":", 1)[1])
+                source_port = "output"
+            else:
+                continue
+            edges.append({
+                "id": f"edge:{source_id}:{process_id}",
+                "kind": "data",
+                "source": {"nodeId": source_id, "portId": source_port},
+                "target": {"nodeId": process_id, "portId": "input"},
+            })
+    return {"nodes": nodes, "edges": edges}
+
+
+def _initial_canvas_layout(project_id: str, value: dict[str, Any]) -> dict[str, Any]:
+    layout_nodes: dict[str, dict[str, Any]] = {}
+    scenes = sorted(value["scenes"], key=lambda scene: scene["rank"])
+    shots_by_scene: dict[str, list[dict[str, Any]]] = {scene["id"]: [] for scene in scenes}
+    for shot in sorted(value["shots"], key=lambda item: item["rank"]):
+        shots_by_scene.setdefault(shot["sceneId"], []).append(shot)
+    y = 0
+    for scene in scenes:
+        shots = shots_by_scene.get(scene["id"], [])
+        layout_nodes[scene["id"]] = {
+            "x": 0,
+            "y": y,
+            "width": max(320, 80 + 260 * len(shots)),
+            "height": 240,
+            "collapsed": False,
+        }
+        for index, shot in enumerate(shots):
+            layout_nodes[_workflow_id("shot", shot["id"])] = {"x": 40 + index * 260, "y": y + 80}
+        y += 280
+    return {
+        "scope": {"type": "project", "id": project_id},
+        "layoutRevision": 0,
+        "nodes": layout_nodes,
+        "viewport": {"x": 0, "y": 0, "zoom": 1},
+    }
+
+
+def _workflow_id(kind: str, *parts: str) -> str:
+    return ":".join((kind, *(quote(part, safe="") for part in parts)))
 
 
 def _node_label(kind: str) -> str:

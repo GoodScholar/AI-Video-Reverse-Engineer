@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   downloadPreproductionPackage,
+  getPreproductionWorkspace,
   importPreparationShots,
   runPreproductionNode,
   savePreproductionWorkspace,
@@ -9,9 +10,13 @@ import {
 } from "./preproductionApi";
 
 const workspace: PreproductionWorkspace = {
+  schemaVersion: 2,
   revision: 3,
   brief: { theme: "雨夜追踪", purpose: "预告片", style: "电影感", duration: 12, aspect: "16:9", mustPreserve: "人物服装" },
-  assets: [], shots: [], checks: [], nodeCatalog: [{ kind: "reference", label: "引用素材" }],
+  assets: [], scenes: [{ id: "scene-default", title: "未分场", rank: "00000001", description: "" }], shots: [],
+  workflow: { nodes: [], edges: [] },
+  canvasLayout: { scope: { type: "project", id: "project-001" }, layoutRevision: 0, nodes: {} },
+  checks: [], nodeCatalog: [{ kind: "reference", label: "引用素材" }],
 };
 
 const response = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
@@ -31,6 +36,27 @@ describe("preproductionApi", () => {
       "/api/projects/project%2F001/preproduction",
       expect.objectContaining({ method: "PUT", body: JSON.stringify({ revision: 3, brief: workspace.brief, shots: [] }) }),
     );
+  });
+
+  it("读取 v2 工作区时保留场景、只读关系和独立布局契约", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(response({
+      ...workspace,
+      schemaVersion: 2,
+      scenes: [{ id: "scene-default", title: "未分场", rank: "00000001", description: "" }],
+      shots: [],
+      workflow: { nodes: [{ id: "shot:shot-a", type: "shot", shotId: "shot-a" }], edges: [] },
+      canvasLayout: {
+        scope: { type: "project", id: "project-001" }, layoutRevision: 0, nodes: {},
+        viewport: { x: 0, y: 0, zoom: 1 },
+      },
+    }));
+
+    const loaded = await getPreproductionWorkspace("project-001");
+
+    expect(loaded.schemaVersion).toBe(2);
+    expect(loaded.scenes[0].id).toBe("scene-default");
+    expect(loaded.workflow.nodes[0]).toMatchObject({ type: "shot", shotId: "shot-a" });
+    expect(loaded.canvasLayout.layoutRevision).toBe(0);
   });
 
   it("从现有分镜导入时携带当前 revision", async () => {

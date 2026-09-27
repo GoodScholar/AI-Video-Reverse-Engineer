@@ -4,7 +4,15 @@ import { ReproductionFlow } from "./ReproductionFlow";
 import type { Project } from "./models";
 import type { PreproductionWorkspace } from "./preproductionApi";
 const project: Project = { id: "p1", name: "项目", createdAt: "", updatedAt: "", referenceMedia: null, localPreprocessing: null };
-const workspace: PreproductionWorkspace = { revision: 0, brief: { inputKind: "depth_video", theme: "", purpose: "", style: "", duration: 0, aspect: "", mustPreserve: "" }, assets: [], shots: [], checks: [], nodeCatalog: [] };
+const workspace: PreproductionWorkspace = {
+  schemaVersion: 2,
+  revision: 0,
+  brief: { inputKind: "depth_video", theme: "", purpose: "", style: "", duration: 0, aspect: "", mustPreserve: "" },
+  assets: [], scenes: [{ id: "scene-default", title: "未分场", rank: "00000001", description: "" }], shots: [],
+  workflow: { nodes: [], edges: [] },
+  canvasLayout: { scope: { type: "project", id: "project-001" }, layoutRevision: 0, nodes: {} },
+  checks: [], nodeCatalog: [],
+};
 const actions = { disabled: false, dirty: false, onKindChange: vi.fn(), onNavigate: vi.fn(), onImportShots: vi.fn() };
 beforeEach(() => localStorage.clear());
 afterEach(() => vi.unstubAllGlobals());
@@ -25,7 +33,7 @@ it("收起流程保留摘要，重开项目恢复折叠偏好且不改变方案"
 it("按已保存检查列出准备缺项并定位镜头，控制素材保持可选", () => {
  const locate = vi.fn();
  const saved = { ...workspace, brief: { ...workspace.brief, inputKind: "reference_video" as const }, shots: [
-   { id: "s1", title: "镜头一", duration: 2, prompt: "", negativePrompt: "", assetIds: [], nodes: [] },
+   { id: "s1", sceneId: "scene-default", rank: "00000001", title: "镜头一", duration: 2, prompt: "", negativePrompt: "", assetIds: [], nodes: [] },
  ], checks: [{ level: "warning" as const, code: "shot_prompt_missing", shotId: "s1", message: "镜头尚未填写提示词。" }] };
  render(<ReproductionFlow project={project} workspace={saved} {...actions} dirty onLocateCheck={locate} />);
  expect(screen.getByText(/进度依据已保存版本/)).toBeVisible();
@@ -37,7 +45,7 @@ it("按已保存检查列出准备缺项并定位镜头，控制素材保持可�
 it("回传进度区分已上传、时长合格与人工复核", () => {
  const locate = vi.fn();
  const saved = { ...workspace, assets: [{ id: "v1", name: "结果", kind: "video" as const, role: "motion" as const, url: "/v1", duration: 2 }], shots: [
-   { id: "s1", title: "镜头一", duration: 2, prompt: "光线", negativePrompt: "", assetIds: [], nodes: [], resultAssetId: "v1", resultVersions: [{ assetId: "v1", reviewed: false, planChanged: false }] },
+   { id: "s1", sceneId: "scene-default", rank: "00000001", title: "镜头一", duration: 2, prompt: "光线", negativePrompt: "", assetIds: [], nodes: [], resultAssetId: "v1", resultVersions: [{ assetId: "v1", reviewed: false, planChanged: false }] },
  ] };
  render(<ReproductionFlow project={project} workspace={saved} {...actions} onLocateCheck={locate} />);
  expect(screen.getByText(/已回传 1 \/ 1.*时长合格 1.*已人工复核 0/)).toBeVisible();

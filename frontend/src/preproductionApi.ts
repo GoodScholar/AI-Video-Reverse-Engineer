@@ -50,8 +50,17 @@ export type ResultAssociation = {
 };
 export type ShotResultVersion = { assetId: string; reviewed: boolean; planChanged: boolean; association?: ResultAssociation; externalNote?: string; adoptionReason?: string };
 
+export type PreproductionScene = {
+  id: string;
+  title: string;
+  rank: string;
+  description: string;
+};
+
 export type PreproductionShot = {
   id: string;
+  sceneId: string;
+  rank: string;
   title: string;
   duration: number;
   prompt: string;
@@ -60,6 +69,40 @@ export type PreproductionShot = {
   resultVersions?: ShotResultVersion[];
   assetIds: string[];
   nodes: PreproductionNode[];
+};
+
+export type WorkflowNode =
+  | { id: string; type: "shot"; shotId: string }
+  | {
+      id: string;
+      type: "process";
+      ownerShotId: string;
+      processKind: NodeKind;
+      config: { input: string; params: Record<string, unknown> };
+      status: NodeStatus;
+      error?: string | null;
+      artifacts: Array<{ name: string; url: string }>;
+    }
+  | { id: string; type: "asset"; assetId: string; ownerShotId?: string; role?: AssetRole };
+
+export type WorkflowEdge = {
+  id: string;
+  kind: "data";
+  source: { nodeId: string; portId: string };
+  target: { nodeId: string; portId: string };
+};
+
+export type CanvasLayout = {
+  scope: { type: "project" | "scene" | "shot"; id: string };
+  layoutRevision: number;
+  nodes: Record<string, {
+    x: number;
+    y: number;
+    width?: number;
+    height?: number;
+    collapsed?: boolean;
+  }>;
+  viewport?: { x: number; y: number; zoom: number };
 };
 
 export type PreproductionCheck = {
@@ -71,10 +114,14 @@ export type PreproductionCheck = {
 };
 
 export type PreproductionWorkspace = {
+  schemaVersion: 2;
   revision: number;
   brief: PreproductionBrief;
   assets: PreproductionAsset[];
+  scenes: PreproductionScene[];
   shots: PreproductionShot[];
+  workflow: { nodes: WorkflowNode[]; edges: WorkflowEdge[] };
+  canvasLayout: CanvasLayout;
   checks: PreproductionCheck[];
   nodeCatalog: Array<{ kind: NodeKind; label: string }>;
 };

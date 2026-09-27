@@ -6,7 +6,7 @@ const assets: PreproductionAsset[] = [
   { id: "ref", kind: "video", role: "reference", name: "参考.mp4", url: "/ref.mp4", duration: 10 },
   { id: "result", kind: "video", role: "motion", name: "结果.mp4", url: "/result.mp4", duration: 2 },
 ];
-const shot: PreproductionShot = { id: "s1", title: "镜头", duration: 3, prompt: "", negativePrompt: "", assetIds: ["ref"], resultAssetId: "result", nodes: [{ id: "trim", kind: "trim", input: "asset:ref", params: { start: 4, end: 7 }, status: "pending", artifacts: [] }] };
+const shot: PreproductionShot = { id: "s1", sceneId: "scene-default", rank: "00000001", title: "镜头", duration: 3, prompt: "", negativePrompt: "", assetIds: ["ref"], resultAssetId: "result", nodes: [{ id: "trim", kind: "trim", input: "asset:ref", params: { start: 4, end: 7 }, status: "pending", artifacts: [] }] };
 function loaded() {
  const a = screen.getByLabelText("对比参考视频") as HTMLVideoElement;
  const b = screen.getByLabelText("对比结果视频") as HTMLVideoElement;

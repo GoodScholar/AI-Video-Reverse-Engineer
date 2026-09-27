@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { ShotResultVersions } from "./ShotResultVersions";
-const shot = { id: "s1", title: "镜头", duration: 3, prompt: "", negativePrompt: "", assetIds: [], nodes: [], resultAssetId: "v2", resultVersions: [
+const shot = { id: "s1", sceneId: "scene-default", rank: "00000001", title: "镜头", duration: 3, prompt: "", negativePrompt: "", assetIds: [], nodes: [], resultAssetId: "v2", resultVersions: [
   { assetId: "v1", reviewed: true, planChanged: false }, { assetId: "v2", reviewed: false, planChanged: true },
 ] };
 const assets = ["v1", "v2"].map((id) => ({ id, name: id + ".mp4", kind: "video" as const, role: "motion" as const, url: "/" + id, duration: 3 }));
