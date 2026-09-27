@@ -1,6 +1,7 @@
 """Pure content-workflow projection behavior."""
 
 import json
+from copy import deepcopy
 
 from app.content_workflow import project_content_workflow
 
@@ -225,3 +226,53 @@ def test_failed_variant_reports_issue_without_overwriting_siblings():
     assert projection["counts"]["failed"] == 1
     assert projection["variants"][0]["issues"][0]["code"] == "generation_failed"
     assert projection["variants"][1]["stage"] == "approved"
+
+
+def test_projection_keeps_voice_ready_after_timeline_or_subtitle_edits():
+    child = variant_task("voice-ready")
+    child["voiceover"] = {
+        "id": "voice", "voiceId": "serena", "status": "completed", "error": None,
+        "contentRevision": 0, "variantRevision": 0, "subtitleRevision": 0,
+    }
+    child["variant"]["revision"] = 1
+    child["variant"]["subtitles"]["revision"] = 1
+    aigc, batch = active_batch(child)
+
+    projection = project_content_workflow(aigc, batch, {"front", "use"})
+    item = projection["variants"][0]
+
+    assert item["stage"] == "voice_ready"
+    assert "voiceover_stale" not in {issue["code"] for issue in item["issues"]}
+    assert "preview_stale" in {issue["code"] for issue in item["issues"]}
+
+
+def test_projection_requires_review_for_a_new_preview_of_the_same_version():
+    child = variant_task("new-preview", decision="approved")
+    latest_preview = deepcopy(child["variant"]["runs"][0])
+    latest_preview["id"] = "preview-new-preview-2"
+    latest_preview["output"] = "preview-new-preview-2.mp4"
+    child["variant"]["runs"].append(latest_preview)
+    aigc, batch = active_batch(child)
+
+    projection = project_content_workflow(aigc, batch, {"front", "use"})
+    item = projection["variants"][0]
+
+    assert item["stage"] == "review_pending"
+    assert item["reviewStatus"] == "stale"
+    assert item["currentPreviewRunId"] == "preview-new-preview-2"
+    assert "review_stale" in {issue["code"] for issue in item["issues"]}
+
+
+def test_projection_keeps_delivery_after_the_same_preview_is_reapproved():
+    child = variant_task("reapproved", decision="approved", delivered=True)
+    latest_review = deepcopy(child["reviews"][0])
+    latest_review["id"] = "review-reapproved-2"
+    child["reviews"].append(latest_review)
+    aigc, batch = active_batch(child)
+
+    projection = project_content_workflow(aigc, batch, {"front", "use"})
+    item = projection["variants"][0]
+
+    assert item["stage"] == "delivered"
+    assert item["currentExportRunId"] == "export-reapproved"
+    assert "export_stale" not in {issue["code"] for issue in item["issues"]}
