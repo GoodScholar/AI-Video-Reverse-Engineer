@@ -3,6 +3,7 @@ from copy import deepcopy
 
 import pytest
 
+from app import batch_production as production
 from app.batch_production import (
     BatchProductionError,
     complete_voiceover,
@@ -33,6 +34,114 @@ def video_tracks():
                     "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0}]},
         {"id": "audio", "name": "声音", "kind": "audio", "muted": False, "hidden": False, "clips": []},
     ]
+
+
+def completed_preview(task, preview_id="preview"):
+    content_revision, variant_revision, subtitle_revision = production.current_version(task)
+    return {
+        "id": preview_id,
+        "revision": variant_revision,
+        "contentRevision": content_revision,
+        "subtitleRevision": subtitle_revision,
+        "subtitleCues": deepcopy(task["variant"]["subtitles"]["cues"]),
+        "status": "completed",
+        "error": None,
+        "output": preview_id + ".mp4",
+        "snapshot": {
+            "settings": deepcopy(task["variant"]["settings"]),
+            "tracks": deepcopy(task["variant"]["tracks"]),
+        },
+        "sources": {"shot": "shot.mp4"},
+    }
+
+
+def approved_review(task, preview, review_id="review"):
+    content_revision, variant_revision, subtitle_revision = production.current_version(task)
+    return {
+        "id": review_id,
+        "runId": preview["id"],
+        "decision": "approved",
+        "reason": "确认",
+        "contentRevision": content_revision,
+        "variantRevision": variant_revision,
+        "subtitleRevision": subtitle_revision,
+    }
+
+
+def test_inspection_keeps_completed_voice_current_across_non_voice_edits():
+    task = create_batch("省时", "操作演示", id_factory=ids("task", "variant"))
+    task["variant"].update(revision=4, tracks=video_tracks())
+    task["variant"]["subtitles"].update(
+        revision=2, cues=[{"id": "cue", "start": 0, "end": 1, "text": "人工字幕"}]
+    )
+    task["voiceover"] = {
+        "id": "voice", "voiceId": "serena", "status": "completed", "error": None,
+        "contentRevision": 0, "variantRevision": 2, "subtitleRevision": 1,
+        "model": "qwen", "modelRevision": "local", "assetIds": ["voice-asset"],
+    }
+
+    lifecycle = production.inspect_variant(task)
+
+    assert lifecycle.voice.status == "current"
+    assert lifecycle.voice.reason is None
+    assert lifecycle.voice.record["id"] == "voice"
+    assert lifecycle.preview.status == "absent"
+
+
+def test_inspection_stales_review_when_a_new_preview_replaces_the_reviewed_artifact():
+    task = create_batch("省时", "操作演示", id_factory=ids("task", "variant"))
+    task["variant"].update(revision=2, tracks=video_tracks())
+    task["variant"]["subtitles"]["revision"] = 1
+    first = completed_preview(task, "preview-1")
+    second = completed_preview(task, "preview-2")
+    task["variant"]["runs"].extend([first, second])
+    task["reviews"].append(approved_review(task, first))
+
+    lifecycle = production.inspect_variant(task)
+
+    assert lifecycle.preview.status == "current"
+    assert lifecycle.preview.record["id"] == "preview-2"
+    assert lifecycle.review.status == "stale"
+    assert lifecycle.review.reason == "review_stale"
+    assert lifecycle.review.record is None
+
+
+def test_inspection_keeps_delivery_current_after_the_same_preview_is_reapproved():
+    task = create_batch("省时", "操作演示", id_factory=ids("task", "variant"))
+    task["variant"].update(revision=2, tracks=video_tracks())
+    preview = completed_preview(task)
+    first_review = approved_review(task, preview, "review-1")
+    latest_review = approved_review(task, preview, "review-2")
+    task["variant"]["runs"].append(preview)
+    task["reviews"].extend([first_review, latest_review])
+    task["variant"]["exports"].append({
+        "id": "delivery", "status": "completed", "contentRevision": 0,
+        "variantRevision": 2, "subtitleRevision": 0, "previewRunId": "preview",
+        "review": first_review, "output": "delivery.mp4",
+    })
+
+    lifecycle = production.inspect_variant(task)
+
+    assert lifecycle.review.status == "approved"
+    assert lifecycle.review.record["id"] == "review-2"
+    assert lifecycle.delivery.status == "current"
+    assert lifecycle.delivery.record["id"] == "delivery"
+
+
+def test_inspection_reads_missing_legacy_revision_fields_as_zero():
+    task = create_batch("省时", "操作演示", id_factory=ids("task", "variant"))
+    task["variant"]["tracks"] = video_tracks()
+    preview = completed_preview(task)
+    preview.pop("contentRevision")
+    preview.pop("subtitleRevision")
+    task["variant"]["runs"].append(preview)
+    task["reviews"].append(approved_review(task, preview))
+
+    lifecycle = production.inspect_variant(task)
+
+    assert lifecycle.preview.status == "current"
+    assert lifecycle.preview.record["id"] == "preview"
+    assert lifecycle.review.status == "approved"
 
 
 def test_commands_share_one_frozen_edit_snapshot_for_preview_review_and_export():

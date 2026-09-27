@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from typing import Any, Callable
+from dataclasses import dataclass
+from typing import Any, Callable, Literal
 from uuid import uuid4
 
 from .durable_runs import LOCAL_RUN_POLICY, RunConflict, freeze_run_input
@@ -19,6 +20,26 @@ class BatchProductionError(ValueError):
         self.code = code
         self.message = message
         self.status_code = status_code
+
+
+LifecycleStatus = Literal[
+    "absent", "active", "failed", "current", "stale", "pending", "approved", "rejected"
+]
+
+
+@dataclass(frozen=True)
+class LifecycleFact:
+    status: LifecycleStatus
+    reason: str | None = None
+    record: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class VariantLifecycle:
+    voice: LifecycleFact
+    preview: LifecycleFact
+    review: LifecycleFact
+    delivery: LifecycleFact
 
 
 def _new_id() -> str:
@@ -40,9 +61,7 @@ def current_version(task: dict[str, Any]) -> tuple[int, int, int]:
 
 
 def _voice_is_current(task: dict[str, Any]) -> bool:
-    voice = task.get("voiceover")
-    return voice is None or (voice["status"] == "completed"
-                             and voice["contentRevision"] == task.get("contentRevision", 0))
+    return _voice_fact(task).status in ("absent", "current")
 
 
 def frozen_edit_snapshot(task: dict[str, Any]) -> dict[str, Any]:
@@ -57,23 +76,86 @@ def frozen_edit_snapshot(task: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def review_status(task: dict[str, Any]) -> str:
+def _voice_fact(task: dict[str, Any]) -> LifecycleFact:
+    voice = task.get("voiceover")
+    if voice is None:
+        return LifecycleFact("absent")
+    if voice.get("status") in ("queued", "running"):
+        return LifecycleFact("active", "voiceover_active", voice)
+    if voice.get("status") == "failed":
+        return LifecycleFact("failed", "voiceover_failed", voice)
+    if (voice.get("status") == "completed"
+            and voice.get("contentRevision", 0) == task.get("contentRevision", 0)):
+        return LifecycleFact("current", record=voice)
+    return LifecycleFact("stale", "voiceover_stale")
+
+
+def _preview_fact(task: dict[str, Any], voice: LifecycleFact) -> LifecycleFact:
+    variant = task["variant"]
+    runs = variant.get("runs", [])
+    if not runs:
+        return LifecycleFact("absent")
+    run = runs[-1]
+    if run.get("status") in ("queued", "running"):
+        return LifecycleFact("active", "preview_active", run)
+    if run.get("status") == "failed":
+        return LifecycleFact("failed", "preview_failed", run)
+    frozen = frozen_edit_snapshot(task)
+    if (run.get("status") != "completed"
+            or voice.status not in ("absent", "current")
+            or (run.get("contentRevision", 0), run.get("revision"), run.get("subtitleRevision", 0))
+            != current_version(task)
+            or run.get("snapshot") != frozen["snapshot"]
+            or run.get("subtitleCues", []) != frozen["subtitleCues"]):
+        return LifecycleFact("stale", "preview_stale")
+    return LifecycleFact("current", record=run)
+
+
+def _review_fact(task: dict[str, Any], preview: LifecycleFact) -> LifecycleFact:
     reviews = task.get("reviews", [])
     if not reviews:
-        return "pending"
-    if not _voice_is_current(task):
-        return "stale"
+        return LifecycleFact("pending")
     latest = reviews[-1]
-    variant = task["variant"]
-    reviewed_run = next((run for run in variant["runs"] if run["id"] == latest["runId"]), None)
-    frozen = frozen_edit_snapshot(task)
-    if ((latest["contentRevision"], latest["variantRevision"], latest["subtitleRevision"])
-            != current_version(task)
-            or reviewed_run is None
-            or reviewed_run["snapshot"] != frozen["snapshot"]
-            or reviewed_run.get("subtitleCues", []) != frozen["subtitleCues"]):
-        return "stale"
-    return latest["decision"]
+    if (preview.status != "current" or preview.record is None
+            or latest.get("runId") != preview.record.get("id")
+            or (latest.get("contentRevision", 0), latest.get("variantRevision", 0),
+                latest.get("subtitleRevision", 0)) != current_version(task)
+            or latest.get("decision") not in ("approved", "rejected")):
+        return LifecycleFact("stale", "review_stale")
+    return LifecycleFact(latest["decision"], record=latest)
+
+
+def _delivery_fact(task: dict[str, Any], preview: LifecycleFact, review: LifecycleFact) -> LifecycleFact:
+    exports = task["variant"].get("exports", [])
+    if not exports:
+        return LifecycleFact("absent")
+    version = current_version(task)
+    if review.status == "approved" and preview.status == "current" and preview.record is not None:
+        current = next((delivery for delivery in reversed(exports)
+                        if delivery.get("status") == "completed"
+                        and (delivery.get("contentRevision", 0), delivery.get("variantRevision", 0),
+                             delivery.get("subtitleRevision", 0)) == version
+                        and delivery.get("previewRunId") == preview.record.get("id")), None)
+        if current is not None:
+            return LifecycleFact("current", record=current)
+    latest = exports[-1]
+    if latest.get("status") in ("queued", "running"):
+        return LifecycleFact("active", "export_active", latest)
+    if latest.get("status") == "failed":
+        return LifecycleFact("failed", "export_failed", latest)
+    return LifecycleFact("stale", "export_stale")
+
+
+def inspect_variant(task: dict[str, Any]) -> VariantLifecycle:
+    voice = _voice_fact(task)
+    preview = _preview_fact(task, voice)
+    review = _review_fact(task, preview)
+    delivery = _delivery_fact(task, preview, review)
+    return VariantLifecycle(voice=voice, preview=preview, review=review, delivery=delivery)
+
+
+def review_status(task: dict[str, Any]) -> str:
+    return inspect_variant(task).review.status
 
 
 def create_batch(selling_point: str, script: str, aspect: dict[str, Any] | None = None,
