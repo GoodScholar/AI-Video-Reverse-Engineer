@@ -75,12 +75,12 @@ def _exports(variant: dict) -> list:
     return variant.setdefault("exports", [])
 
 
-def _review_version(task: dict) -> tuple[int, int, int]:
+def review_version(task: dict) -> tuple[int, int, int]:
     variant = task["variant"]
     return (task.get("contentRevision", 0), variant["revision"], variant.get("subtitles", {}).get("revision", 0))
 
 
-def _review_status(task: dict) -> str:
+def review_status(task: dict) -> str:
     reviews = task.get("reviews", [])
     if not reviews:
         return "pending"
@@ -90,7 +90,7 @@ def _review_status(task: dict) -> str:
     latest = reviews[-1]
     variant = task["variant"]
     reviewed_run = next((run for run in variant["runs"] if run["id"] == latest["runId"]), None)
-    if ((latest["contentRevision"], latest["variantRevision"], latest["subtitleRevision"]) != _review_version(task)
+    if ((latest["contentRevision"], latest["variantRevision"], latest["subtitleRevision"]) != review_version(task)
             or reviewed_run is None or reviewed_run["snapshot"] != {"settings": variant["settings"], "tracks": variant["tracks"]}
             or reviewed_run.get("subtitleCues", []) != variant.get("subtitles", {}).get("cues", [])):
         return "stale"
@@ -321,7 +321,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
 
     def public_task(project_id: str, task: dict[str, Any]):
         result = {**task, "contentRevision": task.get("contentRevision", 0), "reviews": task.get("reviews", []),
-                  "reviewStatus": _review_status(task), "variant": {**task["variant"]}}
+                  "reviewStatus": review_status(task), "variant": {**task["variant"]}}
         saved_ratio = ratio_label(task["variant"]["settings"]["width"], task["variant"]["settings"]["height"])
         result["variant"].setdefault("aspectMode", saved_ratio if saved_ratio in PRODUCT_PRESETS else "smart")
         result["variant"].setdefault("resolvedAspect", saved_ratio)
@@ -1005,7 +1005,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 voice = task.get("voiceover")
                 if not voice or voice["id"] != job_id or voice["status"] != "queued":
                     return
-                if _review_version(task) != (voice["contentRevision"], voice["variantRevision"], voice["subtitleRevision"]):
+                if review_version(task) != (voice["contentRevision"], voice["variantRevision"], voice["subtitleRevision"]):
                     raise ValueError("脚本、镜头或字幕已修改，未覆盖新内容，请重新生成配音。")
                 voice["status"] = "running"
                 save(project_id, state)
@@ -1026,7 +1026,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 task = task_for(state, task_id)
                 voice = task.get("voiceover")
                 if (not voice or voice["id"] != job_id or voice["status"] != "running"
-                        or _review_version(task) != _review_version(snapshot)):
+                        or review_version(task) != review_version(snapshot)):
                     raise ValueError("脚本、镜头或字幕已修改，未覆盖新内容，请重新生成配音。")
                 preparation = preproduction.load(project_id)
                 assets = {a["id"]: a for a in preparation["assets"]}
@@ -1099,7 +1099,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 task = task_for(state, requested["taskId"])
                 if task["id"] != owner["id"] and task.get("batchId") != owner["id"]:
                     raise HTTPException(422, detail={"code": "batch_voiceover_scope", "message": "只能处理当前任务或它的批量变体。"})
-                if _review_version(task) != (requested["contentRevision"], requested["variantRevision"], requested["subtitleRevision"]):
+                if review_version(task) != (requested["contentRevision"], requested["variantRevision"], requested["subtitleRevision"]):
                     raise HTTPException(409, detail={"code": "batch_voiceover_conflict", "message": "脚本、镜头或字幕已更新，请保存或刷新后重新确认。"})
                 if task.get("voiceover", {}).get("status") in ("queued", "running"):
                     raise HTTPException(409, detail={"code": "batch_voiceover_active", "message": "配音正在处理中。"})
@@ -1220,7 +1220,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             task = task_for(state, task_id)
             voice_current(task)
             run = find_run(task["variant"], body["runId"])
-            version = _review_version(task)
+            version = review_version(task)
             if (run is not task["variant"]["runs"][-1] or run["status"] != "completed"
                     or (run.get("contentRevision", 0), run["revision"], run.get("subtitleRevision", 0)) != version):
                 raise HTTPException(409, detail={"code": "batch_review_preview_stale", "message": "请先完成当前版本的预览。"})
@@ -1251,10 +1251,10 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 child = task_for(state, child_id)
                 if child.get("batchId") != task_id:
                     raise HTTPException(422, detail={"code": "batch_export_selection_invalid", "message": "所选变体不属于此批量任务。"})
-                version = _review_version(child)
+                version = review_version(child)
                 review = child.get("reviews", [])[-1] if child.get("reviews") else None
                 preview = child["variant"]["runs"][-1] if child["variant"]["runs"] else None
-                if (_review_status(child) != "approved" or review is None or preview is None
+                if (review_status(child) != "approved" or review is None or preview is None
                         or preview["status"] != "completed"
                         or child["variant"]["settings"].get("fps") != 30
                         or preview["snapshot"] != {"settings": child["variant"]["settings"], "tracks": child["variant"]["tracks"]}
