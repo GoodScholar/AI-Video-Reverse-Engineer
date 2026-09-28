@@ -237,6 +237,82 @@ describe("PreproductionWorkspace", () => {
     expect(sessionStorage.getItem("aivre:preproduction-draft:project-001")).toBeNull();
   });
 
+  it("恢复画布新建镜头草稿时保留初始位置并随工作区提交", async () => {
+    const current = workspace();
+    const draftShot = {
+      ...current.shots[0], id: "shot-draft", rank: "00000002", title: "画布草稿镜头", nodes: [],
+    };
+    const draftLayout = {
+      ...current.canvasLayout,
+      nodes: { ...current.canvasLayout.nodes, "shot:shot-draft": { x: 520, y: 240 } },
+    };
+    const baseline = JSON.stringify({
+      revision: current.revision,
+      brief: current.brief,
+      scenes: current.scenes,
+      shots: current.shots,
+    });
+    sessionStorage.setItem("aivre:preproduction-draft:project-001", JSON.stringify({
+      draft: {
+        revision: current.revision,
+        brief: current.brief,
+        scenes: current.scenes,
+        shots: [...current.shots, draftShot],
+        canvasLayout: draftLayout,
+      },
+      baseline,
+    }));
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(response(current))
+      .mockImplementationOnce(async (_url, init) => response({
+        ...current,
+        ...JSON.parse(String(init?.body)),
+        revision: current.revision + 1,
+        canvasLayout: { ...draftLayout, layoutRevision: 1 },
+      }));
+    render(<PreproductionWorkspace project={project} tools={null} />);
+
+    expect(await screen.findAllByText("画布草稿镜头")).not.toHaveLength(0);
+    await userEvent.click(screen.getByRole("button", { name: "保存更改" }));
+
+    const saved = JSON.parse(String(vi.mocked(fetch).mock.calls[1][1]?.body));
+    expect(saved.canvasLayout.nodes["shot:shot-draft"]).toEqual({ x: 520, y: 240 });
+  });
+
+  it("待提交布局独立保存期间禁用工作区保存以避免 revision 竞态", async () => {
+    const current = workspace();
+    const pending = deferred<Response>();
+    const draftLayout = {
+      ...current.canvasLayout,
+      nodes: { "shot:shot-001": { x: 420, y: 180 } },
+    };
+    const baseline = JSON.stringify({
+      revision: current.revision,
+      brief: current.brief,
+      scenes: current.scenes,
+      shots: current.shots,
+    });
+    sessionStorage.setItem("aivre:preproduction-draft:project-001", JSON.stringify({
+      draft: {
+        revision: current.revision,
+        brief: current.brief,
+        scenes: current.scenes,
+        shots: current.shots,
+        canvasLayout: draftLayout,
+      },
+      baseline,
+    }));
+    vi.mocked(fetch).mockResolvedValueOnce(response(current)).mockReturnValueOnce(pending.promise);
+    render(<PreproductionWorkspace project={project} tools={null} />);
+
+    const saveButton = await screen.findByRole("button", { name: "保存更改" });
+    await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(saveButton).toBeDisabled());
+
+    await act(async () => pending.resolve(response({ ...draftLayout, layoutRevision: 1 })));
+    await waitFor(() => expect(saveButton).toBeDisabled());
+  });
+
   it("上传按钮支持键盘触发，导航和筛选暴露选中状态", async () => {
     vi.mocked(fetch).mockResolvedValueOnce(response(workspace()));
     render(<PreproductionWorkspace project={project} tools={<p>工具</p>} />);

@@ -1019,8 +1019,10 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
           layoutPersistence: {
             ...state.layoutPersistence,
             interactionBase: null,
-            saveStatus: "idle",
-            conflictMessage: null,
+            saveStatus: state.layoutPersistence.saveStatus === "saving" ? "saving" : "idle",
+            conflictMessage: state.layoutPersistence.saveStatus === "saving"
+              ? state.layoutPersistence.conflictMessage
+              : null,
           },
         }));
         return true;

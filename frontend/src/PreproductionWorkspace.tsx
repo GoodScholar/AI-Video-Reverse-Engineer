@@ -16,6 +16,7 @@ import {
   uploadShotResult,
   reviewShotResult,
   type AssetRole,
+  type CanvasLayout,
   type NodeKind,
   type PreproductionNode,
   type PreproductionShot,
@@ -71,16 +72,30 @@ function editableSnapshot(workspace: Workspace | null) {
 
 function draftKey(projectId: string) { return `aivre:preproduction-draft:${projectId}`; }
 async function readDraft(cache: ReturnType<typeof createDraftCache>): Promise<{
-  draft: Pick<Workspace, "revision" | "brief" | "shots"> & { scenes?: Workspace["scenes"] };
+  draft: Pick<Workspace, "revision" | "brief" | "shots"> & {
+    scenes?: Workspace["scenes"];
+    canvasLayout?: CanvasLayout;
+  };
   baseline: string;
 } | null> {
   try {
     const cached = JSON.parse(await cache.read() ?? "null");
     if (!cached || typeof cached.baseline !== "string" || !Number.isInteger(cached.draft?.revision)
       || !cached.draft.brief || (cached.draft.scenes !== undefined && !Array.isArray(cached.draft.scenes)) || !Array.isArray(cached.draft.shots)
+      || (cached.draft.canvasLayout !== undefined && !isDraftLayout(cached.draft.canvasLayout))
       || !cached.draft.shots.every((shot: PreproductionShot) => shot && Array.isArray(shot.nodes) && Array.isArray(shot.assetIds))) return null;
     return cached;
   } catch { return null; }
+}
+
+function isDraftLayout(value: unknown): value is CanvasLayout {
+  if (!value || typeof value !== "object") return false;
+  const layout = value as Partial<CanvasLayout>;
+  return Boolean(layout.scope && ["project", "scene", "shot"].includes(layout.scope.type)
+    && typeof layout.scope.id === "string"
+    && Number.isInteger(layout.layoutRevision)
+    && layout.layoutRevision! >= 0
+    && layout.nodes && typeof layout.nodes === "object");
 }
 
 function updateShot(workspace: Workspace, shotId: string, change: (shot: PreproductionShot) => PreproductionShot): Workspace {
@@ -117,6 +132,7 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
   useEffect(() => { if(savedWorkspace) onAssetsChanged?.(savedWorkspace.assets); }, [savedWorkspace,onAssetsChanged]);
   const savedSnapshot = useStore(workspaceStore, (state) => state.persistence.savedSnapshot);
   const dirty = useStore(workspaceStore, selectWorkspaceDirty);
+  const layoutSaving = useStore(workspaceStore, (state) => state.layoutPersistence.saveStatus === "saving");
   const selectedShotIds = useStore(workspaceStore, (state) => state.selection.selectedShotIds);
   const primaryEntity = useStore(workspaceStore, (state) => state.selection.primaryEntity);
   const [managedAssetId, setManagedAssetId] = useState<string | null>(null);
@@ -187,7 +203,12 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
         ...next,
         ...cached.draft,
         scenes: cached.draft.scenes ?? next.scenes,
+        canvasLayout: cached.draft.canvasLayout ?? next.canvasLayout,
       }, cached.baseline);
+      if (cached.draft.canvasLayout
+        && JSON.stringify(cached.draft.canvasLayout) !== JSON.stringify(next.canvasLayout)) {
+        workspaceStore.getState().actions.deferLayoutToWorkspaceSave(cached.draft.canvasLayout);
+      }
       setSavedWorkspace(next);
       setDraftNotice(next.revision === cached.draft.revision
         ? "已恢复此浏览器保存的未保存草稿，请保存更改。"
@@ -222,7 +243,14 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
     if (loading || !workspace || loadedProjectRef.current !== project.id) return;
     let active = true;
     void draftCache.write(dirty ? JSON.stringify({
-      draft: { revision: workspace.revision, brief: workspace.brief, scenes: workspace.scenes, shots: workspace.shots }, baseline: savedSnapshot,
+      draft: {
+        revision: workspace.revision,
+        brief: workspace.brief,
+        scenes: workspace.scenes,
+        shots: workspace.shots,
+        canvasLayout: workspace.canvasLayout,
+      },
+      baseline: savedSnapshot,
     }) : null).then(() => { if (active && !dirty) setDraftNotice(""); })
       .catch((reason) => { if (active) setDraftNotice(errorMessage(reason, "浏览器无法缓存草稿，请在离开项目前保存更改。")); });
     return () => { active = false; };
@@ -262,7 +290,7 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
   }
 
   async function save() {
-    if (busy) return;
+    if (busy || workspaceStore.getState().layoutPersistence.saveStatus === "saving") return;
     setBusy("save"); setError("");
     workspaceStore.getState().actions.setSaveStatus("saving");
     const submittedSnapshot = workspaceStore.getState().persistence.editableSnapshot;
@@ -361,7 +389,7 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
       <div><p className="preproduction-kicker">VIDEO PREPRODUCTION</p><h2>前置工作台</h2><p>组织需求、素材与可复用的镜头步骤。</p></div>
       <div className="preproduction-header-actions">
         {dirty && <span className="preproduction-dirty" role="status">有未保存更改</span>}
-        <button type="button" className="secondary-action" disabled={!dirty || Boolean(busy) || hasActiveNodes} onClick={() => void save()}><Save size={16} aria-hidden="true" />{busy === "save" ? "正在保存…" : "保存更改"}</button>
+        <button type="button" className="secondary-action" disabled={!dirty || Boolean(busy) || layoutSaving || hasActiveNodes} onClick={() => void save()}><Save size={16} aria-hidden="true" />{busy === "save" ? "正在保存…" : "保存更改"}</button>
       </div>
     </header>
     {draftNotice && <p className="preproduction-draft-notice" role="status">{draftNotice}</p>}
