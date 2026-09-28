@@ -8,6 +8,7 @@ import { WorkflowCanvas } from "./WorkflowCanvas";
 
 type Props = {
   store: PreproductionWorkspaceStore;
+  projectId?: string;
   children: ReactNode;
   onCreateShot?: () => void;
 };
@@ -18,7 +19,7 @@ const viewOptions: Array<{ mode: WorkspaceViewMode; label: string; icon: typeof 
   { mode: "list", label: "列表视图", icon: List },
 ];
 
-export function ShotWorkspaceLayout({ store, children, onCreateShot }: Props) {
+export function ShotWorkspaceLayout({ store, projectId, children, onCreateShot }: Props) {
   const mode = useStore(store, (state) => state.view.mode);
   const inspectorOpen = useStore(store, (state) => state.view.inspectorOpen);
 
@@ -51,7 +52,7 @@ export function ShotWorkspaceLayout({ store, children, onCreateShot }: Props) {
     </header>
     <div className="shot-workspace__body">
       {mode !== "canvas" && <SceneShotList store={store} onCreateShot={onCreateShot} />}
-      {mode !== "list" && <WorkflowCanvas store={store} />}
+      {mode !== "list" && <WorkflowCanvas projectId={projectId} store={store} />}
       {inspectorOpen && <>
         <button type="button" className="shot-workspace__backdrop" aria-label="收起检查器遮罩" onClick={() => store.getState().actions.setInspectorOpen(false)} />
         <aside className="shot-workspace__inspector" aria-label="工作区检查器">

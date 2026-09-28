@@ -11,22 +11,23 @@ import {
   useReactFlow,
   type Edge,
   type Node,
-  type NodeChange,
   type NodeMouseHandler,
   type NodeProps,
 } from "@xyflow/react";
-import { Box, ChevronLeft, Focus, Image, Layers3 } from "lucide-react";
+import { Box, ChevronDown, ChevronLeft, ChevronRight, Focus, Image, Layers3, Redo2, Undo2 } from "lucide-react";
 import { useStore } from "zustand";
 
 import "@xyflow/react/dist/style.css";
 
-import type { PreproductionWorkspaceStore, SelectableEntity } from "./preproductionWorkspaceStore";
+import { getCanvasLayout, saveCanvasLayout, type CanvasLayout } from "./preproductionApi";
+import { canvasLayoutScopeKey, type PreproductionWorkspaceStore, type SelectableEntity } from "./preproductionWorkspaceStore";
 import { projectWorkflowCanvas, type WorkflowCanvasNode } from "./workflowCanvasProjection";
 
-type Props = { store: PreproductionWorkspaceStore };
+type Props = { store: PreproductionWorkspaceStore; projectId?: string };
 type CanvasNodeData = WorkflowCanvasNode["data"] & {
   store: PreproductionWorkspaceStore;
   onOpenShot?: (shotId: string) => void;
+  onToggleScene?: (sceneId: string) => void;
 };
 type CanvasNode = Node<CanvasNodeData, WorkflowCanvasNode["kind"]>;
 
@@ -70,6 +71,10 @@ const SceneNode = memo(function SceneNode({ data, selected: boxSelected }: NodeP
     onMouseEnter={() => setTransient("hover", true)} onMouseLeave={() => setTransient("hover", false)} onFocus={() => setTransient("focus", true)} onBlur={() => setTransient("focus", false)}>
     <div><Layers3 size={16} aria-hidden="true" /><strong>{data.label}</strong></div>
     <small>{data.shotCount} 个镜头 · {data.duration} 秒{data.issueCount ? ` · ${data.issueCount} 项问题` : ""}</small>
+    <button type="button" className="nodrag" aria-label={`${data.collapsed ? "展开" : "折叠"}场景 ${data.label}`} onClick={(event) => {
+      event.stopPropagation();
+      data.onToggleScene?.(data.entityId);
+    }}>{data.collapsed ? <ChevronRight size={15} aria-hidden="true" /> : <ChevronDown size={15} aria-hidden="true" />}{data.collapsed ? "展开" : "折叠"}</button>
   </section>;
 });
 
@@ -79,7 +84,7 @@ const ShotNode = memo(function ShotNode({ data, selected: boxSelected }: NodePro
     onMouseEnter={() => setTransient("hover", true)} onMouseLeave={() => setTransient("hover", false)} onFocus={() => setTransient("focus", true)} onBlur={() => setTransient("focus", false)}>
     <div><Box size={16} aria-hidden="true" /><strong>{data.label}</strong></div>
     <small>{data.detail} · {data.status}</small>
-    <button type="button" aria-label={`查看${data.label}关系`} onClick={(event) => { event.stopPropagation(); data.onOpenShot?.(data.entityId); }}>查看关系</button>
+    <button type="button" className="nodrag" aria-label={`查看${data.label}关系`} onClick={(event) => { event.stopPropagation(); data.onOpenShot?.(data.entityId); }}>查看关系</button>
   </article>;
 });
 
@@ -103,8 +108,9 @@ const ProcessNode = memo(function ProcessNode({ data, selected: boxSelected }: N
 });
 
 const nodeTypes = { scene: SceneNode, shot: ShotNode, asset: AssetNode, process: ProcessNode };
+const emptyLayoutHistory: Array<CanvasLayout["nodes"]> = [];
 
-function WorkflowCanvasInner({ store }: Props) {
+function WorkflowCanvasInner({ store, projectId: providedProjectId }: Props) {
   const entities = useStore(store, (state) => state.entities);
   const order = useStore(store, (state) => state.order);
   const assets = useStore(store, (state) => state.assets);
@@ -113,10 +119,23 @@ function WorkflowCanvasInner({ store }: Props) {
   const layout = useStore(store, (state) => state.layout);
   const scope = useStore(store, (state) => state.view.scope);
   const locateRequest = useStore(store, (state) => state.view.locateRequest);
-  const { fitView } = useReactFlow<CanvasNode, Edge>();
+  const layoutSaveStatus = useStore(store, (state) => state.layoutPersistence.saveStatus);
+  const layoutMessage = useStore(store, (state) => state.layoutPersistence.conflictMessage);
+  const { fitView, setViewport } = useReactFlow<CanvasNode, Edge>();
   const boxSelectedShotIds = useRef<string[]>([]);
   const boxSelecting = useRef(false);
+  const savingLayout = useRef(false);
+  const restoringViewport = useRef(false);
   const prefersReducedMotion = typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  const projectId = providedProjectId ?? (layout.scope.type === "project" ? layout.scope.id : "");
+  const layoutScope = useMemo<CanvasLayout["scope"]>(() => scope.type === "project"
+    ? { type: "project", id: projectId }
+    : { type: "shot", id: scope.id }, [projectId, scope]);
+  const layoutReady = canvasLayoutScopeKey(layout.scope) === canvasLayoutScopeKey(layoutScope);
+  const historyByScope = useStore(store, (state) => state.layoutPersistence.historyByScope);
+  const futureByScope = useStore(store, (state) => state.layoutPersistence.futureByScope);
+  const layoutHistory = historyByScope[canvasLayoutScopeKey(layoutScope)] ?? emptyLayoutHistory;
+  const layoutFuture = futureByScope[canvasLayoutScopeKey(layoutScope)] ?? emptyLayoutHistory;
 
   const graph = useMemo(() => projectWorkflowCanvas({
     ...store.getState(), entities, order, assets, checks, nodeCatalog, layout,
@@ -127,13 +146,47 @@ function WorkflowCanvasInner({ store }: Props) {
     store.getState().actions.focusShot(shotId);
   }, [store]);
 
+  const persistLayout = useCallback((next: CanvasLayout | null) => {
+    if (!next || !projectId || savingLayout.current) return;
+    savingLayout.current = true;
+    store.getState().actions.setLayoutSaveStatus("saving");
+    void saveCanvasLayout(projectId, next).then((saved) => {
+      const currentScope = store.getState().view.scope;
+      const activeScope: CanvasLayout["scope"] = currentScope.type === "project"
+        ? { type: "project", id: projectId }
+        : { type: "shot", id: currentScope.id };
+      store.getState().actions.acceptLayout(saved, canvasLayoutScopeKey(activeScope) === canvasLayoutScopeKey(saved.scope));
+    }).catch((reason: unknown) => {
+      const message = reason instanceof Error ? reason.message : "无法保存画布布局。";
+      store.getState().actions.setLayoutSaveStatus(message.includes("已被更新") ? "conflict" : "error", message);
+    }).finally(() => { savingLayout.current = false; });
+  }, [projectId, store]);
+
+  const reloadLayout = useCallback(() => {
+    if (!projectId) return;
+    store.getState().actions.setLayoutSaveStatus("saving");
+    void getCanvasLayout(projectId, layoutScope).then((loaded) => {
+      const currentScope = store.getState().view.scope;
+      const activeScope: CanvasLayout["scope"] = currentScope.type === "project"
+        ? { type: "project", id: projectId }
+        : { type: "shot", id: currentScope.id };
+      store.getState().actions.acceptLayout(loaded, canvasLayoutScopeKey(activeScope) === canvasLayoutScopeKey(loaded.scope));
+    }).catch((reason: unknown) => {
+      store.getState().actions.setLayoutSaveStatus("error", reason instanceof Error ? reason.message : "无法读取画布布局。");
+    });
+  }, [layoutScope, projectId, store]);
+
+  const toggleScene = useCallback((sceneId: string) => {
+    if (layoutSaveStatus === "saving") return;
+    persistLayout(store.getState().actions.toggleCanvasScene(sceneId));
+  }, [layoutSaveStatus, persistLayout, store]);
+
   const nodes = useMemo<CanvasNode[]>(() => graph.nodes.map((node) => ({
     id: node.id,
     type: node.kind,
     position: node.position,
     parentId: node.parentId,
     extent: node.parentId ? "parent" : undefined,
-    draggable: false,
     selectable: node.kind !== "asset",
     width: node.width,
     height: node.height,
@@ -142,8 +195,9 @@ function WorkflowCanvasInner({ store }: Props) {
       ...node.data,
       store,
       onOpenShot: node.kind === "shot" ? openShot : undefined,
+      onToggleScene: node.kind === "scene" ? toggleScene : undefined,
     },
-  })), [graph.nodes, openShot, store]);
+  })), [graph.nodes, openShot, store, toggleScene]);
 
   const edges = useMemo<Edge[]>(() => graph.edges.map((edge) => ({
     ...edge,
@@ -169,10 +223,26 @@ function WorkflowCanvasInner({ store }: Props) {
     fitCurrent(selected.length ? selected : undefined);
   }, [fitCurrent, nodes, store]);
 
-  const fitMeasuredNodes = useCallback((changes: NodeChange<CanvasNode>[]) => {
-    if (!changes.some((change) => change.type === "dimensions")) return;
-    requestAnimationFrame(() => fitCurrent());
-  }, [fitCurrent]);
+  useEffect(() => {
+    if (!projectId) return;
+    if (store.getState().actions.activateLayout(layoutScope)) return;
+    let active = true;
+    store.getState().actions.setLayoutSaveStatus("saving");
+    void getCanvasLayout(projectId, layoutScope).then((loaded) => {
+      if (active) store.getState().actions.acceptLayout(loaded, true);
+    }).catch((reason: unknown) => {
+      if (active) store.getState().actions.setLayoutSaveStatus("error", reason instanceof Error ? reason.message : "无法读取画布布局。");
+    });
+    return () => { active = false; };
+  }, [layoutScope, projectId, store]);
+
+  useEffect(() => {
+    if (!layoutReady || !layout.viewport) return;
+    restoringViewport.current = true;
+    void Promise.resolve(setViewport(layout.viewport, { duration: 0 })).finally(() => {
+      requestAnimationFrame(() => { restoringViewport.current = false; });
+    });
+  }, [layout.layoutRevision, layout.scope, layout.viewport, layoutReady, setViewport]);
 
   useEffect(() => {
     if (!locateRequest || locateRequest.source === "canvas") return;
@@ -208,30 +278,64 @@ function WorkflowCanvasInner({ store }: Props) {
       } else if (!event.metaKey && !event.ctrlKey && event.key.toLowerCase() === "f") {
         event.preventDefault();
         focusSelection();
+      } else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z" && layoutSaveStatus !== "saving") {
+        event.preventDefault();
+        persistLayout(event.shiftKey ? store.getState().actions.redoLayout() : store.getState().actions.undoLayout());
       }
     }}
   >
-    <header className="workflow-canvas__toolbar">
+    <div className="workflow-canvas__toolbar-stack"><header className="workflow-canvas__toolbar">
       <nav aria-label="画布范围">
         {scope.type === "shot" && <button type="button" aria-label="返回项目范围" onClick={() => store.getState().actions.focusProject()}><ChevronLeft size={16} aria-hidden="true" />项目</button>}
         <span aria-current="page">{scopeShot?.title ?? "项目关系"}</span>
       </nav>
       <div>
+        <button type="button" aria-label="撤销布局" disabled={!layoutHistory.length || layoutSaveStatus === "saving"} onClick={() => persistLayout(store.getState().actions.undoLayout())}><Undo2 size={16} aria-hidden="true" />撤销</button>
+        <button type="button" aria-label="重做布局" disabled={!layoutFuture.length || layoutSaveStatus === "saving"} onClick={() => persistLayout(store.getState().actions.redoLayout())}><Redo2 size={16} aria-hidden="true" />重做</button>
         <button type="button" onClick={focusSelection}><Focus size={16} aria-hidden="true" />聚焦选择</button>
         <button type="button" onClick={() => fitCurrent()}><Layers3 size={16} aria-hidden="true" />适配当前范围</button>
       </div>
     </header>
+    {layoutSaveStatus !== "idle" && <div className={`workflow-canvas__layout-status workflow-canvas__layout-status--${layoutSaveStatus}`} role={layoutSaveStatus === "conflict" || layoutSaveStatus === "error" ? "alert" : "status"}>
+      <span>{layoutSaveStatus === "saving" ? "正在保存画布布局…" : layoutMessage}</span>
+      {(layoutSaveStatus === "conflict" || layoutSaveStatus === "error") && <button type="button" onClick={reloadLayout}>重新读取布局</button>}
+    </div>}</div>
     <div className="workflow-canvas__surface">
       <ReactFlow<CanvasNode, Edge>
         key={scope.type === "project" ? "project" : `shot:${scope.id}`}
         nodes={nodes}
         edges={edges}
         nodeTypes={nodeTypes}
-        nodesDraggable={false}
+        nodesDraggable={layoutReady && layoutSaveStatus !== "saving"}
         nodesConnectable={false}
         nodesFocusable={false}
         elementsSelectable
-        onNodesChange={fitMeasuredNodes}
+        onNodeDragStart={() => store.getState().actions.beginLayoutChange()}
+        onNodeDrag={(_, node) => store.getState().actions.previewLayoutNode(
+          node.type === "scene" ? node.data.entityId : node.id,
+          node.position,
+          {
+            sceneId: node.type === "scene" ? node.data.entityId : node.parentId?.replace(/^scene:/, ""),
+            width: node.type === "scene" && node.data.collapsed ? undefined : node.measured?.width ?? node.width,
+            height: node.type === "scene" && node.data.collapsed ? undefined : node.measured?.height ?? node.height,
+          },
+        )}
+        onNodeDragStop={(_, node) => {
+          store.getState().actions.previewLayoutNode(
+            node.type === "scene" ? node.data.entityId : node.id,
+            node.position,
+            {
+              sceneId: node.type === "scene" ? node.data.entityId : node.parentId?.replace(/^scene:/, ""),
+              width: node.type === "scene" && node.data.collapsed ? undefined : node.measured?.width ?? node.width,
+              height: node.type === "scene" && node.data.collapsed ? undefined : node.measured?.height ?? node.height,
+            },
+          );
+          persistLayout(store.getState().actions.finishLayoutChange());
+        }}
+        onMoveEnd={(_, viewport) => {
+          if (restoringViewport.current || layoutSaveStatus === "saving") return;
+          persistLayout(store.getState().actions.updateLayoutViewport(viewport));
+        }}
         onNodeClick={selectNode}
         onSelectionStart={() => { boxSelecting.current = true; boxSelectedShotIds.current = []; }}
         onSelectionChange={({ nodes: selectedNodes }) => {
@@ -254,7 +358,7 @@ function WorkflowCanvasInner({ store }: Props) {
         zoomOnPinch
         onlyRenderVisibleElements
         proOptions={{ hideAttribution: true }}
-        aria-label="只读镜头关系画布"
+        aria-label="镜头关系画布"
       >
         <Background color="#dce1e9" gap={24} size={1} />
         <Controls showInteractive={false} position="bottom-right" />

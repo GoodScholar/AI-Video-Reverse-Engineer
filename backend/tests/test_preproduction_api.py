@@ -90,6 +90,189 @@ def test_new_shot_keeps_its_custom_scene_on_legacy_workspace_save(tmp_path):
     assert saved.json()["shots"][0]["sceneId"] == "scene-custom"
 
 
+def test_canvas_layout_persists_with_an_independent_revision(tmp_path):
+    client, _, _ = setup(tmp_path)
+    content = client.get(BASE).json()
+    layout_url = BASE + f"/layouts/project/{PROJECT_ID}"
+    layout = client.get(layout_url).json()
+
+    saved = client.put(layout_url, json={
+        "layoutRevision": layout["layoutRevision"],
+        "nodes": {
+            **layout["nodes"],
+            "scene-default": {
+                **layout["nodes"]["scene-default"],
+                "x": 180,
+                "y": 96,
+                "width": 480,
+                "height": 260,
+                "collapsed": True,
+            },
+        },
+        "viewport": {"x": -120, "y": 48, "zoom": 1.25},
+    })
+
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["layoutRevision"] == 1
+    assert saved.json()["nodes"]["scene-default"] == {
+        "x": 180,
+        "y": 96,
+        "width": 480,
+        "height": 260,
+        "collapsed": True,
+    }
+    assert client.get(BASE).json()["revision"] == content["revision"]
+    restored = client.get(layout_url).json()
+    assert restored == saved.json()
+    assert client.get(BASE).json()["canvasLayout"] == saved.json()
+
+
+def test_layout_and_content_cas_conflicts_are_isolated(tmp_path):
+    client, _, _ = setup(tmp_path)
+    current = client.get(BASE).json()
+    layout_url = BASE + f"/layouts/project/{PROJECT_ID}"
+    initial_layout = client.get(layout_url).json()
+
+    first_layout = client.put(layout_url, json={
+        "layoutRevision": 0,
+        "nodes": initial_layout["nodes"],
+        "viewport": {"x": 12, "y": 8, "zoom": 1},
+    })
+    stale_layout = client.put(layout_url, json={
+        "layoutRevision": 0,
+        "nodes": initial_layout["nodes"],
+        "viewport": {"x": 20, "y": 10, "zoom": 1},
+    })
+    content_saved = client.put(BASE, json={
+        "revision": current["revision"],
+        "brief": {**current["brief"], "theme": "布局冲突后仍可保存内容"},
+        "shots": current["shots"],
+    })
+
+    assert first_layout.status_code == 200
+    assert stale_layout.status_code == 409
+    assert stale_layout.json()["detail"]["code"] == "preproduction_layout_conflict"
+    assert content_saved.status_code == 200, content_saved.text
+    assert content_saved.json()["revision"] == current["revision"] + 1
+    assert content_saved.json()["canvasLayout"]["layoutRevision"] == 1
+
+    stale_content = client.put(BASE, json={
+        "revision": current["revision"],
+        "brief": current["brief"],
+        "shots": current["shots"],
+    })
+    layout_after_content_conflict = client.put(layout_url, json={
+        "layoutRevision": 1,
+        "nodes": initial_layout["nodes"],
+        "viewport": {"x": 24, "y": 12, "zoom": 1.1},
+    })
+
+    assert stale_content.status_code == 409
+    assert layout_after_content_conflict.status_code == 200, layout_after_content_conflict.text
+    assert layout_after_content_conflict.json()["layoutRevision"] == 2
+
+
+def test_corrupt_layout_does_not_block_content_read_or_save(tmp_path):
+    client, _, _ = setup(tmp_path)
+    current = client.get(BASE).json()
+    layout_url = BASE + f"/layouts/project/{PROJECT_ID}"
+    layout = client.get(layout_url).json()
+    assert client.put(layout_url, json={
+        "layoutRevision": layout["layoutRevision"],
+        "nodes": layout["nodes"],
+        "viewport": {"x": 10, "y": 20, "zoom": 1},
+    }).status_code == 200
+    layout_path = (
+        tmp_path
+        / "project-files"
+        / PROJECT_ID
+        / "preproduction"
+        / "canvas-layouts"
+        / "project"
+        / f"{PROJECT_ID}.json"
+    )
+    layout_path.write_text("not-json", encoding="utf-8")
+
+    readable = client.get(BASE)
+    saved = client.put(BASE, json={
+        "revision": current["revision"],
+        "brief": {**current["brief"], "theme": "布局损坏不阻塞内容"},
+        "shots": current["shots"],
+    })
+    broken_layout = client.get(layout_url)
+
+    assert readable.status_code == 200, readable.text
+    assert readable.json()["canvasLayout"]["layoutRevision"] == 0
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["revision"] == current["revision"] + 1
+    assert broken_layout.status_code == 503
+    assert broken_layout.json()["detail"]["code"] == "preproduction_layout_storage_invalid"
+
+
+def test_each_canvas_scope_restores_its_own_viewport(tmp_path):
+    client, _, _ = setup(tmp_path)
+    current = client.get(BASE).json()
+    saved_content = client.put(BASE, json={
+        "revision": current["revision"],
+        "brief": current["brief"],
+        "shots": [{
+            "id": "shot-a", "title": "镜头 A", "duration": 2,
+            "prompt": "", "negativePrompt": "", "assetIds": [], "nodes": [],
+        }],
+    })
+    assert saved_content.status_code == 200, saved_content.text
+    project_url = BASE + f"/layouts/project/{PROJECT_ID}"
+    shot_url = BASE + "/layouts/shot/shot-a"
+    project_layout = client.get(project_url).json()
+    shot_layout = client.get(shot_url).json()
+
+    assert client.put(project_url, json={
+        "layoutRevision": project_layout["layoutRevision"],
+        "nodes": project_layout["nodes"],
+        "viewport": {"x": 100, "y": 40, "zoom": 0.75},
+    }).status_code == 200
+    assert client.put(shot_url, json={
+        "layoutRevision": shot_layout["layoutRevision"],
+        "nodes": shot_layout["nodes"],
+        "viewport": {"x": -30, "y": 15, "zoom": 1.8},
+    }).status_code == 200
+
+    assert client.get(project_url).json()["viewport"] == {"x": 100, "y": 40, "zoom": 0.75}
+    assert client.get(shot_url).json()["viewport"] == {"x": -30, "y": 15, "zoom": 1.8}
+
+
+def test_layout_save_discards_nodes_removed_by_independent_content_edit(tmp_path):
+    client, _, _ = setup(tmp_path)
+    current = client.get(BASE).json()
+    created = client.put(BASE, json={
+        "revision": current["revision"],
+        "brief": current["brief"],
+        "shots": [{
+            "id": "shot-a", "title": "镜头 A", "duration": 2,
+            "prompt": "", "negativePrompt": "", "assetIds": [], "nodes": [],
+        }],
+    }).json()
+    layout_url = BASE + f"/layouts/project/{PROJECT_ID}"
+    stale_layout = client.get(layout_url).json()
+    assert "shot:shot-a" in stale_layout["nodes"]
+    removed = client.put(BASE, json={
+        "revision": created["revision"],
+        "brief": created["brief"],
+        "shots": [],
+    })
+    assert removed.status_code == 200, removed.text
+
+    saved_layout = client.put(layout_url, json={
+        "layoutRevision": stale_layout["layoutRevision"],
+        "nodes": stale_layout["nodes"],
+        "viewport": {"x": 5, "y": 10, "zoom": 1},
+    })
+
+    assert saved_layout.status_code == 200, saved_layout.text
+    assert "shot:shot-a" not in saved_layout.json()["nodes"]
+    assert client.get(BASE).json()["revision"] == removed.json()["revision"]
+
+
 def test_save_uses_cas_and_marks_downstream_node_stale(tmp_path):
     client, _, _ = setup(tmp_path)
     state = client.get(BASE).json()

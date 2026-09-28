@@ -160,6 +160,25 @@ export function savePreproductionWorkspace(projectId: string, workspace: Preprod
   }, "无法保存前置工作台，请刷新后重试。");
 }
 
+function layoutUrl(projectId: string, scope: CanvasLayout["scope"]) {
+  return `${baseUrl(projectId)}/layouts/${scope.type}/${encodeURIComponent(scope.id)}`;
+}
+
+export function getCanvasLayout(projectId: string, scope: CanvasLayout["scope"]): Promise<CanvasLayout> {
+  return request(layoutUrl(projectId, scope), {}, "无法读取画布布局，请重试。");
+}
+
+export function saveCanvasLayout(projectId: string, layout: CanvasLayout): Promise<CanvasLayout> {
+  return request(layoutUrl(projectId, layout.scope), {
+    method: "PUT", headers: jsonHeaders,
+    body: JSON.stringify({
+      layoutRevision: layout.layoutRevision,
+      nodes: layout.nodes,
+      viewport: layout.viewport,
+    }),
+  }, "无法保存画布布局，请重新读取后重试。");
+}
+
 export function uploadPreproductionAsset(projectId: string, role: AssetRole, file: File): Promise<PreproductionWorkspace> {
   const data = new FormData();
   data.append("file", file);

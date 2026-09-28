@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.background import BackgroundTask
 
 from .asset_references import preproduction_asset_references, timeline_asset_references
+from .canvas_layout import CanvasLayoutConflict, CanvasLayoutStore
 from .durable_runs import LOCAL_RUN_POLICY
 from .timeline import TimelineStore
 from .preproduction import PreproductionStore
@@ -132,6 +133,13 @@ class AssetMetadata(RevisionRequest):
         return value
 
 
+class CanvasLayoutUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    layoutRevision: int = Field(ge=0)
+    nodes: dict[str, dict[str, Any]]
+    viewport: Optional[dict[str, Any]] = None
+
+
 def create_preproduction_router(
     data_dir: Path,
     get_project: Callable[[str], Any],
@@ -145,6 +153,7 @@ def create_preproduction_router(
     """Create the router; ``runner`` is a test seam and defaults to execute_node."""
     root = Path(data_dir)
     store = PreproductionStore(root)
+    layout_store = CanvasLayoutStore(root)
     project_assets = ProjectAssets(root, reference_facts=(
         lambda project_id, asset_id: preproduction_asset_references(store.load(project_id), asset_id),
         lambda project_id, asset_id: timeline_asset_references(TimelineStore(root).load(project_id), asset_id),
@@ -246,7 +255,14 @@ def create_preproduction_router(
         return record
 
     def response(project_id: str, state: dict[str, Any]) -> dict[str, Any]:
-        public = _public_state(project_id, state)
+        default_layout = _initial_canvas_layout(project_id, state, "project", project_id)
+        try:
+            project_layout = layout_store.read(project_id, default_layout)
+        except (OSError, ValueError):
+            # Layout persistence is intentionally independent: a broken layout
+            # must not make otherwise valid production content unavailable.
+            project_layout = default_layout
+        public = _public_state(project_id, state, project_layout)
         by_id = project_assets.index_from(state)
         for asset in public["assets"]:
             asset["available"] = project_assets.available(project_id, by_id[asset["id"]])
@@ -295,6 +311,53 @@ def create_preproduction_router(
             decide(production.edit, body.brief.model_dump(), [shot.model_dump() for shot in body.shots])
             save(project_id, state)
             return response(project_id, state)
+
+    def layout_default(project_id: str, state: dict[str, Any], scope_type: str, scope_id: str) -> dict[str, Any]:
+        if scope_type == "project" and scope_id != project_id:
+            fail("preproduction_layout_scope_missing", "画布布局范围不存在。", 404)
+        if scope_type == "scene" and not any(scene["id"] == scope_id for scene in state["scenes"]):
+            fail("preproduction_layout_scope_missing", "画布布局范围不存在。", 404)
+        if scope_type == "shot" and not any(shot["id"] == scope_id for shot in state["shots"]):
+            fail("preproduction_layout_scope_missing", "画布布局范围不存在。", 404)
+        try:
+            return _initial_canvas_layout(project_id, state, scope_type, scope_id)
+        except (KeyError, TypeError, ValueError):
+            fail("preproduction_layout_scope_invalid", "画布布局范围无效。", 422)
+
+    @router.get("/layouts/{scope_type}/{scope_id}")
+    def get_canvas_layout(project_id: str, scope_type: Literal["project", "scene", "shot"], scope_id: str):
+        project_for(project_id)
+        with lock:
+            state = state_for(project_id)
+            try:
+                return layout_store.read(project_id, layout_default(project_id, state, scope_type, scope_id))
+            except (OSError, ValueError):
+                fail("preproduction_layout_storage_invalid", "画布布局无法读取。", 503)
+
+    @router.put("/layouts/{scope_type}/{scope_id}")
+    def save_canvas_layout(
+        project_id: str,
+        scope_type: Literal["project", "scene", "shot"],
+        scope_id: str,
+        body: CanvasLayoutUpdate,
+    ):
+        project_for(project_id)
+        with lock:
+            state = state_for(project_id)
+            try:
+                return layout_store.apply(
+                    project_id,
+                    layout_default(project_id, state, scope_type, scope_id),
+                    body.layoutRevision,
+                    body.nodes,
+                    body.viewport,
+                )
+            except CanvasLayoutConflict:
+                fail("preproduction_layout_conflict", "画布布局已被更新，请重新读取后重试。")
+            except ValueError as error:
+                fail("preproduction_layout_invalid", str(error), 422)
+            except OSError:
+                fail("preproduction_layout_storage_failed", "画布布局无法保存。", 503)
 
     def managed_asset(state, asset_id):
         try:
@@ -798,7 +861,7 @@ def _display_name(name: Optional[str]) -> str:
     return value[:255] or "素材"
 
 
-def _public_state(project_id: str, value: dict[str, Any]) -> dict[str, Any]:
+def _public_state(project_id: str, value: dict[str, Any], canvas_layout: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     result = {
         "schemaVersion": value["schemaVersion"],
         "revision": value["revision"],
@@ -814,7 +877,7 @@ def _public_state(project_id: str, value: dict[str, Any]) -> dict[str, Any]:
             {key: item for key, item in node.items() if key != "runId" and not key.startswith("_")} for node in shot["nodes"]
         ]})
     result["workflow"] = _workflow_projection(value)
-    result["canvasLayout"] = _initial_canvas_layout(project_id, value)
+    result["canvasLayout"] = canvas_layout or _initial_canvas_layout(project_id, value, "project", project_id)
     return result
 
 
@@ -867,27 +930,55 @@ def _workflow_projection(value: dict[str, Any]) -> dict[str, list[dict[str, Any]
     return {"nodes": nodes, "edges": edges}
 
 
-def _initial_canvas_layout(project_id: str, value: dict[str, Any]) -> dict[str, Any]:
+def _initial_canvas_layout(
+    project_id: str,
+    value: dict[str, Any],
+    scope_type: str = "project",
+    scope_id: Optional[str] = None,
+) -> dict[str, Any]:
+    scope_id = scope_id or project_id
     layout_nodes: dict[str, dict[str, Any]] = {}
     scenes = sorted(value["scenes"], key=lambda scene: scene["rank"])
     shots_by_scene: dict[str, list[dict[str, Any]]] = {scene["id"]: [] for scene in scenes}
     for shot in sorted(value["shots"], key=lambda item: item["rank"]):
         shots_by_scene.setdefault(shot["sceneId"], []).append(shot)
-    y = 0
-    for scene in scenes:
-        shots = shots_by_scene.get(scene["id"], [])
-        layout_nodes[scene["id"]] = {
-            "x": 0,
-            "y": y,
-            "width": max(320, 80 + 260 * len(shots)),
-            "height": 240,
-            "collapsed": False,
+    if scope_type == "project":
+        y = 0
+        for scene in scenes:
+            shots = shots_by_scene.get(scene["id"], [])
+            layout_nodes[scene["id"]] = {
+                "x": 0,
+                "y": y,
+                "width": max(320, 80 + 260 * len(shots)),
+                "height": 240,
+                "collapsed": False,
+            }
+            for index, shot in enumerate(shots):
+                layout_nodes[_workflow_id("shot", shot["id"])] = {"x": 40 + index * 260, "y": y + 80}
+            y += 280
+    elif scope_type == "scene":
+        shots = shots_by_scene.get(scope_id, [])
+        layout_nodes = {
+            _workflow_id("shot", shot["id"]): {"x": 40 + index * 260, "y": 80}
+            for index, shot in enumerate(shots)
         }
-        for index, shot in enumerate(shots):
-            layout_nodes[_workflow_id("shot", shot["id"])] = {"x": 40 + index * 260, "y": y + 80}
-        y += 280
+    elif scope_type == "shot":
+        workflow_nodes = [
+            node for node in _workflow_projection(value)["nodes"]
+            if node.get("ownerShotId") == scope_id and node["type"] in ("asset", "process")
+        ]
+        asset_index = process_index = 0
+        for node in workflow_nodes:
+            if node["type"] == "asset":
+                layout_nodes[node["id"]] = {"x": 40, "y": 40 + asset_index * 140}
+                asset_index += 1
+            else:
+                layout_nodes[node["id"]] = {"x": 320, "y": 40 + process_index * 140}
+                process_index += 1
+    else:
+        raise ValueError("画布布局范围无效")
     return {
-        "scope": {"type": "project", "id": project_id},
+        "scope": {"type": scope_type, "id": scope_id},
         "layoutRevision": 0,
         "nodes": layout_nodes,
         "viewport": {"x": 0, "y": 0, "zoom": 1},

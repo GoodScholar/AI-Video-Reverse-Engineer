@@ -24,6 +24,9 @@ export type ShotSelectionOptions = { mode?: ShotSelectionMode; source?: Selectio
 
 export type WorkspaceViewMode = "split" | "canvas" | "list";
 export type WorkspaceViewScope = { type: "project" } | { type: "shot"; id: string };
+type LayoutScope = CanvasLayout["scope"];
+type LayoutNodes = CanvasLayout["nodes"];
+type LayoutPosition = Pick<LayoutNodes[string], "x" | "y">;
 
 export type SceneSection = { sceneId: string; shotIds: string[] };
 
@@ -58,6 +61,14 @@ export type PreproductionWorkspaceState = {
     locateRequest: { entity: SelectableEntity; source: SelectionSource; requestId: number } | null;
   };
   layout: CanvasLayout;
+  layoutPersistence: {
+    layoutsByScope: Record<string, CanvasLayout>;
+    historyByScope: Record<string, LayoutNodes[]>;
+    futureByScope: Record<string, LayoutNodes[]>;
+    interactionBase: LayoutNodes | null;
+    saveStatus: "idle" | "saving" | "conflict" | "error";
+    conflictMessage: string | null;
+  };
   persistence: {
     revision: number;
     savedSnapshot: string;
@@ -88,6 +99,23 @@ export type PreproductionWorkspaceState = {
     focusShot: (shotId: string) => void;
     setInspectorOpen: (open: boolean) => void;
     setSaveStatus: (status: PreproductionWorkspaceState["persistence"]["saveStatus"], message?: string | null) => void;
+    activateLayout: (scope: LayoutScope) => boolean;
+    acceptLayout: (layout: CanvasLayout, activate?: boolean) => void;
+    beginLayoutChange: () => void;
+    previewLayoutNode: (
+      nodeId: string,
+      position: LayoutPosition,
+      options?: { sceneId?: string; width?: number; height?: number },
+    ) => void;
+    finishLayoutChange: () => CanvasLayout | null;
+    toggleCanvasScene: (sceneId: string) => CanvasLayout | null;
+    updateLayoutViewport: (viewport: NonNullable<CanvasLayout["viewport"]>) => CanvasLayout | null;
+    undoLayout: () => CanvasLayout | null;
+    redoLayout: () => CanvasLayout | null;
+    setLayoutSaveStatus: (
+      status: PreproductionWorkspaceState["layoutPersistence"]["saveStatus"],
+      message?: string | null,
+    ) => void;
   };
 };
 
@@ -99,6 +127,34 @@ function compareRank(left: { rank: string; id: string }, right: { rank: string; 
 
 function editableSnapshot(revision: number, brief: PreproductionBrief, shots: PreproductionShot[]) {
   return JSON.stringify({ revision, brief, shots });
+}
+
+export function canvasLayoutScopeKey(scope: LayoutScope) {
+  return `${scope.type}:${scope.id}`;
+}
+
+function cloneLayoutNodes(nodes: LayoutNodes): LayoutNodes {
+  return Object.fromEntries(Object.entries(nodes).map(([id, node]) => [id, { ...node }]));
+}
+
+function sameLayoutNodes(left: LayoutNodes, right: LayoutNodes) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function withCachedLayout(
+  state: PreproductionWorkspaceState,
+  layout: CanvasLayout,
+  layoutPersistence: Partial<PreproductionWorkspaceState["layoutPersistence"]> = {},
+) {
+  const key = canvasLayoutScopeKey(layout.scope);
+  return {
+    layout,
+    layoutPersistence: {
+      ...state.layoutPersistence,
+      ...layoutPersistence,
+      layoutsByScope: { ...state.layoutPersistence.layoutsByScope, [key]: layout },
+    },
+  };
 }
 
 function indexById<T extends { id: string }>(items: T[]) {
@@ -191,7 +247,6 @@ type WorkspaceSnapshotCache = {
   checks: PreproductionCheck[];
   nodeCatalog: PreproductionWorkspace["nodeCatalog"];
   order: PreproductionWorkspaceState["order"];
-  layout: CanvasLayout;
   revision: number;
   snapshot: PreproductionWorkspace;
 };
@@ -206,7 +261,6 @@ export function selectWorkspaceSnapshot(state: PreproductionWorkspaceState): Pre
     && cached.checks === state.checks
     && cached.nodeCatalog === state.nodeCatalog
     && cached.order === state.order
-    && cached.layout === state.layout
     && cached.revision === state.persistence.revision) return cached.snapshot;
   const scenes = state.order.sceneIds.map((id) => state.entities.scenesById[id]).filter(Boolean);
   const shots = state.order.sceneIds.flatMap((sceneId) => state.order.shotIdsByScene[sceneId] ?? [])
@@ -232,7 +286,6 @@ export function selectWorkspaceSnapshot(state: PreproductionWorkspaceState): Pre
     checks: state.checks,
     nodeCatalog: state.nodeCatalog,
     order: state.order,
-    layout: state.layout,
     revision: state.persistence.revision,
     snapshot,
   });
@@ -243,6 +296,8 @@ function initialState(workspace: PreproductionWorkspace) {
   const normalized = normalize(workspace);
   const snapshot = editableSnapshot(workspace.revision, workspace.brief, selectShots(normalized.order, normalized.entities.shotsById));
   const firstShotId = normalized.order.sceneIds.flatMap((sceneId) => normalized.order.shotIdsByScene[sceneId] ?? [])[0] ?? null;
+  const layout = workspace.canvasLayout ?? { scope: { type: "project" as const, id: "legacy" }, layoutRevision: 0, nodes: {} };
+  const layoutKey = canvasLayoutScopeKey(layout.scope);
   return {
     schemaVersion: 2 as const,
     brief: workspace.brief,
@@ -264,7 +319,15 @@ function initialState(workspace: PreproductionWorkspace) {
       expandedSceneIds: new Set(normalized.order.sceneIds),
       locateRequest: null,
     },
-    layout: workspace.canvasLayout ?? { scope: { type: "project", id: "legacy" }, layoutRevision: 0, nodes: {} },
+    layout,
+    layoutPersistence: {
+      layoutsByScope: { [layoutKey]: layout },
+      historyByScope: {},
+      futureByScope: {},
+      interactionBase: null,
+      saveStatus: "idle" as const,
+      conflictMessage: null,
+    },
     persistence: {
       revision: workspace.revision,
       savedSnapshot: snapshot,
@@ -381,6 +444,8 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
           return {
             ...base,
             actions: state.actions,
+            layout: state.layout,
+            layoutPersistence: state.layoutPersistence,
             selection: {
               ...state.selection,
               primaryEntity: validPrimary,
@@ -411,7 +476,6 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
             checks: next.checks,
             nodeCatalog: next.nodeCatalog,
             ...normalized,
-            layout: next.canvasLayout,
           });
         });
       },
@@ -627,6 +691,177 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
       },
       setSaveStatus(saveStatus, message = null) {
         set((state) => ({ persistence: { ...state.persistence, saveStatus, conflictMessage: message } }));
+      },
+      activateLayout(scope) {
+        const cached = get().layoutPersistence.layoutsByScope[canvasLayoutScopeKey(scope)];
+        if (!cached) return false;
+        set((state) => ({
+          layout: cached,
+          layoutPersistence: {
+            ...state.layoutPersistence,
+            interactionBase: null,
+            saveStatus: "idle",
+            conflictMessage: null,
+          },
+        }));
+        return true;
+      },
+      acceptLayout(layout, activate = false) {
+        set((state) => {
+          const nextKey = canvasLayoutScopeKey(layout.scope);
+          const cached = { ...state.layoutPersistence.layoutsByScope, [nextKey]: layout };
+          return {
+            layout: activate ? layout : state.layout,
+            layoutPersistence: {
+              ...state.layoutPersistence,
+              layoutsByScope: cached,
+              ...(activate ? {
+                interactionBase: null,
+                saveStatus: "idle" as const,
+                conflictMessage: null,
+              } : {}),
+            },
+          };
+        });
+      },
+      beginLayoutChange() {
+        set((state) => state.layoutPersistence.interactionBase ? state : ({
+          layoutPersistence: {
+            ...state.layoutPersistence,
+            interactionBase: cloneLayoutNodes(state.layout.nodes),
+          },
+        }));
+      },
+      previewLayoutNode(nodeId, position, options = {}) {
+        set((state) => {
+          const current = state.layout.nodes[nodeId];
+          if (!current) return state;
+          const nodes = cloneLayoutNodes(state.layout.nodes);
+          let x = position.x;
+          let y = position.y;
+          if (options.sceneId && nodeId !== options.sceneId) {
+            const scene = nodes[options.sceneId];
+            if (scene) { x += scene.x; y += scene.y; }
+          }
+          if (options.sceneId === nodeId) {
+            const dx = x - current.x;
+            const dy = y - current.y;
+            for (const shotId of state.order.shotIdsByScene[nodeId] ?? []) {
+              const shotNodeId = `shot:${encodeURIComponent(shotId)}`;
+              const shotNode = nodes[shotNodeId];
+              if (shotNode) nodes[shotNodeId] = { ...shotNode, x: shotNode.x + dx, y: shotNode.y + dy };
+            }
+          }
+          nodes[nodeId] = {
+            ...current,
+            x,
+            y,
+            ...(options.width ? { width: options.width } : {}),
+            ...(options.height ? { height: options.height } : {}),
+          };
+          const layout = { ...state.layout, nodes };
+          return withCachedLayout(state, layout);
+        });
+      },
+      finishLayoutChange() {
+        let result: CanvasLayout | null = null;
+        set((state) => {
+          const base = state.layoutPersistence.interactionBase;
+          if (!base || sameLayoutNodes(base, state.layout.nodes)) {
+            return { layoutPersistence: { ...state.layoutPersistence, interactionBase: null } };
+          }
+          const key = canvasLayoutScopeKey(state.layout.scope);
+          result = state.layout;
+          return {
+            layoutPersistence: {
+              ...state.layoutPersistence,
+              historyByScope: {
+                ...state.layoutPersistence.historyByScope,
+                [key]: [...(state.layoutPersistence.historyByScope[key] ?? []), base],
+              },
+              futureByScope: { ...state.layoutPersistence.futureByScope, [key]: [] },
+              interactionBase: null,
+            },
+          };
+        });
+        return result;
+      },
+      toggleCanvasScene(sceneId) {
+        let result: CanvasLayout | null = null;
+        set((state) => {
+          const scene = state.layout.nodes[sceneId];
+          if (!scene) return state;
+          const key = canvasLayoutScopeKey(state.layout.scope);
+          const previous = cloneLayoutNodes(state.layout.nodes);
+          const layout = {
+            ...state.layout,
+            nodes: { ...state.layout.nodes, [sceneId]: { ...scene, collapsed: !scene.collapsed } },
+          };
+          result = layout;
+          return withCachedLayout(state, layout, {
+            historyByScope: {
+              ...state.layoutPersistence.historyByScope,
+              [key]: [...(state.layoutPersistence.historyByScope[key] ?? []), previous],
+            },
+            futureByScope: { ...state.layoutPersistence.futureByScope, [key]: [] },
+          });
+        });
+        return result;
+      },
+      updateLayoutViewport(viewport) {
+        let result: CanvasLayout | null = null;
+        set((state) => {
+          if (state.layout.viewport?.x === viewport.x
+            && state.layout.viewport.y === viewport.y
+            && state.layout.viewport.zoom === viewport.zoom) return state;
+          const layout = { ...state.layout, viewport };
+          result = layout;
+          return withCachedLayout(state, layout);
+        });
+        return result;
+      },
+      undoLayout() {
+        let result: CanvasLayout | null = null;
+        set((state) => {
+          const key = canvasLayoutScopeKey(state.layout.scope);
+          const history = state.layoutPersistence.historyByScope[key] ?? [];
+          const previous = history[history.length - 1];
+          if (!previous) return state;
+          const layout = { ...state.layout, nodes: cloneLayoutNodes(previous) };
+          result = layout;
+          return withCachedLayout(state, layout, {
+            historyByScope: { ...state.layoutPersistence.historyByScope, [key]: history.slice(0, -1) },
+            futureByScope: {
+              ...state.layoutPersistence.futureByScope,
+              [key]: [...(state.layoutPersistence.futureByScope[key] ?? []), cloneLayoutNodes(state.layout.nodes)],
+            },
+          });
+        });
+        return result;
+      },
+      redoLayout() {
+        let result: CanvasLayout | null = null;
+        set((state) => {
+          const key = canvasLayoutScopeKey(state.layout.scope);
+          const future = state.layoutPersistence.futureByScope[key] ?? [];
+          const next = future[future.length - 1];
+          if (!next) return state;
+          const layout = { ...state.layout, nodes: cloneLayoutNodes(next) };
+          result = layout;
+          return withCachedLayout(state, layout, {
+            historyByScope: {
+              ...state.layoutPersistence.historyByScope,
+              [key]: [...(state.layoutPersistence.historyByScope[key] ?? []), cloneLayoutNodes(state.layout.nodes)],
+            },
+            futureByScope: { ...state.layoutPersistence.futureByScope, [key]: future.slice(0, -1) },
+          });
+        });
+        return result;
+      },
+      setLayoutSaveStatus(saveStatus, message = null) {
+        set((state) => ({
+          layoutPersistence: { ...state.layoutPersistence, saveStatus, conflictMessage: message },
+        }));
       },
     },
   }));

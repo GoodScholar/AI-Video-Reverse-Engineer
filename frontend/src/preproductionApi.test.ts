@@ -2,10 +2,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   downloadPreproductionPackage,
+  getCanvasLayout,
   getPreproductionWorkspace,
   importPreparationShots,
   runPreproductionNode,
   savePreproductionWorkspace,
+  saveCanvasLayout,
   type PreproductionWorkspace,
 } from "./preproductionApi";
 
@@ -57,6 +59,25 @@ describe("preproductionApi", () => {
     expect(loaded.scenes[0].id).toBe("scene-default");
     expect(loaded.workflow.nodes[0]).toMatchObject({ type: "shot", shotId: "shot-a" });
     expect(loaded.canvasLayout.layoutRevision).toBe(0);
+  });
+
+  it("按范围读取和以独立 revision 保存画布布局", async () => {
+    const layout = {
+      scope: { type: "shot" as const, id: "shot/001" },
+      layoutRevision: 4,
+      nodes: { "process:shot%2F001:trim": { x: 120, y: 80, width: 220, height: 104 } },
+      viewport: { x: -20, y: 10, zoom: 1.4 },
+    };
+    vi.mocked(fetch).mockResolvedValueOnce(response(layout)).mockResolvedValueOnce(response({ ...layout, layoutRevision: 5 }));
+
+    await expect(getCanvasLayout("project/001", layout.scope)).resolves.toEqual(layout);
+    await expect(saveCanvasLayout("project/001", layout)).resolves.toEqual({ ...layout, layoutRevision: 5 });
+
+    expect(fetch).toHaveBeenNthCalledWith(1, "/api/projects/project%2F001/preproduction/layouts/shot/shot%2F001", {});
+    expect(fetch).toHaveBeenNthCalledWith(2, "/api/projects/project%2F001/preproduction/layouts/shot/shot%2F001", expect.objectContaining({
+      method: "PUT",
+      body: JSON.stringify({ layoutRevision: 4, nodes: layout.nodes, viewport: layout.viewport }),
+    }));
   });
 
   it("从现有分镜导入时携带当前 revision", async () => {

@@ -106,7 +106,7 @@ describe("WorkflowCanvas", () => {
     const store = createPreproductionWorkspaceStore(current);
     const view = render(<div style={{ width: 900, height: 600 }}><WorkflowCanvas store={store} /></div>);
 
-    await user.click(await screen.findByRole("region", { name: "场景 相遇" }));
+    fireEvent.click(await screen.findByRole("region", { name: "场景 相遇" }));
     expect(store.getState().selection.primaryEntity).toEqual({ type: "scene", id: "scene-a" });
     expect(store.getState().view.locateRequest).toMatchObject({ entity: { type: "scene", id: "scene-a" }, source: "canvas" });
 
@@ -115,7 +115,7 @@ describe("WorkflowCanvas", () => {
       store.getState().actions.focusShot("shot-a");
     });
     view.rerender(<div style={{ width: 900, height: 600 }}><WorkflowCanvas store={store} /></div>);
-    await user.click(await screen.findByRole("article", { name: "流程节点 截取" }));
+    fireEvent.click(await screen.findByRole("article", { name: "流程节点 截取" }));
     expect(store.getState().selection.primaryEntity).toEqual({ type: "processNode", id: "trim-a", shotId: "shot-a" });
     expect(store.getState().selection.selectedShotIds).toEqual(new Set(["shot-b"]));
     expect(store.getState().view.locateRequest).toMatchObject({ entity: { type: "processNode", id: "trim-a", shotId: "shot-a" }, source: "canvas" });

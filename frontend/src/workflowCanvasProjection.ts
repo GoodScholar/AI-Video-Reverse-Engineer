@@ -21,6 +21,7 @@ export type WorkflowCanvasNode = {
     shotCount?: number;
     duration?: number;
     issueCount?: number;
+    collapsed?: boolean;
   };
 };
 
@@ -54,14 +55,15 @@ function projectGraph(state: PreproductionWorkspaceState): WorkflowCanvasGraph {
     if (!scene) return;
     const shotIds = state.order.shotIdsByScene[sceneId] ?? [];
     const savedScene = state.layout.nodes[sceneId];
+    const collapsed = savedScene?.collapsed ?? false;
     const scenePosition = { x: savedScene?.x ?? 0, y: savedScene?.y ?? sceneIndex * 280 };
     const sceneNodeId = `scene:${sceneId}`;
     nodes.push({
       id: sceneNodeId,
       kind: "scene",
       position: scenePosition,
-      width: savedScene?.width ?? Math.max(320, 80 + shotIds.length * 260),
-      height: savedScene?.height ?? 240,
+      width: collapsed ? 320 : savedScene?.width ?? Math.max(320, 80 + shotIds.length * 260),
+      height: collapsed ? 76 : savedScene?.height ?? 240,
       data: {
         label: scene.title,
         detail: scene.description,
@@ -69,8 +71,10 @@ function projectGraph(state: PreproductionWorkspaceState): WorkflowCanvasGraph {
         shotCount: shotIds.length,
         duration: shotIds.reduce((total, shotId) => total + (state.entities.shotsById[shotId]?.duration ?? 0), 0),
         issueCount: state.checks.reduce((total, check) => total + Number(Boolean(check.shotId && shotIds.includes(check.shotId))), 0),
+        collapsed,
       },
     });
+    if (collapsed) return;
     shotIds.forEach((shotId, shotIndex) => {
       const shot = state.entities.shotsById[shotId];
       if (!shot) return;

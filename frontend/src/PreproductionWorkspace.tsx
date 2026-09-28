@@ -175,7 +175,11 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
       const cached = await readDraft(draftCache);
       if (!mounted.current || currentProjectId.current !== project.id) return;
       loadedProjectRef.current = project.id;
-      if (!cached) { accept(next); return; }
+      if (!cached) {
+        if (next.canvasLayout) workspaceStore.getState().actions.acceptLayout(next.canvasLayout, true);
+        accept(next);
+        return;
+      }
       workspaceStore.getState().actions.restoreDraft({ ...next, ...cached.draft }, cached.baseline);
       setSavedWorkspace(next);
       setDraftNotice(next.revision === cached.draft.revision
@@ -369,7 +373,7 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
           })()}
         </section>}
 
-        {section === "shots" && <ShotWorkspaceLayout store={workspaceStore} onCreateShot={() => { const shot = createShot(workspace.scenes[0]?.id ?? "scene-default", String(workspace.shots.length + 1).padStart(8, "0")); edit((current) => ({ ...current, shots: [...current.shots, shot] })); workspaceStore.getState().actions.selectShot(shot.id); }}>
+        {section === "shots" && <ShotWorkspaceLayout projectId={project.id} store={workspaceStore} onCreateShot={() => { const shot = createShot(workspace.scenes[0]?.id ?? "scene-default", String(workspace.shots.length + 1).padStart(8, "0")); edit((current) => ({ ...current, shots: [...current.shots, shot] })); workspaceStore.getState().actions.selectShot(shot.id); }}>
           <section className="preproduction-workspace-inspector" aria-label="镜头检查器">
           {selectedScene ? <section className="preproduction-selection-summary" aria-label={`${selectedScene.title}场景摘要`}>
             <h3>场景摘要</h3>

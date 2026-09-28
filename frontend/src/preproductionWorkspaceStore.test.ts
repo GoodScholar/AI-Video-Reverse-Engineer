@@ -142,6 +142,98 @@ describe("preproductionWorkspaceStore", () => {
     expect(store.getState().view.scope).toEqual({ type: "project" });
   });
 
+  it("拖动只在结束时形成一个布局提交且不改变内容修订", () => {
+    const current = workspace();
+    current.canvasLayout.nodes = {
+      "scene-a": { x: 0, y: 0, width: 600, height: 240, collapsed: false },
+      "shot:shot-a1": { x: 40, y: 80, width: 220, height: 112 },
+    };
+    const store = createPreproductionWorkspaceStore(current);
+    const contentBefore = selectWorkspaceSnapshot(store.getState());
+
+    store.getState().actions.beginLayoutChange();
+    store.getState().actions.previewLayoutNode("shot:shot-a1", { x: 80, y: 90 });
+    store.getState().actions.previewLayoutNode("shot:shot-a1", { x: 160, y: 110 });
+    const committed = store.getState().actions.finishLayoutChange();
+    const duplicate = store.getState().actions.finishLayoutChange();
+
+    expect(committed?.nodes["shot:shot-a1"]).toMatchObject({ x: 160, y: 110 });
+    expect(duplicate).toBeNull();
+    expect(store.getState().layoutPersistence.historyByScope["project:project-1"]).toHaveLength(1);
+    expect(store.getState().persistence.revision).toBe(3);
+    expect(store.getState().persistence.dirty).toBe(false);
+    expect(selectWorkspaceSnapshot(store.getState()).shots).toEqual(contentBefore.shots);
+    expect(selectWorkspaceSnapshot(store.getState()).workflow).toEqual(contentBefore.workflow);
+  });
+
+  it("场景折叠和节点移动可布局级撤销重做，视口不进入历史", () => {
+    const current = workspace();
+    current.canvasLayout.nodes = {
+      "scene-a": { x: 0, y: 0, width: 600, height: 240, collapsed: false },
+      "shot:shot-a1": { x: 40, y: 80 },
+      "shot:shot-a2": { x: 300, y: 80 },
+    };
+    const store = createPreproductionWorkspaceStore(current);
+
+    const collapsed = store.getState().actions.toggleCanvasScene("scene-a");
+    expect(collapsed?.nodes["scene-a"].collapsed).toBe(true);
+    expect(store.getState().actions.updateLayoutViewport({ x: -30, y: 12, zoom: 1.2 })).not.toBeNull();
+    expect(store.getState().layoutPersistence.historyByScope["project:project-1"]).toHaveLength(1);
+
+    const undone = store.getState().actions.undoLayout();
+    expect(undone?.nodes["scene-a"].collapsed).toBe(false);
+    expect(undone?.viewport).toEqual({ x: -30, y: 12, zoom: 1.2 });
+    const redone = store.getState().actions.redoLayout();
+    expect(redone?.nodes["scene-a"].collapsed).toBe(true);
+
+    store.getState().actions.beginLayoutChange();
+    store.getState().actions.previewLayoutNode("scene-a", { x: 100, y: 50 }, { sceneId: "scene-a" });
+    const moved = store.getState().actions.finishLayoutChange();
+    expect(moved?.nodes["shot:shot-a1"]).toMatchObject({ x: 140, y: 130 });
+    expect(moved?.nodes["shot:shot-a2"]).toMatchObject({ x: 400, y: 130 });
+  });
+
+  it("为不同范围缓存独立布局并在服务端确认后更新布局修订", () => {
+    const store = createPreproductionWorkspaceStore(workspace());
+    const shotLayout = {
+      scope: { type: "shot" as const, id: "shot-a1" }, layoutRevision: 2,
+      nodes: { "process:shot-a1:trim": { x: 300, y: 40 } },
+      viewport: { x: 20, y: 10, zoom: 1.5 },
+    };
+
+    store.getState().actions.acceptLayout(shotLayout, true);
+    expect(store.getState().layout).toEqual(shotLayout);
+    store.getState().actions.acceptLayout({ ...shotLayout, layoutRevision: 3 }, true);
+    expect(store.getState().layout.layoutRevision).toBe(3);
+    expect(store.getState().actions.activateLayout({ type: "project", id: "project-1" })).toBe(true);
+    expect(store.getState().layout.scope).toEqual({ type: "project", id: "project-1" });
+    expect(store.getState().actions.activateLayout({ type: "shot", id: "shot-a1" })).toBe(true);
+    expect(store.getState().layout.viewport).toEqual({ x: 20, y: 10, zoom: 1.5 });
+  });
+
+  it("迟到的非当前范围回包只更新缓存，不打断当前布局交互状态", () => {
+    const store = createPreproductionWorkspaceStore(workspace());
+    const shotLayout = {
+      scope: { type: "shot" as const, id: "shot-a1" }, layoutRevision: 1,
+      nodes: { "process:shot-a1:trim": { x: 300, y: 40 } },
+      viewport: { x: 0, y: 0, zoom: 1 },
+    };
+    store.getState().actions.acceptLayout(shotLayout, true);
+    store.getState().actions.beginLayoutChange();
+    store.getState().actions.setLayoutSaveStatus("saving");
+
+    store.getState().actions.acceptLayout({
+      ...workspace().canvasLayout,
+      layoutRevision: 3,
+    });
+
+    const state = store.getState();
+    expect(state.layout).toBe(shotLayout);
+    expect(state.layoutPersistence.layoutsByScope["project:project-1"].layoutRevision).toBe(3);
+    expect(state.layoutPersistence.interactionBase).not.toBeNull();
+    expect(state.layoutPersistence.saveStatus).toBe("saving");
+  });
+
   it("通过统一命令支持替换、增减、范围和框选镜头", () => {
     const store = createPreproductionWorkspaceStore(workspace());
 
