@@ -198,6 +198,46 @@ def test_canvas_shot_creation_rolls_back_content_when_layout_save_fails(tmp_path
     assert restored["shots"] == []
 
 
+def test_canvas_shot_creation_recovers_without_partial_objects_after_interrupted_commit(tmp_path, monkeypatch):
+    client, _, project = setup(tmp_path)
+    current = client.get(BASE).json()
+    original_save = CanvasLayoutStore._save
+
+    def interrupt_layout_save(self, project_id, layout):
+        if "shot:shot-canvas" in layout["nodes"]:
+            raise KeyboardInterrupt
+        return original_save(self, project_id, layout)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(CanvasLayoutStore, "_save", interrupt_layout_save)
+        with pytest.raises(KeyboardInterrupt):
+            client.put(BASE, json={
+                "revision": current["revision"],
+                "brief": current["brief"],
+                "scenes": current["scenes"],
+                "shots": [{
+                    "id": "shot-canvas", "sceneId": "scene-default", "rank": "00000001",
+                    "title": "画布镜头", "duration": 3, "prompt": "", "negativePrompt": "",
+                    "assetIds": [], "nodes": [],
+                }],
+                "canvasLayout": {
+                    **current["canvasLayout"],
+                    "nodes": {
+                        **current["canvasLayout"]["nodes"],
+                        "shot:shot-canvas": {"x": 520, "y": 240},
+                    },
+                },
+            })
+
+    recovered_app = FastAPI()
+    recovered_app.include_router(create_preproduction_router(tmp_path, lambda _: project, Queue()))
+    recovered = TestClient(recovered_app).get(BASE)
+
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["shots"] == []
+    assert "shot:shot-canvas" not in recovered.json()["canvasLayout"]["nodes"]
+
+
 def test_canvas_layout_persists_with_an_independent_revision(tmp_path):
     client, _, _ = setup(tmp_path)
     content = client.get(BASE).json()

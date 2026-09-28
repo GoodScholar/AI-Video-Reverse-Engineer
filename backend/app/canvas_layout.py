@@ -87,6 +87,10 @@ class CanvasLayoutStore:
         self._save(project_id, next_layout)
         return next_layout
 
+    def save_snapshot(self, project_id: str, layout: dict[str, Any]) -> None:
+        validate_layout(layout)
+        self._save(project_id, deepcopy(layout))
+
     def _save(self, project_id: str, layout: dict[str, Any]) -> None:
         scope = layout["scope"]
         path = self.path(project_id, scope["type"], scope["id"])

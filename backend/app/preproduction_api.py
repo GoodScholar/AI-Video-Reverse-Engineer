@@ -41,6 +41,7 @@ from .reference_media_storage import managed_reference_media_is_safe, resolve_re
 from .reference_video import validate_storage_id
 from .shot_production import MAX_RESULT_VERSIONS, NODE_KINDS, ShotProduction, ShotProductionError, StepSource, public_result_versions
 from .shot_organization import ShotOrganization, ShotOrganizationError
+from .preproduction_transaction import WorkspaceTransaction, WorkspaceTransactionError
 
 
 MAX_ASSET_BYTES = 200_000_000
@@ -171,6 +172,7 @@ def create_preproduction_router(
     root = Path(data_dir)
     store = PreproductionStore(root)
     layout_store = CanvasLayoutStore(root)
+    workspace_transaction = WorkspaceTransaction(store, layout_store)
     project_assets = ProjectAssets(root, reference_facts=(
         lambda project_id, asset_id: preproduction_asset_references(store.load(project_id), asset_id),
         lambda project_id, asset_id: timeline_asset_references(TimelineStore(root).load(project_id), asset_id),
@@ -193,6 +195,7 @@ def create_preproduction_router(
 
     def state_for(project_id: str) -> dict[str, Any]:
         try:
+            workspace_transaction.recover(project_id)
             return store.load(project_id)
         except (OSError, ValueError):
             fail("preproduction_storage_invalid", "前置工作台状态无法读取。", 503)
@@ -302,6 +305,7 @@ def create_preproduction_router(
                 if path.is_symlink():
                     continue
                 project_id = path.parents[1].name
+                workspace_transaction.recover(project_id)
                 state = store.load(project_id)
                 changed = False
                 for shot in state["shots"]:
@@ -332,6 +336,7 @@ def create_preproduction_router(
                 fail("preproduction_conflict", "前置工作台已被更新，请刷新后重试。")
             original_state = deepcopy(state)
             requested_layout = deepcopy(body.canvasLayout)
+            current_layout = None
             if requested_layout is not None:
                 try:
                     validate_layout(requested_layout)
@@ -358,29 +363,39 @@ def create_preproduction_router(
                     [{"id": shot.id, "sceneId": shot.sceneId, "rank": shot.rank} for shot in body.shots],
                     increment_revision=False,
                 )
-            save(project_id, state)
-            if requested_layout is not None:
+            if requested_layout is None:
+                save(project_id, state)
+            else:
                 try:
                     default_layout = _initial_canvas_layout(project_id, state, "project", project_id)
-                    stored_layout = layout_store.read(project_id, default_layout)
                     desired_nodes = {
                         node_id: {**default_node, **requested_layout["nodes"].get(node_id, {})}
                         for node_id, default_node in default_layout["nodes"].items()
                     }
-                    if desired_nodes != stored_layout["nodes"] or requested_layout.get("viewport") != stored_layout.get("viewport"):
-                        layout_store.apply(
+                    requested_viewport = requested_layout.get("viewport")
+                    if desired_nodes != current_layout["nodes"] or requested_viewport != current_layout.get("viewport"):
+                        next_layout = {
+                            "scope": deepcopy(default_layout["scope"]),
+                            "layoutRevision": current_layout["layoutRevision"] + 1,
+                            "nodes": desired_nodes,
+                            "viewport": deepcopy(requested_viewport),
+                        }
+                        validate_layout(next_layout)
+                        workspace_transaction.commit(
                             project_id,
-                            default_layout,
-                            requested_layout["layoutRevision"],
-                            requested_layout["nodes"],
-                            requested_layout.get("viewport"),
+                            original_state,
+                            current_layout,
+                            state,
+                            next_layout,
                         )
-                except (CanvasLayoutConflict, OSError, ValueError):
-                    try:
-                        store.save(project_id, original_state)
-                    except (OSError, ValueError):
+                    else:
+                        save(project_id, state)
+                except WorkspaceTransactionError as error:
+                    if error.recovery_pending:
                         fail("preproduction_transaction_failed", "镜头创建失败且无法恢复原工作区，请停止编辑并检查存储。", 503)
                     fail("preproduction_layout_storage_failed", "画布布局无法保存，镜头更改已撤销。", 503)
+                except (OSError, ValueError):
+                    fail("preproduction_layout_storage_failed", "画布布局无法保存，镜头更改未写入。", 503)
             return response(project_id, state)
 
     def layout_default(project_id: str, state: dict[str, Any], scope_type: str, scope_id: str) -> dict[str, Any]:

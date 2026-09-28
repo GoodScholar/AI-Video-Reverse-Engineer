@@ -239,8 +239,13 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
 
   function addShot(position?: { x: number; y: number }) {
     const sceneId = workspace.scenes[0]?.id ?? "scene-default";
-    const shot = createShot(sceneId, String(workspace.shots.length + 1).padStart(8, "0"));
-    workspaceStore.getState().actions.createShot(shot, position);
+    const occupiedRanks = new Set(workspace.shots.map((shot) => shot.rank));
+    let nextRank = workspace.shots.length + 1;
+    while (occupiedRanks.has(String(nextRank).padStart(8, "0"))) nextRank += 1;
+    const shot = createShot(sceneId, String(nextRank).padStart(8, "0"));
+    if (!workspaceStore.getState().actions.createShot(shot, position)) {
+      setError("无法新建镜头，请刷新工作台后重试。");
+    }
   }
 
   function deleteSelectedNode() {

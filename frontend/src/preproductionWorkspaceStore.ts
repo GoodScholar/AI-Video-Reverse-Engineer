@@ -30,7 +30,7 @@ type LayoutPosition = Pick<LayoutNodes[string], "x" | "y">;
 type OrganizationSnapshot = {
   scenes: PreproductionScene[];
   shots: PreproductionShot[];
-  layoutNodes: LayoutNodes;
+  layoutNodes: Record<string, LayoutNodes[string] | null>;
 };
 
 export type SceneSection = { sceneId: string; shotIds: string[] };
@@ -270,6 +270,7 @@ type WorkspaceSnapshotCache = {
   assets: PreproductionAsset[];
   checks: PreproductionCheck[];
   nodeCatalog: PreproductionWorkspace["nodeCatalog"];
+  layout: CanvasLayout;
   order: PreproductionWorkspaceState["order"];
   revision: number;
   snapshot: PreproductionWorkspace;
@@ -284,6 +285,7 @@ export function selectWorkspaceSnapshot(state: PreproductionWorkspaceState): Pre
     && cached.assets === state.assets
     && cached.checks === state.checks
     && cached.nodeCatalog === state.nodeCatalog
+    && cached.layout === state.layout
     && cached.order === state.order
     && cached.revision === state.persistence.revision) return cached.snapshot;
   const scenes = state.order.sceneIds.map((id) => state.entities.scenesById[id]).filter(Boolean);
@@ -309,6 +311,7 @@ export function selectWorkspaceSnapshot(state: PreproductionWorkspaceState): Pre
     assets: state.assets,
     checks: state.checks,
     nodeCatalog: state.nodeCatalog,
+    layout: state.layout,
     order: state.order,
     revision: state.persistence.revision,
     snapshot,
@@ -427,11 +430,17 @@ function withDirtyState(state: PreproductionWorkspaceState, change: Partial<Prep
   };
 }
 
-function organizationSnapshot(state: PreproductionWorkspaceState): OrganizationSnapshot {
+function organizationSnapshot(
+  state: PreproductionWorkspaceState,
+  layoutNodeIds: string[] = [],
+): OrganizationSnapshot {
   return {
     scenes: selectScenes(state.order, state.entities.scenesById),
     shots: selectShots(state.order, state.entities.shotsById),
-    layoutNodes: cloneLayoutNodes(state.layout.nodes),
+    layoutNodes: Object.fromEntries(layoutNodeIds.map((nodeId) => [
+      nodeId,
+      state.layout.nodes[nodeId] ? { ...state.layout.nodes[nodeId] } : null,
+    ])),
   };
 }
 
@@ -439,13 +448,23 @@ function restoreOrganizationSnapshot(
   state: PreproductionWorkspaceState,
   snapshot: OrganizationSnapshot,
 ) {
+  const scenes = snapshot.scenes.map((scene) => state.entities.scenesById[scene.id] ?? scene);
+  const shots = snapshot.shots.map((shot) => {
+    const current = state.entities.shotsById[shot.id];
+    return current ? { ...current, sceneId: shot.sceneId, rank: shot.rank } : shot;
+  });
   const normalized = normalize({
     ...selectWorkspaceSnapshot(state),
-    scenes: snapshot.scenes,
-    shots: snapshot.shots,
+    scenes,
+    shots,
   });
   const next = withDirtyState(state, normalized);
-  const layout = { ...next.layout, nodes: cloneLayoutNodes(snapshot.layoutNodes) };
+  const nodes = cloneLayoutNodes(next.layout.nodes);
+  for (const [nodeId, node] of Object.entries(snapshot.layoutNodes)) {
+    if (node) nodes[nodeId] = { ...node };
+    else delete nodes[nodeId];
+  }
+  const layout = { ...next.layout, nodes };
   return { ...next, ...withCachedLayout(next, layout) };
 }
 
@@ -454,8 +473,9 @@ function commitOrganization(
   scenes: PreproductionScene[],
   shots: PreproductionShot[],
   layoutNodes: LayoutNodes = state.layout.nodes,
+  affectedLayoutNodeIds: string[] = [],
 ) {
-  const before = organizationSnapshot(state);
+  const before = organizationSnapshot(state, affectedLayoutNodeIds);
   const normalized = normalize({ ...selectWorkspaceSnapshot(state), scenes, shots });
   let next = withDirtyState(state, normalized);
   if (layoutNodes !== state.layout.nodes) {
@@ -720,6 +740,7 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
             selectScenes(state.order, state.entities.scenesById),
             shots,
             nodes,
+            position ? [nodeId] : [],
           );
           return {
             ...next,
@@ -785,7 +806,11 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
             for (const shotId of affectedIds) delete nodes[`shot:${encodeURIComponent(shotId)}`];
           }
           deleted = true;
-          const next = commitOrganization(state, scenes, shots, nodes);
+          const affectedLayoutNodeIds = [
+            sceneId,
+            ...(resolution.deleteShots ? affectedIds.map((shotId) => `shot:${encodeURIComponent(shotId)}`) : []),
+          ];
+          const next = commitOrganization(state, scenes, shots, nodes, affectedLayoutNodeIds);
           const selectedShotIds = new Set([...next.selection.selectedShotIds].filter((id) => next.entities.shotsById[id]));
           const primary = next.selection.primaryEntity;
           const primaryEntity = primary?.type === "scene" && primary.id === sceneId
@@ -813,7 +838,7 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
           const previous = history[history.length - 1];
           if (!previous) return state;
           undone = true;
-          const current = organizationSnapshot(state);
+          const current = organizationSnapshot(state, Object.keys(previous.layoutNodes));
           const next = restoreOrganizationSnapshot(state, previous);
           return {
             ...next,
@@ -832,7 +857,7 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
           const nextSnapshot = future[future.length - 1];
           if (!nextSnapshot) return state;
           redone = true;
-          const current = organizationSnapshot(state);
+          const current = organizationSnapshot(state, Object.keys(nextSnapshot.layoutNodes));
           const next = restoreOrganizationSnapshot(state, nextSnapshot);
           return {
             ...next,

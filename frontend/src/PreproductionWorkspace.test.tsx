@@ -91,6 +91,30 @@ describe("PreproductionWorkspace", () => {
     expect(screen.queryByRole("heading", { name: "步骤参数" })).not.toBeInTheDocument();
   });
 
+  it("镜头顺序有空洞时新建镜头使用未占用的新 rank", async () => {
+    const current = workspace({
+      shots: [
+        { ...workspace().shots[0], id: "shot-003", rank: "00000003" },
+        { ...workspace().shots[0], id: "shot-004", rank: "00000004", title: "镜头四" },
+      ],
+    });
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(response(current))
+      .mockImplementationOnce(async (_url, init) => response({
+        ...current,
+        ...JSON.parse(String(init?.body)),
+        revision: current.revision + 1,
+      }));
+    render(<PreproductionWorkspace project={project} tools={null} />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "新建镜头" }));
+    await userEvent.click(screen.getByRole("button", { name: "保存更改" }));
+
+    const saved = JSON.parse(String(vi.mocked(fetch).mock.calls[1][1]?.body));
+    expect(saved.shots).toHaveLength(3);
+    expect(saved.shots.map((shot: Workspace["shots"][number]) => shot.rank)).toContain("00000005");
+  });
+
   it("跨镜头同名流程节点仍打开所属镜头的检查器", async () => {
     const sharedNode = { id: "shared-node", kind: "prompt" as const, input: "", params: { text: "节点内容" }, status: "pending" as const, artifacts: [] };
     const first = { ...workspace().shots[0], nodes: [sharedNode] };

@@ -64,6 +64,27 @@ describe("preproductionWorkspaceStore", () => {
     ]);
   });
 
+  it("组织撤销重做不回退之后的镜头内容和独立布局修改", () => {
+    const current = workspace();
+    current.canvasLayout.nodes = { "shot:shot-a1": { x: 40, y: 80 } };
+    const store = createPreproductionWorkspaceStore(current);
+
+    store.getState().actions.reorderShots(["shot-a2", "shot-a1", "shot-b1", "shot-b2"]);
+    store.getState().actions.updateShot("shot-a1", (shot) => ({ ...shot, prompt: "重排后的内容编辑" }));
+    store.getState().actions.placeShotOnCanvas("shot-a1", { x: 520, y: 240 });
+
+    store.getState().actions.undoOrganization();
+    expect(store.getState().entities.shotsById["shot-a1"].prompt).toBe("重排后的内容编辑");
+    expect(store.getState().layout.nodes["shot:shot-a1"]).toMatchObject({ x: 520, y: 240 });
+    expect(selectWorkspaceSnapshot(store.getState()).shots.map((shot) => shot.id)).toEqual([
+      "shot-a1", "shot-a2", "shot-b1", "shot-b2",
+    ]);
+
+    store.getState().actions.redoOrganization();
+    expect(store.getState().entities.shotsById["shot-a1"].prompt).toBe("重排后的内容编辑");
+    expect(store.getState().layout.nodes["shot:shot-a1"]).toMatchObject({ x: 520, y: 240 });
+  });
+
   it("批量移入场景只改变归属并完整保留镜头、候选、素材和依赖", () => {
     const current = workspace();
     current.shots = current.shots.map((shot) => shot.id === "shot-a1" ? {
@@ -317,6 +338,22 @@ describe("preproductionWorkspaceStore", () => {
     expect(store.getState().layout.scope).toEqual({ type: "project", id: "project-1" });
     expect(store.getState().actions.activateLayout({ type: "shot", id: "shot-a1" })).toBe(true);
     expect(store.getState().layout.viewport).toEqual({ x: 20, y: 10, zoom: 1.5 });
+  });
+
+  it("布局确认后工作区快照立即使用最新布局修订", () => {
+    const store = createPreproductionWorkspaceStore(workspace());
+    const before = selectWorkspaceSnapshot(store.getState());
+
+    store.getState().actions.acceptLayout({
+      ...store.getState().layout,
+      layoutRevision: 3,
+      nodes: { "shot:shot-a1": { x: 180, y: 90 } },
+    }, true);
+
+    const after = selectWorkspaceSnapshot(store.getState());
+    expect(after).not.toBe(before);
+    expect(after.canvasLayout.layoutRevision).toBe(3);
+    expect(after.canvasLayout.nodes["shot:shot-a1"]).toEqual({ x: 180, y: 90 });
   });
 
   it("迟到的非当前范围回包只更新缓存，不打断当前布局交互状态", () => {
