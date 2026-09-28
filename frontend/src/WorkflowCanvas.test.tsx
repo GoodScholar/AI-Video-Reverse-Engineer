@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -31,6 +31,17 @@ function workspace(): PreproductionWorkspace {
     },
     checks: [],
     nodeCatalog: [{ kind: "trim", label: "截取" }],
+  };
+}
+
+function workspaceWithTwoShots(): PreproductionWorkspace {
+  const current = workspace();
+  return {
+    ...current,
+    shots: [...current.shots, {
+      id: "shot-b", sceneId: "scene-a", rank: "00000002", title: "擦肩而过", duration: 4,
+      prompt: "", negativePrompt: "", assetIds: [], nodes: [],
+    }],
   };
 }
 
@@ -87,5 +98,44 @@ describe("WorkflowCanvas", () => {
     expect(shouldHandleCanvasShortcut(input)).toBe(false);
     expect(shouldHandleCanvasShortcut(textarea)).toBe(false);
     expect(shouldHandleCanvasShortcut(canvas)).toBe(true);
+  });
+
+  it("镜头、场景和流程节点点击都通过共享选择命令同步", async () => {
+    const user = userEvent.setup();
+    const current = workspaceWithTwoShots();
+    const store = createPreproductionWorkspaceStore(current);
+    const view = render(<div style={{ width: 900, height: 600 }}><WorkflowCanvas store={store} /></div>);
+
+    await user.click(await screen.findByRole("region", { name: "场景 相遇" }));
+    expect(store.getState().selection.primaryEntity).toEqual({ type: "scene", id: "scene-a" });
+    expect(store.getState().view.locateRequest).toMatchObject({ entity: { type: "scene", id: "scene-a" }, source: "canvas" });
+
+    act(() => {
+      store.getState().actions.selectShot("shot-b");
+      store.getState().actions.focusShot("shot-a");
+    });
+    view.rerender(<div style={{ width: 900, height: 600 }}><WorkflowCanvas store={store} /></div>);
+    await user.click(await screen.findByRole("article", { name: "流程节点 截取" }));
+    expect(store.getState().selection.primaryEntity).toEqual({ type: "processNode", id: "trim-a" });
+    expect(store.getState().selection.selectedShotIds).toEqual(new Set(["shot-b"]));
+    expect(store.getState().view.locateRequest).toMatchObject({ entity: { type: "shot", id: "shot-a" }, source: "canvas" });
+  });
+
+  it("画布呈现共享多选，并区分悬停与键盘焦点", async () => {
+    const store = createPreproductionWorkspaceStore(workspaceWithTwoShots());
+    render(<div style={{ width: 900, height: 600 }}><WorkflowCanvas store={store} /></div>);
+
+    const first = await screen.findByRole("article", { name: "制作镜头 雨中相遇" });
+    const second = screen.getByRole("article", { name: "制作镜头 擦肩而过" });
+    fireEvent.click(second, { ctrlKey: true });
+    expect(store.getState().selection.selectedShotIds).toEqual(new Set(["shot-a", "shot-b"]));
+    expect(first).toHaveClass("is-selected");
+    expect(second).toHaveClass("is-selected");
+
+    await userEvent.hover(first);
+    expect(first).toHaveClass("is-hovered");
+    fireEvent.focus(first);
+    expect(first).toHaveClass("is-focused");
+    expect(store.getState().persistence.dirty).toBe(false);
   });
 });

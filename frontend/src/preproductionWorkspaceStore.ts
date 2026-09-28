@@ -12,11 +12,15 @@ import type {
   WorkflowNode,
 } from "./preproductionApi";
 
-type PrimaryEntity =
+export type SelectableEntity =
   | { type: "shot"; id: string }
   | { type: "processNode"; id: string }
-  | { type: "scene"; id: string }
-  | null;
+  | { type: "scene"; id: string };
+
+type PrimaryEntity = SelectableEntity | null;
+export type SelectionSource = "list" | "canvas" | "external";
+export type ShotSelectionMode = "replace" | "toggle" | "range";
+export type ShotSelectionOptions = { mode?: ShotSelectionMode; source?: SelectionSource };
 
 export type WorkspaceViewMode = "split" | "canvas" | "list";
 export type WorkspaceViewScope = { type: "project" } | { type: "shot"; id: string };
@@ -42,14 +46,16 @@ export type PreproductionWorkspaceState = {
   selection: {
     primaryEntity: PrimaryEntity;
     selectedShotIds: Set<string>;
-    hoveredEntity: { type: "shot" | "processNode" | "scene"; id: string } | null;
+    selectionAnchorShotId: string | null;
+    hoveredEntity: SelectableEntity | null;
+    focusedEntity: SelectableEntity | null;
   };
   view: {
     mode: WorkspaceViewMode;
     scope: WorkspaceViewScope;
     inspectorOpen: boolean;
     expandedSceneIds: Set<string>;
-    locateShotId: string | null;
+    locateRequest: { entity: SelectableEntity; source: SelectionSource; requestId: number } | null;
   };
   layout: CanvasLayout;
   persistence: {
@@ -70,11 +76,13 @@ export type PreproductionWorkspaceState = {
     replaceShots: (shots: PreproductionShot[]) => void;
     duplicateShot: (shotId: string) => void;
     moveShot: (shotId: string, direction: -1 | 1) => void;
-    selectShot: (shotId: string, nodeId?: string | null) => void;
-    selectNode: (shotId: string, nodeId: string) => void;
-    selectScene: (sceneId: string) => void;
+    selectShot: (shotId: string, options?: ShotSelectionOptions) => void;
+    selectShots: (shotIds: string[], source?: SelectionSource) => void;
+    selectNode: (shotId: string, nodeId: string, source?: SelectionSource) => void;
+    selectScene: (sceneId: string, source?: SelectionSource) => void;
+    setHoveredEntity: (entity: SelectableEntity | null) => void;
+    setFocusedEntity: (entity: SelectableEntity | null) => void;
     toggleScene: (sceneId: string) => void;
-    locateShot: (shotId: string | null) => void;
     setViewMode: (mode: WorkspaceViewMode) => void;
     focusProject: () => void;
     focusShot: (shotId: string) => void;
@@ -245,14 +253,16 @@ function initialState(workspace: PreproductionWorkspace) {
     selection: {
       primaryEntity: firstShotId ? { type: "shot" as const, id: firstShotId } : null,
       selectedShotIds: new Set(firstShotId ? [firstShotId] : []),
+      selectionAnchorShotId: firstShotId,
       hoveredEntity: null,
+      focusedEntity: null,
     },
     view: {
       mode: "split" as const,
       scope: { type: "project" as const },
       inspectorOpen: true,
       expandedSceneIds: new Set(normalized.order.sceneIds),
-      locateShotId: null,
+      locateRequest: null,
     },
     layout: workspace.canvasLayout ?? { scope: { type: "project", id: "legacy" }, layoutRevision: 0, nodes: {} },
     persistence: {
@@ -269,6 +279,18 @@ function initialState(workspace: PreproductionWorkspace) {
 function selectShots(order: PreproductionWorkspaceState["order"], shotsById: Record<string, PreproductionShot>) {
   return order.sceneIds.flatMap((sceneId) => order.shotIdsByScene[sceneId] ?? [])
     .map((id) => shotsById[id]).filter(Boolean);
+}
+
+function orderedShotIds(state: PreproductionWorkspaceState) {
+  return state.order.sceneIds.flatMap((sceneId) => state.order.shotIdsByScene[sceneId] ?? []);
+}
+
+function locateRequest(
+  state: PreproductionWorkspaceState,
+  entity: SelectableEntity,
+  source: SelectionSource,
+) {
+  return { entity, source, requestId: (state.view.locateRequest?.requestId ?? 0) + 1 };
 }
 
 function rerankShots(order: PreproductionWorkspaceState["order"], shotsById: Record<string, PreproductionShot>) {
@@ -343,7 +365,9 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
             ? primary
             : primary?.type === "processNode" && next.shots.some((shot) => shot.nodes.some((node) => node.id === primary.id))
               ? primary
-              : base.selection.primaryEntity;
+              : primary?.type === "scene" && base.entities.scenesById[primary.id]
+                ? primary
+                : base.selection.primaryEntity;
           const selectedShotIds = new Set([...state.selection.selectedShotIds].filter((id) => Boolean(base.entities.shotsById[id])));
           if (selectedShotIds.size === 0) {
             for (const id of base.selection.selectedShotIds) selectedShotIds.add(id);
@@ -444,8 +468,17 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
           return withDirtyState(state, {
             entities: { ...state.entities, shotsById },
             order,
-            selection: { ...state.selection, primaryEntity: { type: "shot", id: copyId }, selectedShotIds: new Set([copyId]) },
-            view: { ...state.view, expandedSceneIds: new Set([...state.view.expandedSceneIds, source.sceneId]), locateShotId: copyId },
+            selection: {
+              ...state.selection,
+              primaryEntity: { type: "shot", id: copyId },
+              selectedShotIds: new Set([copyId]),
+              selectionAnchorShotId: copyId,
+            },
+            view: {
+              ...state.view,
+              expandedSceneIds: new Set([...state.view.expandedSceneIds, source.sceneId]),
+              locateRequest: locateRequest(state, { type: "shot", id: copyId }, "external"),
+            },
           });
         });
       },
@@ -467,27 +500,94 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
           });
         });
       },
-      selectShot(shotId, nodeId = null) {
+      selectShot(shotId, options = {}) {
         const shot = get().entities.shotsById[shotId];
         if (!shot) return;
-        set((state) => ({
-          selection: {
-            ...state.selection,
-            primaryEntity: nodeId ? { type: "processNode", id: nodeId } : { type: "shot", id: shotId },
-            selectedShotIds: new Set([shotId]),
-          },
-          view: { ...state.view, expandedSceneIds: new Set([...state.view.expandedSceneIds, shot.sceneId]), locateShotId: shotId },
-        }));
+        const mode = options.mode ?? "replace";
+        const source = options.source ?? "external";
+        set((state) => {
+          let selectedShotIds: Set<string>;
+          if (mode === "toggle") {
+            selectedShotIds = new Set(state.selection.selectedShotIds);
+            if (selectedShotIds.has(shotId)) selectedShotIds.delete(shotId);
+            else selectedShotIds.add(shotId);
+          } else if (mode === "range") {
+            const ids = orderedShotIds(state);
+            const anchor = state.selection.selectionAnchorShotId ?? shotId;
+            const anchorIndex = ids.indexOf(anchor);
+            const targetIndex = ids.indexOf(shotId);
+            const start = Math.min(anchorIndex < 0 ? targetIndex : anchorIndex, targetIndex);
+            const end = Math.max(anchorIndex < 0 ? targetIndex : anchorIndex, targetIndex);
+            selectedShotIds = new Set(ids.slice(start, end + 1));
+          } else {
+            selectedShotIds = new Set([shotId]);
+          }
+          return {
+            selection: {
+              ...state.selection,
+              primaryEntity: { type: "shot", id: shotId },
+              selectedShotIds,
+              selectionAnchorShotId: mode === "range" ? state.selection.selectionAnchorShotId ?? shotId : shotId,
+            },
+            view: {
+              ...state.view,
+              scope: { type: "project" },
+              expandedSceneIds: new Set([...state.view.expandedSceneIds, shot.sceneId]),
+              locateRequest: locateRequest(state, { type: "shot", id: shotId }, source),
+            },
+          };
+        });
       },
-      selectNode(shotId, nodeId) {
+      selectShots(shotIds, source = "external") {
+        set((state) => {
+          const requested = new Set(shotIds);
+          const selected = orderedShotIds(state).filter((id) => requested.has(id));
+          const primaryShotId = [...selected].pop() ?? null;
+          if (!primaryShotId) return {
+            selection: { ...state.selection, primaryEntity: null, selectedShotIds: new Set(), selectionAnchorShotId: null },
+          };
+          const expandedSceneIds = new Set(state.view.expandedSceneIds);
+          for (const id of selected) expandedSceneIds.add(state.entities.shotsById[id].sceneId);
+          return {
+            selection: {
+              ...state.selection,
+              primaryEntity: { type: "shot", id: primaryShotId },
+              selectedShotIds: new Set(selected),
+              selectionAnchorShotId: primaryShotId,
+            },
+            view: {
+              ...state.view,
+              scope: { type: "project" },
+              expandedSceneIds,
+              locateRequest: locateRequest(state, { type: "shot", id: primaryShotId }, source),
+            },
+          };
+        });
+      },
+      selectNode(shotId, nodeId, source = "external") {
         if (!get().entities.shotsById[shotId]?.nodes.some((node) => node.id === nodeId)) return;
         set((state) => ({
-          selection: { ...state.selection, primaryEntity: { type: "processNode", id: nodeId }, selectedShotIds: new Set([shotId]) },
+          selection: { ...state.selection, primaryEntity: { type: "processNode", id: nodeId } },
+          view: {
+            ...state.view,
+            scope: { type: "shot", id: shotId },
+            expandedSceneIds: new Set([...state.view.expandedSceneIds, state.entities.shotsById[shotId].sceneId]),
+            locateRequest: locateRequest(state, { type: "shot", id: shotId }, source),
+          },
         }));
       },
-      selectScene(sceneId) {
+      selectScene(sceneId, source = "external") {
         if (!get().entities.scenesById[sceneId]) return;
-        set((state) => ({ selection: { ...state.selection, primaryEntity: { type: "scene", id: sceneId } } }));
+        set((state) => ({
+          selection: { ...state.selection, primaryEntity: { type: "scene", id: sceneId } },
+          view: { ...state.view, scope: { type: "project" }, locateRequest: locateRequest(state, { type: "scene", id: sceneId }, source) },
+        }));
+      },
+      setHoveredEntity(hoveredEntity) {
+        set((state) => ({ selection: { ...state.selection, hoveredEntity } }));
+      },
+      setFocusedEntity(focusedEntity) {
+        set((state) => ({ selection: { ...state.selection, focusedEntity } }));
       },
       toggleScene(sceneId) {
         set((state) => {
@@ -496,9 +596,6 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
           else expandedSceneIds.add(sceneId);
           return { view: { ...state.view, expandedSceneIds } };
         });
-      },
-      locateShot(shotId) {
-        set((state) => ({ view: { ...state.view, locateShotId: shotId } }));
       },
       setViewMode(mode) {
         set((state) => ({ view: { ...state.view, mode } }));

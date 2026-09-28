@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef } from "react";
 import {
   Background,
   Controls,
@@ -7,6 +7,7 @@ import {
   Position,
   ReactFlow,
   ReactFlowProvider,
+  SelectionMode,
   useReactFlow,
   type Edge,
   type Node,
@@ -23,7 +24,13 @@ import type { PreproductionWorkspaceStore } from "./preproductionWorkspaceStore"
 import { projectWorkflowCanvas, type WorkflowCanvasNode } from "./workflowCanvasProjection";
 
 type Props = { store: PreproductionWorkspaceStore };
-type CanvasNodeData = WorkflowCanvasNode["data"] & { onOpenShot?: (shotId: string) => void };
+type CanvasNodeData = WorkflowCanvasNode["data"] & {
+  isHovered?: boolean;
+  isFocused?: boolean;
+  onOpenShot?: (shotId: string) => void;
+  onHover?: (hovered: boolean) => void;
+  onFocus?: (focused: boolean) => void;
+};
 type CanvasNode = Node<CanvasNodeData, WorkflowCanvasNode["kind"]>;
 
 export function shouldHandleCanvasShortcut(target: EventTarget | null) {
@@ -33,18 +40,24 @@ export function shouldHandleCanvasShortcut(target: EventTarget | null) {
     || (target instanceof HTMLElement && target.isContentEditable));
 }
 
-const SceneNode = memo(function SceneNode({ data }: NodeProps<CanvasNode>) {
-  return <section className="workflow-canvas-node workflow-canvas-node--scene" aria-label={`场景 ${data.label}`}>
+function transientClasses(data: CanvasNodeData) {
+  return `${data.isHovered ? " is-hovered" : ""}${data.isFocused ? " is-focused" : ""}`;
+}
+
+const SceneNode = memo(function SceneNode({ data, selected }: NodeProps<CanvasNode>) {
+  return <section className={`workflow-canvas-node workflow-canvas-node--scene${selected ? " is-selected" : ""}${transientClasses(data)}`} aria-label={`场景 ${data.label}`} tabIndex={0}
+    onMouseEnter={() => data.onHover?.(true)} onMouseLeave={() => data.onHover?.(false)} onFocus={() => data.onFocus?.(true)} onBlur={() => data.onFocus?.(false)}>
     <div><Layers3 size={16} aria-hidden="true" /><strong>{data.label}</strong></div>
     <small>{data.shotCount} 个镜头 · {data.duration} 秒{data.issueCount ? ` · ${data.issueCount} 项问题` : ""}</small>
   </section>;
 });
 
 const ShotNode = memo(function ShotNode({ data, selected }: NodeProps<CanvasNode>) {
-  return <article className={`workflow-canvas-node workflow-canvas-node--shot${selected ? " is-selected" : ""}`} aria-label={`制作镜头 ${data.label}`}>
+  return <article className={`workflow-canvas-node workflow-canvas-node--shot${selected ? " is-selected" : ""}${transientClasses(data)}`} aria-label={`制作镜头 ${data.label}`} tabIndex={0}
+    onMouseEnter={() => data.onHover?.(true)} onMouseLeave={() => data.onHover?.(false)} onFocus={() => data.onFocus?.(true)} onBlur={() => data.onFocus?.(false)}>
     <div><Box size={16} aria-hidden="true" /><strong>{data.label}</strong></div>
     <small>{data.detail} · {data.status}</small>
-    <button type="button" aria-label={`查看${data.label}关系`} onClick={() => data.onOpenShot?.(data.entityId)}>查看关系</button>
+    <button type="button" aria-label={`查看${data.label}关系`} onClick={(event) => { event.stopPropagation(); data.onOpenShot?.(data.entityId); }}>查看关系</button>
   </article>;
 });
 
@@ -57,7 +70,8 @@ const AssetNode = memo(function AssetNode({ data, selected }: NodeProps<CanvasNo
 });
 
 const ProcessNode = memo(function ProcessNode({ data, selected }: NodeProps<CanvasNode>) {
-  return <article className={`workflow-canvas-node workflow-canvas-node--process${selected ? " is-selected" : ""}`} aria-label={`流程节点 ${data.label}`}>
+  return <article className={`workflow-canvas-node workflow-canvas-node--process${selected ? " is-selected" : ""}${transientClasses(data)}`} aria-label={`流程节点 ${data.label}`} tabIndex={0}
+    onMouseEnter={() => data.onHover?.(true)} onMouseLeave={() => data.onHover?.(false)} onFocus={() => data.onFocus?.(true)} onBlur={() => data.onFocus?.(false)}>
     <Handle id="input" type="target" position={Position.Left} isConnectable={false} className="workflow-canvas__handle" aria-hidden="true" />
     <Handle id="output" type="source" position={Position.Right} isConnectable={false} className="workflow-canvas__handle" aria-hidden="true" />
     <div><Focus size={16} aria-hidden="true" /><strong>{data.label}</strong></div>
@@ -76,7 +90,13 @@ function WorkflowCanvasInner({ store }: Props) {
   const layout = useStore(store, (state) => state.layout);
   const scope = useStore(store, (state) => state.view.scope);
   const primaryEntity = useStore(store, (state) => state.selection.primaryEntity);
+  const selectedShotIds = useStore(store, (state) => state.selection.selectedShotIds);
+  const hoveredEntity = useStore(store, (state) => state.selection.hoveredEntity);
+  const focusedEntity = useStore(store, (state) => state.selection.focusedEntity);
+  const locateRequest = useStore(store, (state) => state.view.locateRequest);
   const { fitView } = useReactFlow<CanvasNode, Edge>();
+  const boxSelectedShotIds = useRef<string[]>([]);
+  const boxSelecting = useRef(false);
   const prefersReducedMotion = typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
   const graph = useMemo(() => projectWorkflowCanvas({
@@ -84,8 +104,15 @@ function WorkflowCanvasInner({ store }: Props) {
   }, scope), [assets, checks, entities, layout, nodeCatalog, order, scope, store]);
 
   const openShot = useCallback((shotId: string) => {
-    store.getState().actions.selectShot(shotId);
+    store.getState().actions.selectShot(shotId, { source: "canvas" });
     store.getState().actions.focusShot(shotId);
+  }, [store]);
+
+  const setTransient = useCallback((kind: WorkflowCanvasNode["kind"], id: string, transient: "hover" | "focus", active: boolean) => {
+    if (kind === "asset") return;
+    const entity = active ? { type: kind === "process" ? "processNode" : kind, id } as const : null;
+    if (transient === "hover") store.getState().actions.setHoveredEntity(entity);
+    else store.getState().actions.setFocusedEntity(entity);
   }, [store]);
 
   const nodes = useMemo<CanvasNode[]>(() => graph.nodes.map((node) => ({
@@ -95,15 +122,24 @@ function WorkflowCanvasInner({ store }: Props) {
     parentId: node.parentId,
     extent: node.parentId ? "parent" : undefined,
     draggable: false,
-    selectable: node.kind !== "scene",
-    selected: node.kind === "process"
-      ? primaryEntity?.type === "processNode" && primaryEntity.id === node.data.entityId
-      : primaryEntity?.type === node.kind && primaryEntity.id === node.data.entityId,
+    selectable: node.kind !== "asset",
+    selected: node.kind === "shot"
+      ? selectedShotIds.has(node.data.entityId)
+      : node.kind === "process"
+        ? primaryEntity?.type === "processNode" && primaryEntity.id === node.data.entityId
+        : node.kind === "scene" && primaryEntity?.type === "scene" && primaryEntity.id === node.data.entityId,
     width: node.width,
     height: node.height,
     style: { width: node.width, height: node.height },
-    data: { ...node.data, onOpenShot: node.kind === "shot" ? openShot : undefined },
-  })), [graph.nodes, openShot, primaryEntity]);
+    data: {
+      ...node.data,
+      isHovered: node.kind !== "asset" && hoveredEntity?.type === (node.kind === "process" ? "processNode" : node.kind) && hoveredEntity.id === node.data.entityId,
+      isFocused: node.kind !== "asset" && focusedEntity?.type === (node.kind === "process" ? "processNode" : node.kind) && focusedEntity.id === node.data.entityId,
+      onOpenShot: node.kind === "shot" ? openShot : undefined,
+      onHover: (active) => setTransient(node.kind, node.data.entityId, "hover", active),
+      onFocus: (active) => setTransient(node.kind, node.data.entityId, "focus", active),
+    },
+  })), [focusedEntity, graph.nodes, hoveredEntity, openShot, primaryEntity, selectedShotIds, setTransient]);
 
   const edges = useMemo<Edge[]>(() => graph.edges.map((edge) => ({
     ...edge,
@@ -133,9 +169,22 @@ function WorkflowCanvasInner({ store }: Props) {
     requestAnimationFrame(() => fitCurrent());
   }, [fitCurrent]);
 
-  const selectNode: NodeMouseHandler<CanvasNode> = useCallback((_event, node) => {
-    if (node.type === "shot") store.getState().actions.selectShot(node.data.entityId);
-    if (node.type === "scene") store.getState().actions.selectScene(node.data.entityId);
+  useEffect(() => {
+    if (!locateRequest || locateRequest.source === "canvas") return;
+    const target = nodes.find((node) => {
+      if (locateRequest.entity.type === "processNode") return node.type === "process" && node.data.entityId === locateRequest.entity.id;
+      return node.type === locateRequest.entity.type && node.data.entityId === locateRequest.entity.id;
+    });
+    if (target) fitCurrent([target]);
+  }, [fitCurrent, locateRequest, nodes]);
+
+  const selectNode: NodeMouseHandler<CanvasNode> = useCallback((event, node) => {
+    if (node.type === "shot") store.getState().actions.selectShot(node.data.entityId, {
+      mode: event.metaKey || event.ctrlKey ? "toggle" : "replace",
+      source: "canvas",
+    });
+    if (node.type === "scene") store.getState().actions.selectScene(node.data.entityId, "canvas");
+    if (node.type === "process" && node.data.ownerShotId) store.getState().actions.selectNode(node.data.ownerShotId, node.data.entityId, "canvas");
   }, [store]);
 
   const scopeShot = scope.type === "shot" ? entities.shotsById[scope.id] : null;
@@ -173,13 +222,26 @@ function WorkflowCanvasInner({ store }: Props) {
         nodeTypes={nodeTypes}
         nodesDraggable={false}
         nodesConnectable={false}
+        nodesFocusable={false}
         elementsSelectable
         onNodesChange={fitMeasuredNodes}
         onNodeClick={selectNode}
+        onSelectionStart={() => { boxSelecting.current = true; boxSelectedShotIds.current = []; }}
+        onSelectionChange={({ nodes: selectedNodes }) => {
+          if (boxSelecting.current) boxSelectedShotIds.current = selectedNodes.filter((node) => node.type === "shot").map((node) => node.data.entityId);
+        }}
+        onSelectionEnd={() => {
+          if (!boxSelecting.current) return;
+          boxSelecting.current = false;
+          store.getState().actions.selectShots(boxSelectedShotIds.current, "canvas");
+        }}
         deleteKeyCode={null}
         selectionKeyCode={null}
+        multiSelectionKeyCode={["Meta", "Control"]}
+        selectionOnDrag={scope.type === "project"}
+        selectionMode={SelectionMode.Partial}
         panActivationKeyCode="Space"
-        panOnDrag={[1, 2]}
+        panOnDrag={scope.type === "project" ? [2] : [1, 2]}
         panOnScroll
         zoomOnScroll={false}
         zoomOnPinch

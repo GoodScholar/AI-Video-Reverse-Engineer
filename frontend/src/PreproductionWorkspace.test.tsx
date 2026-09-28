@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -63,6 +63,32 @@ describe("PreproductionWorkspace", () => {
     expect(screen.getByRole("button", { name: "分屏视图" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByRole("heading", { name: "清晨" })).toBeVisible();
     expect(screen.getByLabelText("场景 清晨")).toBeVisible();
+  });
+
+  it("检查器随场景和多镜头选择切换，只呈现兼容内容", async () => {
+    const second = {
+      ...workspace().shots[0], id: "shot-002", rank: "00000002", title: "镜头二", nodes: [],
+    };
+    vi.mocked(fetch).mockResolvedValueOnce(response(workspace({
+      scenes: [{ id: "scene-default", title: "雨夜相遇", rank: "00000001", description: "雨夜街头的完整段落" }],
+      shots: [workspace().shots[0], second],
+    })));
+    render(<PreproductionWorkspace project={project} tools={<p>工具</p>} />);
+
+    const sceneButton = await screen.findByRole("button", { name: "折叠场景雨夜相遇" });
+    await userEvent.click(sceneButton);
+    const sceneSummary = screen.getByRole("region", { name: "雨夜相遇场景摘要" });
+    expect(within(sceneSummary).getByRole("heading", { name: "场景摘要" })).toBeVisible();
+    expect(within(sceneSummary).getByText("雨夜街头的完整段落")).toBeVisible();
+    expect(within(sceneSummary).getByText("2 个镜头 · 6 秒")).toBeVisible();
+    expect(screen.queryByLabelText("镜头名称")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "展开场景雨夜相遇" }));
+    fireEvent.click(await screen.findByRole("button", { name: "1 镜头一 3 秒" }));
+    fireEvent.click(screen.getByRole("button", { name: "2 镜头二 3 秒" }), { metaKey: true });
+    expect(screen.getByRole("heading", { name: "已选择 2 个镜头" })).toBeVisible();
+    expect(screen.queryByLabelText("镜头名称")).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "步骤参数" })).not.toBeInTheDocument();
   });
 
   it("正式全站导航能直接打开素材与工具，切换时保留未保存需求", async () => {

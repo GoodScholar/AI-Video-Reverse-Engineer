@@ -114,7 +114,7 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
   useEffect(() => { if(savedWorkspace) onAssetsChanged?.(savedWorkspace.assets); }, [savedWorkspace,onAssetsChanged]);
   const savedSnapshot = useStore(workspaceStore, (state) => state.persistence.savedSnapshot);
   const dirty = useStore(workspaceStore, (state) => state.persistence.dirty);
-  const selectedShotId = useStore(workspaceStore, (state) => state.selection.selectedShotIds.values().next().value ?? null);
+  const selectedShotIds = useStore(workspaceStore, (state) => state.selection.selectedShotIds);
   const primaryEntity = useStore(workspaceStore, (state) => state.selection.primaryEntity);
   const [managedAssetId, setManagedAssetId] = useState<string | null>(null);
   const [roleFilter, setRoleFilter] = useState<AssetRole | "all">("all");
@@ -142,7 +142,14 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
   dirtyRef.current = dirty;
   busyRef.current = busy;
 
-  const selectedShot = workspace.shots.find((shot) => shot.id === selectedShotId) ?? workspace.shots[0] ?? null;
+  const selectedScene = primaryEntity?.type === "scene" ? workspace.scenes.find((scene) => scene.id === primaryEntity.id) ?? null : null;
+  const selectedShot = primaryEntity?.type === "shot"
+    ? workspace.shots.find((shot) => shot.id === primaryEntity.id) ?? null
+    : primaryEntity?.type === "processNode"
+      ? workspace.shots.find((shot) => shot.nodes.some((node) => node.id === primaryEntity.id)) ?? null
+      : null;
+  const selectedSceneShots = selectedScene ? workspace.shots.filter((shot) => shot.sceneId === selectedScene.id) : [];
+  const multiShotSelection = primaryEntity?.type === "shot" && selectedShotIds.size > 1;
   const selectedNodeId = primaryEntity?.type === "processNode" ? primaryEntity.id : selectedShot?.nodes[0]?.id ?? null;
   const selectedNode = selectedShot?.nodes.find((node) => node.id === selectedNodeId) ?? selectedShot?.nodes[0] ?? null;
   const hasActiveNodes = workspace.shots.some((shot) => shot.nodes.some((node) => activeStatuses.has(node.status)));
@@ -332,7 +339,7 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
     {(!studioMode || sectionOverride === "shots") && <ReproductionFlow project={project} workspace={savedWorkspace ?? workspace} disabled={Boolean(busy) || hasActiveNodes} dirty={dirty} timelineDirty={timelineDirty} draftInputKind={workspace.brief.inputKind} onImportShots={() => { setSection("shots"); void importAction("shots"); }}
       onKindChange={(inputKind) => edit((current) => ({ ...current, brief: { ...current.brief, inputKind } }))}
       onNavigate={(next, target) => { setSection(next); setToolTarget(target ?? null); }}
-      onLocateCheck={(check) => { if (check.shotId) workspaceStore.getState().actions.selectShot(check.shotId, check.nodeId); setSection(check.shotId ? "shots" : check.code === "brief_incomplete" ? "brief" : "shots"); }}
+      onLocateCheck={(check) => { if (check.shotId) { if (check.nodeId) workspaceStore.getState().actions.selectNode(check.shotId, check.nodeId); else workspaceStore.getState().actions.selectShot(check.shotId); } setSection(check.shotId ? "shots" : check.code === "brief_incomplete" ? "brief" : "shots"); }}
       onFocusClip={(trackId, clipId) => { setTimelineFocus({ trackId, clipId }); setSection("timeline"); }} />}
     <div className="preproduction-layout">
       {(!studioMode || sectionOverride === "shots") && <nav className="preproduction-nav" aria-label="工作台导航">
@@ -364,6 +371,15 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
 
         {section === "shots" && <ShotWorkspaceLayout store={workspaceStore} onCreateShot={() => { const shot = createShot(workspace.scenes[0]?.id ?? "scene-default", String(workspace.shots.length + 1).padStart(8, "0")); edit((current) => ({ ...current, shots: [...current.shots, shot] })); workspaceStore.getState().actions.selectShot(shot.id); }}>
           <section className="preproduction-workspace-inspector" aria-label="镜头检查器">
+          {selectedScene ? <section className="preproduction-selection-summary" aria-label={`${selectedScene.title}场景摘要`}>
+            <h3>场景摘要</h3>
+            <strong>{selectedScene.title}</strong>
+            <p>{selectedScene.description || "这个场景还没有说明。"}</p>
+            <p>{selectedSceneShots.length} 个镜头 · {selectedSceneShots.reduce((total, shot) => total + shot.duration, 0)} 秒</p>
+          </section> : multiShotSelection ? <section className="preproduction-selection-summary" aria-label="多镜头选择摘要">
+            <h3>已选择 {selectedShotIds.size} 个镜头</h3>
+            <p>批量选择只显示可同时应用的操作。继续在列表或画布中调整所选镜头。</p>
+          </section> : <>
           <div className="preproduction-editor">{selectedShot ? <><div className="preproduction-editor-heading"><label>镜头名称<input value={selectedShot.title} onChange={(event) => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, title: event.target.value })))} /></label><label>时长（秒）<input type="number" min="0.1" step="0.1" value={selectedShot.duration} onChange={(event) => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, duration: Number(event.target.value) })))} /></label><button type="button" aria-label="删除当前镜头" className="icon-action" onClick={() => edit((current) => ({ ...current, shots: current.shots.filter((shot) => shot.id !== selectedShot.id) }))}><Trash2 size={17} /></button></div>
             <label className="preproduction-full-field">画面提示词<textarea value={selectedShot.prompt} onChange={(event) => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, prompt: event.target.value })))} /></label><label className="preproduction-full-field">负面提示词<textarea value={selectedShot.negativePrompt} onChange={(event) => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, negativePrompt: event.target.value })))} /></label>
             <div className="preproduction-bindings"><h4>绑定素材</h4>{workspace.assets.length ? workspace.assets.map((asset) => <button type="button" key={asset.id} aria-pressed={selectedShot.assetIds.includes(asset.id)} className={selectedShot.assetIds.includes(asset.id) ? "is-bound" : ""} onClick={() => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, assetIds: shot.assetIds.includes(asset.id) ? shot.assetIds.filter((id) => id !== asset.id) : [...shot.assetIds, asset.id] })))}>{selectedShot.assetIds.includes(asset.id) ? "已绑定 " : "绑定 "}{asset.name}</button>) : <p>先在素材页添加素材。</p>}</div>
@@ -386,6 +402,7 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
             <p className={`preproduction-node-status preproduction-node-status--${selectedNode.status}`}>{statusLabels[selectedNode.status]}{selectedNode.error ? `：${selectedNode.error}` : ""}</p>{selectedNode.artifacts.map((artifact) => <a key={artifact.name} href={artifact.url} download>下载 {artifact.name}</a>)}{!selectedInputReady && <p className="preproduction-save-note">等待所选前序节点完成后才能运行。</p>}<button type="button" className="primary-action" disabled={!canRun} onClick={() => void runNode()}><Play size={16} aria-hidden="true" />{busy === "run" ? "正在提交…" : "运行当前节点"}</button><button type="button" className="icon-action" aria-label="删除当前节点" onClick={deleteSelectedNode}><Trash2 size={17} /></button>{dirty && <p className="preproduction-save-note">先保存更改，才能运行或导出。</p>}</> : <p className="preproduction-empty">选择一个步骤后编辑参数。</p>}</aside>
           {selectedShot && <CandidateResultComparison shot={selectedShot} assets={workspace.assets} disabled={Boolean(busy) || hasActiveNodes} />}
           {selectedShot && <ShotResultComparison shot={selectedShot} assets={workspace.assets} disabled={Boolean(busy) || hasActiveNodes} />}
+          </>}
           </section>
         </ShotWorkspaceLayout>}
 
@@ -410,7 +427,10 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
               <CircleAlert size={16} aria-hidden="true" />
               <span>{check.level === "error" ? "错误" : "提醒"}：{location && `${location}：`}{check.message}</span>
               {shot ? <button type="button" className="secondary-action" aria-label={`定位${location}`} onClick={() => {
-                workspaceStore.getState().actions.selectShot(shot.id, node?.id ?? shot.nodes[0]?.id ?? null); setSection("shots");
+                const nodeId = node?.id ?? shot.nodes[0]?.id;
+                if (nodeId) workspaceStore.getState().actions.selectNode(shot.id, nodeId);
+                else workspaceStore.getState().actions.selectShot(shot.id);
+                setSection("shots");
               }}>定位</button> : !check.shotId && <button type="button" className="secondary-action" onClick={() => setSection(workspace.shots.length ? "brief" : "shots")}>{workspace.shots.length ? "查看需求" : "添加镜头"}</button>}
             </li>;
           })}</ul> : <p className="preproduction-delivery-ready"><PackageCheck size={18} aria-hidden="true" />尚未发现交付阻断项。</p>}

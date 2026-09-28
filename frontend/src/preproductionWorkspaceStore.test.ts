@@ -141,4 +141,68 @@ describe("preproductionWorkspaceStore", () => {
     state.actions.focusProject();
     expect(store.getState().view.scope).toEqual({ type: "project" });
   });
+
+  it("通过统一命令支持替换、增减、范围和框选镜头", () => {
+    const store = createPreproductionWorkspaceStore(workspace());
+
+    store.getState().actions.focusShot("shot-b1");
+    store.getState().actions.selectShot("shot-a1", { source: "list" });
+    expect(store.getState().view.scope).toEqual({ type: "project" });
+    store.getState().actions.selectShot("shot-a2", { mode: "toggle", source: "list" });
+    expect(store.getState().selection.selectedShotIds).toEqual(new Set(["shot-a1", "shot-a2"]));
+    expect(store.getState().selection.primaryEntity).toEqual({ type: "shot", id: "shot-a2" });
+
+    store.getState().actions.selectShot("shot-b1", { mode: "range", source: "list" });
+    expect(store.getState().selection.selectedShotIds).toEqual(new Set(["shot-a2", "shot-b1"]));
+
+    store.getState().actions.selectShots(["shot-a2", "shot-b2"], "canvas");
+    expect(store.getState().selection.selectedShotIds).toEqual(new Set(["shot-a2", "shot-b2"]));
+    expect(store.getState().selection.primaryEntity).toEqual({ type: "shot", id: "shot-b2" });
+    expect(store.getState().view.locateRequest).toMatchObject({ entity: { type: "shot", id: "shot-b2" }, source: "canvas" });
+  });
+
+  it("流程节点和场景成为主对象时不污染批量镜头选择", () => {
+    const current = workspace();
+    current.shots = current.shots.map((shot) => shot.id === "shot-b1" ? {
+      ...shot,
+      nodes: [{ id: "trim-b1", kind: "trim", input: "", params: {}, status: "pending", artifacts: [] }],
+    } : shot);
+    const store = createPreproductionWorkspaceStore(current);
+    store.getState().actions.selectShot("shot-a2");
+
+    store.getState().actions.selectNode("shot-b1", "trim-b1", "canvas");
+    expect(store.getState().selection.primaryEntity).toEqual({ type: "processNode", id: "trim-b1" });
+    expect(store.getState().selection.selectedShotIds).toEqual(new Set(["shot-a2"]));
+    expect(store.getState().view.expandedSceneIds.has("scene-b")).toBe(true);
+    expect(store.getState().view.scope).toEqual({ type: "shot", id: "shot-b1" });
+    expect(store.getState().view.locateRequest).toMatchObject({ entity: { type: "shot", id: "shot-b1" }, source: "canvas" });
+
+    store.getState().actions.selectScene("scene-a", "canvas");
+    expect(store.getState().selection.primaryEntity).toEqual({ type: "scene", id: "scene-a" });
+    expect(store.getState().selection.selectedShotIds).toEqual(new Set(["shot-a2"]));
+    expect(store.getState().view.scope).toEqual({ type: "project" });
+    expect(store.getState().view.locateRequest).toMatchObject({ entity: { type: "scene", id: "scene-a" }, source: "canvas" });
+  });
+
+  it("悬停和键盘焦点保持瞬时，并在切换项目时清理", () => {
+    const store = createPreproductionWorkspaceStore(workspace());
+    const before = selectWorkspaceSnapshot(store.getState());
+    store.getState().actions.setHoveredEntity({ type: "shot", id: "shot-b1" });
+    store.getState().actions.setFocusedEntity({ type: "scene", id: "scene-b" });
+
+    expect(store.getState().selection.hoveredEntity).toEqual({ type: "shot", id: "shot-b1" });
+    expect(store.getState().selection.focusedEntity).toEqual({ type: "scene", id: "scene-b" });
+    expect(selectWorkspaceSnapshot(store.getState())).toBe(before);
+    expect(store.getState().persistence.dirty).toBe(false);
+
+    const next = workspace();
+    next.scenes = [{ id: "scene-next", title: "下一项目", rank: "00000001", description: "" }];
+    next.shots = [{ ...next.shots[0], id: "shot-next", sceneId: "scene-next" }];
+    store.getState().actions.hydrate(next);
+
+    expect(store.getState().selection.hoveredEntity).toBeNull();
+    expect(store.getState().selection.focusedEntity).toBeNull();
+    expect(store.getState().selection.selectedShotIds).toEqual(new Set(["shot-next"]));
+    expect(store.getState().view.locateRequest).toBeNull();
+  });
 });

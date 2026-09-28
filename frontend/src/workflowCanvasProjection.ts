@@ -17,6 +17,7 @@ export type WorkflowCanvasNode = {
     status?: string;
     statusTone?: "neutral" | "running" | "success" | "warning" | "error";
     entityId: string;
+    ownerShotId?: string;
     shotCount?: number;
     duration?: number;
     issueCount?: number;
@@ -129,6 +130,7 @@ function shotGraph(state: PreproductionWorkspaceState, shotId: string): Workflow
         status: statusLabels[node.status],
         statusTone: statusTones[node.status],
         entityId: processEntityId(node.id, shotId),
+        ownerShotId: shotId,
       },
     };
   });

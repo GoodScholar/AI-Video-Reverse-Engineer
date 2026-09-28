@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type MouseEvent } from "react";
 import { measureElement, observeElementRect, useVirtualizer } from "@tanstack/react-virtual";
 import { ChevronDown, ChevronRight, Copy, FolderOpen, Image, LocateFixed, Plus } from "lucide-react";
 import { useStore } from "zustand";
@@ -13,10 +13,18 @@ function SceneRow({ store, sceneId }: Props & { sceneId: string }) {
   const scene = useStore(store, (state) => state.entities.scenesById[sceneId]);
   const shotIds = useStore(store, (state) => state.order.shotIdsByScene[sceneId] ?? []);
   const expanded = useStore(store, (state) => state.view.expandedSceneIds.has(sceneId));
+  const selected = useStore(store, (state) => state.selection.primaryEntity?.type === "scene" && state.selection.primaryEntity.id === sceneId);
+  const hovered = useStore(store, (state) => state.selection.hoveredEntity?.type === "scene" && state.selection.hoveredEntity.id === sceneId);
+  const focused = useStore(store, (state) => state.selection.focusedEntity?.type === "scene" && state.selection.focusedEntity.id === sceneId);
   const totalDuration = useStore(store, (state) => shotIds.reduce((total, id) => total + (state.entities.shotsById[id]?.duration ?? 0), 0));
   if (!scene) return null;
-  return <header className="scene-shot-list__scene">
-    <button type="button" aria-expanded={expanded} aria-label={`${expanded ? "折叠" : "展开"}场景${scene.title}`} onClick={() => store.getState().actions.toggleScene(sceneId)}>
+  return <header className={`scene-shot-list__scene${selected ? " is-selected" : ""}${hovered ? " is-hovered" : ""}${focused ? " is-focused" : ""}`}>
+    <button type="button" aria-expanded={expanded} aria-pressed={selected} aria-label={`${expanded ? "折叠" : "展开"}场景${scene.title}`}
+      onMouseEnter={() => store.getState().actions.setHoveredEntity({ type: "scene", id: sceneId })}
+      onMouseLeave={() => store.getState().actions.setHoveredEntity(null)}
+      onFocus={() => store.getState().actions.setFocusedEntity({ type: "scene", id: sceneId })}
+      onBlur={() => store.getState().actions.setFocusedEntity(null)}
+      onClick={() => { store.getState().actions.toggleScene(sceneId); store.getState().actions.selectScene(sceneId, "list"); }}>
       {expanded ? <ChevronDown size={17} aria-hidden="true" /> : <ChevronRight size={17} aria-hidden="true" />}
       <span><h3>{scene.title}</h3><small>{shotIds.length} 个镜头 · {totalDuration} 秒</small></span>
     </button>
@@ -26,6 +34,10 @@ function SceneRow({ store, sceneId }: Props & { sceneId: string }) {
 function ShotCard({ store, shotId }: Props & { shotId: string }) {
   const shot = useStore(store, (state) => state.entities.shotsById[shotId]);
   const selected = useStore(store, (state) => state.selection.selectedShotIds.has(shotId));
+  const context = useStore(store, (state) => state.selection.primaryEntity?.type === "processNode"
+    && Boolean(state.entities.shotsById[shotId]?.nodes.some((node) => node.id === state.selection.primaryEntity?.id)));
+  const hovered = useStore(store, (state) => state.selection.hoveredEntity?.type === "shot" && state.selection.hoveredEntity.id === shotId);
+  const focused = useStore(store, (state) => state.selection.focusedEntity?.type === "shot" && state.selection.focusedEntity.id === shotId);
   const thumbnail = useStore(store, (state) => {
     const currentShot = state.entities.shotsById[shotId];
     return state.assets.find((asset) => asset.kind === "image" && currentShot?.assetIds.includes(asset.id));
@@ -36,8 +48,19 @@ function ShotCard({ store, shotId }: Props & { shotId: string }) {
   if (!shot) return null;
   const candidateCount = shot.resultVersions?.length ?? (shot.resultAssetId ? 1 : 0);
   const status = getShotPreparationStatus(shot);
-  return <article className={selected ? "scene-shot-card is-selected" : "scene-shot-card"} aria-label={shot.title}>
-    <button type="button" className="scene-shot-card__open" aria-label={`${position} ${shot.title} ${shot.duration} 秒`} aria-pressed={selected} onClick={() => store.getState().actions.selectShot(shotId)}>
+  const select = (event: MouseEvent<HTMLButtonElement>) => store.getState().actions.selectShot(shotId, {
+    mode: event.shiftKey ? "range" : event.metaKey || event.ctrlKey ? "toggle" : "replace",
+    source: "list",
+  });
+  return <article
+    className={`scene-shot-card${selected ? " is-selected" : ""}${context ? " is-context" : ""}${hovered ? " is-hovered" : ""}${focused ? " is-focused" : ""}`}
+    aria-label={shot.title}
+    onMouseEnter={() => store.getState().actions.setHoveredEntity({ type: "shot", id: shotId })}
+    onMouseLeave={() => store.getState().actions.setHoveredEntity(null)}
+    onFocus={() => store.getState().actions.setFocusedEntity({ type: "shot", id: shotId })}
+    onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) store.getState().actions.setFocusedEntity(null); }}
+  >
+    <button type="button" className="scene-shot-card__open" aria-label={`${position} ${shot.title} ${shot.duration} 秒`} aria-pressed={selected} onClick={select}>
       <span className="scene-shot-card__thumb">
         {thumbnail ? <img src={thumbnail.url} alt={`${shot.title}缩略图`} loading="lazy" /> : <Image size={22} aria-hidden="true" />}
       </span>
@@ -50,9 +73,9 @@ function ShotCard({ store, shotId }: Props & { shotId: string }) {
       </span>
     </button>
     <div className="scene-shot-card__actions" aria-label={`${shot.title}摘要操作`}>
-      <button type="button" aria-label={`打开${shot.title}`} onClick={() => store.getState().actions.selectShot(shotId)}><FolderOpen size={15} aria-hidden="true" /></button>
+      <button type="button" aria-label={`打开${shot.title}`} onClick={() => store.getState().actions.selectShot(shotId, { source: "list" })}><FolderOpen size={15} aria-hidden="true" /></button>
       <button type="button" aria-label={`复制${shot.title}`} onClick={() => store.getState().actions.duplicateShot(shotId)}><Copy size={15} aria-hidden="true" /></button>
-      <button type="button" aria-label={`定位${shot.title}`} onClick={() => store.getState().actions.selectShot(shotId)}><LocateFixed size={15} aria-hidden="true" /></button>
+      <button type="button" aria-label={`定位${shot.title}`} onClick={() => store.getState().actions.selectShot(shotId, { source: "list" })}><LocateFixed size={15} aria-hidden="true" /></button>
       <details>
         <summary>更多{shot.title}</summary>
         <div>
@@ -68,7 +91,7 @@ export function SceneShotList({ store, onCreateShot }: Props) {
   const [scrollElement, setScrollElement] = useState<HTMLDivElement | null>(null);
   const order = useStore(store, (state) => state.order);
   const expandedSceneIds = useStore(store, (state) => state.view.expandedSceneIds);
-  const locateShotId = useStore(store, (state) => state.view.locateShotId);
+  const locateRequest = useStore(store, (state) => state.view.locateRequest);
   const rows = useMemo(() => order.sceneIds.flatMap<ListRow>((sceneId) => [
     { type: "scene", id: sceneId },
     ...(expandedSceneIds.has(sceneId) ? (order.shotIdsByScene[sceneId] ?? []).map((id): ListRow => ({ type: "shot", id })) : []),
@@ -92,12 +115,11 @@ export function SceneShotList({ store, onCreateShot }: Props) {
   });
 
   useEffect(() => {
-    if (!locateShotId) return;
-    const index = rows.findIndex((row) => row.type === "shot" && row.id === locateShotId);
+    if (!locateRequest || locateRequest.source === "list") return;
+    const index = rows.findIndex((row) => row.type === locateRequest.entity.type && row.id === locateRequest.entity.id);
     if (index < 0) return;
     virtualizer.scrollToIndex(index, { align: "auto" });
-    store.getState().actions.locateShot(null);
-  }, [locateShotId, rows, store, virtualizer]);
+  }, [locateRequest, rows, virtualizer]);
 
   return <aside className="scene-shot-list" aria-label="按场景组织的镜头列表">
     <div className="scene-shot-list__heading"><div><h2>镜头列表</h2><p>按场景与管理顺序浏览</p></div>{onCreateShot && <button type="button" className="icon-action" aria-label="新建镜头" onClick={onCreateShot}><Plus size={17} aria-hidden="true" /></button>}</div>

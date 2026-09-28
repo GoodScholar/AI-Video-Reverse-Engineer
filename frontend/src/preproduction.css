@@ -77,12 +77,18 @@
 .scene-shot-list__row--shot { min-height: 164px; padding: 8px 12px; }
 .scene-shot-list__scene button { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 48px; padding: 0 8px; border: 0; border-radius: 7px; background: transparent; color: #17202d; text-align: left; }
 .scene-shot-list__scene button:hover { background: #e9ecf2; }
+.scene-shot-list__scene.is-selected button { background: #eeecfd; color: #4d42d2; box-shadow: inset 3px 0 #887fe9; }
+.scene-shot-list__scene.is-hovered:not(.is-selected) button { background: #f6f7fb; }
+.scene-shot-list__scene.is-focused button { outline: 3px solid #9b94f6; outline-offset: -3px; }
 .scene-shot-list__scene button > span { min-width: 0; }
 .scene-shot-list__scene h3, .scene-shot-list__scene small { display: block; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .scene-shot-list__scene h3 { font-size: 14px; }
 .scene-shot-list__scene small { margin-top: 3px; color: #596579; font-size: 12px; }
 .scene-shot-card { display: grid; grid-template-columns: minmax(0, 1fr); min-height: 148px; overflow: visible; border: 1px solid #dce1e9; border-radius: 10px; background: #fff; box-shadow: 0 1px 2px rgb(23 32 45 / 5%); }
 .scene-shot-card.is-selected { border-color: #887fe9; background: #eeecfd; box-shadow: 0 0 0 1px #887fe9; }
+.scene-shot-card.is-context:not(.is-selected) { border-color: #b9b3f0; background: #f8f7ff; box-shadow: inset 3px 0 #b9b3f0; }
+.scene-shot-card.is-hovered:not(.is-selected):not(.is-context) { border-color: #b9c1d1; background: #f6f7fb; }
+.scene-shot-card.is-focused { outline: 3px solid #9b94f6; outline-offset: -3px; }
 .scene-shot-card__open { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 12px; min-width: 0; padding: 12px 12px 8px; border: 0; border-radius: 10px 10px 0 0; background: transparent; color: #17202d; text-align: left; }
 .scene-shot-card__thumb { display: flex; align-items: center; justify-content: center; width: 72px; height: 58px; overflow: hidden; border-radius: 7px; background: #202733; color: #b4bdcc; }
 .scene-shot-card__thumb img { width: 100%; height: 100%; object-fit: cover; }
@@ -124,7 +130,9 @@
 .workflow-canvas-node--scene { padding: 15px 18px; border: 1px solid #ccd3df; border-radius: 10px; background: #ffffffb8; }
 .workflow-canvas-node--scene > div { color: #4d42d2; }
 .workflow-canvas-node--shot, .workflow-canvas-node--asset, .workflow-canvas-node--process { padding: 14px; border: 1px solid #dce1e9; border-radius: 9px; background: #fff; box-shadow: 0 2px 8px #17202d0d; }
-.workflow-canvas-node--shot.is-selected, .workflow-canvas-node--asset.is-selected, .workflow-canvas-node--process.is-selected { border-color: #887fe9; background: #eeecfd; box-shadow: 0 0 0 1px #887fe9; }
+.workflow-canvas-node--scene.is-selected, .workflow-canvas-node--shot.is-selected, .workflow-canvas-node--asset.is-selected, .workflow-canvas-node--process.is-selected { border-color: #887fe9; background: #eeecfd; box-shadow: 0 0 0 1px #887fe9; }
+.workflow-canvas-node.is-hovered:not(.is-selected) { border-color: #b9b3f0; background: #f8f7ff; }
+.workflow-canvas-node.is-focused { outline: 3px solid #9b94f6; outline-offset: 3px; }
 .workflow-canvas-node--shot button { position: absolute; right: 10px; bottom: 8px; min-height: 30px; padding: 0 8px; border: 0; border-radius: 5px; background: transparent; color: #4d42d2; font: inherit; font-size: 11px; }
 .workflow-canvas-node--shot button:hover { background: #e6e3fb; }
 .workflow-canvas-node--asset > div { color: #347760; }
@@ -140,6 +148,10 @@
 .workflow-canvas__empty strong { color: #17202d; font-size: 15px; }
 .workflow-canvas__empty span { margin-top: 6px; font-size: 12px; line-height: 1.55; }
 .preproduction-list-heading { margin-bottom: 13px; }
+.preproduction-selection-summary { grid-column: 1 / -1; align-content: start; min-height: 680px; padding: 28px 24px; background: #fff; }
+.preproduction-selection-summary h3 { margin: 0 0 20px; font-size: 18px; }
+.preproduction-selection-summary strong { display: block; font-size: 16px; }
+.preproduction-selection-summary p { max-width: 58ch; margin: 8px 0 0; color: #596579; font-size: 13px; line-height: 1.6; }
 .preproduction-list-heading h4 { flex-shrink: 0; }
 .preproduction-list-heading select { flex: 1; min-width: 0; width: auto; }
 .preproduction-list-heading h3, .preproduction-list-heading h4, .preproduction-bindings h4, .preproduction-nodes h4 { margin: 0; font-size: 16px; }

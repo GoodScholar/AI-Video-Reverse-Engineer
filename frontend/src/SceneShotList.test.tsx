@@ -98,4 +98,51 @@ describe("SceneShotList", () => {
     expect(await screen.findByRole("button", { name: "打开长列表镜头 30" })).toBeVisible();
     expect(scroll.scrollTo).toHaveBeenCalled();
   });
+
+  it("支持 Cmd/Ctrl 增减和 Shift 范围选择", async () => {
+    const store = createPreproductionWorkspaceStore(workspace());
+    render(<SceneShotList store={store} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "2 开始追逐 4 秒" }), { metaKey: true });
+    expect(store.getState().selection.selectedShotIds).toEqual(new Set(["shot-a", "shot-b"]));
+
+    fireEvent.click(screen.getByRole("button", { name: "1 雨中相遇 5 秒" }), { metaKey: true });
+    expect(store.getState().selection.selectedShotIds).toEqual(new Set(["shot-b"]));
+
+    fireEvent.click(screen.getByRole("button", { name: "2 开始追逐 4 秒" }), { shiftKey: true });
+    expect(store.getState().selection.selectedShotIds).toEqual(new Set(["shot-a", "shot-b"]));
+  });
+
+  it("流程节点只弱高亮所属镜头，场景选择成为检查器主对象", async () => {
+    const user = userEvent.setup();
+    const store = createPreproductionWorkspaceStore(workspace());
+    render(<SceneShotList store={store} />);
+    store.getState().actions.selectShot("shot-b");
+
+    act(() => store.getState().actions.selectNode("shot-a", "node-a", "canvas"));
+    expect(screen.getByRole("article", { name: "雨中相遇" })).toHaveClass("is-context");
+    expect(screen.getByRole("button", { name: "1 雨中相遇 5 秒" })).toHaveAttribute("aria-pressed", "false");
+    expect(store.getState().selection.selectedShotIds).toEqual(new Set(["shot-b"]));
+
+    await user.click(screen.getByRole("button", { name: "折叠场景相遇" }));
+    expect(store.getState().selection.primaryEntity).toEqual({ type: "scene", id: "scene-a" });
+  });
+
+  it("悬停和键盘焦点只更新瞬时反馈", () => {
+    const store = createPreproductionWorkspaceStore(workspace());
+    render(<SceneShotList store={store} />);
+    const card = screen.getByRole("article", { name: "雨中相遇" });
+    const open = screen.getByRole("button", { name: "1 雨中相遇 5 秒" });
+
+    fireEvent.mouseEnter(card);
+    expect(card).toHaveClass("is-hovered");
+    fireEvent.focus(open);
+    expect(card).toHaveClass("is-focused");
+    expect(store.getState().persistence.dirty).toBe(false);
+
+    fireEvent.mouseLeave(card);
+    fireEvent.blur(open);
+    expect(card).not.toHaveClass("is-hovered");
+    expect(card).not.toHaveClass("is-focused");
+  });
 });
