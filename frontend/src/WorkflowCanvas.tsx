@@ -20,16 +20,13 @@ import { useStore } from "zustand";
 
 import "@xyflow/react/dist/style.css";
 
-import type { PreproductionWorkspaceStore } from "./preproductionWorkspaceStore";
+import type { PreproductionWorkspaceStore, SelectableEntity } from "./preproductionWorkspaceStore";
 import { projectWorkflowCanvas, type WorkflowCanvasNode } from "./workflowCanvasProjection";
 
 type Props = { store: PreproductionWorkspaceStore };
 type CanvasNodeData = WorkflowCanvasNode["data"] & {
-  isHovered?: boolean;
-  isFocused?: boolean;
+  store: PreproductionWorkspaceStore;
   onOpenShot?: (shotId: string) => void;
-  onHover?: (hovered: boolean) => void;
-  onFocus?: (focused: boolean) => void;
 };
 type CanvasNode = Node<CanvasNodeData, WorkflowCanvasNode["kind"]>;
 
@@ -40,21 +37,46 @@ export function shouldHandleCanvasShortcut(target: EventTarget | null) {
     || (target instanceof HTMLElement && target.isContentEditable));
 }
 
-function transientClasses(data: CanvasNodeData) {
-  return `${data.isHovered ? " is-hovered" : ""}${data.isFocused ? " is-focused" : ""}`;
+function canvasEntity(kind: WorkflowCanvasNode["kind"], data: CanvasNodeData): SelectableEntity | null {
+  if (kind === "asset") return null;
+  if (kind === "process") return data.ownerShotId
+    ? { type: "processNode", id: data.entityId, shotId: data.ownerShotId }
+    : null;
+  return { type: kind, id: data.entityId };
 }
 
-const SceneNode = memo(function SceneNode({ data, selected }: NodeProps<CanvasNode>) {
-  return <section className={`workflow-canvas-node workflow-canvas-node--scene${selected ? " is-selected" : ""}${transientClasses(data)}`} aria-label={`场景 ${data.label}`} tabIndex={0}
-    onMouseEnter={() => data.onHover?.(true)} onMouseLeave={() => data.onHover?.(false)} onFocus={() => data.onFocus?.(true)} onBlur={() => data.onFocus?.(false)}>
+function sameEntity(current: SelectableEntity | null, target: SelectableEntity | null) {
+  return Boolean(current && target && current.type === target.type && current.id === target.id
+    && (current.type !== "processNode" || target.type !== "processNode" || current.shotId === target.shotId));
+}
+
+function useCanvasNodeState(kind: WorkflowCanvasNode["kind"], data: CanvasNodeData) {
+  const entity = canvasEntity(kind, data);
+  const selected = useStore(data.store, (state) => kind === "shot"
+    ? state.selection.selectedShotIds.has(data.entityId)
+    : sameEntity(state.selection.primaryEntity, entity));
+  const hovered = useStore(data.store, (state) => sameEntity(state.selection.hoveredEntity, entity));
+  const focused = useStore(data.store, (state) => sameEntity(state.selection.focusedEntity, entity));
+  const setTransient = (type: "hover" | "focus", active: boolean) => {
+    if (type === "hover") data.store.getState().actions.setHoveredEntity(active ? entity : null);
+    else data.store.getState().actions.setFocusedEntity(active ? entity : null);
+  };
+  return { selected, hovered, focused, setTransient };
+}
+
+const SceneNode = memo(function SceneNode({ data, selected: boxSelected }: NodeProps<CanvasNode>) {
+  const { selected, hovered, focused, setTransient } = useCanvasNodeState("scene", data);
+  return <section className={`workflow-canvas-node workflow-canvas-node--scene${selected || boxSelected ? " is-selected" : ""}${hovered ? " is-hovered" : ""}${focused ? " is-focused" : ""}`} aria-label={`场景 ${data.label}`} tabIndex={0}
+    onMouseEnter={() => setTransient("hover", true)} onMouseLeave={() => setTransient("hover", false)} onFocus={() => setTransient("focus", true)} onBlur={() => setTransient("focus", false)}>
     <div><Layers3 size={16} aria-hidden="true" /><strong>{data.label}</strong></div>
     <small>{data.shotCount} 个镜头 · {data.duration} 秒{data.issueCount ? ` · ${data.issueCount} 项问题` : ""}</small>
   </section>;
 });
 
-const ShotNode = memo(function ShotNode({ data, selected }: NodeProps<CanvasNode>) {
-  return <article className={`workflow-canvas-node workflow-canvas-node--shot${selected ? " is-selected" : ""}${transientClasses(data)}`} aria-label={`制作镜头 ${data.label}`} tabIndex={0}
-    onMouseEnter={() => data.onHover?.(true)} onMouseLeave={() => data.onHover?.(false)} onFocus={() => data.onFocus?.(true)} onBlur={() => data.onFocus?.(false)}>
+const ShotNode = memo(function ShotNode({ data, selected: boxSelected }: NodeProps<CanvasNode>) {
+  const { selected, hovered, focused, setTransient } = useCanvasNodeState("shot", data);
+  return <article className={`workflow-canvas-node workflow-canvas-node--shot${selected || boxSelected ? " is-selected" : ""}${hovered ? " is-hovered" : ""}${focused ? " is-focused" : ""}`} aria-label={`制作镜头 ${data.label}`} tabIndex={0}
+    onMouseEnter={() => setTransient("hover", true)} onMouseLeave={() => setTransient("hover", false)} onFocus={() => setTransient("focus", true)} onBlur={() => setTransient("focus", false)}>
     <div><Box size={16} aria-hidden="true" /><strong>{data.label}</strong></div>
     <small>{data.detail} · {data.status}</small>
     <button type="button" aria-label={`查看${data.label}关系`} onClick={(event) => { event.stopPropagation(); data.onOpenShot?.(data.entityId); }}>查看关系</button>
@@ -69,9 +91,10 @@ const AssetNode = memo(function AssetNode({ data, selected }: NodeProps<CanvasNo
   </article>;
 });
 
-const ProcessNode = memo(function ProcessNode({ data, selected }: NodeProps<CanvasNode>) {
-  return <article className={`workflow-canvas-node workflow-canvas-node--process${selected ? " is-selected" : ""}${transientClasses(data)}`} aria-label={`流程节点 ${data.label}`} tabIndex={0}
-    onMouseEnter={() => data.onHover?.(true)} onMouseLeave={() => data.onHover?.(false)} onFocus={() => data.onFocus?.(true)} onBlur={() => data.onFocus?.(false)}>
+const ProcessNode = memo(function ProcessNode({ data, selected: boxSelected }: NodeProps<CanvasNode>) {
+  const { selected, hovered, focused, setTransient } = useCanvasNodeState("process", data);
+  return <article className={`workflow-canvas-node workflow-canvas-node--process${selected || boxSelected ? " is-selected" : ""}${hovered ? " is-hovered" : ""}${focused ? " is-focused" : ""}`} aria-label={`流程节点 ${data.label}`} tabIndex={0}
+    onMouseEnter={() => setTransient("hover", true)} onMouseLeave={() => setTransient("hover", false)} onFocus={() => setTransient("focus", true)} onBlur={() => setTransient("focus", false)}>
     <Handle id="input" type="target" position={Position.Left} isConnectable={false} className="workflow-canvas__handle" aria-hidden="true" />
     <Handle id="output" type="source" position={Position.Right} isConnectable={false} className="workflow-canvas__handle" aria-hidden="true" />
     <div><Focus size={16} aria-hidden="true" /><strong>{data.label}</strong></div>
@@ -89,10 +112,6 @@ function WorkflowCanvasInner({ store }: Props) {
   const nodeCatalog = useStore(store, (state) => state.nodeCatalog);
   const layout = useStore(store, (state) => state.layout);
   const scope = useStore(store, (state) => state.view.scope);
-  const primaryEntity = useStore(store, (state) => state.selection.primaryEntity);
-  const selectedShotIds = useStore(store, (state) => state.selection.selectedShotIds);
-  const hoveredEntity = useStore(store, (state) => state.selection.hoveredEntity);
-  const focusedEntity = useStore(store, (state) => state.selection.focusedEntity);
   const locateRequest = useStore(store, (state) => state.view.locateRequest);
   const { fitView } = useReactFlow<CanvasNode, Edge>();
   const boxSelectedShotIds = useRef<string[]>([]);
@@ -108,13 +127,6 @@ function WorkflowCanvasInner({ store }: Props) {
     store.getState().actions.focusShot(shotId);
   }, [store]);
 
-  const setTransient = useCallback((kind: WorkflowCanvasNode["kind"], id: string, transient: "hover" | "focus", active: boolean) => {
-    if (kind === "asset") return;
-    const entity = active ? { type: kind === "process" ? "processNode" : kind, id } as const : null;
-    if (transient === "hover") store.getState().actions.setHoveredEntity(entity);
-    else store.getState().actions.setFocusedEntity(entity);
-  }, [store]);
-
   const nodes = useMemo<CanvasNode[]>(() => graph.nodes.map((node) => ({
     id: node.id,
     type: node.kind,
@@ -123,23 +135,15 @@ function WorkflowCanvasInner({ store }: Props) {
     extent: node.parentId ? "parent" : undefined,
     draggable: false,
     selectable: node.kind !== "asset",
-    selected: node.kind === "shot"
-      ? selectedShotIds.has(node.data.entityId)
-      : node.kind === "process"
-        ? primaryEntity?.type === "processNode" && primaryEntity.id === node.data.entityId
-        : node.kind === "scene" && primaryEntity?.type === "scene" && primaryEntity.id === node.data.entityId,
     width: node.width,
     height: node.height,
     style: { width: node.width, height: node.height },
     data: {
       ...node.data,
-      isHovered: node.kind !== "asset" && hoveredEntity?.type === (node.kind === "process" ? "processNode" : node.kind) && hoveredEntity.id === node.data.entityId,
-      isFocused: node.kind !== "asset" && focusedEntity?.type === (node.kind === "process" ? "processNode" : node.kind) && focusedEntity.id === node.data.entityId,
+      store,
       onOpenShot: node.kind === "shot" ? openShot : undefined,
-      onHover: (active) => setTransient(node.kind, node.data.entityId, "hover", active),
-      onFocus: (active) => setTransient(node.kind, node.data.entityId, "focus", active),
     },
-  })), [focusedEntity, graph.nodes, hoveredEntity, openShot, primaryEntity, selectedShotIds, setTransient]);
+  })), [graph.nodes, openShot, store]);
 
   const edges = useMemo<Edge[]>(() => graph.edges.map((edge) => ({
     ...edge,
@@ -155,14 +159,15 @@ function WorkflowCanvasInner({ store }: Props) {
   }, [fitView, prefersReducedMotion]);
 
   const focusSelection = useCallback(() => {
+    const primaryEntity = store.getState().selection.primaryEntity;
     const selected = nodes.filter((node) => {
       if (!primaryEntity) return false;
       if (primaryEntity.type === "shot") return node.type === "shot" && node.data.entityId === primaryEntity.id;
       if (primaryEntity.type === "scene") return node.type === "scene" && node.data.entityId === primaryEntity.id;
-      return node.type === "process" && node.data.entityId === primaryEntity.id;
+      return node.type === "process" && node.data.entityId === primaryEntity.id && node.data.ownerShotId === primaryEntity.shotId;
     });
     fitCurrent(selected.length ? selected : undefined);
-  }, [fitCurrent, nodes, primaryEntity]);
+  }, [fitCurrent, nodes, store]);
 
   const fitMeasuredNodes = useCallback((changes: NodeChange<CanvasNode>[]) => {
     if (!changes.some((change) => change.type === "dimensions")) return;
@@ -172,7 +177,9 @@ function WorkflowCanvasInner({ store }: Props) {
   useEffect(() => {
     if (!locateRequest || locateRequest.source === "canvas") return;
     const target = nodes.find((node) => {
-      if (locateRequest.entity.type === "processNode") return node.type === "process" && node.data.entityId === locateRequest.entity.id;
+      if (locateRequest.entity.type === "processNode") return node.type === "process"
+        && node.data.entityId === locateRequest.entity.id
+        && node.data.ownerShotId === locateRequest.entity.shotId;
       return node.type === locateRequest.entity.type && node.data.entityId === locateRequest.entity.id;
     });
     if (target) fitCurrent([target]);

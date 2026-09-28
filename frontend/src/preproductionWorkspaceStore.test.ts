@@ -152,6 +152,15 @@ describe("preproductionWorkspaceStore", () => {
     expect(store.getState().selection.selectedShotIds).toEqual(new Set(["shot-a1", "shot-a2"]));
     expect(store.getState().selection.primaryEntity).toEqual({ type: "shot", id: "shot-a2" });
 
+    store.getState().actions.selectShot("shot-a2", { mode: "toggle", source: "list" });
+    expect(store.getState().selection.selectedShotIds).toEqual(new Set(["shot-a1"]));
+    expect(store.getState().selection.primaryEntity).toEqual({ type: "shot", id: "shot-a1" });
+    store.getState().actions.selectShot("shot-a1", { mode: "toggle", source: "list" });
+    expect(store.getState().selection.selectedShotIds).toEqual(new Set());
+    expect(store.getState().selection.primaryEntity).toBeNull();
+
+    store.getState().actions.selectShot("shot-a2", { source: "list" });
+
     store.getState().actions.selectShot("shot-b1", { mode: "range", source: "list" });
     expect(store.getState().selection.selectedShotIds).toEqual(new Set(["shot-a2", "shot-b1"]));
 
@@ -171,12 +180,17 @@ describe("preproductionWorkspaceStore", () => {
     store.getState().actions.selectShot("shot-a2");
 
     store.getState().actions.selectNode("shot-b1", "trim-b1", "canvas");
-    expect(store.getState().selection.primaryEntity).toEqual({ type: "processNode", id: "trim-b1" });
+    expect(store.getState().selection.primaryEntity).toEqual({ type: "processNode", id: "trim-b1", shotId: "shot-b1" });
     expect(store.getState().selection.selectedShotIds).toEqual(new Set(["shot-a2"]));
     expect(store.getState().view.expandedSceneIds.has("scene-b")).toBe(true);
     expect(store.getState().view.scope).toEqual({ type: "shot", id: "shot-b1" });
-    expect(store.getState().view.locateRequest).toMatchObject({ entity: { type: "shot", id: "shot-b1" }, source: "canvas" });
+    expect(store.getState().view.locateRequest).toMatchObject({ entity: { type: "processNode", id: "trim-b1", shotId: "shot-b1" }, source: "canvas" });
 
+    store.getState().actions.selectShot("shot-b1");
+    store.getState().actions.selectNode("shot-b1", "trim-b1", "external");
+    expect(store.getState().selection.selectedShotIds).toEqual(new Set());
+
+    store.getState().actions.selectShot("shot-a2");
     store.getState().actions.selectScene("scene-a", "canvas");
     expect(store.getState().selection.primaryEntity).toEqual({ type: "scene", id: "scene-a" });
     expect(store.getState().selection.selectedShotIds).toEqual(new Set(["shot-a2"]));

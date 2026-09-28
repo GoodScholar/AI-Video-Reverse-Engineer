@@ -146,7 +146,7 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
   const selectedShot = primaryEntity?.type === "shot"
     ? workspace.shots.find((shot) => shot.id === primaryEntity.id) ?? null
     : primaryEntity?.type === "processNode"
-      ? workspace.shots.find((shot) => shot.nodes.some((node) => node.id === primaryEntity.id)) ?? null
+      ? workspace.shots.find((shot) => shot.id === primaryEntity.shotId) ?? null
       : null;
   const selectedSceneShots = selectedScene ? workspace.shots.filter((shot) => shot.sceneId === selectedScene.id) : [];
   const multiShotSelection = primaryEntity?.type === "shot" && selectedShotIds.size > 1;

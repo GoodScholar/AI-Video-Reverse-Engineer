@@ -116,9 +116,9 @@ describe("WorkflowCanvas", () => {
     });
     view.rerender(<div style={{ width: 900, height: 600 }}><WorkflowCanvas store={store} /></div>);
     await user.click(await screen.findByRole("article", { name: "流程节点 截取" }));
-    expect(store.getState().selection.primaryEntity).toEqual({ type: "processNode", id: "trim-a" });
+    expect(store.getState().selection.primaryEntity).toEqual({ type: "processNode", id: "trim-a", shotId: "shot-a" });
     expect(store.getState().selection.selectedShotIds).toEqual(new Set(["shot-b"]));
-    expect(store.getState().view.locateRequest).toMatchObject({ entity: { type: "shot", id: "shot-a" }, source: "canvas" });
+    expect(store.getState().view.locateRequest).toMatchObject({ entity: { type: "processNode", id: "trim-a", shotId: "shot-a" }, source: "canvas" });
   });
 
   it("画布呈现共享多选，并区分悬停与键盘焦点", async () => {

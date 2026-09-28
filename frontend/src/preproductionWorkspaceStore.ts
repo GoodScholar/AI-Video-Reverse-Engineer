@@ -14,7 +14,7 @@ import type {
 
 export type SelectableEntity =
   | { type: "shot"; id: string }
-  | { type: "processNode"; id: string }
+  | { type: "processNode"; id: string; shotId: string }
   | { type: "scene"; id: string };
 
 type PrimaryEntity = SelectableEntity | null;
@@ -363,7 +363,7 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
           const primary = state.selection.primaryEntity;
           const validPrimary = primary?.type === "shot" && base.entities.shotsById[primary.id]
             ? primary
-            : primary?.type === "processNode" && next.shots.some((shot) => shot.nodes.some((node) => node.id === primary.id))
+            : primary?.type === "processNode" && base.entities.shotsById[primary.shotId]?.nodes.some((node) => node.id === primary.id)
               ? primary
               : primary?.type === "scene" && base.entities.scenesById[primary.id]
                 ? primary
@@ -522,10 +522,13 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
           } else {
             selectedShotIds = new Set([shotId]);
           }
+          const primaryShotId = mode === "toggle" && !selectedShotIds.has(shotId)
+            ? [...selectedShotIds].pop() ?? null
+            : shotId;
           return {
             selection: {
               ...state.selection,
-              primaryEntity: { type: "shot", id: shotId },
+              primaryEntity: primaryShotId ? { type: "shot", id: primaryShotId } : null,
               selectedShotIds,
               selectionAnchorShotId: mode === "range" ? state.selection.selectionAnchorShotId ?? shotId : shotId,
             },
@@ -533,7 +536,7 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
               ...state.view,
               scope: { type: "project" },
               expandedSceneIds: new Set([...state.view.expandedSceneIds, shot.sceneId]),
-              locateRequest: locateRequest(state, { type: "shot", id: shotId }, source),
+              locateRequest: primaryShotId ? locateRequest(state, { type: "shot", id: primaryShotId }, source) : null,
             },
           };
         });
@@ -566,15 +569,27 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
       },
       selectNode(shotId, nodeId, source = "external") {
         if (!get().entities.shotsById[shotId]?.nodes.some((node) => node.id === nodeId)) return;
-        set((state) => ({
-          selection: { ...state.selection, primaryEntity: { type: "processNode", id: nodeId } },
-          view: {
-            ...state.view,
-            scope: { type: "shot", id: shotId },
-            expandedSceneIds: new Set([...state.view.expandedSceneIds, state.entities.shotsById[shotId].sceneId]),
-            locateRequest: locateRequest(state, { type: "shot", id: shotId }, source),
-          },
-        }));
+        set((state) => {
+          const selectedShotIds = new Set(state.selection.selectedShotIds);
+          selectedShotIds.delete(shotId);
+          const entity = { type: "processNode" as const, id: nodeId, shotId };
+          return {
+            selection: {
+              ...state.selection,
+              primaryEntity: entity,
+              selectedShotIds,
+              selectionAnchorShotId: state.selection.selectionAnchorShotId === shotId
+                ? [...selectedShotIds].pop() ?? null
+                : state.selection.selectionAnchorShotId,
+            },
+            view: {
+              ...state.view,
+              scope: { type: "shot", id: shotId },
+              expandedSceneIds: new Set([...state.view.expandedSceneIds, state.entities.shotsById[shotId].sceneId]),
+              locateRequest: locateRequest(state, entity, source),
+            },
+          };
+        });
       },
       selectScene(sceneId, source = "external") {
         if (!get().entities.scenesById[sceneId]) return;

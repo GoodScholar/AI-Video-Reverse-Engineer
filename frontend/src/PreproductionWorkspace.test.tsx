@@ -91,6 +91,22 @@ describe("PreproductionWorkspace", () => {
     expect(screen.queryByRole("heading", { name: "步骤参数" })).not.toBeInTheDocument();
   });
 
+  it("跨镜头同名流程节点仍打开所属镜头的检查器", async () => {
+    const sharedNode = { id: "shared-node", kind: "prompt" as const, input: "", params: { text: "节点内容" }, status: "pending" as const, artifacts: [] };
+    const first = { ...workspace().shots[0], nodes: [sharedNode] };
+    const second = { ...first, id: "shot-002", rank: "00000002", title: "镜头二" };
+    vi.mocked(fetch).mockResolvedValueOnce(response(workspace({ shots: [first, second] })));
+    render(<PreproductionWorkspace project={project} tools={<p>工具</p>} />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "2 镜头二 3 秒" }));
+    await userEvent.click(screen.getByRole("button", { name: "查看镜头二关系" }));
+    await userEvent.click(await screen.findByRole("article", { name: "流程节点 提示词" }));
+
+    expect(screen.getByLabelText("镜头名称")).toHaveValue("镜头二");
+    expect(screen.getByRole("article", { name: "镜头二" })).toHaveClass("is-context");
+    expect(screen.getByRole("button", { name: "2 镜头二 3 秒" })).toHaveAttribute("aria-pressed", "false");
+  });
+
   it("正式全站导航能直接打开素材与工具，切换时保留未保存需求", async () => {
     vi.mocked(fetch).mockResolvedValue(response(workspace()));
     const view = render(<PreproductionWorkspace project={project} tools={<p>真实项目工具</p>} sectionOverride="brief" studioMode />);

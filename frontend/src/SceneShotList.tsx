@@ -35,7 +35,7 @@ function ShotCard({ store, shotId }: Props & { shotId: string }) {
   const shot = useStore(store, (state) => state.entities.shotsById[shotId]);
   const selected = useStore(store, (state) => state.selection.selectedShotIds.has(shotId));
   const context = useStore(store, (state) => state.selection.primaryEntity?.type === "processNode"
-    && Boolean(state.entities.shotsById[shotId]?.nodes.some((node) => node.id === state.selection.primaryEntity?.id)));
+    && state.selection.primaryEntity.shotId === shotId);
   const hovered = useStore(store, (state) => state.selection.hoveredEntity?.type === "shot" && state.selection.hoveredEntity.id === shotId);
   const focused = useStore(store, (state) => state.selection.focusedEntity?.type === "shot" && state.selection.focusedEntity.id === shotId);
   const thumbnail = useStore(store, (state) => {
@@ -116,7 +116,10 @@ export function SceneShotList({ store, onCreateShot }: Props) {
 
   useEffect(() => {
     if (!locateRequest || locateRequest.source === "list") return;
-    const index = rows.findIndex((row) => row.type === locateRequest.entity.type && row.id === locateRequest.entity.id);
+    const target = locateRequest.entity.type === "processNode"
+      ? { type: "shot" as const, id: locateRequest.entity.shotId }
+      : locateRequest.entity;
+    const index = rows.findIndex((row) => row.type === target.type && row.id === target.id);
     if (index < 0) return;
     virtualizer.scrollToIndex(index, { align: "auto" });
   }, [locateRequest, rows, virtualizer]);
