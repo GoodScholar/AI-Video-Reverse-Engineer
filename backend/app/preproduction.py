@@ -48,8 +48,11 @@ class PreproductionStore:
             raise OSError("前置工作台状态无法读取") from error
         if not isinstance(value, dict) or value.get("schemaVersion") not in (1, 2):
             raise OSError("前置工作台状态无效")
-        _validate_state_shape(value)
-        return migrate_workspace(value)
+        try:
+            _validate_state_shape(value)
+            return migrate_workspace(value)
+        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            raise OSError("前置工作台状态无效") from error
 
     def save(self, project_id: str, state: dict[str, Any]) -> None:
         state = prepare_workspace_for_save(state)

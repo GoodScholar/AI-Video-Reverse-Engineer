@@ -193,3 +193,50 @@ def test_invalid_v2_scene_is_rejected_without_rewriting_storage(tmp_path):
     assert response.status_code == 503
     assert response.json()["detail"]["code"] == "preproduction_storage_invalid"
     assert path.read_bytes() == original
+
+
+def test_invalid_v1_shot_is_rejected_without_rewriting_storage(tmp_path):
+    client, _, _ = setup(tmp_path)
+    store = PreproductionStore(tmp_path)
+    path = store.path("project-001", "state.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    invalid = legacy_workspace()
+    invalid["shots"] = [None]
+    original = json.dumps(invalid).encode()
+    path.write_bytes(original)
+
+    response = client.get(BASE)
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "preproduction_storage_invalid",
+        "message": "前置工作台状态无法读取。",
+    }
+    assert path.read_bytes() == original
+
+
+def test_legacy_list_reorder_updates_canonical_shot_ranks(tmp_path):
+    client, _, _ = setup(tmp_path)
+    store = PreproductionStore(tmp_path)
+    path = store.path("project-001", "state.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    legacy = legacy_workspace()
+    second = json.loads(json.dumps(legacy["shots"][0]))
+    second.update(id="shot-b", title="反打")
+    second["nodes"][0]["id"] = "trim-b"
+    legacy["shots"].append(second)
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    current = client.get(BASE).json()
+
+    saved = client.put(BASE, json={
+        "revision": current["revision"],
+        "brief": current["brief"],
+        "shots": list(reversed(current["shots"])),
+    })
+
+    assert saved.status_code == 200, saved.text
+    shots = saved.json()["shots"]
+    assert [(shot["id"], shot["rank"]) for shot in shots] == [
+        ("shot-b", "00000001"),
+        ("shot-a", "00000002"),
+    ]

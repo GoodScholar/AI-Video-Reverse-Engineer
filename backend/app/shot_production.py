@@ -255,7 +255,7 @@ class ShotProduction:
                 "assetIds": item.get("assetIds", []), "nodes": nodes,
                 "resultAssetId": item.get("resultAssetId"),
                 "sceneId": old_shot.get("sceneId", "scene-default"),
-                "rank": old_shot.get("rank", f"{len(result) + 1:08d}"),
+                "rank": f"{len(result) + 1:08d}",
             }
             history = result_history(old_shot)
             result_asset_id = item.get("resultAssetId")
