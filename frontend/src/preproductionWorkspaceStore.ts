@@ -88,6 +88,57 @@ function indexById<T extends { id: string }>(items: T[]) {
   return Object.fromEntries(items.map((item) => [item.id, item])) as Record<string, T>;
 }
 
+function workflowId(kind: "shot" | "asset" | "process", ...parts: string[]) {
+  return [kind, ...parts.map(encodeURIComponent)].join(":");
+}
+
+function projectWorkflow(shots: PreproductionShot[], assets: PreproductionAsset[]) {
+  const nodes: WorkflowNode[] = [];
+  const edges: WorkflowEdge[] = [];
+  const assetsById = indexById(assets);
+  for (const shot of shots) {
+    nodes.push({ id: workflowId("shot", shot.id), type: "shot", shotId: shot.id });
+    const assetIds = new Set([
+      ...shot.assetIds,
+      ...shot.nodes.filter((node) => node.input.startsWith("asset:")).map((node) => node.input.slice(6)),
+    ]);
+    for (const assetId of assetIds) {
+      nodes.push({
+        id: workflowId("asset", shot.id, assetId),
+        type: "asset",
+        assetId,
+        ownerShotId: shot.id,
+        role: assetsById[assetId]?.role ?? "reference",
+      });
+    }
+    for (const step of shot.nodes) {
+      const processId = workflowId("process", shot.id, step.id);
+      nodes.push({
+        id: processId,
+        type: "process",
+        ownerShotId: shot.id,
+        processKind: step.kind,
+        config: { input: step.input, params: step.params },
+        status: step.status,
+        error: step.error,
+        artifacts: step.artifacts,
+      });
+      const sourceId = step.input.startsWith("asset:")
+        ? workflowId("asset", shot.id, step.input.slice(6))
+        : step.input.startsWith("node:")
+          ? workflowId("process", shot.id, step.input.slice(5))
+          : null;
+      if (sourceId) edges.push({
+        id: `edge:${sourceId}:${processId}`,
+        kind: "data",
+        source: { nodeId: sourceId, portId: step.input.startsWith("asset:") ? "asset" : "output" },
+        target: { nodeId: processId, portId: "input" },
+      });
+    }
+  }
+  return { nodes, edges };
+}
+
 function normalize(workspace: PreproductionWorkspace) {
   const scenes = [...(workspace.scenes?.length ? workspace.scenes : [{ id: "scene-default", title: "未分场", rank: "00000001", description: "" }])].sort(compareRank);
   const fallbackSceneId = scenes[0].id;
@@ -96,14 +147,15 @@ function normalize(workspace: PreproductionWorkspace) {
     sceneId: shot.sceneId ?? fallbackSceneId,
     rank: shot.rank ?? String(index + 1).padStart(8, "0"),
   })).sort(compareRank);
+  const workflow = projectWorkflow(shots, workspace.assets ?? []);
   const shotIdsByScene: Record<string, string[]> = Object.fromEntries(scenes.map((scene) => [scene.id, []]));
   for (const shot of shots) (shotIdsByScene[shot.sceneId] ??= []).push(shot.id);
   return {
     entities: {
       scenesById: indexById(scenes),
       shotsById: indexById(shots),
-      workflowNodesById: indexById(workspace.workflow?.nodes ?? []),
-      workflowEdgesById: indexById(workspace.workflow?.edges ?? []),
+      workflowNodesById: indexById(workflow.nodes),
+      workflowEdgesById: indexById(workflow.edges),
     },
     order: { sceneIds: scenes.map((scene) => scene.id), shotIdsByScene },
   };
@@ -116,11 +168,29 @@ export function selectOrderedSceneSections(state: PreproductionWorkspaceState): 
   }));
 }
 
-const workspaceSnapshotCache = new WeakMap<PreproductionWorkspaceState, PreproductionWorkspace>();
+type WorkspaceSnapshotCache = {
+  brief: PreproductionBrief;
+  assets: PreproductionAsset[];
+  checks: PreproductionCheck[];
+  nodeCatalog: PreproductionWorkspace["nodeCatalog"];
+  order: PreproductionWorkspaceState["order"];
+  layout: CanvasLayout;
+  revision: number;
+  snapshot: PreproductionWorkspace;
+};
+
+const workspaceSnapshotCache = new WeakMap<PreproductionWorkspaceState["entities"], WorkspaceSnapshotCache>();
 
 export function selectWorkspaceSnapshot(state: PreproductionWorkspaceState): PreproductionWorkspace {
-  const cached = workspaceSnapshotCache.get(state);
-  if (cached) return cached;
+  const cached = workspaceSnapshotCache.get(state.entities);
+  if (cached
+    && cached.brief === state.brief
+    && cached.assets === state.assets
+    && cached.checks === state.checks
+    && cached.nodeCatalog === state.nodeCatalog
+    && cached.order === state.order
+    && cached.layout === state.layout
+    && cached.revision === state.persistence.revision) return cached.snapshot;
   const scenes = state.order.sceneIds.map((id) => state.entities.scenesById[id]).filter(Boolean);
   const shots = state.order.sceneIds.flatMap((sceneId) => state.order.shotIdsByScene[sceneId] ?? [])
     .map((id) => state.entities.shotsById[id]).filter(Boolean);
@@ -139,7 +209,16 @@ export function selectWorkspaceSnapshot(state: PreproductionWorkspaceState): Pre
     checks: state.checks,
     nodeCatalog: state.nodeCatalog,
   };
-  workspaceSnapshotCache.set(state, snapshot);
+  workspaceSnapshotCache.set(state.entities, {
+    brief: state.brief,
+    assets: state.assets,
+    checks: state.checks,
+    nodeCatalog: state.nodeCatalog,
+    order: state.order,
+    layout: state.layout,
+    revision: state.persistence.revision,
+    snapshot,
+  });
   return snapshot;
 }
 
@@ -181,20 +260,38 @@ function selectShots(order: PreproductionWorkspaceState["order"], shotsById: Rec
     .map((id) => shotsById[id]).filter(Boolean);
 }
 
+function rerankShots(order: PreproductionWorkspaceState["order"], shotsById: Record<string, PreproductionShot>) {
+  const ranked = { ...shotsById };
+  selectShots(order, shotsById).forEach((shot, index) => {
+    ranked[shot.id] = { ...shot, rank: String(index + 1).padStart(8, "0") };
+  });
+  return ranked;
+}
+
 function withDirtyState(state: PreproductionWorkspaceState, change: Partial<PreproductionWorkspaceState>) {
   const next = { ...state, ...change };
+  const shots = selectShots(next.order, next.entities.shotsById);
+  const workflow = projectWorkflow(shots, next.assets);
+  const projected = {
+    ...next,
+    entities: {
+      ...next.entities,
+      workflowNodesById: indexById(workflow.nodes),
+      workflowEdgesById: indexById(workflow.edges),
+    },
+  };
   const snapshot = editableSnapshot(
-    next.persistence.revision,
-    next.brief,
-    selectShots(next.order, next.entities.shotsById),
+    projected.persistence.revision,
+    projected.brief,
+    shots,
   );
   return {
-    ...next,
+    ...projected,
     persistence: {
-      ...next.persistence,
+      ...projected.persistence,
       editableSnapshot: snapshot,
-      dirty: snapshot !== next.persistence.savedSnapshot,
-      saveStatus: next.persistence.saveStatus === "conflict" ? "conflict" as const : "idle" as const,
+      dirty: snapshot !== projected.persistence.savedSnapshot,
+      saveStatus: projected.persistence.saveStatus === "conflict" ? "conflict" as const : "idle" as const,
     },
   };
 }
@@ -311,16 +408,19 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
           const sceneShotIds = state.order.shotIdsByScene[source.sceneId] ?? [];
           const sourceIndex = sceneShotIds.indexOf(shotId);
           const copyId = `shot-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+          const nodeIds = new Map(source.nodes.map((node, index) => [node.id, `${copyId}-node-${index + 1}`]));
           const copy: PreproductionShot = {
             ...source,
             id: copyId,
             title: `${source.title} 副本`,
             resultAssetId: null,
             resultVersions: [],
-            nodes: source.nodes.map((node, index) => ({
+            nodes: source.nodes.map((node) => ({
               ...node,
-              id: `${copyId}-node-${index + 1}`,
-              input: node.input.startsWith("node:") ? "" : node.input,
+              id: nodeIds.get(node.id)!,
+              input: node.input.startsWith("node:")
+                ? `node:${nodeIds.get(node.input.slice(5)) ?? ""}`
+                : node.input,
               status: "pending",
               error: undefined,
               artifacts: [],
@@ -328,13 +428,11 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
           };
           const nextSceneShotIds = [...sceneShotIds];
           nextSceneShotIds.splice(sourceIndex + 1, 0, copyId);
-          const shotsById = { ...state.entities.shotsById, [copyId]: copy };
-          nextSceneShotIds.forEach((id, index) => {
-            shotsById[id] = { ...shotsById[id], rank: String(index + 1).padStart(8, "0") };
-          });
+          const order = { ...state.order, shotIdsByScene: { ...state.order.shotIdsByScene, [source.sceneId]: nextSceneShotIds } };
+          const shotsById = rerankShots(order, { ...state.entities.shotsById, [copyId]: copy });
           return withDirtyState(state, {
             entities: { ...state.entities, shotsById },
-            order: { ...state.order, shotIdsByScene: { ...state.order.shotIdsByScene, [source.sceneId]: nextSceneShotIds } },
+            order,
             selection: { ...state.selection, primaryEntity: { type: "shot", id: copyId }, selectedShotIds: new Set([copyId]) },
             view: { ...state.view, expandedSceneIds: new Set([...state.view.expandedSceneIds, source.sceneId]), locateShotId: copyId },
           });
@@ -350,13 +448,11 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
           if (from < 0 || to < 0 || to >= current.length) return state;
           const nextIds = [...current];
           [nextIds[from], nextIds[to]] = [nextIds[to], nextIds[from]];
-          const shotsById = { ...state.entities.shotsById };
-          nextIds.forEach((id, index) => {
-            shotsById[id] = { ...shotsById[id], rank: String(index + 1).padStart(8, "0") };
-          });
+          const order = { ...state.order, shotIdsByScene: { ...state.order.shotIdsByScene, [shot.sceneId]: nextIds } };
+          const shotsById = rerankShots(order, state.entities.shotsById);
           return withDirtyState(state, {
             entities: { ...state.entities, shotsById },
-            order: { ...state.order, shotIdsByScene: { ...state.order.shotIdsByScene, [shot.sceneId]: nextIds } },
+            order,
           });
         });
       },

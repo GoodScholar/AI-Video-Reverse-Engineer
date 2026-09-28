@@ -1,6 +1,6 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { SceneShotList } from "./SceneShotList";
 import type { PreproductionWorkspace } from "./preproductionApi";
@@ -20,7 +20,7 @@ function workspace(): PreproductionWorkspace {
       { id: "scene-a", title: "相遇", rank: "00000001", description: "" },
     ],
     shots: [
-      { id: "shot-b", sceneId: "scene-b", rank: "00000001", title: "开始追逐", duration: 4, prompt: "", negativePrompt: "", assetIds: [], nodes: [] },
+      { id: "shot-b", sceneId: "scene-b", rank: "00000002", title: "开始追逐", duration: 4, prompt: "", negativePrompt: "", assetIds: [], nodes: [] },
       { id: "shot-a", sceneId: "scene-a", rank: "00000001", title: "雨中相遇", duration: 5, prompt: "", negativePrompt: "", assetIds: ["thumb"], resultAssetId: "result", resultVersions: [{ assetId: "result", reviewed: false, planChanged: false }], nodes: [
         { id: "node-a", kind: "reference", input: "asset:thumb", params: {}, status: "failed", error: "素材无法读取", artifacts: [] },
       ] },
@@ -45,6 +45,7 @@ describe("SceneShotList", () => {
     expect(screen.getByText("1 个候选")).toBeVisible();
     expect(screen.getByText("步骤运行失败")).toBeVisible();
     expect(screen.getByRole("button", { name: "打开雨中相遇" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "1 雨中相遇 5 秒" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByRole("button", { name: "复制雨中相遇" })).toBeVisible();
     expect(screen.getByRole("button", { name: "定位雨中相遇" })).toBeVisible();
     expect(screen.getByText("更多雨中相遇")).toBeVisible();
@@ -64,5 +65,37 @@ describe("SceneShotList", () => {
     expect(await screen.findByRole("button", { name: "打开雨中相遇" })).toBeVisible();
     expect(store.getState().entities.shotsById["shot-a"].prompt).toBe("保留的草稿");
     expect(store.getState().persistence.dirty).toBe(true);
+  });
+
+  it("定位视口外镜头时通过虚拟列表滚动并呈现目标卡片", async () => {
+    const longWorkspace = workspace();
+    longWorkspace.scenes = [longWorkspace.scenes[0]];
+    longWorkspace.shots = Array.from({ length: 30 }, (_, index) => ({
+      id: `shot-${index + 1}`,
+      sceneId: longWorkspace.scenes[0].id,
+      rank: String(index + 1).padStart(8, "0"),
+      title: `长列表镜头 ${index + 1}`,
+      duration: 2,
+      prompt: "",
+      negativePrompt: "",
+      assetIds: [],
+      nodes: [],
+    }));
+    const store = createPreproductionWorkspaceStore(longWorkspace);
+    const view = render(<SceneShotList store={store} />);
+    const scroll = view.container.querySelector<HTMLElement>(".scene-shot-list__scroll")!;
+    Object.defineProperty(scroll, "scrollTo", { configurable: true, value: vi.fn((options: ScrollToOptions) => {
+      scroll.scrollTop = options.top ?? 0;
+      queueMicrotask(() => fireEvent.scroll(scroll));
+    }) });
+    expect(screen.queryByRole("button", { name: "打开长列表镜头 30" })).not.toBeInTheDocument();
+
+    await act(async () => {
+      store.getState().actions.selectShot("shot-30");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(await screen.findByRole("button", { name: "打开长列表镜头 30" })).toBeVisible();
+    expect(scroll.scrollTo).toHaveBeenCalled();
   });
 });

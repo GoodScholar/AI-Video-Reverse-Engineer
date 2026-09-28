@@ -10,6 +10,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app.preproduction import PreproductionStore
 from app.preproduction_api import create_preproduction_router
 
 
@@ -64,6 +65,29 @@ def setup(tmp_path, *, runner=None):
 
 
 pytestmark = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="需要本地 FFmpeg")
+
+
+def test_new_shot_keeps_its_custom_scene_on_legacy_workspace_save(tmp_path):
+    client, _, _ = setup(tmp_path)
+    store = PreproductionStore(tmp_path)
+    state = store.load(PROJECT_ID)
+    state["scenes"] = [{"id": "scene-custom", "title": "自定义场景", "rank": "00000001", "description": ""}]
+    state["shots"] = []
+    store.save(PROJECT_ID, state)
+    current = client.get(BASE).json()
+
+    saved = client.put(BASE, json={
+        "revision": current["revision"],
+        "brief": current["brief"],
+        "shots": [{
+            "id": "shot-copy", "sceneId": "scene-custom", "rank": "00000001",
+            "title": "复制镜头", "duration": 2, "prompt": "", "negativePrompt": "",
+            "assetIds": [], "nodes": [],
+        }],
+    })
+
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["shots"][0]["sceneId"] == "scene-custom"
 
 
 def test_save_uses_cas_and_marks_downstream_node_stale(tmp_path):

@@ -44,7 +44,7 @@ function ShotCard({ store, shotId }: Props & { shotId: string }) {
   const candidateCount = shot.resultVersions?.length ?? (shot.resultAssetId ? 1 : 0);
   const status = shotStatus(shot);
   return <article className={selected ? "scene-shot-card is-selected" : "scene-shot-card"} aria-label={shot.title}>
-    <button type="button" className="scene-shot-card__open" aria-label={`${position} ${shot.title} ${shot.duration} 秒`} onClick={() => store.getState().actions.selectShot(shotId)}>
+    <button type="button" className="scene-shot-card__open" aria-label={`${position} ${shot.title} ${shot.duration} 秒`} aria-pressed={selected} onClick={() => store.getState().actions.selectShot(shotId)}>
       <span className="scene-shot-card__thumb">
         {thumbnail ? <img src={thumbnail.url} alt={`${shot.title}缩略图`} loading="lazy" /> : <Image size={22} aria-hidden="true" />}
       </span>

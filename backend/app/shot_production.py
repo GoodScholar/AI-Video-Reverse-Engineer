@@ -207,9 +207,12 @@ class ShotProduction:
     def _validate_shots(self, incoming: list[dict[str, Any]]) -> None:
         assets = self.state["assets"]
         asset_ids = {asset["id"] for asset in assets}
+        scene_ids = {scene["id"] for scene in self.state.get("scenes", [])}
         if len({shot["id"] for shot in incoming}) != len(incoming):
             self._fail("preproduction_shot_invalid", "镜头标识符不能重复。", 422)
         for shot in incoming:
+            if shot.get("sceneId") is not None and shot["sceneId"] not in scene_ids:
+                self._fail("preproduction_scene_missing", "镜头所属场景不存在。", 422)
             result_asset_id = shot.get("resultAssetId")
             if result_asset_id is not None and not any(asset["id"] == result_asset_id and asset["kind"] == "video" for asset in assets):
                 self._fail("preproduction_result_invalid", "镜头结果必须是本项目的视频素材。", 422)
@@ -254,7 +257,7 @@ class ShotProduction:
                 "prompt": item.get("prompt", ""), "negativePrompt": item.get("negativePrompt", ""),
                 "assetIds": item.get("assetIds", []), "nodes": nodes,
                 "resultAssetId": item.get("resultAssetId"),
-                "sceneId": old_shot.get("sceneId", "scene-default"),
+                "sceneId": old_shot.get("sceneId", item.get("sceneId") or "scene-default"),
                 "rank": f"{len(result) + 1:08d}",
             }
             history = result_history(old_shot)

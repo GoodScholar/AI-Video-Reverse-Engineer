@@ -18,9 +18,9 @@ function workspace(): PreproductionWorkspace {
       { id: "scene-a", title: "相遇", rank: "00000001", description: "" },
     ],
     shots: [
-      { id: "shot-b2", sceneId: "scene-b", rank: "00000002", title: "跑出画面", duration: 2, prompt: "", negativePrompt: "", assetIds: [], nodes: [] },
+      { id: "shot-b2", sceneId: "scene-b", rank: "00000004", title: "跑出画面", duration: 2, prompt: "", negativePrompt: "", assetIds: [], nodes: [] },
       { id: "shot-a2", sceneId: "scene-a", rank: "00000002", title: "抬头", duration: 3, prompt: "", negativePrompt: "", assetIds: [], nodes: [] },
-      { id: "shot-b1", sceneId: "scene-b", rank: "00000001", title: "开始追逐", duration: 4, prompt: "", negativePrompt: "", assetIds: [], nodes: [] },
+      { id: "shot-b1", sceneId: "scene-b", rank: "00000003", title: "开始追逐", duration: 4, prompt: "", negativePrompt: "", assetIds: [], nodes: [] },
       { id: "shot-a1", sceneId: "scene-a", rank: "00000001", title: "雨中相遇", duration: 5, prompt: "", negativePrompt: "", assetIds: [], nodes: [] },
     ],
     workflow: { nodes: [], edges: [] },
@@ -68,6 +68,40 @@ describe("preproductionWorkspaceStore", () => {
     expect(state.entities.shotsById["shot-b1"].prompt).toBe("追逐中的低机位");
     expect(state.view.expandedSceneIds.has("scene-a")).toBe(false);
     expect(state.persistence.dirty).toBe(true);
+  });
+
+  it("选择变化复用内容快照，节点编辑同步 workflow 投影", () => {
+    const store = createPreproductionWorkspaceStore(workspace());
+    const beforeSelection = selectWorkspaceSnapshot(store.getState());
+    store.getState().actions.selectShot("shot-b1");
+    expect(selectWorkspaceSnapshot(store.getState())).toBe(beforeSelection);
+
+    store.getState().actions.updateShot("shot-a1", (shot) => ({ ...shot, nodes: [{
+      id: "prompt-a", kind: "prompt", input: "", params: { text: "同步后的提示词" }, status: "pending", artifacts: [],
+    }] }));
+
+    const process = store.getState().entities.workflowNodesById["process:shot-a1:prompt-a"];
+    expect(process).toMatchObject({ type: "process", ownerShotId: "shot-a1", config: { params: { text: "同步后的提示词" } } });
+    expect(selectWorkspaceSnapshot(store.getState()).workflow.nodes).toContain(process);
+  });
+
+  it("复制镜头重映射步骤依赖，并保持跨场景 rank 唯一", () => {
+    const source = workspace();
+    source.shots = source.shots.map((shot) => shot.id === "shot-a1" ? { ...shot, nodes: [
+      { id: "source", kind: "prompt", input: "", params: { text: "首步" }, status: "completed", artifacts: [{ name: "prompt.txt", url: "/prompt.txt" }] },
+      { id: "frame", kind: "first_frame", input: "node:source", params: {}, status: "completed", artifacts: [{ name: "frame.png", url: "/frame.png" }] },
+    ] } : shot);
+    const store = createPreproductionWorkspaceStore(source);
+
+    store.getState().actions.duplicateShot("shot-a1");
+
+    const copyId = [...store.getState().selection.selectedShotIds][0];
+    const copy = store.getState().entities.shotsById[copyId];
+    expect(copy.sceneId).toBe("scene-a");
+    expect(copy.nodes[1].input).toBe(`node:${copy.nodes[0].id}`);
+    expect(copy.nodes.every((node) => node.status === "pending" && node.artifacts.length === 0)).toBe(true);
+    const ranks = selectWorkspaceSnapshot(store.getState()).shots.map((shot) => shot.rank);
+    expect(new Set(ranks).size).toBe(ranks.length);
   });
 
   it("保存回包到达时保留提交后继续编辑的草稿，同时更新已保存修订", () => {
