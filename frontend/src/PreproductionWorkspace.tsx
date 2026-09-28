@@ -28,7 +28,7 @@ import { ShotResultVersions } from "./ShotResultVersions";
 import { CandidateResultComparison, ShotResultComparison } from "./ShotResultComparison";
 import { TimelineEditor } from "./TimelineEditor";
 import { BatchEditor } from "./BatchEditor";
-import { SceneShotList } from "./SceneShotList";
+import { ShotWorkspaceLayout } from "./ShotWorkspaceLayout";
 import { createPreproductionWorkspaceStore, selectWorkspaceSnapshot } from "./preproductionWorkspaceStore";
 
 type Props = { project: Project; tools: ReactNode; onDraftChange?: (projectId: string, dirty: boolean) => void;
@@ -362,8 +362,7 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
           })()}
         </section>}
 
-        {section === "shots" && <section className="preproduction-shot-editor preproduction-native-form" aria-label="镜头编辑器">
-          <SceneShotList store={workspaceStore} onCreateShot={() => { const shot = createShot(workspace.scenes[0]?.id ?? "scene-default", String(workspace.shots.length + 1).padStart(8, "0")); edit((current) => ({ ...current, shots: [...current.shots, shot] })); workspaceStore.getState().actions.selectShot(shot.id); }} />
+        {section === "shots" && <ShotWorkspaceLayout store={workspaceStore} onCreateShot={() => { const shot = createShot(workspace.scenes[0]?.id ?? "scene-default", String(workspace.shots.length + 1).padStart(8, "0")); edit((current) => ({ ...current, shots: [...current.shots, shot] })); workspaceStore.getState().actions.selectShot(shot.id); }}>
           <section className="preproduction-workspace-inspector" aria-label="镜头检查器">
           <div className="preproduction-editor">{selectedShot ? <><div className="preproduction-editor-heading"><label>镜头名称<input value={selectedShot.title} onChange={(event) => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, title: event.target.value })))} /></label><label>时长（秒）<input type="number" min="0.1" step="0.1" value={selectedShot.duration} onChange={(event) => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, duration: Number(event.target.value) })))} /></label><button type="button" aria-label="删除当前镜头" className="icon-action" onClick={() => edit((current) => ({ ...current, shots: current.shots.filter((shot) => shot.id !== selectedShot.id) }))}><Trash2 size={17} /></button></div>
             <label className="preproduction-full-field">画面提示词<textarea value={selectedShot.prompt} onChange={(event) => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, prompt: event.target.value })))} /></label><label className="preproduction-full-field">负面提示词<textarea value={selectedShot.negativePrompt} onChange={(event) => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, negativePrompt: event.target.value })))} /></label>
@@ -388,7 +387,7 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
           {selectedShot && <CandidateResultComparison shot={selectedShot} assets={workspace.assets} disabled={Boolean(busy) || hasActiveNodes} />}
           {selectedShot && <ShotResultComparison shot={selectedShot} assets={workspace.assets} disabled={Boolean(busy) || hasActiveNodes} />}
           </section>
-        </section>}
+        </ShotWorkspaceLayout>}
 
         {section === "tools" && <section className="preproduction-panel" aria-labelledby="preproduction-tools-title"><h3 id="preproduction-tools-title">现有工具</h3><p>这些工具沿用原有面板；完成后可在素材页导入其产物并绑定镜头。</p>{tools}</section>}
 

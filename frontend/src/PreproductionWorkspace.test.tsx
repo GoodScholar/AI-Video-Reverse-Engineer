@@ -38,7 +38,32 @@ function deferred<T>() {
 }
 
 describe("PreproductionWorkspace", () => {
-  beforeEach(() => { sessionStorage.clear(); localStorage.clear(); vi.stubGlobal("fetch", vi.fn()); vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined); });
+  beforeEach(() => {
+    sessionStorage.clear(); localStorage.clear();
+    vi.stubGlobal("fetch", vi.fn());
+    vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
+    vi.stubGlobal("matchMedia", vi.fn((query: string) => ({ matches: false, media: query, onchange: null, addEventListener: vi.fn(), removeEventListener: vi.fn(), addListener: vi.fn(), removeListener: vi.fn(), dispatchEvent: vi.fn() })));
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
+  });
+
+  it("镜头页接入分屏、画布和列表模式，项目切换后恢复新项目默认范围", async () => {
+    const secondProject = { ...project, id: "project-002", name: "清晨街景" };
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(response(workspace()))
+      .mockResolvedValueOnce(response(workspace({ scenes: [{ id: "scene-morning", title: "清晨", rank: "00000001", description: "" }], shots: [{ ...workspace().shots[0], id: "shot-morning", sceneId: "scene-morning", title: "清晨镜头" }] })));
+    const view = render(<PreproductionWorkspace project={project} tools={<p>工具</p>} />);
+
+    expect(await screen.findByRole("button", { name: "分屏视图" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("region", { name: "镜头关系图" })).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "画布视图" }));
+    expect(screen.queryByRole("complementary", { name: "按场景组织的镜头列表" })).not.toBeInTheDocument();
+
+    view.rerender(<PreproductionWorkspace project={secondProject} tools={<p>工具</p>} />);
+    expect(await screen.findAllByText("清晨镜头")).toHaveLength(2);
+    expect(screen.getByRole("button", { name: "分屏视图" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("heading", { name: "清晨" })).toBeVisible();
+    expect(screen.getByLabelText("场景 清晨")).toBeVisible();
+  });
 
   it("正式全站导航能直接打开素材与工具，切换时保留未保存需求", async () => {
     vi.mocked(fetch).mockResolvedValue(response(workspace()));
@@ -218,6 +243,8 @@ describe("PreproductionWorkspace", () => {
     expect(await screen.findByText("从已有参考或分镜开始")).toBeVisible();
     expect(screen.getByRole("button", { name: "导入参考素材" })).toBeVisible();
     expect(screen.getAllByRole("button", { name: "新建镜头" })).toHaveLength(2);
+    await userEvent.click(screen.getByRole("button", { name: "画布视图" }));
+    expect(screen.getByText("还没有可查看的镜头")).toBeVisible();
   });
 
   it("绑定素材、保存后才允许运行当前节点", async () => {
@@ -228,7 +255,7 @@ describe("PreproductionWorkspace", () => {
       .mockResolvedValueOnce(response(workspace({ shots: [{ ...workspace().shots[0], assetIds: ["asset-001"], nodes: [{ ...workspace().shots[0].nodes[0], status: "queued" }] }] }), 202));
     render(<PreproductionWorkspace project={project} tools={<p>已有工具</p>} />);
 
-    await screen.findByText("镜头一");
+    await screen.findByRole("button", { name: "打开镜头一" });
     await user.click(screen.getByRole("button", { name: /绑定\s*主角\.png/ }));
     expect(screen.getByRole("button", { name: "运行当前节点" })).toBeDisabled();
     await user.click(screen.getByRole("button", { name: "保存更改" }));
@@ -285,7 +312,7 @@ describe("PreproductionWorkspace", () => {
     const view = render(<PreproductionWorkspace project={project} tools={<p>已有工具</p>} />);
     view.rerender(<PreproductionWorkspace project={secondProject} tools={<p>已有工具</p>} />);
 
-    expect(await screen.findByText("新项目镜头")).toBeVisible();
+    expect(await screen.findByRole("button", { name: "打开新项目镜头" })).toBeVisible();
     old.resolve(response(workspace({ shots: [{ ...workspace().shots[0], title: "旧项目镜头" }] })));
     await Promise.resolve();
     expect(screen.queryByText("旧项目镜头")).not.toBeInTheDocument();
@@ -299,7 +326,7 @@ describe("PreproductionWorkspace", () => {
       .mockResolvedValueOnce(response({ detail: "前置工作台已被更新，请刷新后重试。" }, 409));
     render(<PreproductionWorkspace project={project} tools={<p>已有工具</p>} />);
 
-    await screen.findByText("镜头一");
+    await screen.findByRole("button", { name: "打开镜头一" });
     await user.click(screen.getByRole("button", { name: "素材" }));
     await user.click(screen.getByRole("button", { name: "导入已有分镜" }));
     await user.click(screen.getByRole("button", { name: "导入已有分镜" }));

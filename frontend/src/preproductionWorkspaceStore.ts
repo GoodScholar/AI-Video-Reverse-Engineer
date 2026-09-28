@@ -18,6 +18,9 @@ type PrimaryEntity =
   | { type: "scene"; id: string }
   | null;
 
+export type WorkspaceViewMode = "split" | "canvas" | "list";
+export type WorkspaceViewScope = { type: "project" } | { type: "shot"; id: string };
+
 export type SceneSection = { sceneId: string; shotIds: string[] };
 
 export type PreproductionWorkspaceState = {
@@ -42,7 +45,9 @@ export type PreproductionWorkspaceState = {
     hoveredEntity: { type: "shot" | "processNode" | "scene"; id: string } | null;
   };
   view: {
-    mode: "list";
+    mode: WorkspaceViewMode;
+    scope: WorkspaceViewScope;
+    inspectorOpen: boolean;
     expandedSceneIds: Set<string>;
     locateShotId: string | null;
   };
@@ -70,6 +75,10 @@ export type PreproductionWorkspaceState = {
     selectScene: (sceneId: string) => void;
     toggleScene: (sceneId: string) => void;
     locateShot: (shotId: string | null) => void;
+    setViewMode: (mode: WorkspaceViewMode) => void;
+    focusProject: () => void;
+    focusShot: (shotId: string) => void;
+    setInspectorOpen: (open: boolean) => void;
     setSaveStatus: (status: PreproductionWorkspaceState["persistence"]["saveStatus"], message?: string | null) => void;
   };
 };
@@ -239,7 +248,9 @@ function initialState(workspace: PreproductionWorkspace) {
       hoveredEntity: null,
     },
     view: {
-      mode: "list" as const,
+      mode: "split" as const,
+      scope: { type: "project" as const },
+      inspectorOpen: true,
       expandedSceneIds: new Set(normalized.order.sceneIds),
       locateShotId: null,
     },
@@ -488,6 +499,19 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
       },
       locateShot(shotId) {
         set((state) => ({ view: { ...state.view, locateShotId: shotId } }));
+      },
+      setViewMode(mode) {
+        set((state) => ({ view: { ...state.view, mode } }));
+      },
+      focusProject() {
+        set((state) => ({ view: { ...state.view, scope: { type: "project" } } }));
+      },
+      focusShot(shotId) {
+        if (!get().entities.shotsById[shotId]) return;
+        set((state) => ({ view: { ...state.view, scope: { type: "shot", id: shotId } } }));
+      },
+      setInspectorOpen(open) {
+        set((state) => ({ view: { ...state.view, inspectorOpen: open } }));
       },
       setSaveStatus(saveStatus, message = null) {
         set((state) => ({ persistence: { ...state.persistence, saveStatus, conflictMessage: message } }));

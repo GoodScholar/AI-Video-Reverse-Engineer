@@ -3,18 +3,11 @@ import { measureElement, observeElementRect, useVirtualizer } from "@tanstack/re
 import { ChevronDown, ChevronRight, Copy, FolderOpen, Image, LocateFixed, Plus } from "lucide-react";
 import { useStore } from "zustand";
 
-import type { PreproductionShot } from "./preproductionApi";
 import type { PreproductionWorkspaceStore } from "./preproductionWorkspaceStore";
+import { getShotPreparationStatus } from "./shotPreparationStatus";
 
 type Props = { store: PreproductionWorkspaceStore; onCreateShot?: () => void };
 type ListRow = { type: "scene"; id: string } | { type: "shot"; id: string };
-
-function shotStatus(shot: PreproductionShot) {
-  if (shot.nodes.some((node) => node.status === "failed" || node.status === "stale")) return "需处理";
-  if (shot.nodes.some((node) => node.status === "queued" || node.status === "running")) return "处理中";
-  if (shot.nodes.length > 0 && shot.nodes.every((node) => node.status === "completed")) return "已准备";
-  return "待准备";
-}
 
 function SceneRow({ store, sceneId }: Props & { sceneId: string }) {
   const scene = useStore(store, (state) => state.entities.scenesById[sceneId]);
@@ -42,7 +35,7 @@ function ShotCard({ store, shotId }: Props & { shotId: string }) {
   const position = useStore(store, (state) => state.order.sceneIds.flatMap((sceneId) => state.order.shotIdsByScene[sceneId] ?? []).indexOf(shotId) + 1);
   if (!shot) return null;
   const candidateCount = shot.resultVersions?.length ?? (shot.resultAssetId ? 1 : 0);
-  const status = shotStatus(shot);
+  const status = getShotPreparationStatus(shot);
   return <article className={selected ? "scene-shot-card is-selected" : "scene-shot-card"} aria-label={shot.title}>
     <button type="button" className="scene-shot-card__open" aria-label={`${position} ${shot.title} ${shot.duration} 秒`} aria-pressed={selected} onClick={() => store.getState().actions.selectShot(shotId)}>
       <span className="scene-shot-card__thumb">

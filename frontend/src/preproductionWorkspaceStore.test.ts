@@ -120,4 +120,25 @@ describe("preproductionWorkspaceStore", () => {
     expect(state.persistence.revision).toBe(4);
     expect(state.persistence.dirty).toBe(true);
   });
+
+  it("切换列表、分屏、画布和聚焦范围不改变内容快照或未保存草稿", () => {
+    const store = createPreproductionWorkspaceStore(workspace());
+    store.getState().actions.updateShot("shot-a1", (shot) => ({ ...shot, prompt: "保留草稿" }));
+    const before = selectWorkspaceSnapshot(store.getState());
+
+    store.getState().actions.setViewMode("canvas");
+    store.getState().actions.focusShot("shot-a1");
+    store.getState().actions.setInspectorOpen(false);
+
+    const state = store.getState();
+    expect(state.view.mode).toBe("canvas");
+    expect(state.view.scope).toEqual({ type: "shot", id: "shot-a1" });
+    expect(state.view.inspectorOpen).toBe(false);
+    expect(state.entities.shotsById["shot-a1"].prompt).toBe("保留草稿");
+    expect(state.persistence.dirty).toBe(true);
+    expect(selectWorkspaceSnapshot(state)).toBe(before);
+
+    state.actions.focusProject();
+    expect(store.getState().view.scope).toEqual({ type: "project" });
+  });
 });
