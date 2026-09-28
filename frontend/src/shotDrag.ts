@@ -8,3 +8,7 @@ export function writeShotDrag(dataTransfer: DataTransfer, shotId: string) {
 export function readShotDrag(dataTransfer: DataTransfer) {
   return dataTransfer.getData(SHOT_DRAG_TYPE);
 }
+
+export function hasShotDrag(dataTransfer: DataTransfer) {
+  return Array.from(dataTransfer.types).includes(SHOT_DRAG_TYPE);
+}

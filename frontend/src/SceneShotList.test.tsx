@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, createEvent, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
@@ -152,6 +152,7 @@ describe("SceneShotList", () => {
     const dataTransfer = {
       effectAllowed: "move",
       dropEffect: "move",
+      types: ["application/x-aivre-shot-id"],
       setData: (type: string, value: string) => { data.set(type, value); },
       getData: (type: string) => data.get(type) ?? "",
     } as unknown as DataTransfer;
@@ -160,7 +161,11 @@ describe("SceneShotList", () => {
     const second = screen.getByRole("article", { name: "开始追逐" });
 
     fireEvent.dragStart(second, { dataTransfer });
-    fireEvent.dragOver(first, { dataTransfer });
+    const dragOver = createEvent.dragOver(first, {
+      dataTransfer: { ...dataTransfer, getData: () => "" },
+    });
+    fireEvent(first, dragOver);
+    expect(dragOver.defaultPrevented).toBe(true);
     fireEvent.drop(first, { dataTransfer });
 
     expect(store.getState().entities.shotsById["shot-b"]).toMatchObject({ rank: "00000001", sceneId: "scene-b" });

@@ -165,7 +165,10 @@ describe("WorkflowCanvas layout persistence", () => {
     });
     render(<WorkflowCanvas projectId="project-1" store={store} onCreateShot={create} />);
     const data = new Map([["application/x-aivre-shot-id", "shot-a"]]);
-    const dataTransfer = { getData: (type: string) => data.get(type) ?? "" } as DataTransfer;
+    const dataTransfer = {
+      types: ["application/x-aivre-shot-id"],
+      getData: (type: string) => data.get(type) ?? "",
+    } as unknown as DataTransfer;
 
     const canvas = screen.getByRole("region", { name: "镜头关系图" });
     const drop = createEvent.drop(canvas, { dataTransfer });
@@ -182,5 +185,18 @@ describe("WorkflowCanvas layout persistence", () => {
     expect(store.getState().layout.nodes["shot:shot-new"]).toMatchObject({ x: 120, y: 120 });
     expect(Object.values(store.getState().entities.workflowNodesById)
       .filter((node) => node.type === "shot" && node.shotId === "shot-new")).toHaveLength(1);
+
+    const protectedDragOver = createEvent.dragOver(canvas, {
+      dataTransfer: { ...dataTransfer, getData: () => "" },
+    });
+    fireEvent(canvas, protectedDragOver);
+    expect(protectedDragOver.defaultPrevented).toBe(true);
+    data.set("application/x-aivre-shot-id", "shot-new");
+    const newShotDrop = createEvent.drop(canvas, { dataTransfer });
+    Object.defineProperties(newShotDrop, { clientX: { value: 640 }, clientY: { value: 320 } });
+    fireEvent(canvas, newShotDrop);
+
+    expect(api.saveCanvasLayout).toHaveBeenCalledTimes(1);
+    expect(store.getState().layout.nodes["shot:shot-new"]).toMatchObject({ x: 640, y: 320 });
   });
 });

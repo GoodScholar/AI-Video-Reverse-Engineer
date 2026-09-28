@@ -5,7 +5,7 @@ import { useStore } from "zustand";
 
 import type { PreproductionWorkspaceStore } from "./preproductionWorkspaceStore";
 import { getShotPreparationStatus } from "./shotPreparationStatus";
-import { readShotDrag, writeShotDrag } from "./shotDrag";
+import { hasShotDrag, readShotDrag, writeShotDrag } from "./shotDrag";
 
 type Props = { store: PreproductionWorkspaceStore; onCreateShot?: () => void };
 type ListRow = { type: "scene"; id: string } | { type: "shot"; id: string };
@@ -22,7 +22,7 @@ function SceneRow({ store, sceneId, onRequestDelete }: Props & { sceneId: string
   if (!scene) return null;
   return <header
     className={`scene-shot-list__scene${selected ? " is-selected" : ""}${hovered ? " is-hovered" : ""}${focused ? " is-focused" : ""}`}
-    onDragOver={(event) => { if (readShotDrag(event.dataTransfer)) event.preventDefault(); }}
+    onDragOver={(event) => { if (hasShotDrag(event.dataTransfer)) event.preventDefault(); }}
     onDrop={(event) => {
       const shotId = readShotDrag(event.dataTransfer);
       if (!shotId) return;
@@ -70,7 +70,7 @@ function ShotCard({ store, shotId }: Props & { shotId: string }) {
     aria-label={shot.title}
     draggable
     onDragStart={(event) => writeShotDrag(event.dataTransfer, shotId)}
-    onDragOver={(event) => { if (readShotDrag(event.dataTransfer)) event.preventDefault(); }}
+    onDragOver={(event) => { if (hasShotDrag(event.dataTransfer)) event.preventDefault(); }}
     onDrop={(event) => {
       const sourceId = readShotDrag(event.dataTransfer);
       if (!sourceId || sourceId === shotId) return;

@@ -22,7 +22,7 @@ import "@xyflow/react/dist/style.css";
 import { getCanvasLayout, saveCanvasLayout, type CanvasLayout } from "./preproductionApi";
 import { canvasLayoutScopeKey, type PreproductionWorkspaceStore, type SelectableEntity } from "./preproductionWorkspaceStore";
 import { projectWorkflowCanvas, type WorkflowCanvasNode } from "./workflowCanvasProjection";
-import { readShotDrag } from "./shotDrag";
+import { hasShotDrag, readShotDrag } from "./shotDrag";
 
 type Props = {
   store: PreproductionWorkspaceStore;
@@ -153,6 +153,7 @@ function WorkflowCanvasInner({ store, projectId: providedProjectId, onCreateShot
 
   const persistLayout = useCallback((next: CanvasLayout | null) => {
     if (!next || !projectId || savingLayout.current) return;
+    if (next.scope.type === "project" && store.getState().persistence.dirty) return;
     savingLayout.current = true;
     store.getState().actions.setLayoutSaveStatus("saving");
     void saveCanvasLayout(projectId, next).then((saved) => {
@@ -276,7 +277,7 @@ function WorkflowCanvasInner({ store, projectId: providedProjectId, onCreateShot
     role="region"
     tabIndex={0}
     onDragOver={(event) => {
-      if (scope.type === "project" && readShotDrag(event.dataTransfer)) event.preventDefault();
+      if (scope.type === "project" && hasShotDrag(event.dataTransfer)) event.preventDefault();
     }}
     onDrop={(event) => {
       if (scope.type !== "project") return;
