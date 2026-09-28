@@ -85,6 +85,26 @@ describe("preproductionWorkspaceStore", () => {
     expect(store.getState().layout.nodes["shot:shot-a1"]).toMatchObject({ x: 520, y: 240 });
   });
 
+  it("复制镜头作为独立组织命令逐次撤销，不跨越并误删副本", () => {
+    const store = createPreproductionWorkspaceStore(workspace());
+    store.getState().actions.reorderShots(["shot-a2", "shot-a1", "shot-b1", "shot-b2"]);
+    store.getState().actions.duplicateShot("shot-a1");
+    const copyId = Object.keys(store.getState().entities.shotsById)
+      .find((shotId) => !["shot-a1", "shot-a2", "shot-b1", "shot-b2"].includes(shotId));
+
+    expect(copyId).toBeDefined();
+    expect(store.getState().organizationHistory.history).toHaveLength(2);
+    store.getState().actions.undoOrganization();
+    expect(store.getState().entities.shotsById[copyId!]).toBeUndefined();
+    expect(selectWorkspaceSnapshot(store.getState()).shots.map((shot) => shot.id)).toEqual([
+      "shot-a2", "shot-a1", "shot-b1", "shot-b2",
+    ]);
+    store.getState().actions.undoOrganization();
+    expect(selectWorkspaceSnapshot(store.getState()).shots.map((shot) => shot.id)).toEqual([
+      "shot-a1", "shot-a2", "shot-b1", "shot-b2",
+    ]);
+  });
+
   it("批量移入场景只改变归属并完整保留镜头、候选、素材和依赖", () => {
     const current = workspace();
     current.shots = current.shots.map((shot) => shot.id === "shot-a1" ? {

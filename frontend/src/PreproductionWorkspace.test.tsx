@@ -94,8 +94,8 @@ describe("PreproductionWorkspace", () => {
   it("镜头顺序有空洞时新建镜头使用未占用的新 rank", async () => {
     const current = workspace({
       shots: [
-        { ...workspace().shots[0], id: "shot-003", rank: "00000003" },
-        { ...workspace().shots[0], id: "shot-004", rank: "00000004", title: "镜头四" },
+        { ...workspace().shots[0], id: "shot-010", rank: "00000010" },
+        { ...workspace().shots[0], id: "shot-011", rank: "00000011", title: "镜头十一" },
       ],
     });
     vi.mocked(fetch)
@@ -112,7 +112,7 @@ describe("PreproductionWorkspace", () => {
 
     const saved = JSON.parse(String(vi.mocked(fetch).mock.calls[1][1]?.body));
     expect(saved.shots).toHaveLength(3);
-    expect(saved.shots.map((shot: Workspace["shots"][number]) => shot.rank)).toContain("00000005");
+    expect(saved.shots.map((shot: Workspace["shots"][number]) => shot.rank)).toContain("00000012");
   });
 
   it("跨镜头同名流程节点仍打开所属镜头的检查器", async () => {

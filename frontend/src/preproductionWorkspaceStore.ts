@@ -643,21 +643,25 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
           nextSceneShotIds.splice(sourceIndex + 1, 0, copyId);
           const order = { ...state.order, shotIdsByScene: { ...state.order.shotIdsByScene, [source.sceneId]: nextSceneShotIds } };
           const shotsById = rerankShots(order, { ...state.entities.shotsById, [copyId]: copy });
-          return withDirtyState(state, {
-            entities: { ...state.entities, shotsById },
-            order,
+          const next = commitOrganization(
+            state,
+            selectScenes(state.order, state.entities.scenesById),
+            selectShots(order, shotsById),
+          );
+          return {
+            ...next,
             selection: {
-              ...state.selection,
+              ...next.selection,
               primaryEntity: { type: "shot", id: copyId },
               selectedShotIds: new Set([copyId]),
               selectionAnchorShotId: copyId,
             },
             view: {
-              ...state.view,
-              expandedSceneIds: new Set([...state.view.expandedSceneIds, source.sceneId]),
-              locateRequest: locateRequest(state, { type: "shot", id: copyId }, "external"),
+              ...next.view,
+              expandedSceneIds: new Set([...next.view.expandedSceneIds, source.sceneId]),
+              locateRequest: locateRequest(next, { type: "shot", id: copyId }, "external"),
             },
-          });
+          };
         });
       },
       moveShot(shotId, direction) {

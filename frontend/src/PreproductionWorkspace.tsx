@@ -240,7 +240,10 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
   function addShot(position?: { x: number; y: number }) {
     const sceneId = workspace.scenes[0]?.id ?? "scene-default";
     const occupiedRanks = new Set(workspace.shots.map((shot) => shot.rank));
-    let nextRank = workspace.shots.length + 1;
+    let nextRank = workspace.shots.reduce((highest, shot) => {
+      const rank = Number(shot.rank);
+      return Number.isSafeInteger(rank) ? Math.max(highest, rank) : highest;
+    }, workspace.shots.length) + 1;
     while (occupiedRanks.has(String(nextRank).padStart(8, "0"))) nextRank += 1;
     const shot = createShot(sceneId, String(nextRank).padStart(8, "0"));
     if (!workspaceStore.getState().actions.createShot(shot, position)) {

@@ -36,8 +36,11 @@ class WorkspaceTransaction:
             if set(transaction) != {"version", "originalState", "originalLayout"} or transaction["version"] != 1:
                 raise ValueError("工作区事务记录无效")
             self.content_store.save(project_id, transaction["originalState"])
+            _sync_directory(self.content_store.path(project_id, "state.json").parent)
             self.layout_store.save_snapshot(project_id, transaction["originalLayout"])
+            _sync_directory(self._layout_path(project_id, transaction["originalLayout"]).parent)
             path.unlink()
+            _sync_directory(path.parent)
         except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise OSError("工作区事务无法恢复") from error
 
@@ -57,8 +60,11 @@ class WorkspaceTransaction:
         })
         try:
             self.content_store.save(project_id, next_state)
+            _sync_directory(self.content_store.path(project_id, "state.json").parent)
             self.layout_store.save_snapshot(project_id, next_layout)
+            _sync_directory(self._layout_path(project_id, next_layout).parent)
             self.path(project_id).unlink()
+            _sync_directory(self.path(project_id).parent)
         except (OSError, ValueError) as error:
             try:
                 self.recover(project_id)
@@ -78,6 +84,19 @@ class WorkspaceTransaction:
                 target.flush()
                 os.fsync(target.fileno())
             os.replace(temporary, path)
+            _sync_directory(path.parent)
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
+
+    def _layout_path(self, project_id: str, layout: dict[str, Any]) -> Path:
+        scope = layout["scope"]
+        return self.layout_store.path(project_id, scope["type"], scope["id"])
+
+
+def _sync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
