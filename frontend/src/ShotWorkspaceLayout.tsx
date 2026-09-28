@@ -1,4 +1,4 @@
-import { useEffect, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, type ReactNode } from "react";
 import { Columns3, List, Network, PanelRightClose, PanelRightOpen, Redo2, Undo2, X } from "lucide-react";
 import { useStore } from "zustand";
 
@@ -20,6 +20,7 @@ const viewOptions: Array<{ mode: WorkspaceViewMode; label: string; icon: typeof 
 ];
 
 export function ShotWorkspaceLayout({ store, projectId, children, onCreateShot }: Props) {
+  const inspectorToggleRef = useRef<HTMLButtonElement>(null);
   const mode = useStore(store, (state) => state.view.mode);
   const inspectorOpen = useStore(store, (state) => state.view.inspectorOpen);
   const organizationHistory = useStore(store, (state) => state.organizationHistory.history.length);
@@ -31,6 +32,11 @@ export function ShotWorkspaceLayout({ store, projectId, children, onCreateShot }
       store.getState().actions.setViewMode("list");
       store.getState().actions.setInspectorOpen(false);
     }
+  }, [store]);
+
+  const closeInspector = useCallback(() => {
+    store.getState().actions.setInspectorOpen(false);
+    requestAnimationFrame(() => inspectorToggleRef.current?.focus());
   }, [store]);
 
   return <section className={`shot-workspace shot-workspace--${mode}${inspectorOpen ? " has-inspector" : ""}`} data-view-mode={mode}>
@@ -45,6 +51,7 @@ export function ShotWorkspaceLayout({ store, projectId, children, onCreateShot }
         ><Icon size={16} aria-hidden="true" /><span>{label.replace("视图", "")}</span></button>)}
       </div>
       <button
+        ref={inspectorToggleRef}
         type="button"
         className="shot-workspace__inspector-toggle"
         aria-label={inspectorOpen ? "关闭检查器" : "打开检查器"}
@@ -60,9 +67,14 @@ export function ShotWorkspaceLayout({ store, projectId, children, onCreateShot }
       {mode !== "canvas" && <SceneShotList store={store} onCreateShot={() => onCreateShot?.()} />}
       {mode !== "list" && <WorkflowCanvas projectId={projectId} store={store} onCreateShot={onCreateShot} />}
       {inspectorOpen && <>
-        <button type="button" className="shot-workspace__backdrop" aria-label="收起检查器遮罩" onClick={() => store.getState().actions.setInspectorOpen(false)} />
-        <aside className="shot-workspace__inspector" aria-label="工作区检查器">
-          <header><strong>检查器</strong><button type="button" className="icon-action" aria-label="收起检查器" onClick={() => store.getState().actions.setInspectorOpen(false)}><X size={17} aria-hidden="true" /></button></header>
+        <button type="button" className="shot-workspace__backdrop" aria-label="收起检查器遮罩" onClick={closeInspector} />
+        <aside className="shot-workspace__inspector" aria-label="工作区检查器" onKeyDown={(event) => {
+          if (event.key !== "Escape") return;
+          event.preventDefault();
+          event.stopPropagation();
+          closeInspector();
+        }}>
+          <header><strong>检查器</strong><button type="button" className="icon-action" aria-label="收起检查器" onClick={closeInspector}><X size={17} aria-hidden="true" /></button></header>
           <div className="shot-workspace__inspector-content">{children}</div>
         </aside>
       </>}

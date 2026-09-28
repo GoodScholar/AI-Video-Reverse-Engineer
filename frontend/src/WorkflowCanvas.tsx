@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, type KeyboardEvent } from "react";
 import {
   Background,
   Controls,
@@ -70,9 +70,27 @@ function useCanvasNodeState(kind: WorkflowCanvasNode["kind"], data: CanvasNodeDa
   return { selected, hovered, focused, setTransient };
 }
 
+function handleNodeKeyboard(
+  event: KeyboardEvent<HTMLElement>,
+  kind: Exclude<WorkflowCanvasNode["kind"], "asset">,
+  data: CanvasNodeData,
+) {
+  if (event.target !== event.currentTarget || (event.key !== " " && event.key !== "Enter")) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (kind === "shot") data.store.getState().actions.selectShot(data.entityId, {
+    mode: event.shiftKey ? "range" : event.metaKey || event.ctrlKey ? "toggle" : "replace",
+    source: "canvas",
+  });
+  if (kind === "scene") data.store.getState().actions.selectScene(data.entityId, "canvas");
+  if (kind === "process" && data.ownerShotId) data.store.getState().actions.selectNode(data.ownerShotId, data.entityId, "canvas");
+  if (event.key === "Enter") data.store.getState().actions.setInspectorOpen(true);
+}
+
 const SceneNode = memo(function SceneNode({ data, selected: boxSelected }: NodeProps<CanvasNode>) {
   const { selected, hovered, focused, setTransient } = useCanvasNodeState("scene", data);
   return <section className={`workflow-canvas-node workflow-canvas-node--scene${selected || boxSelected ? " is-selected" : ""}${hovered ? " is-hovered" : ""}${focused ? " is-focused" : ""}`} aria-label={`场景 ${data.label}`} tabIndex={0}
+    onKeyDown={(event) => handleNodeKeyboard(event, "scene", data)}
     onMouseEnter={() => setTransient("hover", true)} onMouseLeave={() => setTransient("hover", false)} onFocus={() => setTransient("focus", true)} onBlur={() => setTransient("focus", false)}>
     <div><Layers3 size={16} aria-hidden="true" /><strong>{data.label}</strong></div>
     <small>{data.shotCount} 个镜头 · {data.duration} 秒{data.issueCount ? ` · ${data.issueCount} 项问题` : ""}</small>
@@ -86,6 +104,7 @@ const SceneNode = memo(function SceneNode({ data, selected: boxSelected }: NodeP
 const ShotNode = memo(function ShotNode({ data, selected: boxSelected }: NodeProps<CanvasNode>) {
   const { selected, hovered, focused, setTransient } = useCanvasNodeState("shot", data);
   return <article className={`workflow-canvas-node workflow-canvas-node--shot${selected || boxSelected ? " is-selected" : ""}${hovered ? " is-hovered" : ""}${focused ? " is-focused" : ""}`} aria-label={`制作镜头 ${data.label}`} tabIndex={0}
+    onKeyDown={(event) => handleNodeKeyboard(event, "shot", data)}
     onMouseEnter={() => setTransient("hover", true)} onMouseLeave={() => setTransient("hover", false)} onFocus={() => setTransient("focus", true)} onBlur={() => setTransient("focus", false)}>
     <div><Box size={16} aria-hidden="true" /><strong>{data.label}</strong></div>
     <small>{data.detail} · {data.status}</small>
@@ -94,8 +113,8 @@ const ShotNode = memo(function ShotNode({ data, selected: boxSelected }: NodePro
 });
 
 const AssetNode = memo(function AssetNode({ data, selected }: NodeProps<CanvasNode>) {
-  return <article className={`workflow-canvas-node workflow-canvas-node--asset${selected ? " is-selected" : ""}`} aria-label={`素材 ${data.label}`}>
-    <Handle id="asset" type="source" position={Position.Right} isConnectable={false} className="workflow-canvas__handle" aria-hidden="true" />
+  return <article className={`workflow-canvas-node workflow-canvas-node--asset${selected ? " is-selected" : ""}`} aria-label={`素材 ${data.label}`} tabIndex={0}>
+    <Handle id="asset" type="source" position={Position.Right} isConnectable={false} className="workflow-canvas__handle" aria-label="素材输出端口" />
     <div><Image size={16} aria-hidden="true" /><strong>{data.label}</strong></div>
     <small>{data.detail}{data.status ? ` · ${data.status}` : ""}</small>
   </article>;
@@ -104,9 +123,10 @@ const AssetNode = memo(function AssetNode({ data, selected }: NodeProps<CanvasNo
 const ProcessNode = memo(function ProcessNode({ data, selected: boxSelected }: NodeProps<CanvasNode>) {
   const { selected, hovered, focused, setTransient } = useCanvasNodeState("process", data);
   return <article className={`workflow-canvas-node workflow-canvas-node--process${selected || boxSelected ? " is-selected" : ""}${hovered ? " is-hovered" : ""}${focused ? " is-focused" : ""}`} aria-label={`流程节点 ${data.label}`} tabIndex={0}
+    onKeyDown={(event) => handleNodeKeyboard(event, "process", data)}
     onMouseEnter={() => setTransient("hover", true)} onMouseLeave={() => setTransient("hover", false)} onFocus={() => setTransient("focus", true)} onBlur={() => setTransient("focus", false)}>
-    <Handle id="input" type="target" position={Position.Left} isConnectable={false} className="workflow-canvas__handle" aria-hidden="true" />
-    <Handle id="output" type="source" position={Position.Right} isConnectable={false} className="workflow-canvas__handle" aria-hidden="true" />
+    <Handle id="input" type="target" position={Position.Left} isConnectable={false} className="workflow-canvas__handle" aria-label="流程输入端口" />
+    <Handle id="output" type="source" position={Position.Right} isConnectable={false} className="workflow-canvas__handle" aria-label="流程输出端口" />
     <div><Focus size={16} aria-hidden="true" /><strong>{data.label}</strong></div>
     <small>{data.detail} · <span className={`workflow-canvas__status workflow-canvas__status--${data.statusTone ?? "neutral"}`}>{data.status}</span></small>
   </article>;
@@ -302,6 +322,12 @@ function WorkflowCanvasInner({ store, projectId: providedProjectId, onCreateShot
       const position = screenToFlowPosition({ x: event.clientX, y: event.clientY });
       persistLayout(store.getState().actions.placeShotOnCanvas(shotId, position));
       store.getState().actions.selectShot(shotId, { source: "canvas" });
+    }}
+    onKeyDownCapture={(event) => {
+      if (event.key !== "Escape" || scope.type !== "shot" || !shouldHandleCanvasShortcut(event.target)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      store.getState().actions.focusProject();
     }}
     onKeyDown={(event) => {
       if (!shouldHandleCanvasShortcut(event.target)) return;

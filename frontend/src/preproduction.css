@@ -150,7 +150,7 @@
 .workflow-canvas-node--shot, .workflow-canvas-node--asset, .workflow-canvas-node--process { padding: 14px; border: 1px solid #dce1e9; border-radius: 9px; background: #fff; box-shadow: 0 2px 8px #17202d0d; }
 .workflow-canvas-node--scene.is-selected, .workflow-canvas-node--shot.is-selected, .workflow-canvas-node--asset.is-selected, .workflow-canvas-node--process.is-selected { border-color: #887fe9; background: #eeecfd; box-shadow: 0 0 0 1px #887fe9; }
 .workflow-canvas-node.is-hovered:not(.is-selected) { border-color: #b9b3f0; background: #f8f7ff; }
-.workflow-canvas-node.is-focused { outline: 3px solid #9b94f6; outline-offset: 3px; }
+.workflow-canvas-node.is-focused, .workflow-canvas-node:focus-visible { outline: 3px solid #9b94f6; outline-offset: 3px; }
 .workflow-canvas-node--shot button { position: absolute; right: 10px; bottom: 8px; min-height: 30px; padding: 0 8px; border: 0; border-radius: 5px; background: transparent; color: #4d42d2; font: inherit; font-size: 11px; }
 .workflow-canvas-node--shot button:hover { background: #e6e3fb; }
 .workflow-canvas-node--asset > div { color: #347760; }

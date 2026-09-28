@@ -37,6 +37,62 @@ function workspace(): PreproductionWorkspace {
 }
 
 describe("projectWorkflowCanvas", () => {
+  it("约 1000 个总节点时项目范围不展开流程节点，折叠场景和单镜头范围保持有界", () => {
+    const current = workspace();
+    current.assets = [];
+    current.scenes = Array.from({ length: 20 }, (_, index) => ({
+      id: `scene-${index + 1}`,
+      title: `场景 ${index + 1}`,
+      rank: String(index + 1).padStart(8, "0"),
+      description: "",
+    }));
+    current.shots = current.scenes.flatMap((scene, sceneIndex) => Array.from({ length: 10 }, (_, shotIndex) => {
+      const ordinal = sceneIndex * 10 + shotIndex + 1;
+      return {
+        id: `shot-${ordinal}`,
+        sceneId: scene.id,
+        rank: String(ordinal).padStart(8, "0"),
+        title: `基准镜头 ${ordinal}`,
+        duration: 2,
+        prompt: "",
+        negativePrompt: "",
+        assetIds: [],
+        nodes: Array.from({ length: 4 }, (_, nodeIndex) => ({
+          id: `step-${ordinal}-${nodeIndex + 1}`,
+          kind: "reference",
+          input: "none",
+          params: {},
+          status: "pending" as const,
+          artifacts: [],
+        })),
+      };
+    }));
+    current.nodeCatalog = [{ kind: "reference", label: "引用素材" }];
+    current.canvasLayout = {
+      scope: { type: "project", id: "large-project" },
+      layoutRevision: 0,
+      nodes: Object.fromEntries(current.scenes.map((scene, index) => [scene.id, {
+        x: 0,
+        y: index * 280,
+        collapsed: index % 2 === 1,
+      }])),
+    };
+    const store = createPreproductionWorkspaceStore(current);
+    expect(Object.values(store.getState().entities.workflowNodesById)).toHaveLength(1000);
+
+    projectWorkflowCanvas(store.getState(), { type: "project" });
+    const startedAt = performance.now();
+    const projectGraph = projectWorkflowCanvas(store.getState(), { type: "project" });
+    const duration = performance.now() - startedAt;
+    const shotGraph = projectWorkflowCanvas(store.getState(), { type: "shot", id: "shot-1" });
+
+    expect(projectGraph.nodes).toHaveLength(120);
+    expect(projectGraph.nodes.every((node) => node.kind === "scene" || node.kind === "shot")).toBe(true);
+    expect(shotGraph.nodes).toHaveLength(4);
+    expect(shotGraph.nodes.every((node) => node.kind === "process")).toBe(true);
+    expect(duration).toBeLessThan(50);
+  });
+
   it("项目范围按场景包含规范 ShotNode，并使用独立布局而不改写 store", () => {
     const store = createPreproductionWorkspaceStore(workspace());
     const before = store.getState();

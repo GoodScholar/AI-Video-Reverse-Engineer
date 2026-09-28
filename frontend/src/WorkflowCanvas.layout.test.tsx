@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { PreproductionWorkspace } from "./preproductionApi";
 import { createPreproductionWorkspaceStore, selectWorkspaceDirty } from "./preproductionWorkspaceStore";
 
-const flow = vi.hoisted(() => ({ props: null as Record<string, any> | null }));
+const flow = vi.hoisted(() => ({ props: null as Record<string, any> | null, fitView: vi.fn() }));
 const api = vi.hoisted(() => ({
   getCanvasLayout: vi.fn(),
   saveCanvasLayout: vi.fn(),
@@ -27,7 +27,7 @@ vi.mock("@xyflow/react", async () => {
     Position: { Left: "left", Right: "right" },
     ReactFlowProvider: ({ children }: { children: React.ReactNode }) => children,
     SelectionMode: { Partial: "partial" },
-    useReactFlow: () => ({ fitView: vi.fn(), setViewport: vi.fn(), screenToFlowPosition: ({ x, y }: { x: number; y: number }) => ({ x, y }) }),
+    useReactFlow: () => ({ fitView: flow.fitView, setViewport: vi.fn(), screenToFlowPosition: ({ x, y }: { x: number; y: number }) => ({ x, y }) }),
     ReactFlow: (props: Record<string, any>) => {
       flow.props = props;
       return React.createElement("div", { "data-testid": "flow" }, props.nodes.map((node: Record<string, any>) => {
@@ -67,6 +67,7 @@ function workspace(): PreproductionWorkspace {
 
 beforeEach(() => {
   flow.props = null;
+  flow.fitView.mockReset();
   api.getCanvasLayout.mockReset();
   api.saveCanvasLayout.mockReset();
   api.saveCanvasLayout.mockImplementation(async (_projectId, layout) => ({
@@ -76,6 +77,54 @@ beforeEach(() => {
 });
 
 describe("WorkflowCanvas layout persistence", () => {
+  it("键盘可聚焦选择、适配范围并撤销重做布局", async () => {
+    const store = createPreproductionWorkspaceStore(workspace());
+    render(<WorkflowCanvas projectId="project-1" store={store} />);
+    const canvas = screen.getByRole("region", { name: "镜头关系图" });
+
+    fireEvent.keyDown(canvas, { key: "f" });
+    fireEvent.keyDown(canvas, { key: "0", ctrlKey: true });
+    expect(flow.fitView).toHaveBeenCalledTimes(2);
+
+    await userEvent.click(screen.getByRole("button", { name: "折叠场景 相遇" }));
+    await waitFor(() => expect(api.saveCanvasLayout).toHaveBeenCalledTimes(1));
+    fireEvent.keyDown(canvas, { key: "z", ctrlKey: true });
+    await waitFor(() => expect(api.saveCanvasLayout).toHaveBeenCalledTimes(2));
+    expect(store.getState().layout.nodes["scene-a"].collapsed).toBe(false);
+
+    fireEvent.keyDown(canvas, { key: "z", ctrlKey: true, shiftKey: true });
+    await waitFor(() => expect(api.saveCanvasLayout).toHaveBeenCalledTimes(3));
+    expect(store.getState().layout.nodes["scene-a"].collapsed).toBe(true);
+  });
+
+  it("只读连接向画布库提供可读名称", () => {
+    const current = workspace();
+    current.assets = [{ id: "asset-a", name: "参考图", kind: "image", role: "reference", url: "/asset.png" }];
+    current.shots[0].assetIds = ["asset-a"];
+    current.shots[0].nodes = [{
+      id: "trim-a",
+      kind: "trim",
+      input: "asset:asset-a",
+      params: {},
+      status: "pending",
+      artifacts: [],
+    }];
+    const store = createPreproductionWorkspaceStore(current);
+    store.getState().actions.focusShot("shot-a");
+    api.getCanvasLayout.mockResolvedValue({
+      scope: { type: "shot", id: "shot-a" },
+      layoutRevision: 0,
+      nodes: {},
+    });
+
+    render(<WorkflowCanvas projectId="project-1" store={store} />);
+
+    expect(flow.props!.edges).toEqual([expect.objectContaining({
+      ariaLabel: "数据：asset:shot-a:asset-a 到 process:shot-a:trim-a",
+      focusable: true,
+    })]);
+  });
+
   it("拖动期间只更新交互状态，结束时只保存最后位置一次", async () => {
     const store = createPreproductionWorkspaceStore(workspace());
     render(<WorkflowCanvas projectId="project-1" store={store} />);

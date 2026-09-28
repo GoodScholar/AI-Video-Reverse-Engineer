@@ -64,7 +64,7 @@ describe("WorkflowCanvas", () => {
     expect(screen.getByRole("button", { name: "查看雨中相遇关系" })).toBeVisible();
     expect(screen.getByRole("button", { name: "适配当前范围" })).toBeVisible();
     expect(container.querySelector(".react-flow__handle")).not.toBeInTheDocument();
-    expect(screen.queryByText(/自动排布|新建连线|最终 AI 视频生成/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/浏览器 API Key|远程插件|自定义 JavaScript|自动排布|新建连线|最终 AI 视频生成/)).not.toBeInTheDocument();
   });
 
   it("从镜头节点进入已有素材与流程关系，并能返回项目范围", async () => {
@@ -137,5 +137,39 @@ describe("WorkflowCanvas", () => {
     fireEvent.focus(first);
     expect(first).toHaveClass("is-focused");
     expect(store.getState().persistence.dirty).toBe(false);
+  });
+
+  it("键盘可选择和多选节点、打开检查器并退出镜头范围", async () => {
+    const store = createPreproductionWorkspaceStore(workspaceWithTwoShots());
+    store.getState().actions.setInspectorOpen(false);
+    render(<div style={{ width: 900, height: 600 }}><WorkflowCanvas store={store} /></div>);
+
+    const second = await screen.findByRole("article", { name: "制作镜头 擦肩而过" });
+    second.focus();
+    fireEvent.keyDown(second, { key: " ", ctrlKey: true });
+    expect(store.getState().selection.selectedShotIds).toEqual(new Set(["shot-a", "shot-b"]));
+
+    fireEvent.keyDown(second, { key: "Enter" });
+    expect(store.getState().selection.primaryEntity).toEqual({ type: "shot", id: "shot-b" });
+    expect(store.getState().view.inspectorOpen).toBe(true);
+
+    await userEvent.click(screen.getByRole("button", { name: "查看擦肩而过关系" }));
+    expect(store.getState().view.scope).toEqual({ type: "shot", id: "shot-b" });
+    const flow = screen.getByRole("application", { name: "镜头关系画布" });
+    flow.addEventListener("keydown", (event) => event.stopPropagation());
+    fireEvent.keyDown(flow, { key: "Escape" });
+    expect(store.getState().view.scope).toEqual({ type: "project" });
+  });
+
+  it("镜头范围的素材、流程端口和连接具有可读名称", async () => {
+    const store = createPreproductionWorkspaceStore(workspace());
+    const { container } = render(<div style={{ width: 900, height: 600 }}><WorkflowCanvas store={store} /></div>);
+
+    await userEvent.click(await screen.findByRole("button", { name: "查看雨中相遇关系" }));
+
+    expect(screen.getByRole("article", { name: "素材 街头参考" })).toHaveAttribute("tabindex", "0");
+    expect(container.querySelector('[data-handleid="asset"]')).toHaveAttribute("aria-label", "素材输出端口");
+    expect(container.querySelector('[data-handleid="input"]')).toHaveAttribute("aria-label", "流程输入端口");
+    expect(container.querySelector('[data-handleid="output"]')).toHaveAttribute("aria-label", "流程输出端口");
   });
 });

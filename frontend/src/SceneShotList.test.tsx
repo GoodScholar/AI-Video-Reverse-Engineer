@@ -1,5 +1,6 @@
 import { act, createEvent, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { Profiler, type ProfilerOnRenderCallback } from "react";
 import { describe, expect, it, vi } from "vitest";
 
 import { SceneShotList } from "./SceneShotList";
@@ -33,6 +34,56 @@ function workspace(): PreproductionWorkspace {
 }
 
 describe("SceneShotList", () => {
+  it("大型项目仍只渲染虚拟窗口，选择和悬停更新不产生 50ms 长任务", () => {
+    const largeWorkspace = workspace();
+    largeWorkspace.scenes = Array.from({ length: 20 }, (_, index) => ({
+      id: `scene-${index + 1}`,
+      title: `场景 ${index + 1}`,
+      rank: String(index + 1).padStart(8, "0"),
+      description: "",
+    }));
+    largeWorkspace.shots = largeWorkspace.scenes.flatMap((scene, sceneIndex) => Array.from({ length: 10 }, (_, shotIndex) => {
+      const ordinal = sceneIndex * 10 + shotIndex + 1;
+      return {
+        id: `shot-${ordinal}`,
+        sceneId: scene.id,
+        rank: String(ordinal).padStart(8, "0"),
+        title: `基准镜头 ${ordinal}`,
+        duration: 2,
+        prompt: "",
+        negativePrompt: "",
+        assetIds: [],
+        nodes: Array.from({ length: 4 }, (_, nodeIndex) => ({
+          id: `step-${ordinal}-${nodeIndex + 1}`,
+          kind: "reference",
+          input: "none",
+          params: {},
+          status: "pending" as const,
+          artifacts: [],
+        })),
+      };
+    }));
+    const store = createPreproductionWorkspaceStore(largeWorkspace);
+    largeWorkspace.scenes.filter((_, index) => index % 2 === 1)
+      .forEach((scene) => store.getState().actions.toggleScene(scene.id));
+    const updateDurations: number[] = [];
+    const onRender: ProfilerOnRenderCallback = (_id, phase, actualDuration) => {
+      if (phase === "update") updateDurations.push(actualDuration);
+    };
+    const view = render(<Profiler id="scene-shot-list" onRender={onRender}><SceneShotList store={store} /></Profiler>);
+    updateDurations.length = 0;
+
+    const renderedCards = screen.getAllByRole("article");
+    expect(renderedCards.length).toBeLessThan(largeWorkspace.shots.length);
+    expect(view.container.querySelector("[data-virtualized='true']")).toBeVisible();
+
+    fireEvent.mouseEnter(renderedCards[0]);
+    fireEvent.click(screen.getAllByRole("button", { name: /基准镜头 .* 秒/ })[1]);
+
+    expect(updateDurations.length).toBeGreaterThan(0);
+    expect(Math.max(...updateDurations)).toBeLessThan(50);
+  });
+
   it("以虚拟列表稳定呈现场景和镜头摘要，不在卡片复制详细表单", () => {
     const store = createPreproductionWorkspaceStore(workspace());
     render(<SceneShotList store={store} />);

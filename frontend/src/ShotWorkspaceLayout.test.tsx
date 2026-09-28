@@ -101,4 +101,17 @@ describe("ShotWorkspaceLayout", () => {
     await user.click(screen.getByRole("button", { name: "打开检查器" }));
     expect(screen.getByRole("complementary", { name: "工作区检查器" })).toBeVisible();
   });
+
+  it("从抽屉内部关闭检查器后把焦点返回触发按钮", async () => {
+    setViewport(true);
+    const user = userEvent.setup();
+    const store = createPreproductionWorkspaceStore(workspace());
+    render(<ShotWorkspaceLayout store={store}><div>镜头检查器内容</div></ShotWorkspaceLayout>);
+
+    await user.click(screen.getByRole("button", { name: "打开检查器" }));
+    await user.click(screen.getByRole("button", { name: "收起检查器" }));
+
+    const trigger = screen.getByRole("button", { name: "打开检查器" });
+    await waitFor(() => expect(trigger).toHaveFocus());
+  });
 });
