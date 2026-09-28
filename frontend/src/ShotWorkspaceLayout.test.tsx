@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -113,5 +113,20 @@ describe("ShotWorkspaceLayout", () => {
 
     const trigger = screen.getByRole("button", { name: "打开检查器" });
     await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
+  it("画布节点打开检查器后关闭时把焦点返回该节点", async () => {
+    setViewport(false);
+    const user = userEvent.setup();
+    const store = createPreproductionWorkspaceStore(workspace());
+    store.getState().actions.setInspectorOpen(false);
+    render(<ShotWorkspaceLayout store={store}><div>镜头检查器内容</div></ShotWorkspaceLayout>);
+
+    const node = await screen.findByRole("article", { name: "制作镜头 雨中相遇" });
+    node.focus();
+    act(() => store.getState().actions.setInspectorOpen(true));
+    await user.click(screen.getByRole("button", { name: "收起检查器" }));
+
+    await waitFor(() => expect(node).toHaveFocus());
   });
 });

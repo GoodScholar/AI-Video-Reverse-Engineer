@@ -21,6 +21,7 @@ const viewOptions: Array<{ mode: WorkspaceViewMode; label: string; icon: typeof 
 
 export function ShotWorkspaceLayout({ store, projectId, children, onCreateShot }: Props) {
   const inspectorToggleRef = useRef<HTMLButtonElement>(null);
+  const inspectorTriggerRef = useRef<HTMLElement | null>(null);
   const mode = useStore(store, (state) => state.view.mode);
   const inspectorOpen = useStore(store, (state) => state.view.inspectorOpen);
   const organizationHistory = useStore(store, (state) => state.organizationHistory.history.length);
@@ -34,9 +35,19 @@ export function ShotWorkspaceLayout({ store, projectId, children, onCreateShot }
     }
   }, [store]);
 
+  useEffect(() => {
+    if (!inspectorOpen) return;
+    inspectorTriggerRef.current = document.activeElement instanceof HTMLElement && document.activeElement !== document.body
+      ? document.activeElement
+      : inspectorToggleRef.current;
+  }, [inspectorOpen]);
+
   const closeInspector = useCallback(() => {
+    const trigger = inspectorTriggerRef.current;
     store.getState().actions.setInspectorOpen(false);
-    requestAnimationFrame(() => inspectorToggleRef.current?.focus());
+    requestAnimationFrame(() => {
+      (trigger?.isConnected ? trigger : inspectorToggleRef.current)?.focus();
+    });
   }, [store]);
 
   return <section className={`shot-workspace shot-workspace--${mode}${inspectorOpen ? " has-inspector" : ""}`} data-view-mode={mode}>

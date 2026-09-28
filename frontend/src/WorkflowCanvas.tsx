@@ -114,7 +114,7 @@ const ShotNode = memo(function ShotNode({ data, selected: boxSelected }: NodePro
 
 const AssetNode = memo(function AssetNode({ data, selected }: NodeProps<CanvasNode>) {
   return <article className={`workflow-canvas-node workflow-canvas-node--asset${selected ? " is-selected" : ""}`} aria-label={`素材 ${data.label}`} tabIndex={0}>
-    <Handle id="asset" type="source" position={Position.Right} isConnectable={false} className="workflow-canvas__handle" aria-label="素材输出端口" />
+    <Handle id="asset" type="source" position={Position.Right} isConnectable={false} className="workflow-canvas__handle" aria-label="素材输出端口" tabIndex={0} />
     <div><Image size={16} aria-hidden="true" /><strong>{data.label}</strong></div>
     <small>{data.detail}{data.status ? ` · ${data.status}` : ""}</small>
   </article>;
@@ -125,8 +125,8 @@ const ProcessNode = memo(function ProcessNode({ data, selected: boxSelected }: N
   return <article className={`workflow-canvas-node workflow-canvas-node--process${selected || boxSelected ? " is-selected" : ""}${hovered ? " is-hovered" : ""}${focused ? " is-focused" : ""}`} aria-label={`流程节点 ${data.label}`} tabIndex={0}
     onKeyDown={(event) => handleNodeKeyboard(event, "process", data)}
     onMouseEnter={() => setTransient("hover", true)} onMouseLeave={() => setTransient("hover", false)} onFocus={() => setTransient("focus", true)} onBlur={() => setTransient("focus", false)}>
-    <Handle id="input" type="target" position={Position.Left} isConnectable={false} className="workflow-canvas__handle" aria-label="流程输入端口" />
-    <Handle id="output" type="source" position={Position.Right} isConnectable={false} className="workflow-canvas__handle" aria-label="流程输出端口" />
+    <Handle id="input" type="target" position={Position.Left} isConnectable={false} className="workflow-canvas__handle" aria-label="流程输入端口" tabIndex={0} />
+    <Handle id="output" type="source" position={Position.Right} isConnectable={false} className="workflow-canvas__handle" aria-label="流程输出端口" tabIndex={0} />
     <div><Focus size={16} aria-hidden="true" /><strong>{data.label}</strong></div>
     <small>{data.detail} · <span className={`workflow-canvas__status workflow-canvas__status--${data.statusTone ?? "neutral"}`}>{data.status}</span></small>
   </article>;

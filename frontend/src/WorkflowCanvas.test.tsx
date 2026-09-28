@@ -169,7 +169,10 @@ describe("WorkflowCanvas", () => {
 
     expect(screen.getByRole("article", { name: "素材 街头参考" })).toHaveAttribute("tabindex", "0");
     expect(container.querySelector('[data-handleid="asset"]')).toHaveAttribute("aria-label", "素材输出端口");
+    expect(container.querySelector('[data-handleid="asset"]')).toHaveAttribute("tabindex", "0");
     expect(container.querySelector('[data-handleid="input"]')).toHaveAttribute("aria-label", "流程输入端口");
+    expect(container.querySelector('[data-handleid="input"]')).toHaveAttribute("tabindex", "0");
     expect(container.querySelector('[data-handleid="output"]')).toHaveAttribute("aria-label", "流程输出端口");
+    expect(container.querySelector('[data-handleid="output"]')).toHaveAttribute("tabindex", "0");
   });
 });
