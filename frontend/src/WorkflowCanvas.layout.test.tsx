@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { PreproductionWorkspace } from "./preproductionApi";
-import { createPreproductionWorkspaceStore } from "./preproductionWorkspaceStore";
+import { createPreproductionWorkspaceStore, selectWorkspaceDirty } from "./preproductionWorkspaceStore";
 
 const flow = vi.hoisted(() => ({ props: null as Record<string, any> | null }));
 const api = vi.hoisted(() => ({
@@ -198,5 +198,41 @@ describe("WorkflowCanvas layout persistence", () => {
 
     expect(api.saveCanvasLayout).toHaveBeenCalledTimes(1);
     expect(store.getState().layout.nodes["shot:shot-new"]).toMatchObject({ x: 640, y: 320 });
+    expect(store.getState().layoutPersistence.pendingWorkspaceLayout?.nodes["shot:shot-new"])
+      .toMatchObject({ x: 640, y: 320 });
+  });
+
+  it("内容撤销后补存待提交布局，工作区保存期间锁定布局交互", async () => {
+    const current = workspace();
+    current.shots.push({
+      ...current.shots[0], id: "shot-b", rank: "00000002", title: "继续追逐",
+    });
+    current.canvasLayout.nodes["shot:shot-b"] = { x: 300, y: 80, width: 220, height: 112 };
+    const store = createPreproductionWorkspaceStore(current);
+    store.getState().actions.reorderShots(["shot-b", "shot-a"]);
+    render(<WorkflowCanvas projectId="project-1" store={store} />);
+    const dataTransfer = {
+      types: ["application/x-aivre-shot-id"],
+      getData: () => "shot-a",
+    } as unknown as DataTransfer;
+    const canvas = screen.getByRole("region", { name: "镜头关系图" });
+    const drop = createEvent.drop(canvas, { dataTransfer });
+    Object.defineProperties(drop, { clientX: { value: 560 }, clientY: { value: 260 } });
+
+    fireEvent(canvas, drop);
+    expect(api.saveCanvasLayout).not.toHaveBeenCalled();
+    expect(store.getState().layoutPersistence.pendingWorkspaceLayout).not.toBeNull();
+    act(() => { store.getState().actions.undoOrganization(); });
+    expect(store.getState().persistence.dirty).toBe(false);
+    expect(selectWorkspaceDirty(store.getState())).toBe(true);
+    await waitFor(() => expect(api.saveCanvasLayout).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(store.getState().layoutPersistence.pendingWorkspaceLayout).toBeNull());
+    expect(selectWorkspaceDirty(store.getState())).toBe(false);
+
+    act(() => { store.getState().actions.setSaveStatus("saving"); });
+    expect(flow.props!.nodesDraggable).toBe(false);
+    const viewport = store.getState().layout.viewport;
+    act(() => { flow.props!.onMoveEnd({}, { x: -100, y: 50, zoom: 1.4 }); });
+    expect(store.getState().layout.viewport).toEqual(viewport);
   });
 });

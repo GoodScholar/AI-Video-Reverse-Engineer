@@ -125,6 +125,9 @@ function WorkflowCanvasInner({ store, projectId: providedProjectId, onCreateShot
   const scope = useStore(store, (state) => state.view.scope);
   const locateRequest = useStore(store, (state) => state.view.locateRequest);
   const layoutSaveStatus = useStore(store, (state) => state.layoutPersistence.saveStatus);
+  const contentSaveStatus = useStore(store, (state) => state.persistence.saveStatus);
+  const contentDirty = useStore(store, (state) => state.persistence.dirty);
+  const pendingWorkspaceLayout = useStore(store, (state) => state.layoutPersistence.pendingWorkspaceLayout);
   const layoutMessage = useStore(store, (state) => state.layoutPersistence.conflictMessage);
   const { fitView, setViewport, screenToFlowPosition } = useReactFlow<CanvasNode, Edge>();
   const boxSelectedShotIds = useRef<string[]>([]);
@@ -141,6 +144,7 @@ function WorkflowCanvasInner({ store, projectId: providedProjectId, onCreateShot
   const futureByScope = useStore(store, (state) => state.layoutPersistence.futureByScope);
   const layoutHistory = historyByScope[canvasLayoutScopeKey(layoutScope)] ?? emptyLayoutHistory;
   const layoutFuture = futureByScope[canvasLayoutScopeKey(layoutScope)] ?? emptyLayoutHistory;
+  const interactionLocked = layoutSaveStatus === "saving" || contentSaveStatus === "saving";
 
   const graph = useMemo(() => projectWorkflowCanvas({
     ...store.getState(), entities, order, assets, checks, nodeCatalog, layout,
@@ -153,7 +157,12 @@ function WorkflowCanvasInner({ store, projectId: providedProjectId, onCreateShot
 
   const persistLayout = useCallback((next: CanvasLayout | null) => {
     if (!next || !projectId || savingLayout.current) return;
-    if (next.scope.type === "project" && store.getState().persistence.dirty) return;
+    const current = store.getState();
+    if (current.persistence.saveStatus === "saving") return;
+    if (next.scope.type === "project" && current.persistence.dirty) {
+      current.actions.deferLayoutToWorkspaceSave(next);
+      return;
+    }
     savingLayout.current = true;
     store.getState().actions.setLayoutSaveStatus("saving");
     void saveCanvasLayout(projectId, next).then((saved) => {
@@ -167,6 +176,12 @@ function WorkflowCanvasInner({ store, projectId: providedProjectId, onCreateShot
       store.getState().actions.setLayoutSaveStatus(message.includes("已被更新") ? "conflict" : "error", message);
     }).finally(() => { savingLayout.current = false; });
   }, [projectId, store]);
+
+  useEffect(() => {
+    if (!contentDirty && contentSaveStatus !== "saving" && pendingWorkspaceLayout) {
+      persistLayout(pendingWorkspaceLayout);
+    }
+  }, [contentDirty, contentSaveStatus, pendingWorkspaceLayout, persistLayout]);
 
   const reloadLayout = useCallback(() => {
     if (!projectId) return;
@@ -183,7 +198,7 @@ function WorkflowCanvasInner({ store, projectId: providedProjectId, onCreateShot
   }, [layoutScope, projectId, store]);
 
   const toggleScene = useCallback((sceneId: string) => {
-    if (layoutSaveStatus === "saving") return;
+    if (store.getState().persistence.saveStatus === "saving" || layoutSaveStatus === "saving") return;
     persistLayout(store.getState().actions.toggleCanvasScene(sceneId));
   }, [layoutSaveStatus, persistLayout, store]);
 
@@ -277,10 +292,10 @@ function WorkflowCanvasInner({ store, projectId: providedProjectId, onCreateShot
     role="region"
     tabIndex={0}
     onDragOver={(event) => {
-      if (scope.type === "project" && hasShotDrag(event.dataTransfer)) event.preventDefault();
+      if (!interactionLocked && scope.type === "project" && hasShotDrag(event.dataTransfer)) event.preventDefault();
     }}
     onDrop={(event) => {
-      if (scope.type !== "project") return;
+      if (interactionLocked || scope.type !== "project") return;
       const shotId = readShotDrag(event.dataTransfer);
       if (!shotId) return;
       event.preventDefault();
@@ -296,7 +311,7 @@ function WorkflowCanvasInner({ store, projectId: providedProjectId, onCreateShot
       } else if (!event.metaKey && !event.ctrlKey && event.key.toLowerCase() === "f") {
         event.preventDefault();
         focusSelection();
-      } else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z" && layoutSaveStatus !== "saving") {
+      } else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z" && !interactionLocked) {
         event.preventDefault();
         persistLayout(event.shiftKey ? store.getState().actions.redoLayout() : store.getState().actions.undoLayout());
       }
@@ -308,9 +323,9 @@ function WorkflowCanvasInner({ store, projectId: providedProjectId, onCreateShot
         <span aria-current="page">{scopeShot?.title ?? "项目关系"}</span>
       </nav>
       <div>
-        {scope.type === "project" && onCreateShot && <button type="button" aria-label="在画布新建镜头" onClick={() => onCreateShot({ x: 120, y: 120 })}><Plus size={16} aria-hidden="true" />新建镜头</button>}
-        <button type="button" aria-label="撤销布局" disabled={!layoutHistory.length || layoutSaveStatus === "saving"} onClick={() => persistLayout(store.getState().actions.undoLayout())}><Undo2 size={16} aria-hidden="true" />撤销</button>
-        <button type="button" aria-label="重做布局" disabled={!layoutFuture.length || layoutSaveStatus === "saving"} onClick={() => persistLayout(store.getState().actions.redoLayout())}><Redo2 size={16} aria-hidden="true" />重做</button>
+        {scope.type === "project" && onCreateShot && <button type="button" aria-label="在画布新建镜头" disabled={interactionLocked} onClick={() => onCreateShot({ x: 120, y: 120 })}><Plus size={16} aria-hidden="true" />新建镜头</button>}
+        <button type="button" aria-label="撤销布局" disabled={!layoutHistory.length || interactionLocked} onClick={() => persistLayout(store.getState().actions.undoLayout())}><Undo2 size={16} aria-hidden="true" />撤销</button>
+        <button type="button" aria-label="重做布局" disabled={!layoutFuture.length || interactionLocked} onClick={() => persistLayout(store.getState().actions.redoLayout())}><Redo2 size={16} aria-hidden="true" />重做</button>
         <button type="button" onClick={focusSelection}><Focus size={16} aria-hidden="true" />聚焦选择</button>
         <button type="button" onClick={() => fitCurrent()}><Layers3 size={16} aria-hidden="true" />适配当前范围</button>
       </div>
@@ -325,7 +340,7 @@ function WorkflowCanvasInner({ store, projectId: providedProjectId, onCreateShot
         nodes={nodes}
         edges={edges}
         nodeTypes={nodeTypes}
-        nodesDraggable={layoutReady && layoutSaveStatus !== "saving"}
+        nodesDraggable={layoutReady && !interactionLocked}
         nodesConnectable={false}
         nodesFocusable={false}
         elementsSelectable
@@ -352,7 +367,7 @@ function WorkflowCanvasInner({ store, projectId: providedProjectId, onCreateShot
           persistLayout(store.getState().actions.finishLayoutChange());
         }}
         onMoveEnd={(_, viewport) => {
-          if (restoringViewport.current || layoutSaveStatus === "saving") return;
+          if (restoringViewport.current || interactionLocked) return;
           persistLayout(store.getState().actions.updateLayoutViewport(viewport));
         }}
         onNodeClick={selectNode}

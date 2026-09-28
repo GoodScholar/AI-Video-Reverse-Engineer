@@ -29,7 +29,7 @@ import { CandidateResultComparison, ShotResultComparison } from "./ShotResultCom
 import { TimelineEditor } from "./TimelineEditor";
 import { BatchEditor } from "./BatchEditor";
 import { ShotWorkspaceLayout } from "./ShotWorkspaceLayout";
-import { createPreproductionWorkspaceStore, selectWorkspaceSnapshot } from "./preproductionWorkspaceStore";
+import { createPreproductionWorkspaceStore, selectWorkspaceDirty, selectWorkspaceSnapshot } from "./preproductionWorkspaceStore";
 
 type Props = { project: Project; tools: ReactNode; onDraftChange?: (projectId: string, dirty: boolean) => void;
   importedWorkspace?: {projectId:string;workspace:Workspace}; sectionOverride?: Section; studioMode?: boolean; onAssetsChanged?: (assets: Workspace["assets"]) => void };
@@ -116,7 +116,7 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
   const [savedWorkspace, setSavedWorkspace] = useState<Workspace | null>(null);
   useEffect(() => { if(savedWorkspace) onAssetsChanged?.(savedWorkspace.assets); }, [savedWorkspace,onAssetsChanged]);
   const savedSnapshot = useStore(workspaceStore, (state) => state.persistence.savedSnapshot);
-  const dirty = useStore(workspaceStore, (state) => state.persistence.dirty);
+  const dirty = useStore(workspaceStore, selectWorkspaceDirty);
   const selectedShotIds = useStore(workspaceStore, (state) => state.selection.selectedShotIds);
   const primaryEntity = useStore(workspaceStore, (state) => state.selection.primaryEntity);
   const [managedAssetId, setManagedAssetId] = useState<string | null>(null);

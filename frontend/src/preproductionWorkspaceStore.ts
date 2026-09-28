@@ -70,6 +70,7 @@ export type PreproductionWorkspaceState = {
     layoutsByScope: Record<string, CanvasLayout>;
     historyByScope: Record<string, LayoutNodes[]>;
     futureByScope: Record<string, LayoutNodes[]>;
+    pendingWorkspaceLayout: CanvasLayout | null;
     interactionBase: LayoutNodes | null;
     saveStatus: "idle" | "saving" | "conflict" | "error";
     conflictMessage: string | null;
@@ -135,6 +136,7 @@ export type PreproductionWorkspaceState = {
       status: PreproductionWorkspaceState["layoutPersistence"]["saveStatus"],
       message?: string | null,
     ) => void;
+    deferLayoutToWorkspaceSave: (layout: CanvasLayout) => void;
   };
 };
 
@@ -271,6 +273,7 @@ type WorkspaceSnapshotCache = {
   checks: PreproductionCheck[];
   nodeCatalog: PreproductionWorkspace["nodeCatalog"];
   layout: CanvasLayout;
+  pendingWorkspaceLayout: CanvasLayout | null;
   order: PreproductionWorkspaceState["order"];
   revision: number;
   snapshot: PreproductionWorkspace;
@@ -286,6 +289,7 @@ export function selectWorkspaceSnapshot(state: PreproductionWorkspaceState): Pre
     && cached.checks === state.checks
     && cached.nodeCatalog === state.nodeCatalog
     && cached.layout === state.layout
+    && cached.pendingWorkspaceLayout === state.layoutPersistence.pendingWorkspaceLayout
     && cached.order === state.order
     && cached.revision === state.persistence.revision) return cached.snapshot;
   const scenes = state.order.sceneIds.map((id) => state.entities.scenesById[id]).filter(Boolean);
@@ -302,7 +306,7 @@ export function selectWorkspaceSnapshot(state: PreproductionWorkspaceState): Pre
       nodes: Object.values(state.entities.workflowNodesById),
       edges: Object.values(state.entities.workflowEdgesById),
     },
-    canvasLayout: state.layout,
+    canvasLayout: state.layoutPersistence.pendingWorkspaceLayout ?? state.layout,
     checks: state.checks,
     nodeCatalog: state.nodeCatalog,
   };
@@ -312,6 +316,7 @@ export function selectWorkspaceSnapshot(state: PreproductionWorkspaceState): Pre
     checks: state.checks,
     nodeCatalog: state.nodeCatalog,
     layout: state.layout,
+    pendingWorkspaceLayout: state.layoutPersistence.pendingWorkspaceLayout,
     order: state.order,
     revision: state.persistence.revision,
     snapshot,
@@ -356,6 +361,7 @@ function initialState(workspace: PreproductionWorkspace) {
       layoutsByScope: { [layoutKey]: layout },
       historyByScope: {},
       futureByScope: {},
+      pendingWorkspaceLayout: null,
       interactionBase: null,
       saveStatus: "idle" as const,
       conflictMessage: null,
@@ -489,6 +495,10 @@ function commitOrganization(
       future: [],
     },
   };
+}
+
+export function selectWorkspaceDirty(state: PreproductionWorkspaceState) {
+  return state.persistence.dirty || Boolean(state.layoutPersistence.pendingWorkspaceLayout);
 }
 
 export function createPreproductionWorkspaceStore(workspace: PreproductionWorkspace): PreproductionWorkspaceStore {
@@ -1024,6 +1034,9 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
             layoutPersistence: {
               ...state.layoutPersistence,
               layoutsByScope: cached,
+              pendingWorkspaceLayout: layout.scope.type === "project"
+                ? null
+                : state.layoutPersistence.pendingWorkspaceLayout,
               ...(activate ? {
                 interactionBase: null,
                 saveStatus: "idle" as const,
@@ -1170,6 +1183,12 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
       setLayoutSaveStatus(saveStatus, message = null) {
         set((state) => ({
           layoutPersistence: { ...state.layoutPersistence, saveStatus, conflictMessage: message },
+        }));
+      },
+      deferLayoutToWorkspaceSave(layout) {
+        if (layout.scope.type !== "project") return;
+        set((state) => ({
+          layoutPersistence: { ...state.layoutPersistence, pendingWorkspaceLayout: layout },
         }));
       },
     },
