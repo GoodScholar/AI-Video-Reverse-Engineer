@@ -36,7 +36,7 @@ describe("preproductionApi", () => {
 
     expect(fetch).toHaveBeenCalledWith(
       "/api/projects/project%2F001/preproduction",
-      expect.objectContaining({ method: "PUT", body: JSON.stringify({ revision: 3, brief: workspace.brief, shots: [] }) }),
+      expect.objectContaining({ method: "PUT", body: JSON.stringify({ revision: 3, brief: workspace.brief, scenes: workspace.scenes, shots: [] }) }),
     );
   });
 

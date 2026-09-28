@@ -145,4 +145,46 @@ describe("SceneShotList", () => {
     expect(card).not.toHaveClass("is-hovered");
     expect(card).not.toHaveClass("is-focused");
   });
+
+  it("列表拖动只重排 rank，拖入场景则批量改变归属", () => {
+    const store = createPreproductionWorkspaceStore(workspace());
+    const data = new Map<string, string>();
+    const dataTransfer = {
+      effectAllowed: "move",
+      dropEffect: "move",
+      setData: (type: string, value: string) => { data.set(type, value); },
+      getData: (type: string) => data.get(type) ?? "",
+    } as unknown as DataTransfer;
+    render(<SceneShotList store={store} />);
+    const first = screen.getByRole("article", { name: "雨中相遇" });
+    const second = screen.getByRole("article", { name: "开始追逐" });
+
+    fireEvent.dragStart(second, { dataTransfer });
+    fireEvent.dragOver(first, { dataTransfer });
+    fireEvent.drop(first, { dataTransfer });
+
+    expect(store.getState().entities.shotsById["shot-b"]).toMatchObject({ rank: "00000001", sceneId: "scene-b" });
+    expect(store.getState().entities.shotsById["shot-a"]).toMatchObject({ rank: "00000002", sceneId: "scene-a" });
+
+    fireEvent.dragStart(first, { dataTransfer });
+    fireEvent.drop(screen.getByRole("button", { name: "折叠场景追逐" }), { dataTransfer });
+    expect(store.getState().entities.shotsById["shot-a"].sceneId).toBe("scene-b");
+    expect(store.getState().entities.shotsById["shot-a"].assetIds).toEqual(["thumb"]);
+    expect(store.getState().entities.shotsById["shot-a"].resultVersions).toHaveLength(1);
+  });
+
+  it("删除非空场景先展示迁移或删除镜头的影响选择", async () => {
+    const user = userEvent.setup();
+    const store = createPreproductionWorkspaceStore(workspace());
+    render(<SceneShotList store={store} />);
+
+    await user.click(screen.getByRole("button", { name: "删除场景相遇" }));
+    expect(screen.getByRole("dialog", { name: "删除场景相遇" })).toHaveTextContent("1 个镜头");
+    expect(store.getState().entities.scenesById["scene-a"]).toBeDefined();
+
+    await user.selectOptions(screen.getByRole("combobox", { name: "迁移到场景" }), "scene-b");
+    await user.click(screen.getByRole("button", { name: "迁移镜头并删除场景" }));
+    expect(store.getState().entities.scenesById["scene-a"]).toBeUndefined();
+    expect(store.getState().entities.shotsById["shot-a"].sceneId).toBe("scene-b");
+  });
 });

@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, createEvent, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -27,7 +27,7 @@ vi.mock("@xyflow/react", async () => {
     Position: { Left: "left", Right: "right" },
     ReactFlowProvider: ({ children }: { children: React.ReactNode }) => children,
     SelectionMode: { Partial: "partial" },
-    useReactFlow: () => ({ fitView: vi.fn(), setViewport: vi.fn() }),
+    useReactFlow: () => ({ fitView: vi.fn(), setViewport: vi.fn(), screenToFlowPosition: ({ x, y }: { x: number; y: number }) => ({ x, y }) }),
     ReactFlow: (props: Record<string, any>) => {
       flow.props = props;
       return React.createElement("div", { "data-testid": "flow" }, props.nodes.map((node: Record<string, any>) => {
@@ -153,5 +153,34 @@ describe("WorkflowCanvas layout persistence", () => {
     await user.click(screen.getByRole("button", { name: "重新读取布局" }));
     await waitFor(() => expect(store.getState().layout.layoutRevision).toBe(3));
     expect(store.getState().layout.nodes["scene-a"]).toEqual(expect.objectContaining({ x: 240, collapsed: false }));
+  });
+
+  it("从列表投放只重新摆放现有 ShotNode，画布新建通过一个领域命令完成", async () => {
+    const store = createPreproductionWorkspaceStore(workspace());
+    const create = vi.fn((position: { x: number; y: number }) => {
+      store.getState().actions.createShot({
+        id: "shot-new", sceneId: "scene-a", rank: "00000002", title: "画布镜头", duration: 3,
+        prompt: "", negativePrompt: "", assetIds: [], nodes: [],
+      }, position);
+    });
+    render(<WorkflowCanvas projectId="project-1" store={store} onCreateShot={create} />);
+    const data = new Map([["application/x-aivre-shot-id", "shot-a"]]);
+    const dataTransfer = { getData: (type: string) => data.get(type) ?? "" } as DataTransfer;
+
+    const canvas = screen.getByRole("region", { name: "镜头关系图" });
+    const drop = createEvent.drop(canvas, { dataTransfer });
+    Object.defineProperties(drop, { clientX: { value: 480 }, clientY: { value: 220 } });
+    fireEvent(canvas, drop);
+
+    await waitFor(() => expect(api.saveCanvasLayout).toHaveBeenCalledTimes(1));
+    expect(store.getState().layout.nodes["shot:shot-a"]).toMatchObject({ x: 480, y: 220 });
+    expect(Object.values(store.getState().entities.shotsById)).toHaveLength(1);
+
+    await userEvent.click(screen.getByRole("button", { name: "在画布新建镜头" }));
+    expect(create).toHaveBeenCalledWith({ x: 120, y: 120 });
+    expect(store.getState().entities.shotsById["shot-new"]).toBeDefined();
+    expect(store.getState().layout.nodes["shot:shot-new"]).toMatchObject({ x: 120, y: 120 });
+    expect(Object.values(store.getState().entities.workflowNodesById)
+      .filter((node) => node.type === "shot" && node.shotId === "shot-new")).toHaveLength(1);
   });
 });

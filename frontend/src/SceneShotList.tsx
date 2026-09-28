@@ -1,15 +1,16 @@
 import { useEffect, useMemo, useState, type MouseEvent } from "react";
 import { measureElement, observeElementRect, useVirtualizer } from "@tanstack/react-virtual";
-import { ChevronDown, ChevronRight, Copy, FolderOpen, Image, LocateFixed, Plus } from "lucide-react";
+import { ChevronDown, ChevronRight, Copy, FolderOpen, Image, LocateFixed, Plus, Trash2 } from "lucide-react";
 import { useStore } from "zustand";
 
 import type { PreproductionWorkspaceStore } from "./preproductionWorkspaceStore";
 import { getShotPreparationStatus } from "./shotPreparationStatus";
+import { readShotDrag, writeShotDrag } from "./shotDrag";
 
 type Props = { store: PreproductionWorkspaceStore; onCreateShot?: () => void };
 type ListRow = { type: "scene"; id: string } | { type: "shot"; id: string };
 
-function SceneRow({ store, sceneId }: Props & { sceneId: string }) {
+function SceneRow({ store, sceneId, onRequestDelete }: Props & { sceneId: string; onRequestDelete: (sceneId: string) => void }) {
   const scene = useStore(store, (state) => state.entities.scenesById[sceneId]);
   const shotIds = useStore(store, (state) => state.order.shotIdsByScene[sceneId] ?? []);
   const expanded = useStore(store, (state) => state.view.expandedSceneIds.has(sceneId));
@@ -17,8 +18,19 @@ function SceneRow({ store, sceneId }: Props & { sceneId: string }) {
   const hovered = useStore(store, (state) => state.selection.hoveredEntity?.type === "scene" && state.selection.hoveredEntity.id === sceneId);
   const focused = useStore(store, (state) => state.selection.focusedEntity?.type === "scene" && state.selection.focusedEntity.id === sceneId);
   const totalDuration = useStore(store, (state) => shotIds.reduce((total, id) => total + (state.entities.shotsById[id]?.duration ?? 0), 0));
+  const canDelete = useStore(store, (state) => state.order.sceneIds.length > 1);
   if (!scene) return null;
-  return <header className={`scene-shot-list__scene${selected ? " is-selected" : ""}${hovered ? " is-hovered" : ""}${focused ? " is-focused" : ""}`}>
+  return <header
+    className={`scene-shot-list__scene${selected ? " is-selected" : ""}${hovered ? " is-hovered" : ""}${focused ? " is-focused" : ""}`}
+    onDragOver={(event) => { if (readShotDrag(event.dataTransfer)) event.preventDefault(); }}
+    onDrop={(event) => {
+      const shotId = readShotDrag(event.dataTransfer);
+      if (!shotId) return;
+      event.preventDefault();
+      const selectedIds = store.getState().selection.selectedShotIds;
+      store.getState().actions.moveShotsToScene(selectedIds.has(shotId) ? [...selectedIds] : [shotId], sceneId);
+    }}
+  >
     <button type="button" aria-expanded={expanded} aria-pressed={selected} aria-label={`${expanded ? "折叠" : "展开"}场景${scene.title}`}
       onMouseEnter={() => store.getState().actions.setHoveredEntity({ type: "scene", id: sceneId })}
       onMouseLeave={() => store.getState().actions.setHoveredEntity(null)}
@@ -28,6 +40,7 @@ function SceneRow({ store, sceneId }: Props & { sceneId: string }) {
       {expanded ? <ChevronDown size={17} aria-hidden="true" /> : <ChevronRight size={17} aria-hidden="true" />}
       <span><h3>{scene.title}</h3><small>{shotIds.length} 个镜头 · {totalDuration} 秒</small></span>
     </button>
+    <button type="button" className="scene-shot-list__delete-scene" aria-label={`删除场景${scene.title}`} disabled={!canDelete} onClick={() => onRequestDelete(sceneId)}><Trash2 size={15} aria-hidden="true" /></button>
   </header>;
 }
 
@@ -55,6 +68,20 @@ function ShotCard({ store, shotId }: Props & { shotId: string }) {
   return <article
     className={`scene-shot-card${selected ? " is-selected" : ""}${context ? " is-context" : ""}${hovered ? " is-hovered" : ""}${focused ? " is-focused" : ""}`}
     aria-label={shot.title}
+    draggable
+    onDragStart={(event) => writeShotDrag(event.dataTransfer, shotId)}
+    onDragOver={(event) => { if (readShotDrag(event.dataTransfer)) event.preventDefault(); }}
+    onDrop={(event) => {
+      const sourceId = readShotDrag(event.dataTransfer);
+      if (!sourceId || sourceId === shotId) return;
+      event.preventDefault();
+      const ordered = store.getState().order.sceneIds.flatMap((sceneId) => store.getState().order.shotIdsByScene[sceneId] ?? []);
+      const next = ordered.filter((id) => id !== sourceId);
+      const targetIndex = next.indexOf(shotId);
+      if (targetIndex < 0) return;
+      next.splice(targetIndex, 0, sourceId);
+      store.getState().actions.reorderShots(next);
+    }}
     onMouseEnter={() => store.getState().actions.setHoveredEntity({ type: "shot", id: shotId })}
     onMouseLeave={() => store.getState().actions.setHoveredEntity(null)}
     onFocus={() => store.getState().actions.setFocusedEntity({ type: "shot", id: shotId })}
@@ -89,9 +116,12 @@ function ShotCard({ store, shotId }: Props & { shotId: string }) {
 
 export function SceneShotList({ store, onCreateShot }: Props) {
   const [scrollElement, setScrollElement] = useState<HTMLDivElement | null>(null);
+  const [pendingSceneId, setPendingSceneId] = useState<string | null>(null);
+  const [migrationSceneId, setMigrationSceneId] = useState("");
   const order = useStore(store, (state) => state.order);
   const expandedSceneIds = useStore(store, (state) => state.view.expandedSceneIds);
   const locateRequest = useStore(store, (state) => state.view.locateRequest);
+  const scenesById = useStore(store, (state) => state.entities.scenesById);
   const rows = useMemo(() => order.sceneIds.flatMap<ListRow>((sceneId) => [
     { type: "scene", id: sceneId },
     ...(expandedSceneIds.has(sceneId) ? (order.shotIdsByScene[sceneId] ?? []).map((id): ListRow => ({ type: "shot", id })) : []),
@@ -124,6 +154,14 @@ export function SceneShotList({ store, onCreateShot }: Props) {
     virtualizer.scrollToIndex(index, { align: "auto" });
   }, [locateRequest, rows, virtualizer]);
 
+  const requestSceneDelete = (sceneId: string) => {
+    const target = order.sceneIds.find((id) => id !== sceneId) ?? "";
+    setMigrationSceneId(target);
+    setPendingSceneId(sceneId);
+  };
+  const pendingScene = pendingSceneId ? scenesById[pendingSceneId] : null;
+  const pendingShotCount = pendingSceneId ? order.shotIdsByScene[pendingSceneId]?.length ?? 0 : 0;
+
   return <aside className="scene-shot-list" aria-label="按场景组织的镜头列表">
     <div className="scene-shot-list__heading"><div><h2>镜头列表</h2><p>按场景与管理顺序浏览</p></div>{onCreateShot && <button type="button" className="icon-action" aria-label="新建镜头" onClick={onCreateShot}><Plus size={17} aria-hidden="true" /></button>}</div>
     <div ref={setScrollElement} className="scene-shot-list__scroll" data-virtualized="true">
@@ -131,10 +169,27 @@ export function SceneShotList({ store, onCreateShot }: Props) {
         {virtualizer.getVirtualItems().map((item) => {
           const row = rows[item.index];
           return <div key={item.key} ref={virtualizer.measureElement} data-index={item.index} className={`scene-shot-list__row scene-shot-list__row--${row.type}`} style={{ transform: `translateY(${item.start}px)` }}>
-            {row.type === "scene" ? <SceneRow store={store} sceneId={row.id} /> : <ShotCard store={store} shotId={row.id} />}
+            {row.type === "scene" ? <SceneRow store={store} sceneId={row.id} onRequestDelete={requestSceneDelete} /> : <ShotCard store={store} shotId={row.id} />}
           </div>;
         })}
       </div>
     </div>
+    {pendingScene && <dialog open aria-labelledby="delete-scene-title" className="scene-shot-list__delete-dialog">
+      <h3 id="delete-scene-title">删除场景{pendingScene.title}</h3>
+      <p>该场景包含 {pendingShotCount} 个镜头。运行记录和已生成媒体不会被撤销。</p>
+      {pendingShotCount > 0 && <label>迁移到场景<select aria-label="迁移到场景" value={migrationSceneId} onChange={(event) => setMigrationSceneId(event.target.value)}>
+        {order.sceneIds.filter((id) => id !== pendingScene.id).map((id) => <option key={id} value={id}>{scenesById[id]?.title}</option>)}
+      </select></label>}
+      <div className="scene-shot-list__delete-actions">
+        <button type="button" className="secondary-action" onClick={() => setPendingSceneId(null)}>取消</button>
+        <button type="button" className="secondary-action" onClick={() => {
+          if (store.getState().actions.deleteScene(pendingScene.id, { deleteShots: true })) setPendingSceneId(null);
+        }}>确认删除场景及镜头</button>
+        <button type="button" className="primary-action" disabled={pendingShotCount > 0 && !migrationSceneId} onClick={() => {
+          const resolution = pendingShotCount > 0 ? { migrateToSceneId: migrationSceneId } : {};
+          if (store.getState().actions.deleteScene(pendingScene.id, resolution)) setPendingSceneId(null);
+        }}>{pendingShotCount > 0 ? "迁移镜头并删除场景" : "删除场景"}</button>
+      </div>
+    </dialog>}
   </aside>;
 }

@@ -127,7 +127,9 @@ export type PreproductionWorkspace = {
 };
 
 export type PreproductionSave = Pick<PreproductionWorkspace, "revision" | "brief"> & {
+  scenes: PreproductionScene[];
   shots: PreproductionShot[];
+  canvasLayout?: CanvasLayout;
 };
 
 const connectionError = "无法连接本地服务，请确认应用服务正在运行后重试。";
@@ -154,9 +156,18 @@ export function getPreproductionWorkspace(projectId: string): Promise<Preproduct
 }
 
 export function savePreproductionWorkspace(projectId: string, workspace: PreproductionSave): Promise<PreproductionWorkspace> {
+  const canvasLayout = workspace.canvasLayout?.scope.type === "project" && workspace.canvasLayout.scope.id === projectId
+    ? workspace.canvasLayout
+    : undefined;
   return request(baseUrl(projectId), {
     method: "PUT", headers: jsonHeaders,
-    body: JSON.stringify({ revision: workspace.revision, brief: workspace.brief, shots: workspace.shots }),
+    body: JSON.stringify({
+      revision: workspace.revision,
+      brief: workspace.brief,
+      scenes: workspace.scenes,
+      shots: workspace.shots,
+      ...(canvasLayout ? { canvasLayout } : {}),
+    }),
   }, "无法保存前置工作台，请刷新后重试。");
 }
 

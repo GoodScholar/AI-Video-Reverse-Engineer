@@ -12,6 +12,8 @@ from fastapi.testclient import TestClient
 
 from app.preproduction import PreproductionStore
 from app.preproduction_api import create_preproduction_router
+from app.canvas_layout import CanvasLayoutStore
+from app.timeline import TimelineStore
 
 
 PROJECT_ID = "project-001"
@@ -88,6 +90,112 @@ def test_new_shot_keeps_its_custom_scene_on_legacy_workspace_save(tmp_path):
 
     assert saved.status_code == 200, saved.text
     assert saved.json()["shots"][0]["sceneId"] == "scene-custom"
+
+
+def test_save_persists_scene_ownership_and_rank_without_touching_layout_or_timeline(tmp_path):
+    client, _, _ = setup(tmp_path)
+    store = PreproductionStore(tmp_path)
+    state = store.load(PROJECT_ID)
+    state["scenes"] = [
+        {"id": "scene-a", "title": "相遇", "rank": "00000001", "description": ""},
+        {"id": "scene-b", "title": "追逐", "rank": "00000002", "description": ""},
+    ]
+    state["shots"] = [
+        {"id": "shot-a", "sceneId": "scene-a", "rank": "00000001", "title": "镜头 A", "duration": 2,
+         "prompt": "", "negativePrompt": "", "assetIds": [], "nodes": [], "resultAssetId": None, "_resultVersions": []},
+        {"id": "shot-b", "sceneId": "scene-b", "rank": "00000002", "title": "镜头 B", "duration": 2,
+         "prompt": "", "negativePrompt": "", "assetIds": [], "nodes": [], "resultAssetId": None, "_resultVersions": []},
+    ]
+    store.save(PROJECT_ID, state)
+    layout_url = BASE + f"/layouts/project/{PROJECT_ID}"
+    layout = client.get(layout_url).json()
+    saved_layout = client.put(layout_url, json={
+        "layoutRevision": layout["layoutRevision"], "nodes": layout["nodes"],
+        "viewport": {"x": 90, "y": 40, "zoom": 1.2},
+    }).json()
+    timeline_store = TimelineStore(tmp_path)
+    timeline = timeline_store.load(PROJECT_ID)
+    timeline["revision"] = 7
+    timeline_store.save(PROJECT_ID, timeline)
+
+    current = client.get(BASE).json()
+    saved = client.put(BASE, json={
+        "revision": current["revision"],
+        "brief": current["brief"],
+        "scenes": current["scenes"],
+        "shots": [
+            {**current["shots"][1], "rank": "00000001", "sceneId": "scene-a"},
+            {**current["shots"][0], "rank": "00000002", "sceneId": "scene-b"},
+        ],
+    })
+
+    assert saved.status_code == 200, saved.text
+    assert [(shot["id"], shot["sceneId"], shot["rank"]) for shot in saved.json()["shots"]] == [
+        ("shot-b", "scene-a", "00000001"),
+        ("shot-a", "scene-b", "00000002"),
+    ]
+    assert client.get(layout_url).json() == saved_layout
+    assert timeline_store.load(PROJECT_ID) == timeline
+
+
+def test_canvas_shot_creation_saves_content_and_initial_layout_as_one_transaction(tmp_path):
+    client, _, _ = setup(tmp_path)
+    current = client.get(BASE).json()
+
+    saved = client.put(BASE, json={
+        "revision": current["revision"],
+        "brief": current["brief"],
+        "scenes": current["scenes"],
+        "shots": [{
+            "id": "shot-canvas", "sceneId": "scene-default", "rank": "00000001",
+            "title": "画布镜头", "duration": 3, "prompt": "", "negativePrompt": "",
+            "assetIds": [], "nodes": [],
+        }],
+        "canvasLayout": {
+            **current["canvasLayout"],
+            "nodes": {
+                **current["canvasLayout"]["nodes"],
+                "shot:shot-canvas": {"x": 520, "y": 240},
+            },
+        },
+    })
+
+    assert saved.status_code == 200, saved.text
+    assert [shot["id"] for shot in saved.json()["shots"]] == ["shot-canvas"]
+    assert saved.json()["canvasLayout"]["layoutRevision"] == 1
+    assert saved.json()["canvasLayout"]["nodes"]["shot:shot-canvas"] == {"x": 520, "y": 240}
+
+
+def test_canvas_shot_creation_rolls_back_content_when_layout_save_fails(tmp_path, monkeypatch):
+    client, _, _ = setup(tmp_path)
+    current = client.get(BASE).json()
+
+    def fail_layout_save(self, project_id, layout):
+        raise OSError("layout unavailable")
+
+    monkeypatch.setattr(CanvasLayoutStore, "_save", fail_layout_save)
+    failed = client.put(BASE, json={
+        "revision": current["revision"],
+        "brief": current["brief"],
+        "scenes": current["scenes"],
+        "shots": [{
+            "id": "shot-canvas", "sceneId": "scene-default", "rank": "00000001",
+            "title": "画布镜头", "duration": 3, "prompt": "", "negativePrompt": "",
+            "assetIds": [], "nodes": [],
+        }],
+        "canvasLayout": {
+            **current["canvasLayout"],
+            "nodes": {
+                **current["canvasLayout"]["nodes"],
+                "shot:shot-canvas": {"x": 520, "y": 240},
+            },
+        },
+    })
+
+    assert failed.status_code == 503
+    restored = PreproductionStore(tmp_path).load(PROJECT_ID)
+    assert restored["revision"] == current["revision"]
+    assert restored["shots"] == []
 
 
 def test_canvas_layout_persists_with_an_independent_revision(tmp_path):

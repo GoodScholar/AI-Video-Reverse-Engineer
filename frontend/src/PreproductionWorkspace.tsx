@@ -66,15 +66,18 @@ function emptyWorkspace(projectId: string): Workspace {
 }
 
 function editableSnapshot(workspace: Workspace | null) {
-  return workspace ? JSON.stringify({ revision: workspace.revision, brief: workspace.brief, shots: workspace.shots }) : "";
+  return workspace ? JSON.stringify({ revision: workspace.revision, brief: workspace.brief, scenes: workspace.scenes, shots: workspace.shots }) : "";
 }
 
 function draftKey(projectId: string) { return `aivre:preproduction-draft:${projectId}`; }
-async function readDraft(cache: ReturnType<typeof createDraftCache>): Promise<{ draft: Pick<Workspace, "revision" | "brief" | "shots">; baseline: string } | null> {
+async function readDraft(cache: ReturnType<typeof createDraftCache>): Promise<{
+  draft: Pick<Workspace, "revision" | "brief" | "shots"> & { scenes?: Workspace["scenes"] };
+  baseline: string;
+} | null> {
   try {
     const cached = JSON.parse(await cache.read() ?? "null");
     if (!cached || typeof cached.baseline !== "string" || !Number.isInteger(cached.draft?.revision)
-      || !cached.draft.brief || !Array.isArray(cached.draft.shots)
+      || !cached.draft.brief || (cached.draft.scenes !== undefined && !Array.isArray(cached.draft.scenes)) || !Array.isArray(cached.draft.shots)
       || !cached.draft.shots.every((shot: PreproductionShot) => shot && Array.isArray(shot.nodes) && Array.isArray(shot.assetIds))) return null;
     return cached;
   } catch { return null; }
@@ -180,7 +183,11 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
         accept(next);
         return;
       }
-      workspaceStore.getState().actions.restoreDraft({ ...next, ...cached.draft }, cached.baseline);
+      workspaceStore.getState().actions.restoreDraft({
+        ...next,
+        ...cached.draft,
+        scenes: cached.draft.scenes ?? next.scenes,
+      }, cached.baseline);
       setSavedWorkspace(next);
       setDraftNotice(next.revision === cached.draft.revision
         ? "已恢复此浏览器保存的未保存草稿，请保存更改。"
@@ -215,7 +222,7 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
     if (loading || !workspace || loadedProjectRef.current !== project.id) return;
     let active = true;
     void draftCache.write(dirty ? JSON.stringify({
-      draft: { revision: workspace.revision, brief: workspace.brief, shots: workspace.shots }, baseline: savedSnapshot,
+      draft: { revision: workspace.revision, brief: workspace.brief, scenes: workspace.scenes, shots: workspace.shots }, baseline: savedSnapshot,
     }) : null).then(() => { if (active && !dirty) setDraftNotice(""); })
       .catch((reason) => { if (active) setDraftNotice(errorMessage(reason, "浏览器无法缓存草稿，请在离开项目前保存更改。")); });
     return () => { active = false; };
@@ -229,6 +236,12 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
   }, [dirty]);
 
   function edit(change: (current: Workspace) => Workspace) { workspaceStore.getState().actions.editWorkspace(change); }
+
+  function addShot(position?: { x: number; y: number }) {
+    const sceneId = workspace.scenes[0]?.id ?? "scene-default";
+    const shot = createShot(sceneId, String(workspace.shots.length + 1).padStart(8, "0"));
+    workspaceStore.getState().actions.createShot(shot, position);
+  }
 
   function deleteSelectedNode() {
     if (!selectedShot || !selectedNode) return;
@@ -245,7 +258,13 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
     setBusy("save"); setError("");
     workspaceStore.getState().actions.setSaveStatus("saving");
     const submittedSnapshot = workspaceStore.getState().persistence.editableSnapshot;
-    try { accept(await savePreproductionWorkspace(project.id, workspace), submittedSnapshot); }
+    try {
+      const saved = await savePreproductionWorkspace(project.id, workspace);
+      accept(saved, submittedSnapshot);
+      if (saved.canvasLayout.scope.type === "project" && saved.canvasLayout.scope.id === project.id) {
+        workspaceStore.getState().actions.acceptLayout(saved.canvasLayout, true);
+      }
+    }
     catch (reason) {
       const message = errorMessage(reason, "无法保存前置工作台。");
       workspaceStore.getState().actions.setSaveStatus(message.includes("冲突") || message.includes("已被更新") ? "conflict" : "error", message);
@@ -373,7 +392,7 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
           })()}
         </section>}
 
-        {section === "shots" && <ShotWorkspaceLayout projectId={project.id} store={workspaceStore} onCreateShot={() => { const shot = createShot(workspace.scenes[0]?.id ?? "scene-default", String(workspace.shots.length + 1).padStart(8, "0")); edit((current) => ({ ...current, shots: [...current.shots, shot] })); workspaceStore.getState().actions.selectShot(shot.id); }}>
+        {section === "shots" && <ShotWorkspaceLayout projectId={project.id} store={workspaceStore} onCreateShot={addShot}>
           <section className="preproduction-workspace-inspector" aria-label="镜头检查器">
           {selectedScene ? <section className="preproduction-selection-summary" aria-label={`${selectedScene.title}场景摘要`}>
             <h3>场景摘要</h3>
@@ -401,7 +420,7 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
                 onSelect={(assetId) => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, resultAssetId: assetId })))} onReview={(assetId) => void reviewResult(assetId)} />
             </div>
             <div className="preproduction-nodes"><div className="preproduction-list-heading"><h4>有序步骤</h4><select aria-label="添加节点类型" defaultValue="" onChange={(event) => { const kind = event.target.value as NodeKind; if (!kind) return; const node = createNode(kind); edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, nodes: [...shot.nodes, node] }))); workspaceStore.getState().actions.selectNode(selectedShot.id, node.id); event.currentTarget.value = ""; }}><option value="">添加节点…</option>{workspace.nodeCatalog.map((node) => <option key={node.kind} value={node.kind}>{node.label}</option>)}</select></div>{selectedShot.nodes.length ? <ol>{selectedShot.nodes.map((node, index) => <li key={node.id} className={node.id === selectedNode?.id ? "is-active" : ""}><button type="button" onClick={() => workspaceStore.getState().actions.selectNode(selectedShot.id, node.id)}><span>{index + 1}</span>{kindLabels[node.kind]}<small className={`preproduction-status preproduction-status--${node.status}`}>{statusLabels[node.status]}</small></button></li>)}</ol> : <p>添加步骤以整理镜头输入和产物。</p>}</div>
-          </> : <div className="preproduction-empty"><h3>从已有参考或分镜开始</h3><p>导入现有内容，或新建镜头来准备下一步。</p><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("reference")}>导入参考素材</button><button type="button" className="primary-action" onClick={() => { const shot = createShot(workspace.scenes[0]?.id ?? "scene-default", "00000001"); edit((current) => ({ ...current, shots: [shot] })); workspaceStore.getState().actions.selectShot(shot.id); }}>新建镜头</button></div>}</div>
+          </> : <div className="preproduction-empty"><h3>从已有参考或分镜开始</h3><p>导入现有内容，或新建镜头来准备下一步。</p><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("reference")}>导入参考素材</button><button type="button" className="primary-action" onClick={() => addShot()}>新建镜头</button></div>}</div>
           <aside className="preproduction-node-inspector">{selectedShot && selectedNode ? <><h3>步骤参数</h3><label>节点类型<select value={selectedNode.kind} onChange={(event) => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, nodes: shot.nodes.map((node) => node.id === selectedNode.id ? { ...node, kind: event.target.value as NodeKind, params: event.target.value === "prompt" ? { text: "" } : {}, status: "pending", artifacts: [] } : node) })))}>{workspace.nodeCatalog.map((node) => <option key={node.kind} value={node.kind}>{node.label}</option>)}</select></label>{selectedNode.kind !== "prompt" && <label>输入<select value={selectedNode.input} onChange={(event) => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, nodes: shot.nodes.map((node) => node.id === selectedNode.id ? { ...node, input: event.target.value, status: "pending", artifacts: [] } : node) })))}><InputOptions workspace={workspace} shot={selectedShot} nodeIndex={selectedShot.nodes.findIndex((node) => node.id === selectedNode.id)} /></select></label>}<NodeParameters node={selectedNode} onChange={(params) => edit((current) => updateShot(current, selectedShot.id, (shot) => ({ ...shot, nodes: shot.nodes.map((node) => node.id === selectedNode.id ? { ...node, params, status: "pending", artifacts: [] } : node) })))} />
             <p className={`preproduction-node-status preproduction-node-status--${selectedNode.status}`}>{statusLabels[selectedNode.status]}{selectedNode.error ? `：${selectedNode.error}` : ""}</p>{selectedNode.artifacts.map((artifact) => <a key={artifact.name} href={artifact.url} download>下载 {artifact.name}</a>)}{!selectedInputReady && <p className="preproduction-save-note">等待所选前序节点完成后才能运行。</p>}<button type="button" className="primary-action" disabled={!canRun} onClick={() => void runNode()}><Play size={16} aria-hidden="true" />{busy === "run" ? "正在提交…" : "运行当前节点"}</button><button type="button" className="icon-action" aria-label="删除当前节点" onClick={deleteSelectedNode}><Trash2 size={17} /></button>{dirty && <p className="preproduction-save-note">先保存更改，才能运行或导出。</p>}</> : <p className="preproduction-empty">选择一个步骤后编辑参数。</p>}</aside>
           {selectedShot && <CandidateResultComparison shot={selectedShot} assets={workspace.assets} disabled={Boolean(busy) || hasActiveNodes} />}

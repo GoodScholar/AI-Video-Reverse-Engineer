@@ -27,6 +27,11 @@ export type WorkspaceViewScope = { type: "project" } | { type: "shot"; id: strin
 type LayoutScope = CanvasLayout["scope"];
 type LayoutNodes = CanvasLayout["nodes"];
 type LayoutPosition = Pick<LayoutNodes[string], "x" | "y">;
+type OrganizationSnapshot = {
+  scenes: PreproductionScene[];
+  shots: PreproductionShot[];
+  layoutNodes: LayoutNodes;
+};
 
 export type SceneSection = { sceneId: string; shotIds: string[] };
 
@@ -69,6 +74,10 @@ export type PreproductionWorkspaceState = {
     saveStatus: "idle" | "saving" | "conflict" | "error";
     conflictMessage: string | null;
   };
+  organizationHistory: {
+    history: OrganizationSnapshot[];
+    future: OrganizationSnapshot[];
+  };
   persistence: {
     revision: number;
     savedSnapshot: string;
@@ -87,6 +96,16 @@ export type PreproductionWorkspaceState = {
     replaceShots: (shots: PreproductionShot[]) => void;
     duplicateShot: (shotId: string) => void;
     moveShot: (shotId: string, direction: -1 | 1) => void;
+    reorderShots: (orderedShotIds: string[]) => boolean;
+    moveShotsToScene: (shotIds: string[], sceneId: string) => boolean;
+    createShot: (shot: PreproductionShot, position?: LayoutPosition) => boolean;
+    placeShotOnCanvas: (shotId: string, position: LayoutPosition) => CanvasLayout | null;
+    deleteScene: (
+      sceneId: string,
+      resolution: { migrateToSceneId?: string; deleteShots?: boolean },
+    ) => boolean;
+    undoOrganization: () => boolean;
+    redoOrganization: () => boolean;
     selectShot: (shotId: string, options?: ShotSelectionOptions) => void;
     selectShots: (shotIds: string[], source?: SelectionSource) => void;
     selectNode: (shotId: string, nodeId: string, source?: SelectionSource) => void;
@@ -125,8 +144,13 @@ function compareRank(left: { rank: string; id: string }, right: { rank: string; 
   return left.rank.localeCompare(right.rank) || left.id.localeCompare(right.id);
 }
 
-function editableSnapshot(revision: number, brief: PreproductionBrief, shots: PreproductionShot[]) {
-  return JSON.stringify({ revision, brief, shots });
+function editableSnapshot(
+  revision: number,
+  brief: PreproductionBrief,
+  scenes: PreproductionScene[],
+  shots: PreproductionShot[],
+) {
+  return JSON.stringify({ revision, brief, scenes, shots });
 }
 
 export function canvasLayoutScopeKey(scope: LayoutScope) {
@@ -294,7 +318,12 @@ export function selectWorkspaceSnapshot(state: PreproductionWorkspaceState): Pre
 
 function initialState(workspace: PreproductionWorkspace) {
   const normalized = normalize(workspace);
-  const snapshot = editableSnapshot(workspace.revision, workspace.brief, selectShots(normalized.order, normalized.entities.shotsById));
+  const snapshot = editableSnapshot(
+    workspace.revision,
+    workspace.brief,
+    selectScenes(normalized.order, normalized.entities.scenesById),
+    selectShots(normalized.order, normalized.entities.shotsById),
+  );
   const firstShotId = normalized.order.sceneIds.flatMap((sceneId) => normalized.order.shotIdsByScene[sceneId] ?? [])[0] ?? null;
   const layout = workspace.canvasLayout ?? { scope: { type: "project" as const, id: "legacy" }, layoutRevision: 0, nodes: {} };
   const layoutKey = canvasLayoutScopeKey(layout.scope);
@@ -328,6 +357,7 @@ function initialState(workspace: PreproductionWorkspace) {
       saveStatus: "idle" as const,
       conflictMessage: null,
     },
+    organizationHistory: { history: [], future: [] },
     persistence: {
       revision: workspace.revision,
       savedSnapshot: snapshot,
@@ -342,6 +372,10 @@ function initialState(workspace: PreproductionWorkspace) {
 function selectShots(order: PreproductionWorkspaceState["order"], shotsById: Record<string, PreproductionShot>) {
   return order.sceneIds.flatMap((sceneId) => order.shotIdsByScene[sceneId] ?? [])
     .map((id) => shotsById[id]).filter(Boolean);
+}
+
+function selectScenes(order: PreproductionWorkspaceState["order"], scenesById: Record<string, PreproductionScene>) {
+  return order.sceneIds.map((id) => scenesById[id]).filter(Boolean);
 }
 
 function orderedShotIds(state: PreproductionWorkspaceState) {
@@ -379,6 +413,7 @@ function withDirtyState(state: PreproductionWorkspaceState, change: Partial<Prep
   const snapshot = editableSnapshot(
     projected.persistence.revision,
     projected.brief,
+    selectScenes(projected.order, projected.entities.scenesById),
     shots,
   );
   return {
@@ -388,6 +423,50 @@ function withDirtyState(state: PreproductionWorkspaceState, change: Partial<Prep
       editableSnapshot: snapshot,
       dirty: snapshot !== projected.persistence.savedSnapshot,
       saveStatus: projected.persistence.saveStatus === "conflict" ? "conflict" as const : "idle" as const,
+    },
+  };
+}
+
+function organizationSnapshot(state: PreproductionWorkspaceState): OrganizationSnapshot {
+  return {
+    scenes: selectScenes(state.order, state.entities.scenesById),
+    shots: selectShots(state.order, state.entities.shotsById),
+    layoutNodes: cloneLayoutNodes(state.layout.nodes),
+  };
+}
+
+function restoreOrganizationSnapshot(
+  state: PreproductionWorkspaceState,
+  snapshot: OrganizationSnapshot,
+) {
+  const normalized = normalize({
+    ...selectWorkspaceSnapshot(state),
+    scenes: snapshot.scenes,
+    shots: snapshot.shots,
+  });
+  const next = withDirtyState(state, normalized);
+  const layout = { ...next.layout, nodes: cloneLayoutNodes(snapshot.layoutNodes) };
+  return { ...next, ...withCachedLayout(next, layout) };
+}
+
+function commitOrganization(
+  state: PreproductionWorkspaceState,
+  scenes: PreproductionScene[],
+  shots: PreproductionShot[],
+  layoutNodes: LayoutNodes = state.layout.nodes,
+) {
+  const before = organizationSnapshot(state);
+  const normalized = normalize({ ...selectWorkspaceSnapshot(state), scenes, shots });
+  let next = withDirtyState(state, normalized);
+  if (layoutNodes !== state.layout.nodes) {
+    const layout = { ...next.layout, nodes: cloneLayoutNodes(layoutNodes) };
+    next = { ...next, ...withCachedLayout(next, layout) };
+  }
+  return {
+    ...next,
+    organizationHistory: {
+      history: [...state.organizationHistory.history, before],
+      future: [],
     },
   };
 }
@@ -418,11 +497,21 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
           if (next.revision < state.persistence.revision) return state;
           const keepNewerDraft = Boolean(submittedSnapshot && state.persistence.editableSnapshot !== submittedSnapshot);
           const accepted = keepNewerDraft
-            ? { ...next, brief: state.brief, shots: selectShots(state.order, state.entities.shotsById) }
+            ? {
+                ...next,
+                brief: state.brief,
+                scenes: selectScenes(state.order, state.entities.scenesById),
+                shots: selectShots(state.order, state.entities.shotsById),
+              }
             : next;
           const base = initialState(accepted);
           const savedState = normalize(next);
-          const saved = editableSnapshot(next.revision, next.brief, selectShots(savedState.order, savedState.entities.shotsById));
+          const saved = editableSnapshot(
+            next.revision,
+            next.brief,
+            selectScenes(savedState.order, savedState.entities.scenesById),
+            selectShots(savedState.order, savedState.entities.shotsById),
+          );
           const primary = state.selection.primaryEntity;
           const validPrimary = primary?.type === "shot" && base.entities.shotsById[primary.id]
             ? primary
@@ -440,7 +529,12 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
           for (const sceneId of base.order.sceneIds) {
             if (!previousSceneIds.has(sceneId)) expandedSceneIds.add(sceneId);
           }
-          const draftSnapshot = editableSnapshot(next.revision, accepted.brief, selectShots(base.order, base.entities.shotsById));
+          const draftSnapshot = editableSnapshot(
+            next.revision,
+            accepted.brief,
+            selectScenes(base.order, base.entities.scenesById),
+            selectShots(base.order, base.entities.shotsById),
+          );
           return {
             ...base,
             actions: state.actions,
@@ -558,11 +652,197 @@ export function createPreproductionWorkspaceStore(workspace: PreproductionWorksp
           [nextIds[from], nextIds[to]] = [nextIds[to], nextIds[from]];
           const order = { ...state.order, shotIdsByScene: { ...state.order.shotIdsByScene, [shot.sceneId]: nextIds } };
           const shotsById = rerankShots(order, state.entities.shotsById);
-          return withDirtyState(state, {
-            entities: { ...state.entities, shotsById },
-            order,
+          return commitOrganization(
+            state,
+            selectScenes(state.order, state.entities.scenesById),
+            selectShots(order, shotsById),
+          );
+        });
+      },
+      reorderShots(orderedIds) {
+        let changed = false;
+        set((state) => {
+          const existingIds = orderedShotIds(state);
+          if (orderedIds.length !== existingIds.length
+            || new Set(orderedIds).size !== orderedIds.length
+            || orderedIds.some((id) => !state.entities.shotsById[id])) return state;
+          if (orderedIds.every((id, index) => id === existingIds[index])) return state;
+          const shots = orderedIds.map((id, index) => ({
+            ...state.entities.shotsById[id],
+            rank: String(index + 1).padStart(8, "0"),
+          }));
+          changed = true;
+          return commitOrganization(
+            state,
+            selectScenes(state.order, state.entities.scenesById),
+            shots,
+          );
+        });
+        return changed;
+      },
+      moveShotsToScene(shotIds, sceneId) {
+        let changed = false;
+        set((state) => {
+          if (!state.entities.scenesById[sceneId]
+            || !shotIds.length
+            || new Set(shotIds).size !== shotIds.length
+            || shotIds.some((id) => !state.entities.shotsById[id])) return state;
+          if (shotIds.every((id) => state.entities.shotsById[id].sceneId === sceneId)) return state;
+          const requested = new Set(shotIds);
+          const shots = orderedShotIds(state).map((id) => {
+            const shot = state.entities.shotsById[id];
+            return requested.has(id) ? { ...shot, sceneId } : shot;
+          });
+          changed = true;
+          return commitOrganization(
+            state,
+            selectScenes(state.order, state.entities.scenesById),
+            shots,
+          );
+        });
+        return changed;
+      },
+      createShot(shot, position) {
+        let created = false;
+        set((state) => {
+          const nodeId = `shot:${encodeURIComponent(shot.id)}`;
+          if (state.entities.shotsById[shot.id]
+            || !state.entities.scenesById[shot.sceneId]
+            || Object.values(state.entities.shotsById).some((item) => item.rank === shot.rank)
+            || state.layout.nodes[nodeId]) return state;
+          const shots = [...selectShots(state.order, state.entities.shotsById), shot];
+          const nodes = position
+            ? { ...state.layout.nodes, [nodeId]: { x: position.x, y: position.y } }
+            : state.layout.nodes;
+          created = true;
+          const next = commitOrganization(
+            state,
+            selectScenes(state.order, state.entities.scenesById),
+            shots,
+            nodes,
+          );
+          return {
+            ...next,
+            selection: {
+              ...next.selection,
+              primaryEntity: { type: "shot", id: shot.id },
+              selectedShotIds: new Set([shot.id]),
+              selectionAnchorShotId: shot.id,
+            },
+            view: {
+              ...next.view,
+              expandedSceneIds: new Set([...next.view.expandedSceneIds, shot.sceneId]),
+              locateRequest: locateRequest(next, { type: "shot", id: shot.id }, "external"),
+            },
+          };
+        });
+        return created;
+      },
+      placeShotOnCanvas(shotId, position) {
+        let result: CanvasLayout | null = null;
+        set((state) => {
+          if (!state.entities.shotsById[shotId]) return state;
+          const nodeId = `shot:${encodeURIComponent(shotId)}`;
+          const previous = cloneLayoutNodes(state.layout.nodes);
+          const current = previous[nodeId];
+          if (current?.x === position.x && current.y === position.y) return state;
+          const key = canvasLayoutScopeKey(state.layout.scope);
+          const layout = {
+            ...state.layout,
+            nodes: { ...state.layout.nodes, [nodeId]: { ...current, x: position.x, y: position.y } },
+          };
+          result = layout;
+          return withCachedLayout(state, layout, {
+            historyByScope: {
+              ...state.layoutPersistence.historyByScope,
+              [key]: [...(state.layoutPersistence.historyByScope[key] ?? []), previous],
+            },
+            futureByScope: { ...state.layoutPersistence.futureByScope, [key]: [] },
           });
         });
+        return result;
+      },
+      deleteScene(sceneId, resolution) {
+        let deleted = false;
+        set((state) => {
+          if (!state.entities.scenesById[sceneId] || state.order.sceneIds.length <= 1) return state;
+          const affectedIds = state.order.shotIdsByScene[sceneId] ?? [];
+          if (affectedIds.length && !resolution.migrateToSceneId && !resolution.deleteShots) return state;
+          if (resolution.migrateToSceneId
+            && (resolution.migrateToSceneId === sceneId || !state.entities.scenesById[resolution.migrateToSceneId])) return state;
+          if (resolution.deleteShots && affectedIds.some((id) => state.entities.shotsById[id].nodes
+            .some((node) => node.status === "queued" || node.status === "running"))) return state;
+          const scenes = selectScenes(state.order, state.entities.scenesById).filter((scene) => scene.id !== sceneId);
+          const affected = new Set(affectedIds);
+          const shots = selectShots(state.order, state.entities.shotsById)
+            .filter((shot) => !resolution.deleteShots || !affected.has(shot.id))
+            .map((shot) => affected.has(shot.id) && resolution.migrateToSceneId
+              ? { ...shot, sceneId: resolution.migrateToSceneId }
+              : shot);
+          const nodes = { ...state.layout.nodes };
+          delete nodes[sceneId];
+          if (resolution.deleteShots) {
+            for (const shotId of affectedIds) delete nodes[`shot:${encodeURIComponent(shotId)}`];
+          }
+          deleted = true;
+          const next = commitOrganization(state, scenes, shots, nodes);
+          const selectedShotIds = new Set([...next.selection.selectedShotIds].filter((id) => next.entities.shotsById[id]));
+          const primary = next.selection.primaryEntity;
+          const primaryEntity = primary?.type === "scene" && primary.id === sceneId
+            ? null
+            : primary?.type === "shot" && !next.entities.shotsById[primary.id]
+              ? null
+              : primary?.type === "processNode" && !next.entities.shotsById[primary.shotId]
+                ? null
+                : primary;
+          return {
+            ...next,
+            selection: { ...next.selection, primaryEntity, selectedShotIds },
+            view: {
+              ...next.view,
+              expandedSceneIds: new Set([...next.view.expandedSceneIds].filter((id) => id !== sceneId)),
+            },
+          };
+        });
+        return deleted;
+      },
+      undoOrganization() {
+        let undone = false;
+        set((state) => {
+          const history = state.organizationHistory.history;
+          const previous = history[history.length - 1];
+          if (!previous) return state;
+          undone = true;
+          const current = organizationSnapshot(state);
+          const next = restoreOrganizationSnapshot(state, previous);
+          return {
+            ...next,
+            organizationHistory: {
+              history: history.slice(0, -1),
+              future: [...state.organizationHistory.future, current],
+            },
+          };
+        });
+        return undone;
+      },
+      redoOrganization() {
+        let redone = false;
+        set((state) => {
+          const future = state.organizationHistory.future;
+          const nextSnapshot = future[future.length - 1];
+          if (!nextSnapshot) return state;
+          redone = true;
+          const current = organizationSnapshot(state);
+          const next = restoreOrganizationSnapshot(state, nextSnapshot);
+          return {
+            ...next,
+            organizationHistory: {
+              history: [...state.organizationHistory.history, current],
+              future: future.slice(0, -1),
+            },
+          };
+        });
+        return redone;
       },
       selectShot(shotId, options = {}) {
         const shot = get().entities.shotsById[shotId];

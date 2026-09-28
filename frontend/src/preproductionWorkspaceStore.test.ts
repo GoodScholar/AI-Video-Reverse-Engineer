@@ -31,6 +31,114 @@ function workspace(): PreproductionWorkspace {
 }
 
 describe("preproductionWorkspaceStore", () => {
+  it("列表批量重排只修改 Shot.rank，并作为一次领域事务撤销重做", () => {
+    const current = workspace();
+    current.canvasLayout.nodes = {
+      "scene-a": { x: 0, y: 0 },
+      "shot:shot-a1": { x: 40, y: 80 },
+      "shot:shot-a2": { x: 300, y: 80 },
+    };
+    const store = createPreproductionWorkspaceStore(current);
+    const workflowBefore = structuredClone(selectWorkspaceSnapshot(store.getState()).workflow);
+    const layoutBefore = structuredClone(store.getState().layout);
+
+    store.getState().actions.reorderShots(["shot-a2", "shot-a1", "shot-b1", "shot-b2"]);
+
+    expect(selectWorkspaceSnapshot(store.getState()).shots.map((shot) => [shot.id, shot.rank])).toEqual([
+      ["shot-a2", "00000001"], ["shot-a1", "00000002"], ["shot-b1", "00000003"], ["shot-b2", "00000004"],
+    ]);
+    const workflowAfter = selectWorkspaceSnapshot(store.getState()).workflow;
+    expect(workflowAfter.edges).toEqual(workflowBefore.edges);
+    expect([...workflowAfter.nodes].sort((left, right) => left.id.localeCompare(right.id)))
+      .toEqual([...workflowBefore.nodes].sort((left, right) => left.id.localeCompare(right.id)));
+    expect(store.getState().layout).toEqual(layoutBefore);
+    expect(store.getState().organizationHistory.history).toHaveLength(1);
+
+    store.getState().actions.undoOrganization();
+    expect(selectWorkspaceSnapshot(store.getState()).shots.map((shot) => shot.id)).toEqual([
+      "shot-a1", "shot-a2", "shot-b1", "shot-b2",
+    ]);
+    store.getState().actions.redoOrganization();
+    expect(selectWorkspaceSnapshot(store.getState()).shots.map((shot) => shot.id)).toEqual([
+      "shot-a2", "shot-a1", "shot-b1", "shot-b2",
+    ]);
+  });
+
+  it("批量移入场景只改变归属并完整保留镜头、候选、素材和依赖", () => {
+    const current = workspace();
+    current.shots = current.shots.map((shot) => shot.id === "shot-a1" ? {
+      ...shot,
+      resultAssetId: "result-1",
+      resultVersions: [{ assetId: "result-1", reviewed: true, planChanged: false }],
+      assetIds: ["asset-1"],
+      nodes: [{ id: "prompt", kind: "prompt", input: "", params: { text: "保留" }, status: "completed", artifacts: [{ name: "prompt.txt", url: "/prompt.txt" }] }],
+    } : shot);
+    const store = createPreproductionWorkspaceStore(current);
+    const shotBefore = structuredClone(store.getState().entities.shotsById["shot-a1"]);
+    const workflowBefore = structuredClone(selectWorkspaceSnapshot(store.getState()).workflow);
+    const layoutBefore = structuredClone(store.getState().layout);
+
+    store.getState().actions.moveShotsToScene(["shot-a1", "shot-a2"], "scene-b");
+
+    expect(store.getState().entities.shotsById["shot-a1"]).toEqual({ ...shotBefore, sceneId: "scene-b" });
+    expect(selectWorkspaceSnapshot(store.getState()).workflow).toEqual(workflowBefore);
+    expect(store.getState().layout).toEqual(layoutBefore);
+    expect(store.getState().order.shotIdsByScene["scene-a"]).toEqual([]);
+    expect(store.getState().organizationHistory.history).toHaveLength(1);
+  });
+
+  it("画布创建镜头原子加入 Shot、唯一 ShotNode 和初始布局并可一次撤销", () => {
+    const store = createPreproductionWorkspaceStore(workspace());
+    const shot = {
+      id: "shot-new", sceneId: "scene-a", rank: "00000005", title: "画布镜头", duration: 3,
+      prompt: "", negativePrompt: "", assetIds: [], nodes: [],
+    };
+
+    expect(store.getState().actions.createShot(shot, { x: 420, y: 180 })).toBe(true);
+
+    expect(store.getState().entities.shotsById["shot-new"]).toEqual(shot);
+    expect(Object.values(store.getState().entities.workflowNodesById).filter((node) => node.type === "shot" && node.shotId === "shot-new")).toHaveLength(1);
+    expect(store.getState().layout.nodes["shot:shot-new"]).toMatchObject({ x: 420, y: 180 });
+    expect(store.getState().organizationHistory.history).toHaveLength(1);
+
+    store.getState().actions.undoOrganization();
+    expect(store.getState().entities.shotsById["shot-new"]).toBeUndefined();
+    expect(store.getState().layout.nodes["shot:shot-new"]).toBeUndefined();
+    store.getState().actions.redoOrganization();
+    expect(store.getState().entities.shotsById["shot-new"]).toBeDefined();
+    expect(store.getState().layout.nodes["shot:shot-new"]).toMatchObject({ x: 420, y: 180 });
+  });
+
+  it("列表镜头投放画布只摆放现有规范 ShotNode 并进入布局历史", () => {
+    const store = createPreproductionWorkspaceStore(workspace());
+    const contentBefore = selectWorkspaceSnapshot(store.getState());
+
+    const layout = store.getState().actions.placeShotOnCanvas("shot-a1", { x: 520, y: 240 });
+
+    expect(layout?.nodes["shot:shot-a1"]).toMatchObject({ x: 520, y: 240 });
+    expect(Object.values(store.getState().entities.workflowNodesById)
+      .filter((node) => node.type === "shot" && node.shotId === "shot-a1")).toHaveLength(1);
+    expect(selectWorkspaceSnapshot(store.getState()).shots).toEqual(contentBefore.shots);
+    expect(store.getState().organizationHistory.history).toHaveLength(0);
+    expect(store.getState().layoutPersistence.historyByScope["project:project-1"]).toHaveLength(1);
+  });
+
+  it("删除非空场景必须显式迁移或确认删除影响", () => {
+    const store = createPreproductionWorkspaceStore(workspace());
+
+    expect(store.getState().actions.deleteScene("scene-a", {})).toBe(false);
+    expect(store.getState().entities.scenesById["scene-a"]).toBeDefined();
+    expect(store.getState().actions.deleteScene("scene-a", { migrateToSceneId: "scene-b" })).toBe(true);
+    expect(store.getState().entities.scenesById["scene-a"]).toBeUndefined();
+    expect(store.getState().order.shotIdsByScene["scene-b"]).toEqual([
+      "shot-a1", "shot-a2", "shot-b1", "shot-b2",
+    ]);
+
+    store.getState().actions.undoOrganization();
+    expect(store.getState().entities.scenesById["scene-a"]).toBeDefined();
+    expect(store.getState().order.shotIdsByScene["scene-a"]).toEqual(["shot-a1", "shot-a2"]);
+  });
+
   it("首次服务端回包默认展开新场景并选中首个镜头", () => {
     const empty = workspace();
     empty.revision = 0;

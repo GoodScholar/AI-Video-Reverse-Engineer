@@ -10,6 +10,7 @@ import stat
 import subprocess
 import tempfile
 import zipfile
+from copy import deepcopy
 from contextlib import nullcontext
 from pathlib import Path
 from threading import RLock
@@ -24,7 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.background import BackgroundTask
 
 from .asset_references import preproduction_asset_references, timeline_asset_references
-from .canvas_layout import CanvasLayoutConflict, CanvasLayoutStore
+from .canvas_layout import CanvasLayoutConflict, CanvasLayoutStore, validate_layout
 from .durable_runs import LOCAL_RUN_POLICY
 from .timeline import TimelineStore
 from .preproduction import PreproductionStore
@@ -39,6 +40,7 @@ from .preproduction_nodes import FFMPEG_TIMEOUT_SECONDS, MAX_MEDIA_DURATION_SECO
 from .reference_media_storage import managed_reference_media_is_safe, resolve_reference_media_path
 from .reference_video import validate_storage_id
 from .shot_production import MAX_RESULT_VERSIONS, NODE_KINDS, ShotProduction, ShotProductionError, StepSource, public_result_versions
+from .shot_organization import ShotOrganization, ShotOrganizationError
 
 
 MAX_ASSET_BYTES = 200_000_000
@@ -100,11 +102,26 @@ class ShotUpdate(BaseModel):
         return validate_storage_id(value)
 
 
+class SceneUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    id: str = Field(min_length=1, max_length=100)
+    title: str = Field(default="", max_length=1000)
+    rank: str = Field(min_length=1, max_length=100)
+    description: str = Field(default="", max_length=4000)
+
+    @field_validator("id")
+    @classmethod
+    def safe_id(cls, value: str) -> str:
+        return validate_storage_id(value)
+
+
 class SaveWorkspace(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     revision: int = Field(ge=0)
     brief: Brief
+    scenes: Optional[list[SceneUpdate]] = Field(default=None, max_length=MAX_SHOTS)
     shots: list[ShotUpdate] = Field(default_factory=list, max_length=MAX_SHOTS)
+    canvasLayout: Optional[dict[str, Any]] = None
 
 
 class RevisionRequest(BaseModel):
@@ -216,6 +233,12 @@ def create_preproduction_router(
         except ShotProductionError as error:
             fail(error.code, error.message, error.status)
 
+    def organize(operation, *args, **kwargs):
+        try:
+            return operation(*args, **kwargs)
+        except ShotOrganizationError as error:
+            fail(error.code, error.message, error.status)
+
     def step_source_path(project_id: str, state: dict[str, Any], shot_id: str, source: StepSource | None) -> Optional[Path]:
         if source is None:
             return None
@@ -307,9 +330,57 @@ def create_preproduction_router(
             state = state_for(project_id)
             if body.revision != state["revision"]:
                 fail("preproduction_conflict", "前置工作台已被更新，请刷新后重试。")
+            original_state = deepcopy(state)
+            requested_layout = deepcopy(body.canvasLayout)
+            if requested_layout is not None:
+                try:
+                    validate_layout(requested_layout)
+                    if requested_layout["scope"] != {"type": "project", "id": project_id}:
+                        raise ValueError("画布布局范围无效")
+                    current_layout = layout_store.read(
+                        project_id,
+                        _initial_canvas_layout(project_id, state, "project", project_id),
+                    )
+                    if requested_layout["layoutRevision"] != current_layout["layoutRevision"]:
+                        raise CanvasLayoutConflict
+                except CanvasLayoutConflict:
+                    fail("preproduction_layout_conflict", "画布布局已被更新，请重新读取后重试。")
+                except ValueError as error:
+                    fail("preproduction_layout_invalid", str(error), 422)
+                except OSError:
+                    fail("preproduction_layout_storage_invalid", "画布布局无法读取。", 503)
             production = production_for(project_id, state)
             decide(production.edit, body.brief.model_dump(), [shot.model_dump() for shot in body.shots])
+            if body.scenes is not None:
+                organize(
+                    ShotOrganization(state).replace_snapshot,
+                    [scene.model_dump() for scene in body.scenes],
+                    [{"id": shot.id, "sceneId": shot.sceneId, "rank": shot.rank} for shot in body.shots],
+                    increment_revision=False,
+                )
             save(project_id, state)
+            if requested_layout is not None:
+                try:
+                    default_layout = _initial_canvas_layout(project_id, state, "project", project_id)
+                    stored_layout = layout_store.read(project_id, default_layout)
+                    desired_nodes = {
+                        node_id: {**default_node, **requested_layout["nodes"].get(node_id, {})}
+                        for node_id, default_node in default_layout["nodes"].items()
+                    }
+                    if desired_nodes != stored_layout["nodes"] or requested_layout.get("viewport") != stored_layout.get("viewport"):
+                        layout_store.apply(
+                            project_id,
+                            default_layout,
+                            requested_layout["layoutRevision"],
+                            requested_layout["nodes"],
+                            requested_layout.get("viewport"),
+                        )
+                except (CanvasLayoutConflict, OSError, ValueError):
+                    try:
+                        store.save(project_id, original_state)
+                    except (OSError, ValueError):
+                        fail("preproduction_transaction_failed", "镜头创建失败且无法恢复原工作区，请停止编辑并检查存储。", 503)
+                    fail("preproduction_layout_storage_failed", "画布布局无法保存，镜头更改已撤销。", 503)
             return response(project_id, state)
 
     def layout_default(project_id: str, state: dict[str, Any], scope_type: str, scope_id: str) -> dict[str, Any]:

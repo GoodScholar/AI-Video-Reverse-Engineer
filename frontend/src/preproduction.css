@@ -49,6 +49,7 @@
 .shot-workspace__toolbar > div { display: flex; gap: 3px; padding: 3px; border-radius: 7px; background: #e9edf3; }
 .shot-workspace__toolbar button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 44px; padding: 0 13px; border: 0; border-radius: 5px; background: transparent; color: #596579; font: inherit; font-size: 12px; cursor: pointer; }
 .shot-workspace__toolbar button:hover { background: #f6f7fb; color: #4d42d2; }
+.shot-workspace__toolbar button:disabled { opacity: .45; cursor: not-allowed; }
 .shot-workspace__toolbar button[aria-pressed="true"] { background: #fff; color: #4d42d2; box-shadow: 0 1px 3px #23334c12; }
 .shot-workspace__toolbar .shot-workspace__inspector-toggle { border: 1px solid #dce1e9; background: #fff; }
 .shot-workspace__body { position: relative; display: grid; min-width: 0; min-height: 680px; overflow: hidden; }
@@ -75,15 +76,26 @@
 .scene-shot-list__row { position: absolute; top: 0; left: 0; box-sizing: border-box; width: 100%; }
 .scene-shot-list__row--scene { min-height: 64px; padding: 12px 12px 0; }
 .scene-shot-list__row--shot { min-height: 164px; padding: 8px 12px; }
-.scene-shot-list__scene button { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 48px; padding: 0 8px; border: 0; border-radius: 7px; background: transparent; color: #17202d; text-align: left; }
+.scene-shot-list__scene { display: flex; align-items: center; gap: 4px; }
+.scene-shot-list__scene button { display: flex; align-items: center; gap: 8px; min-height: 48px; padding: 0 8px; border: 0; border-radius: 7px; background: transparent; color: #17202d; text-align: left; }
+.scene-shot-list__scene > button:first-child { flex: 1; min-width: 0; }
+.scene-shot-list__scene .scene-shot-list__delete-scene { flex: 0 0 44px; justify-content: center; width: 44px; padding: 0; color: #934b35; }
+.scene-shot-list__scene .scene-shot-list__delete-scene:disabled { color: #7b8797; opacity: .45; cursor: not-allowed; }
 .scene-shot-list__scene button:hover { background: #e9ecf2; }
-.scene-shot-list__scene.is-selected button { background: #eeecfd; color: #4d42d2; box-shadow: inset 3px 0 #887fe9; }
-.scene-shot-list__scene.is-hovered:not(.is-selected) button { background: #f6f7fb; }
-.scene-shot-list__scene.is-focused button { outline: 3px solid #9b94f6; outline-offset: -3px; }
+.scene-shot-list__scene.is-selected > button:first-child { background: #eeecfd; color: #4d42d2; box-shadow: inset 3px 0 #887fe9; }
+.scene-shot-list__scene.is-hovered:not(.is-selected) > button:first-child { background: #f6f7fb; }
+.scene-shot-list__scene.is-focused > button:first-child { outline: 3px solid #9b94f6; outline-offset: -3px; }
 .scene-shot-list__scene button > span { min-width: 0; }
 .scene-shot-list__scene h3, .scene-shot-list__scene small { display: block; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .scene-shot-list__scene h3 { font-size: 14px; }
 .scene-shot-list__scene small { margin-top: 3px; color: #596579; font-size: 12px; }
+.scene-shot-list__delete-dialog { width: min(520px, calc(100vw - 32px)); max-height: 85vh; padding: 24px; border: 1px solid #dce1e9; border-radius: 12px; color: #17202d; box-shadow: 0 24px 80px #111b3340; }
+.scene-shot-list__delete-dialog::backdrop { background: #17233880; }
+.scene-shot-list__delete-dialog h3 { margin: 0 0 8px; font-size: 18px; }
+.scene-shot-list__delete-dialog p { margin: 0 0 18px; color: #596579; line-height: 1.6; }
+.scene-shot-list__delete-dialog label { display: grid; gap: 8px; color: #596579; font-size: 13px; }
+.scene-shot-list__delete-dialog select { min-height: 44px; padding: 0 12px; border: 1px solid #ccd3df; border-radius: 7px; background: #fff; color: #17202d; font: inherit; }
+.scene-shot-list__delete-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 24px; }
 .scene-shot-card { display: grid; grid-template-columns: minmax(0, 1fr); min-height: 148px; overflow: visible; border: 1px solid #dce1e9; border-radius: 10px; background: #fff; box-shadow: 0 1px 2px rgb(23 32 45 / 5%); }
 .scene-shot-card.is-selected { border-color: #887fe9; background: #eeecfd; box-shadow: 0 0 0 1px #887fe9; }
 .scene-shot-card.is-context:not(.is-selected) { border-color: #b9b3f0; background: #f8f7ff; box-shadow: inset 3px 0 #b9b3f0; }

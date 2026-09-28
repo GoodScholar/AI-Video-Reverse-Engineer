@@ -1,5 +1,5 @@
 import { useEffect, type ReactNode } from "react";
-import { Columns3, List, Network, PanelRightClose, PanelRightOpen, X } from "lucide-react";
+import { Columns3, List, Network, PanelRightClose, PanelRightOpen, Redo2, Undo2, X } from "lucide-react";
 import { useStore } from "zustand";
 
 import { SceneShotList } from "./SceneShotList";
@@ -10,7 +10,7 @@ type Props = {
   store: PreproductionWorkspaceStore;
   projectId?: string;
   children: ReactNode;
-  onCreateShot?: () => void;
+  onCreateShot?: (position?: { x: number; y: number }) => void;
 };
 
 const viewOptions: Array<{ mode: WorkspaceViewMode; label: string; icon: typeof Columns3 }> = [
@@ -22,6 +22,8 @@ const viewOptions: Array<{ mode: WorkspaceViewMode; label: string; icon: typeof 
 export function ShotWorkspaceLayout({ store, projectId, children, onCreateShot }: Props) {
   const mode = useStore(store, (state) => state.view.mode);
   const inspectorOpen = useStore(store, (state) => state.view.inspectorOpen);
+  const organizationHistory = useStore(store, (state) => state.organizationHistory.history.length);
+  const organizationFuture = useStore(store, (state) => state.organizationHistory.future.length);
 
   useEffect(() => {
     const narrow = window.matchMedia?.("(max-width: 899px)");
@@ -49,10 +51,14 @@ export function ShotWorkspaceLayout({ store, projectId, children, onCreateShot }
         aria-expanded={inspectorOpen}
         onClick={() => store.getState().actions.setInspectorOpen(!inspectorOpen)}
       >{inspectorOpen ? <PanelRightClose size={17} aria-hidden="true" /> : <PanelRightOpen size={17} aria-hidden="true" />}<span>检查器</span></button>
+      <div className="shot-workspace__organization-history" role="group" aria-label="镜头组织历史">
+        <button type="button" aria-label="撤销镜头组织" disabled={!organizationHistory} onClick={() => store.getState().actions.undoOrganization()}><Undo2 size={16} aria-hidden="true" /></button>
+        <button type="button" aria-label="重做镜头组织" disabled={!organizationFuture} onClick={() => store.getState().actions.redoOrganization()}><Redo2 size={16} aria-hidden="true" /></button>
+      </div>
     </header>
     <div className="shot-workspace__body">
-      {mode !== "canvas" && <SceneShotList store={store} onCreateShot={onCreateShot} />}
-      {mode !== "list" && <WorkflowCanvas projectId={projectId} store={store} />}
+      {mode !== "canvas" && <SceneShotList store={store} onCreateShot={() => onCreateShot?.()} />}
+      {mode !== "list" && <WorkflowCanvas projectId={projectId} store={store} onCreateShot={onCreateShot} />}
       {inspectorOpen && <>
         <button type="button" className="shot-workspace__backdrop" aria-label="收起检查器遮罩" onClick={() => store.getState().actions.setInspectorOpen(false)} />
         <aside className="shot-workspace__inspector" aria-label="工作区检查器">

@@ -14,7 +14,7 @@ import {
   type NodeMouseHandler,
   type NodeProps,
 } from "@xyflow/react";
-import { Box, ChevronDown, ChevronLeft, ChevronRight, Focus, Image, Layers3, Redo2, Undo2 } from "lucide-react";
+import { Box, ChevronDown, ChevronLeft, ChevronRight, Focus, Image, Layers3, Plus, Redo2, Undo2 } from "lucide-react";
 import { useStore } from "zustand";
 
 import "@xyflow/react/dist/style.css";
@@ -22,8 +22,13 @@ import "@xyflow/react/dist/style.css";
 import { getCanvasLayout, saveCanvasLayout, type CanvasLayout } from "./preproductionApi";
 import { canvasLayoutScopeKey, type PreproductionWorkspaceStore, type SelectableEntity } from "./preproductionWorkspaceStore";
 import { projectWorkflowCanvas, type WorkflowCanvasNode } from "./workflowCanvasProjection";
+import { readShotDrag } from "./shotDrag";
 
-type Props = { store: PreproductionWorkspaceStore; projectId?: string };
+type Props = {
+  store: PreproductionWorkspaceStore;
+  projectId?: string;
+  onCreateShot?: (position: { x: number; y: number }) => void;
+};
 type CanvasNodeData = WorkflowCanvasNode["data"] & {
   store: PreproductionWorkspaceStore;
   onOpenShot?: (shotId: string) => void;
@@ -110,7 +115,7 @@ const ProcessNode = memo(function ProcessNode({ data, selected: boxSelected }: N
 const nodeTypes = { scene: SceneNode, shot: ShotNode, asset: AssetNode, process: ProcessNode };
 const emptyLayoutHistory: Array<CanvasLayout["nodes"]> = [];
 
-function WorkflowCanvasInner({ store, projectId: providedProjectId }: Props) {
+function WorkflowCanvasInner({ store, projectId: providedProjectId, onCreateShot }: Props) {
   const entities = useStore(store, (state) => state.entities);
   const order = useStore(store, (state) => state.order);
   const assets = useStore(store, (state) => state.assets);
@@ -121,7 +126,7 @@ function WorkflowCanvasInner({ store, projectId: providedProjectId }: Props) {
   const locateRequest = useStore(store, (state) => state.view.locateRequest);
   const layoutSaveStatus = useStore(store, (state) => state.layoutPersistence.saveStatus);
   const layoutMessage = useStore(store, (state) => state.layoutPersistence.conflictMessage);
-  const { fitView, setViewport } = useReactFlow<CanvasNode, Edge>();
+  const { fitView, setViewport, screenToFlowPosition } = useReactFlow<CanvasNode, Edge>();
   const boxSelectedShotIds = useRef<string[]>([]);
   const boxSelecting = useRef(false);
   const savingLayout = useRef(false);
@@ -270,6 +275,18 @@ function WorkflowCanvasInner({ store, projectId: providedProjectId }: Props) {
     aria-label="镜头关系图"
     role="region"
     tabIndex={0}
+    onDragOver={(event) => {
+      if (scope.type === "project" && readShotDrag(event.dataTransfer)) event.preventDefault();
+    }}
+    onDrop={(event) => {
+      if (scope.type !== "project") return;
+      const shotId = readShotDrag(event.dataTransfer);
+      if (!shotId) return;
+      event.preventDefault();
+      const position = screenToFlowPosition({ x: event.clientX, y: event.clientY });
+      persistLayout(store.getState().actions.placeShotOnCanvas(shotId, position));
+      store.getState().actions.selectShot(shotId, { source: "canvas" });
+    }}
     onKeyDown={(event) => {
       if (!shouldHandleCanvasShortcut(event.target)) return;
       if ((event.metaKey || event.ctrlKey) && event.key === "0") {
@@ -290,6 +307,7 @@ function WorkflowCanvasInner({ store, projectId: providedProjectId }: Props) {
         <span aria-current="page">{scopeShot?.title ?? "项目关系"}</span>
       </nav>
       <div>
+        {scope.type === "project" && onCreateShot && <button type="button" aria-label="在画布新建镜头" onClick={() => onCreateShot({ x: 120, y: 120 })}><Plus size={16} aria-hidden="true" />新建镜头</button>}
         <button type="button" aria-label="撤销布局" disabled={!layoutHistory.length || layoutSaveStatus === "saving"} onClick={() => persistLayout(store.getState().actions.undoLayout())}><Undo2 size={16} aria-hidden="true" />撤销</button>
         <button type="button" aria-label="重做布局" disabled={!layoutFuture.length || layoutSaveStatus === "saving"} onClick={() => persistLayout(store.getState().actions.redoLayout())}><Redo2 size={16} aria-hidden="true" />重做</button>
         <button type="button" onClick={focusSelection}><Focus size={16} aria-hidden="true" />聚焦选择</button>
