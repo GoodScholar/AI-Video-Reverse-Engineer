@@ -14,7 +14,23 @@ it('正式选声步骤自动展示描述，但不自动提交配音', async () =
   expect(await screen.findByText('温暖女声')).toBeVisible();
   expect(screen.getByRole('button',{name:'生成当前配音'})).toBeDisabled();
   expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
-  expect(vi.mocked(fetch).mock.calls[0][0]).toBe('/api/voices');
+  expect(vi.mocked(fetch).mock.calls[0][0]).toBe('/api/projects/p1/voices');
+});
+
+it('项目音色单独成组并可直接试听选择', async () => {
+  vi.stubGlobal('fetch',vi.fn().mockResolvedValue(response({available:true,message:'已就绪',voices:[
+    {id:'serena',name:'Serena',description:'温暖女声',useCases:'生活分享',group:'chinese',sampleUrl:'/serena.wav'},
+    {id:'original-video-voice',name:'原视频口播音色',description:'从原视频分离的人声',useCases:'商品口播',group:'project',available:true,
+      sampleUrl:'/api/projects/p1/voices/original-video-voice/sample'}]})));
+  render(<VoiceSelector projectId="p1" ownerId="t1" targets={[task]} disabled={false} autoLoad onGenerated={()=>{}} onSelectionPending={()=>{}} />);
+  await screen.findByText('温暖女声');
+
+  await userEvent.click(screen.getByRole('button',{name:'项目音色'}));
+
+  expect(screen.getByText('从原视频分离的人声')).toBeVisible();
+  expect(screen.getByRole('button',{name:'试听 原视频口播音色'})).toBeEnabled();
+  await userEvent.click(screen.getByRole('radio',{name:'选择 原视频口播音色'}));
+  expect(screen.getByText('所选音色：原视频口播音色')).toBeVisible();
 });
 
 it('先展示音色描述，选择并确认当前脚本后才提交配音', async () => {

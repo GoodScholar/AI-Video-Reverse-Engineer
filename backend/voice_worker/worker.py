@@ -19,13 +19,18 @@ for line in sys.stdin:
             from mlx_audio.tts.utils import load_model
             if model is None:
                 model = load_model(Path(sys.argv[1]))
-            assert request['voice'] in model.supported_speakers
             directory = Path(request['directory'])
             for index, text in enumerate(request['texts']):
                 mx.random.seed(42)
                 parts = []
-                for result in model.generate(text=text, voice=request['voice'], lang_code='Chinese', temperature=0.9,
-                                             max_tokens=1600, verbose=False):
+                generation = {'text': text, 'lang_code': 'Chinese', 'temperature': 0.9,
+                              'max_tokens': 1600, 'verbose': False}
+                if 'refAudio' in request:
+                    generation.update(ref_audio=request['refAudio'], ref_text=request['refText'])
+                else:
+                    assert request['voice'] in model.supported_speakers
+                    generation['voice'] = request['voice']
+                for result in model.generate(**generation):
                     mx.eval(result.audio)
                     parts.append(np.asarray(result.audio, dtype=np.float32).reshape(-1))
                 audio = np.concatenate(parts)

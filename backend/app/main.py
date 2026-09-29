@@ -2504,8 +2504,8 @@ def create_app(
     ))
     from .batch_editing_api import create_batch_editing_router
     from .local_voice import LocalVoiceService, create_voice_router
-    voice_service = LocalVoiceService()
-    app.include_router(create_voice_router(voice_service))
+    voice_service = LocalVoiceService(data_dir=data_dir)
+    app.include_router(create_voice_router(voice_service, ensure_project_exists))
     app.include_router(create_batch_editing_router(
         data_dir, ensure_project_exists, compute_jobs,
         ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, source_lock=project_write_lock, voice_service=voice_service,

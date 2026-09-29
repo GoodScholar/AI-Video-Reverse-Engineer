@@ -1,13 +1,13 @@
 import { readApiError } from './referenceMediaApi';
 import type { BatchTask } from './batchEditingApi';
 
-export type Voice = {id:string;name:string;description:string;useCases:string;group?:"chinese"|"other";sampleUrl:string|null};
+export type Voice = {id:string;name:string;description:string;useCases:string;group?:"chinese"|"other"|"project";available?:boolean;sampleUrl:string|null};
 export type VoiceCatalog = {available:boolean;message:string;voices:Voice[]};
 export type VoiceTarget = {id:string;script:string;contentRevision?:number;voiceover?:BatchTask['voiceover'];
   variant:{revision:number;subtitles?:{revision:number}}};
 
-export async function getVoiceCatalog():Promise<VoiceCatalog> {
-  const response=await fetch('/api/voices');
+export async function getVoiceCatalog(projectId:string):Promise<VoiceCatalog> {
+  const response=await fetch(`/api/projects/${encodeURIComponent(projectId)}/voices`);
   if(!response.ok) throw new Error(await readApiError(response,'无法读取音色库。'));
   return response.json();
 }

@@ -234,7 +234,8 @@ def test_subtitle_and_voiceover_commands_own_linked_version_updates():
                                validate_cues=lambda cues, tracks: cues)
     validate_voiceover_target(task, task, (0, 2, 1))
     queue_voiceover(task, job_id="voice-job", voice_id="voice", plan={"texts": ["操作演示"]},
-                    model_revision="local")
+                    model_revision="local", model="Qwen3-TTS-12Hz-0.6B-Base-8bit")
+    assert task["voiceover"]["model"] == "Qwen3-TTS-12Hz-0.6B-Base-8bit"
     assert start_voiceover(task, "voice-job")["status"] == "running"
     published = []
     complete_voiceover(task, job_id="voice-job", expected_version=(0, 3, 1), tracks=video_tracks(),

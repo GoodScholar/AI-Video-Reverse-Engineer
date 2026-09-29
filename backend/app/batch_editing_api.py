@@ -827,7 +827,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 save(project_id, state)
                 snapshot, plan, voice_id = deepcopy(task), deepcopy(voice["plan"]), voice["voiceId"]
             directory.mkdir(parents=True, exist_ok=True)
-            outputs = voice_service.synthesize(plan["texts"], voice_id, directory)
+            outputs = voice_service.synthesize(plan["texts"], voice_id, directory, project_id=project_id)
             if len(outputs) != len(plan["texts"]):
                 raise ValueError("配音段落数量无效，请重试。")
             new_assets = []
@@ -874,11 +874,14 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 or not isinstance(body["voiceId"], str) or not isinstance(body["targets"], list)
                 or not 1 <= len(body["targets"]) <= 20):
             raise HTTPException(422, detail={"code": "batch_voiceover_invalid", "message": "请选择音色并确认当前已保存脚本。"})
-        catalog = voice_service.catalog() if voice_service else {"available": False, "voices": []}
+        catalog = voice_service.catalog(project_id) if voice_service else {"available": False, "voices": []}
         if not catalog["available"]:
             raise HTTPException(503, detail={"code": "voice_service_unavailable", "message": "本地配音环境未就绪，请按 README 配置；不会自动下载。"})
-        if body["voiceId"] not in {voice["id"] for voice in catalog["voices"]}:
+        selected_voice = next((voice for voice in catalog["voices"] if voice["id"] == body["voiceId"]), None)
+        if selected_voice is None:
             raise HTTPException(422, detail={"code": "voice_unknown", "message": "所选音色不存在。"})
+        if selected_voice.get("available") is False:
+            raise HTTPException(503, detail={"code": "voice_unavailable", "message": "所选音色的本地模型尚未就绪。"})
         with source_lock or nullcontext(), lock:
             state = state_for(project_id)
             owner = task_for(state, task_id)
@@ -907,7 +910,10 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             for task, plan in targets:
                 queue_voiceover(
                     task, job_id=job_id, voice_id=body["voiceId"], plan=plan,
-                    model_revision=catalog.get("modelRevision", "unverified-local-directory"),
+                    model_revision=("unverified-local-directory" if selected_voice.get("group") == "project"
+                                    else catalog.get("modelRevision", "unverified-local-directory")),
+                    model=("Qwen3-TTS-12Hz-0.6B-Base-8bit" if selected_voice.get("group") == "project"
+                           else "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit"),
                 )
             save(project_id, state)
             task_ids = [task["id"] for task, _ in targets]

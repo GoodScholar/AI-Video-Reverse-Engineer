@@ -629,7 +629,7 @@ it("从素材页返回精修后可使用新增素材且不丢脚本草稿", asyn
 
 it("选声进入审片再返回后保留音色选择与未制作提示", async () => {
   const child = { ...task, id: "voice-child", batchId: task.id, generationId: "g1", sellingPoint: "第一条" };
-  vi.stubGlobal("fetch", vi.fn().mockImplementation(url => Promise.resolve(response(String(url) === "/api/voices"
+  vi.stubGlobal("fetch", vi.fn().mockImplementation(url => Promise.resolve(response(String(url) === "/api/projects/p1/voices"
     ? { available: true, message: "就绪", voices: [{ id: "serena", name: "Serena", description: "温暖女声", useCases: "美食", sampleUrl: "/serena.wav" }] }
     : { tasks: [task, child], assets: [] }))));
   const onDraftChange = vi.fn();
@@ -647,7 +647,7 @@ it("新批次选声草稿只使目标作品失效，旧批次通过作品仍可�
   const completed = { ...task, id: "old", batchId: task.id, generationId: "g1", sellingPoint: "旧批作品", reviewStatus: "approved",
     variant: { ...task.variant, runs: [{ id: "r", revision: 0, status: "completed", url: "/preview.mp4", error: null }] } };
   const current = { ...completed, id: "new", generationId: "g2", sellingPoint: "新批作品" };
-  vi.stubGlobal("fetch", vi.fn().mockImplementation(url => Promise.resolve(response(String(url) === "/api/voices"
+  vi.stubGlobal("fetch", vi.fn().mockImplementation(url => Promise.resolve(response(String(url) === "/api/projects/p1/voices"
     ? { available: true, message: "就绪", voices: [{ id: "serena", name: "Serena", description: "女声", useCases: "生活", sampleUrl: null }] }
     : { tasks: [task, completed, current], assets: [] }))));
   const view = render(<BatchEditor projectId="p1" presentation="voice" />);
@@ -662,7 +662,7 @@ it("新批次选声草稿只使目标作品失效，旧批次通过作品仍可�
 it("配音提交中跨页返回仍锁定目标音色，迟到回包完成后解除草稿状态", async () => {
   const pending = deferred<Response>();
   const child = { ...task, id: "voice-child", batchId: task.id, generationId: "g1", sellingPoint: "当前作品" };
-  vi.stubGlobal("fetch", vi.fn().mockImplementation(url => String(url).endsWith("/voiceovers") ? pending.promise : Promise.resolve(response(String(url) === "/api/voices"
+  vi.stubGlobal("fetch", vi.fn().mockImplementation(url => String(url).endsWith("/voiceovers") ? pending.promise : Promise.resolve(response(String(url) === "/api/projects/p1/voices"
     ? { available: true, message: "就绪", voices: ["Serena", "Ryan"].map(name => ({ id: name.toLowerCase(), name, description: "音色描述", useCases: "生活", sampleUrl: null })) }
     : { tasks: [task, child], assets: [] }))));
   const onDraftChange = vi.fn();

@@ -18,10 +18,12 @@ def write_audio(path, seconds):
 
 
 class VoiceService:
-    def catalog(self):
+    def catalog(self, project_id):
+        assert project_id == 'p1'
         return {'available': True, 'voices': [{'id': 'serena', 'name': 'Serena', 'description': '温暖女声', 'useCases': '生活分享', 'sampleUrl': None}]}
 
-    def synthesize(self, texts, voice, directory):
+    def synthesize(self, texts, voice, directory, *, project_id):
+        assert project_id == 'p1'
         assert voice == 'serena'
         outputs = []
         for i, text in enumerate(texts):
@@ -109,6 +111,50 @@ def test_generation_rejects_unconfirmed_and_stale_requests(workspace):
         body=request_for(task); body['voiceId']='unknown'
         assert api.post(base,json=body).status_code == 422
         assert not jobs
+
+
+def test_generation_rejects_selected_voice_when_its_model_is_unavailable(workspace):
+    class UnavailableProjectVoice(VoiceService):
+        def catalog(self, project_id):
+            return {'available': True, 'voices': [
+                {'id': 'original-video-voice', 'name': '项目音色', 'description': '参考音色',
+                 'useCases': '商品口播', 'available': False, 'sampleUrl': '/sample.wav'},
+            ]}
+
+    api, jobs = client_for(workspace, UnavailableProjectVoice())
+    with api:
+        task = arranged(api)
+        body = request_for(task)
+        body['voiceId'] = 'original-video-voice'
+
+        response = api.post(f"/api/projects/p1/batch-edits/{task['id']}/voiceovers", json=body)
+
+        assert response.status_code == 503
+        assert response.json()['detail']['code'] == 'voice_unavailable'
+        assert not jobs
+
+
+def test_project_voice_records_the_base_model_without_reusing_preset_revision(workspace):
+    class AvailableProjectVoice(VoiceService):
+        def catalog(self, project_id):
+            return {'available': True, 'modelRevision': 'custom-voice-revision', 'voices': [
+                {'id': 'original-video-voice', 'name': '项目音色', 'description': '参考音色',
+                 'useCases': '商品口播', 'group': 'project', 'available': True, 'sampleUrl': '/sample.wav'},
+            ]}
+
+    api, jobs = client_for(workspace, AvailableProjectVoice())
+    with api:
+        task = arranged(api)
+        body = request_for(task)
+        body['voiceId'] = 'original-video-voice'
+
+        response = api.post(f"/api/projects/p1/batch-edits/{task['id']}/voiceovers", json=body)
+
+        voiceover = response.json()['tasks'][0]['voiceover']
+        assert response.status_code == 202
+        assert voiceover['model'] == 'Qwen3-TTS-12Hz-0.6B-Base-8bit'
+        assert voiceover['modelRevision'] == 'unverified-local-directory'
+        assert len(jobs) == 1
 
 
 def test_edit_during_generation_does_not_overwrite_new_draft(workspace):

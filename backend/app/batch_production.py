@@ -386,14 +386,14 @@ def save_subtitles(task: dict[str, Any], *, expected_revision: int, timeline_rev
 
 
 def queue_voiceover(task: dict[str, Any], *, job_id: str, voice_id: str, plan: dict[str, Any],
-                    model_revision: str) -> dict[str, Any]:
+                    model_revision: str, model: str = "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit") -> dict[str, Any]:
     variant = task["variant"]
     variant["revision"] += 1
     voiceover = {
         "id": job_id, "voiceId": voice_id, "status": LOCAL_RUN_POLICY.initial_status, "error": None,
         "contentRevision": task.get("contentRevision", 0), "variantRevision": variant["revision"],
         "subtitleRevision": subtitles_for(variant)["revision"],
-        "model": "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit", "modelRevision": model_revision,
+        "model": model, "modelRevision": model_revision,
         "plan": plan, "assetIds": [],
     }
     task["voiceover"] = voiceover
