@@ -4,6 +4,7 @@ import type { PreproductionWorkspace as Workspace } from "./preproductionApi";
 import { AigcCreator } from "./AigcCreator";
 import { BatchEditor } from "./BatchEditor";
 import { PreproductionWorkspace } from "./PreproductionWorkspace";
+import { SourceSegmentIndexPanel } from "./SourceSegmentIndexPanel";
 import { StudioSteps } from "./StudioPrototypePrimitives";
 import { getContentWorkflow, type ContentWorkflowProjection } from "./contentWorkflowApi";
 import type { AspectResolution } from "./videoAspect";
@@ -76,6 +77,7 @@ export function ContentProductionWorkspace({ project, page, tools, onNavigate, o
     </div>
     <div hidden={!oldVisible} className={`studio-existing studio-existing-${page}`}><PreproductionWorkspace project={project} tools={tools} studioMode
       sectionOverride={page === "assets" ? "assets" : page === "tools" ? "tools" : "shots"}
-      importedWorkspace={importedWorkspace} onDraftChange={onPreproductionDirty} onAssetsChanged={setAssets} /></div>
+      importedWorkspace={importedWorkspace} onDraftChange={onPreproductionDirty} onAssetsChanged={setAssets} />
+      {page === "assets" && <SourceSegmentIndexPanel projectId={project.id} assets={assets} />}</div>
   </>;
 }

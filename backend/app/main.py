@@ -348,6 +348,7 @@ def create_app(
     analysis_settings: Optional[AnalysisSettings] = None,
     semantic_analysis_queue_factory: Optional[Callable] = None,
     semantic_analysis_runner: Optional[Callable] = None,
+    source_segment_runner: Optional[Callable] = None,
     analysis_provider_registry=None,
     provider_registry=None,
     clock: Optional[Callable[[], datetime]] = None,
@@ -1174,7 +1175,7 @@ def create_app(
             return True
         return (
             request.method in ("POST", "PUT")
-            and bool(re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|preparation|preproduction|timeline|batch-edits|upscale|character-motion|toolkit|backup)(?:/.*)?", path))
+            and bool(re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|preparation|preproduction|source-segments|timeline|batch-edits|upscale|character-motion|toolkit|backup)(?:/.*)?", path))
         ) or (
             request.method == "PUT" and bool(re.fullmatch(r"/api/analysis-providers/[^/]+/configuration", path))
         ) or (
@@ -2495,6 +2496,12 @@ def create_app(
     app.include_router(create_preproduction_router(
         data_dir, ensure_project_exists, compute_jobs,
         ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, source_lock=project_write_lock,
+    ))
+    from .source_segment_index import create_source_segment_router
+    app.include_router(create_source_segment_router(
+        data_dir, ensure_project_exists, compute_jobs,
+        runner=source_segment_runner, ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
+        source_lock=project_write_lock,
     ))
     from .product_images_api import create_product_images_router
     app.include_router(create_product_images_router(data_dir, ensure_project_exists, source_lock=project_write_lock))
