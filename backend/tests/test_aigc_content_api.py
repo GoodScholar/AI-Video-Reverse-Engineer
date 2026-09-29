@@ -195,7 +195,7 @@ def test_only_five_current_confirmed_candidates_enter_batch_editing(tmp_path):
         candidates = [{"id": f"c{index}", "generationId": "g1", "revision": 0, "briefRevision": 1,
                        "confirmedRevision": 0, "sellingPoint": f"卖点 {index}", "beats": [
                            {"text": f"杯盖防泼溅 {index}", "factIds": ["f1"], "assetId": "front"},
-                           {"text": "通勤收纳", "factIds": ["f1"], "assetId": "use"}],
+                           {"text": "通勤收纳。", "factIds": ["f1"], "assetId": "use"}],
                        "provider": "local_openai_compatible", "model": "local-model", "promptDigest": "digest"}
                       for index in range(5)]
         content_root = project_root / "aigc-content"
@@ -217,10 +217,10 @@ def test_only_five_current_confirmed_candidates_enter_batch_editing(tmp_path):
         assert len(tasks) == 6
         children = [task for task in tasks if task.get("batchId") == created.json()["task"]["id"]]
         assert len(children) == 5
-        assert children[0]["script"] == "杯盖防泼溅 0。通勤收纳"
+        assert children[0]["script"] == "杯盖防泼溅 0。通勤收纳。"
         assert [clip["assetId"] for clip in children[0]["variant"]["tracks"][0]["clips"]] == ["front", "use"]
         assert [(cue["start"], cue["end"], cue["text"]) for cue in children[0]["variant"]["subtitles"]["cues"]] == [
-            (0, 3, "杯盖防泼溅 0"), (3, 6, "通勤收纳")]
+            (0, 3, "杯盖防泼溅 0"), (3, 6, "通勤收纳。")]
         assert children[0]["variant"]["aspectMode"] == "smart"
         assert children[0]["variant"]["resolvedAspect"] == "16:9"
         assert children[0]["variant"]["settings"] == {"width": 1280, "height": 720, "fps": 30}

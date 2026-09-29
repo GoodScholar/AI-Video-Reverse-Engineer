@@ -69,7 +69,7 @@
 .cs-root .studio-image-grid a{color:var(--sp-purple)}
 @media(max-width:600px){.cs-root .studio-image-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .cs-root .studio-brief-fields>.studio-image-search,.cs-root .studio-brief-fields>.studio-optional-brief{grid-column:1/-1}
-.cs-root .studio-brief-fields>.aspect-ratio-picker{grid-column:1/-1}
+.cs-root .studio-brief-fields>.aspect-ratio-picker{display:block;grid-column:1/-1}
 .cs-root .studio-image-grid article>p{min-height:160px;display:flex;align-items:center;font-size:12px}
 .cs-root .studio-optional-brief[open]{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
 .cs-root .studio-optional-brief summary{grid-column:1/-1}

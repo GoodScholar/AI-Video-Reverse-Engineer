@@ -264,6 +264,16 @@ def _aigc_source(generation_id: str, brief: dict[str, Any], item: dict[str, Any]
     }
 
 
+def _join_aigc_beats(beats: list[dict[str, Any]]) -> str:
+    script = ""
+    for beat in beats:
+        text = beat["text"].strip()
+        if script and script[-1] not in "。！？；.!?;\n":
+            script += "。"
+        script += text
+    return script
+
+
 def arrange_aigc_candidate(task: dict[str, Any], item: dict[str, Any], assets: dict[str, dict[str, Any]], *,
                            ensure_asset: Callable[[dict[str, Any]], None],
                            id_factory: Callable[[], str] = _new_id) -> None:
@@ -331,7 +341,7 @@ def apply_aigc_handoff(state: dict[str, Any], generation_id: str, brief: dict[st
                 skipped.append(child["id"])
                 continue
             child["sellingPoint"] = item["sellingPoint"]
-            child["script"] = "。".join(beat["text"] for beat in item["beats"])
+            child["script"] = _join_aigc_beats(item["beats"])
             child["aigcSource"] = _aigc_source(generation_id, brief, item, assets)
             arrange_aigc_candidate(child, item, assets, ensure_asset=ensure_asset, id_factory=id_factory)
         if all(children_by_candidate[item["id"]]["aigcSource"]["candidateRevision"] == item["revision"]
@@ -340,14 +350,14 @@ def apply_aigc_handoff(state: dict[str, Any], generation_id: str, brief: dict[st
         return False, existing, children, skipped
 
     parent = create_batch(brief["productName"] + "营销视频",
-                          "。".join(beat["text"] for beat in candidates[0]["beats"]), aspect,
+                          _join_aigc_beats(candidates[0]["beats"]), aspect,
                           id_factory=id_factory)
     parent["aigcHandoffKey"] = handoff_key
     parent["aigcGroup"] = {"generationId": generation_id, "briefRevision": brief["revision"]}
     batch_generation_id = id_factory()
     children = []
     for item in candidates:
-        task = create_batch(item["sellingPoint"], "。".join(beat["text"] for beat in item["beats"]), aspect,
+        task = create_batch(item["sellingPoint"], _join_aigc_beats(item["beats"]), aspect,
                             id_factory=id_factory)
         task.update(batchId=parent["id"], generationId=batch_generation_id,
                     generation={"status": "ready", "error": None},
