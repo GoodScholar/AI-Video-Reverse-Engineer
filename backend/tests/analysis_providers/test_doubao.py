@@ -21,8 +21,8 @@ from app.analysis_providers.base import ProviderAnalysisError, ProviderRequest
 from app.analysis_providers.doubao import DoubaoAnalysisProvider
 
 
-MODEL = "doubao-seed-2-0-lite-260428"
-URL = "https://ark.cn-beijing.volces.com/api/v3/responses"
+MODEL = "doubao-seed-2.1-pro"
+URL = "https://ark.cn-beijing.volces.com/api/coding/v3/responses"
 
 
 def _image_request():

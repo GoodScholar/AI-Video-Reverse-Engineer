@@ -372,10 +372,25 @@ def test_bailian_stops_streaming_response_as_soon_as_byte_limit_is_exceeded():
     assert len(client.calls) == 1
 
 
+def test_shared_transport_allows_prompt_generation_past_two_minutes_within_five_minute_deadline(monkeypatch):
+    response = _StreamingResponse([b'{"ok":true}'])
+    client = _StreamingClient(response)
+    ticks = iter([0.0, 0.0, 121.0])
+    monkeypatch.setattr(provider_http.time, "monotonic", lambda: next(ticks))
+
+    result = provider_http.post_provider_json(
+        client, "https://provider.invalid", headers={}, payload={},
+    )
+
+    assert result.status_code == 200
+    assert result.json_body == {"ok": True}
+    assert response.closed is True
+
+
 def test_bailian_streaming_response_enforces_one_total_deadline(monkeypatch):
     response = _StreamingResponse([b'{"choices":[{"message":{"content":"{}"}}]}'])
     client = _StreamingClient(response)
-    ticks = iter([0.0, 0.0, 121.0])
+    ticks = iter([0.0, 0.0, 301.0])
     monkeypatch.setattr(provider_http.time, "monotonic", lambda: next(ticks))
 
     with pytest.raises(provider_http.ProviderHTTPTransportError) as error:

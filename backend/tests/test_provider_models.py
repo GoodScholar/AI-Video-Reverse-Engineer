@@ -9,7 +9,7 @@ from app.provider_models import MODEL_CATALOG, PROVIDER_IDS, models_for, model_i
     [
         ("bailian", "qwen3.7-flash"),
         ("openai", "gpt-5.6-luna"),
-        ("doubao", "doubao-seed-2-0-lite-260428"),
+        ("doubao", "doubao-seed-2.1-pro"),
         ("gemini", "gemini-2.5-flash"),
         ("grok", "grok-4.6"),
         ("claude", "claude-sonnet-5"),

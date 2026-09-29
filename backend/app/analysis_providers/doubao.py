@@ -14,7 +14,7 @@ from .test_image import connection_test_request
 
 class DoubaoAnalysisProvider:
     provider_id = "doubao"
-    _URL = "https://ark.cn-beijing.volces.com/api/v3/responses"
+    _URL = "https://ark.cn-beijing.volces.com/api/coding/v3/responses"
 
     models = tuple(model.id for model in models_for("doubao"))
 

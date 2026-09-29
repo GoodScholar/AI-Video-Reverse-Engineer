@@ -74,3 +74,44 @@
 .cs-root .studio-optional-brief[open]{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
 .cs-root .studio-optional-brief summary{grid-column:1/-1}
 @media(max-width:600px){.cs-root .studio-optional-brief[open]{grid-template-columns:1fr}}
+
+/* Keep preparation decisions compact: selection first, details on demand. */
+.cs-root .studio-brief-fields>.studio-asset-choices{display:block;grid-column:1/-1}
+.cs-root .studio-asset-choices>legend{margin-bottom:12px}
+.cs-root .studio-asset-group+.studio-asset-group{margin-top:18px;padding-top:18px;border-top:1px solid #edf0f4}
+.cs-root .studio-asset-group-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}
+.cs-root .studio-asset-group-heading h5{font-size:13px;margin:0}
+.cs-root .studio-asset-group-heading span{color:var(--sp-muted);font-size:11px}
+.cs-root .studio-asset-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
+.cs-root .studio-asset-card{min-width:0;border:1px solid var(--sp-line);border-radius:8px;background:#fff;overflow:hidden}
+.cs-root .studio-asset-card:has(input:checked){border-color:#887fe9;background:#fbfaff;box-shadow:0 0 0 1px #887fe9}
+.cs-root .studio-asset-choice{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:10px;padding:10px;cursor:pointer;font-size:12px}
+.cs-root .studio-asset-thumb{grid-column:1/-1;margin:-10px -10px 0;height:112px;background:var(--sp-media-surface,#202733)}
+.cs-root .studio-asset-card-copy{min-width:0}
+.cs-root .studio-asset-card-copy strong{display:-webkit-box;overflow:hidden;-webkit-box-orient:vertical;-webkit-line-clamp:2;font-size:12px;line-height:1.5}
+.cs-root .studio-asset-card-copy small{display:block;margin-top:4px;color:var(--sp-muted);font-size:11px}
+.cs-root .studio-asset-choice>input{margin:0;width:16px;height:16px;accent-color:var(--sp-purple)}
+.cs-root .studio-asset-notes{border-top:1px solid #edf0f4;padding:0 10px}
+.cs-root .studio-asset-notes summary{min-height:40px;display:flex;align-items:center;color:#655ba2;cursor:pointer;font-size:11px}
+.cs-root .studio-asset-notes p{padding:0 0 12px;color:var(--sp-muted);font-size:12px;line-height:1.65;overflow-wrap:anywhere}
+.cs-root .studio-asset-group-empty{padding:12px;border:1px dashed var(--sp-line);border-radius:8px;color:var(--sp-muted);font-size:12px}
+.cs-root .studio-script-controls{position:sticky;bottom:12px;z-index:4;grid-column:1/-1;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:end;padding:14px;border:1px solid #d8d4f2;border-radius:9px;background:#fffffff2;box-shadow:0 8px 24px #14203116;backdrop-filter:blur(8px)}
+.cs-root .studio-script-controls.is-confirming{position:static;box-shadow:none;background:#fff}
+.cs-root .studio-script-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+.cs-root .studio-script-actions .primary-action,.cs-root .studio-script-actions .secondary-action{margin:0}
+.cs-root .studio-aigc .batch-editor-disclosure{display:grid;gap:14px}
+.cs-root .studio-disclosure-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+.cs-root .studio-disclosure-heading h5{font-size:15px;margin:0 0 4px}
+.cs-root .studio-disclosure-heading p{color:#665b86;font-size:12px;margin:0}
+.cs-root .studio-disclosure-heading>span{white-space:nowrap;color:var(--sp-muted);font-size:11px}
+.cs-root .studio-disclosure-summary{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.cs-root .studio-disclosure-summary p{margin:0;padding:12px;border-radius:7px;background:#eeecfd;color:#4d4677;font-size:12px}
+.cs-root .studio-disclosure-details{border-top:1px solid #dcd8f2;border-bottom:1px solid #dcd8f2}
+.cs-root .studio-disclosure-details summary{display:flex;align-items:center;min-height:44px;color:#554aa8;cursor:pointer;font-size:12px;font-weight:600}
+.cs-root .studio-disclosure-details pre{margin:0 0 14px}
+.cs-root .studio-disclosure-actions{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.cs-root .studio-disclosure-actions label{padding:0}
+.cs-root .studio-disclosure-actions .primary-action{margin:0}
+.cs-root .studio-live-preview{position:sticky;top:18px}
+@media(max-width:850px){.cs-root .studio-script-controls{grid-template-columns:1fr}.cs-root .studio-script-actions{justify-content:flex-start}}
+@media(max-width:600px){.cs-root .studio-asset-grid{grid-template-columns:1fr}.cs-root .studio-script-controls{position:static;padding:12px}.cs-root .studio-script-actions{display:grid;grid-template-columns:1fr}.cs-root .studio-script-actions button{width:100%}.cs-root .studio-disclosure-summary{grid-template-columns:1fr}.cs-root .studio-disclosure-actions{align-items:stretch}.cs-root .studio-disclosure-actions .primary-action{width:100%}.cs-root .studio-live-preview{position:static}}

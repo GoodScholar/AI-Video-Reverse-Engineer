@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, expect, it, vi } from "vitest";
 
@@ -35,6 +35,21 @@ it("准备资料可选择七种视频比例并保存恢复实际尺寸", async (
   expect(screen.getByRole("radio", { name: "16:9" })).toBeChecked();
 });
 
+it("准备资料将已选素材与其他素材分组并按需展开授权说明", async () => {
+  const brief = { ...emptyBrief, productName: "晴雨杯", assetIds: ["front"] };
+  vi.mocked(fetch).mockResolvedValueOnce(response({ brief, candidates: [], assets }))
+    .mockResolvedValueOnce(response([provider]));
+  render(<AigcCreator projectId="p1" guidedStep={0} />);
+
+  const selected = await screen.findByRole("region", { name: "已选画面素材 1 项" });
+  const remaining = screen.getByRole("region", { name: "其他项目素材 1 项" });
+  expect(within(selected).getByLabelText("选择素材 杯盖展示")).toBeChecked();
+  expect(within(remaining).getByLabelText("选择素材 通勤演示")).not.toBeChecked();
+  expect(screen.getByText("防泼溅")).not.toBeVisible();
+  await userEvent.click(within(selected).getByText("来源与使用说明"));
+  expect(screen.getByText("防泼溅")).toBeVisible();
+});
+
 it("四步制作的生成按钮先保存新资料并展示发送内容，未经确认不生成", async () => {
   const brief = { ...emptyBrief, revision: 1, productName: "晴雨杯", facts: [{ id: "f1", text: "杯盖防泼溅" }], assetIds: ["front", "use"] };
   const saved = { ...brief, revision: 2, audience: "通勤者" };
@@ -45,7 +60,11 @@ it("四步制作的生成按钮先保存新资料并展示发送内容，未经�
   render(<AigcCreator projectId="p1" guidedStep={0} />);
   await userEvent.type(await screen.findByLabelText("目标受众"), "通勤者");
   await userEvent.click(screen.getByRole("button", { name: "生成 5 条脚本" }));
-  expect(await screen.findByText("已保存新资料：通勤者")).toBeVisible();
+  expect(await screen.findByText("将发送 1 条商品事实和 2 项素材引用")).toBeVisible();
+  expect(screen.getByText("已保存新资料：通勤者")).not.toBeVisible();
+  await userEvent.click(screen.getByText("查看完整发送文字"));
+  expect(screen.getByText("已保存新资料：通勤者")).toBeVisible();
+  expect(screen.getByText("已保存新资料：通勤者")).toHaveAttribute("tabindex", "0");
   expect(screen.getByRole("button", { name: "确认发送并生成 5 条候选" })).toBeDisabled();
   expect(vi.mocked(fetch).mock.calls.map(([url]) => String(url))).toEqual([
     "/api/projects/p1/aigc-content", "/api/analysis-providers", "/api/projects/p1/aigc-content/brief", "/api/projects/p1/aigc-content/disclosure",
@@ -107,6 +126,7 @@ it("保存简报后逐次展示发送文字并由交付人员确认生成五条�
   await userEvent.click(screen.getByRole("button", { name: "保存创作简报" }));
 
   await userEvent.click(await screen.findByRole("button", { name: "预览发送内容" }));
+  await userEvent.click(await screen.findByText("查看完整发送文字"));
   expect(await screen.findByText(disclosure.prompt)).toBeVisible();
   expect(vi.mocked(fetch)).toHaveBeenCalledTimes(4);
   expect(screen.getByRole("button", { name: "确认发送并生成 5 条候选" })).toBeDisabled();
@@ -292,6 +312,7 @@ it("只填商品名时沿用已有画面并补保守事实，不发起网络检�
   render(<AigcCreator projectId="p1" guidedStep={0} />);
   await userEvent.type(await screen.findByLabelText("商品名称"), "大窑果味汽水");
   await userEvent.click(screen.getByRole("button",{name:"生成 5 条脚本"}));
+  await userEvent.click(await screen.findByText("查看完整发送文字"));
   expect(await screen.findByText("商品名称预览")).toBeVisible();
   const saved=JSON.parse(String(vi.mocked(fetch).mock.calls[2][1]?.body)).brief;
   expect(saved.assetIds).toEqual(["front","use"]);
@@ -319,6 +340,7 @@ it("没有素材时按商品名找图，核对后导入并继续准备脚本", a
   expect(screen.getByRole("button",{name:"导入选中图片并继续"})).toBeDisabled();
   await userEvent.click(screen.getByLabelText("我已核对商品、规格与图片来源"));
   await userEvent.click(screen.getByRole("button",{name:"导入选中图片并继续"}));
+  await userEvent.click(await screen.findByText("查看完整发送文字"));
   expect(await screen.findByText("导入后的发送预览")).toBeVisible();
   expect(imported).toHaveBeenCalledWith(expect.objectContaining({revision:1}));
   expect(JSON.parse(String(vi.mocked(fetch).mock.calls[3][1]?.body))).toEqual({searchId:"s1",candidateIds:["pic1","pic2"],confirmed:true});
@@ -358,6 +380,7 @@ it("只勾选一张已有素材时补另一张可用图片，跳过失效素材�
     .mockResolvedValueOnce(response({prompt:"沿用已有图片",provider:provider.provider,model:provider.model}));
   render(<AigcCreator projectId="p1" guidedStep={0} mediaAssets={[{...liveAssets[0],id:"missing",available:false},...liveAssets] as never} />);
   await userEvent.click(await screen.findByRole("button",{name:"生成 5 条脚本"}));
+  await userEvent.click(await screen.findByText("查看完整发送文字"));
   expect(await screen.findByText("沿用已有图片")).toBeVisible();
   expect(JSON.parse(String(vi.mocked(fetch).mock.calls[2][1]?.body)).brief.assetIds).toEqual(["front","use"]);
   expect(screen.queryByLabelText("选择素材 missing")).not.toBeInTheDocument();

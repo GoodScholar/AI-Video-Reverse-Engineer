@@ -12,7 +12,7 @@ from httpcore._backends.sync import SyncStream
 
 
 MAX_PROVIDER_RESPONSE_BYTES = 256_000
-TOTAL_PROVIDER_DEADLINE_SECONDS = 120.0
+TOTAL_PROVIDER_DEADLINE_SECONDS = 300.0
 _CANCELLATION_REGISTRY_ATTRIBUTE = "_aivre_active_socket_registry"
 _REQUEST_ID_HEADERS = ("x-request-id",)
 

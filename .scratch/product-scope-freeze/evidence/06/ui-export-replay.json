@@ -1,0 +1,29 @@
+{
+  "result": "passed",
+  "performedThrough": "正式产品界面：成片与审片 > 导出已通过项",
+  "rawNetworkLog": "ui-export-network.log",
+  "request": {
+    "method": "POST",
+    "path": "/api/projects/697b8d71-b525-4011-ab90-b7f4563bc8f2/batch-edits/571545fe92234cc999f52161ac650b18/exports",
+    "status": 202
+  },
+  "behavior": "当前批准版本已有完成交付，导出命令幂等复用两份交付，没有创建重复交付。",
+  "exports": [
+    {
+      "taskId": "a815aca7e9544592ada771e57b2c6085",
+      "exportCount": 1,
+      "exportId": "d4fdb668d417479e9d7d18597999a238",
+      "previewRunId": "5517952a4a1f47c08c7006c3ce3204ef",
+      "versions": [2, 4, 2],
+      "sha256": "1245a21b2d8a13069aaa3a0fe64ddb93ff7120b106083eaa80be9c2470f0ff46"
+    },
+    {
+      "taskId": "1a2bde6e1556404a8d952e626b2c1e97",
+      "exportCount": 1,
+      "exportId": "e498624a8d12463994b5774019be2741",
+      "previewRunId": "1da0f37c7f194e9a9404135310c42815",
+      "versions": [2, 4, 2],
+      "sha256": "30c58212ad26f1ce1118cd4fa17606e9710cbafdc31e68c55f1deaf4b9691a4d"
+    }
+  ]
+}

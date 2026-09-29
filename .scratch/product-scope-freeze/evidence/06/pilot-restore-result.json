@@ -1,0 +1,130 @@
+{
+  "result": "passed",
+  "sourceProjectId": "697b8d71-b525-4011-ab90-b7f4563bc8f2",
+  "sourceProjectName": "大窑 · 网络图片验收",
+  "backup": {
+    "sha256": "63457bd99a11c03e4073db826a063cf3b3dccffa67e1c93b196f976cb55c39a8",
+    "bytes": 38955665
+  },
+  "restoredProjectId": "b4d86c01-e70e-4765-9b07-49e0aec6eaec",
+  "restoredProjectName": "大窑 · 网络图片验收（恢复）",
+  "p0PublicStateRoundTrip": {
+    "preproduction": true,
+    "aigcContent": true,
+    "batchEdits": true,
+    "contentWorkflow": true
+  },
+  "restoredFiles": {
+    "allowedAssets": [
+      {
+        "assetId": "asset-e4af7b3f8a514a908590b200ed3e405e",
+        "bytes": 2109136,
+        "sha256": "5751bc9bf360a99e5ce28d74e71c1f474586be6c1742d166c945f033ca0eb16e"
+      },
+      {
+        "assetId": "asset-901128fa52d64661bf09bf53751043bb",
+        "bytes": 340163,
+        "sha256": "e96d27dfe9cb26d702a4b9c428383e742ec7bf40c1dd828cf5aff8b0a5da8800"
+      }
+    ],
+    "currentPreviews": [
+      {
+        "taskId": "a815aca7e9544592ada771e57b2c6085",
+        "previewRunId": "5517952a4a1f47c08c7006c3ce3204ef",
+        "bytes": 506004,
+        "sha256": "68eabc15ba38e7647548e66ae347059bc9e2410d7ae498858e4be5335e54ec11"
+      },
+      {
+        "taskId": "1a2bde6e1556404a8d952e626b2c1e97",
+        "previewRunId": "1da0f37c7f194e9a9404135310c42815",
+        "bytes": 475970,
+        "sha256": "1534611d6f0507096bf48a77885cde97a05fa47b94ebb62656aef6874a492a46"
+      }
+    ]
+  },
+  "stableState": {
+    "taskCount": 8,
+    "workflowCounts": {
+      "total": 5,
+      "pending": 3,
+      "approved": 0,
+      "rejected": 0,
+      "delivered": 2,
+      "failed": 0
+    },
+    "briefRevision": 4,
+    "briefAssetIds": [
+      "asset-e4af7b3f8a514a908590b200ed3e405e",
+      "asset-901128fa52d64661bf09bf53751043bb"
+    ],
+    "confirmedCandidates": [
+      {"id": "f8715f6f3f154f52abd8ebe6b069240e", "revision": 0, "confirmedRevision": 0},
+      {"id": "39ad2318bd5c434e9dbd7544543c2b1e", "revision": 0, "confirmedRevision": 0},
+      {"id": "1d1f0be437c5434995a0232f5c2caea8", "revision": 0, "confirmedRevision": 0},
+      {"id": "39c070e578fe438da2a56fc7375e3c39", "revision": 0, "confirmedRevision": 0},
+      {"id": "de4f653425744c0a8a35db7073b3dd71", "revision": 0, "confirmedRevision": 0}
+    ],
+    "handoff": {
+      "batchId": "571545fe92234cc999f52161ac650b18",
+      "generationId": "a5c21efddf994128bc3e747c40e71c96",
+      "sourceGenerationId": "332a1aff24994a0d84b9805cfcb96dce",
+      "taskIds": [
+        "a815aca7e9544592ada771e57b2c6085",
+        "bc856df08a614d9abc1dce1c21a69cf8",
+        "eb7ee51d47a0478ca5f06b8e52b842b8",
+        "1a2bde6e1556404a8d952e626b2c1e97",
+        "638b76e7c12640d6ae2c0be36988d1ea"
+      ]
+    },
+    "exports": [
+      {
+        "taskId": "a815aca7e9544592ada771e57b2c6085",
+        "variantId": "f11de3d5953b48dcb6b6f6c7eb69a36b",
+        "previewRunId": "5517952a4a1f47c08c7006c3ce3204ef",
+        "reviewId": "61adab11349140bdbdf41dedbe2f81d7",
+        "exportId": "d4fdb668d417479e9d7d18597999a238",
+        "versions": [2, 4, 2],
+        "sha256": "1245a21b2d8a13069aaa3a0fe64ddb93ff7120b106083eaa80be9c2470f0ff46",
+        "bytes": 551308
+      },
+      {
+        "taskId": "1a2bde6e1556404a8d952e626b2c1e97",
+        "variantId": "593ab3eb0ba84be891bedd2ae162c00c",
+        "previewRunId": "1da0f37c7f194e9a9404135310c42815",
+        "reviewId": "47ae9e1ce8b14db58f2c761cf26c3375",
+        "exportId": "e498624a8d12463994b5774019be2741",
+        "versions": [2, 4, 2],
+        "sha256": "30c58212ad26f1ce1118cd4fa17606e9710cbafdc31e68c55f1deaf4b9691a4d",
+        "bytes": 517393
+      }
+    ]
+  },
+  "assetReferenceKinds": [
+    "batch_aigc_source",
+    "batch_delivery",
+    "batch_preview",
+    "batch_review",
+    "batch_variant",
+    "content_brief",
+    "script_candidate"
+  ],
+  "referencedAssetDeleteStatus": 409,
+  "disabledFinalGenerationRoutes": [
+    "/api/projects/b4d86c01-e70e-4765-9b07-49e0aec6eaec/reproduction/runs",
+    "/api/projects/b4d86c01-e70e-4765-9b07-49e0aec6eaec/reproduction/runs/previous/refresh",
+    "/api/projects/b4d86c01-e70e-4765-9b07-49e0aec6eaec/reproduction/runs/previous/resolve",
+    "/api/projects/b4d86c01-e70e-4765-9b07-49e0aec6eaec/character-motion/runs",
+    "/api/projects/b4d86c01-e70e-4765-9b07-49e0aec6eaec/character-motion/runs/previous/refresh",
+    "/api/projects/b4d86c01-e70e-4765-9b07-49e0aec6eaec/character-motion/runs/previous/resolve"
+  ],
+  "restartVerified": true,
+  "stageRestart": {
+    "changedTaskId": "a815aca7e9544592ada771e57b2c6085",
+    "changedContentRevision": 3,
+    "changedReviewStatus": "stale",
+    "siblingTaskId": "1a2bde6e1556404a8d952e626b2c1e97",
+    "siblingReviewStatus": "approved",
+    "staleExportStatus": 409
+  },
+  "liveDataMutated": false
+}

@@ -52,7 +52,7 @@ PROVIDER_CATALOG: Mapping[ProviderId, ProviderCatalogEntry] = MappingProxyType({
         compatibilityAvailability="unverified", compatibilityRegions=("global",),
     ),
     "doubao": ProviderCatalogEntry(
-        id="doubao", label="火山方舟豆包", models=(ProviderModel(id="doubao-seed-2-0-lite-260428", label="Doubao Seed 2.0 Lite"),),
+        id="doubao", label="火山方舟豆包", models=(ProviderModel(id="doubao-seed-2.1-pro", label="Doubao Seed 2.1 Pro"),),
         compatibilityAvailability="unverified", compatibilityRegions=("cn",),
     ),
     "gemini": ProviderCatalogEntry(
