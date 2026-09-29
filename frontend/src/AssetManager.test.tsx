@@ -18,9 +18,15 @@ it('保存名称和备注，向父组件返回新工作台', async () => {
   expect(JSON.parse(String(vi.mocked(fetch).mock.calls[1][1]?.body))).toEqual({ revision: 2, name: '新素材', notes: '保留动作' });
 });
 it('展示引用且禁止删除', async () => {
-  vi.mocked(fetch).mockResolvedValue(response({ references: [{ kind: 'candidate', label: '镜头一 · 候选 1' }] }));
+  vi.mocked(fetch).mockResolvedValue(response({ references: [
+    { kind: 'content_brief', label: '创作简报 · 可用素材' },
+    { kind: 'batch_preview', label: '短视频变体「卖点」· 预览 run-1' },
+    { kind: 'batch_delivery', label: '短视频变体「卖点」· 交付 delivery-1' },
+  ] }));
   render(<AssetManager {...props} />);
-  await screen.findByText('镜头一 · 候选 1');
+  await screen.findByText('创作简报 · 可用素材');
+  expect(screen.getByText('短视频变体「卖点」· 预览 run-1')).toBeInTheDocument();
+  expect(screen.getByText('短视频变体「卖点」· 交付 delivery-1')).toBeInTheDocument();
   expect(screen.getByRole('button', { name: '删除素材' })).toBeDisabled();
 });
 it('删除前再次阻止未保存的时间线草稿', async () => {

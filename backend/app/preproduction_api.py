@@ -24,7 +24,14 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.background import BackgroundTask
 
-from .asset_references import preproduction_asset_references, timeline_asset_references
+from .aigc_content_api import load_aigc_content_state
+from .asset_references import (
+    aigc_content_asset_references,
+    batch_asset_references,
+    preproduction_asset_references,
+    timeline_asset_references,
+)
+from .batch_editing_api import BatchStore
 from .canvas_layout import CanvasLayoutConflict, CanvasLayoutStore, validate_layout
 from .durable_runs import LOCAL_RUN_POLICY
 from .timeline import TimelineStore
@@ -171,11 +178,16 @@ def create_preproduction_router(
     """Create the router; ``runner`` is a test seam and defaults to execute_node."""
     root = Path(data_dir)
     store = PreproductionStore(root)
+    batch_store = BatchStore(root)
     layout_store = CanvasLayoutStore(root)
     workspace_transaction = WorkspaceTransaction(store, layout_store)
     project_assets = ProjectAssets(root, reference_facts=(
         lambda project_id, asset_id: preproduction_asset_references(store.load(project_id), asset_id),
         lambda project_id, asset_id: timeline_asset_references(TimelineStore(root).load(project_id), asset_id),
+        lambda project_id, asset_id: aigc_content_asset_references(
+            load_aigc_content_state(root, project_id), asset_id,
+        ),
+        lambda project_id, asset_id: batch_asset_references(batch_store.load(project_id), asset_id),
     ))
     lock = source_lock or RLock()
     router = APIRouter(prefix="/api/projects/{project_id}/preproduction")
@@ -494,7 +506,11 @@ def create_preproduction_router(
             try:
                 project_assets.delete(project_id, state, asset_id, save=lambda value: save(project_id, value))
             except AssetInUseError as error:
-                fail("asset_in_use", "素材仍被引用：" + "；".join(item["label"] for item in error.references[:5]))
+                raise HTTPException(status_code=409, detail={
+                    "code": "asset_in_use",
+                    "message": "素材仍被引用：" + "；".join(item["label"] for item in error.references[:5]),
+                    "references": error.references,
+                }) from None
             except AssetReferencesUnavailableError:
                 fail("asset_references_unavailable", "无法完整读取素材引用，暂不能删除。", 503)
             except AssetFileUnavailableError:

@@ -1,4 +1,7 @@
 from test_preproduction_api import setup, BASE, PROJECT_ID
+from app.aigc_content_api import _save as save_aigc_content
+from app.batch_editing_api import BatchStore
+from app.batch_production import create_batch
 from app.preproduction import PreproductionStore
 from app.timeline import TimelineStore, default_workspace
 
@@ -48,12 +51,64 @@ def test_all_persisted_references_block_deletion(tmp_path):
     assert client.get(state['assets'][0]['url']).status_code == 200
 
 
+def test_aigc_and_batch_references_share_the_delete_guard(tmp_path):
+    client, state, aid = imported(tmp_path)
+    save_aigc_content(tmp_path, PROJECT_ID, {
+        'schemaVersion': 1,
+        'brief': {'revision': 1, 'productName': '商品', 'facts': [], 'audience': '', 'sellingPoints': [],
+                  'callToAction': '', 'forbiddenPhrases': [], 'assetIds': [aid], 'aspectMode': '9:16'},
+        'candidates': [{'id': 'candidate-1', 'sellingPoint': '历史卖点', 'beats': [{'assetId': aid}]}],
+    })
+    ids = iter(('task-1', 'variant-1'))
+    task = create_batch('批量卖点', '脚本', id_factory=lambda: next(ids))
+    task['variant']['tracks'][0]['clips'] = [{
+        'id': 'clip-1', 'assetId': aid, 'start': 0, 'inPoint': 0, 'duration': 1,
+        'speed': 1, 'volume': 1, 'fadeIn': 0, 'fadeOut': 0,
+    }]
+    BatchStore(tmp_path).save(PROJECT_ID, {'schemaVersion': 1, 'tasks': [task]})
+
+    url = BASE + '/assets/' + aid
+    references = client.get(url + '/references').json()['references']
+
+    assert {'content_brief', 'script_candidate', 'batch_variant'} <= {item['kind'] for item in references}
+    result = client.post(url + '/delete', json={'revision': 1})
+    assert result.status_code == 409
+    assert {item['kind'] for item in result.json()['detail']['references']} == {
+        item['kind'] for item in references
+    }
+    assert client.get(state['assets'][0]['url']).status_code == 200
+
+
 def test_unreadable_timeline_fails_closed(tmp_path):
     client, _, aid = imported(tmp_path)
     path = TimelineStore(tmp_path).path(PROJECT_ID, 'state.json')
     path.parent.mkdir(parents=True)
     path.write_text('broken')
     result = client.post(BASE + '/assets/' + aid + '/delete', json={'revision': 1})
+    assert result.status_code == 503
+    assert result.json()['detail']['code'] == 'asset_references_unavailable'
+
+
+def test_unreadable_aigc_content_fails_closed(tmp_path):
+    client, _, aid = imported(tmp_path)
+    path = tmp_path / 'project-files' / PROJECT_ID / 'aigc-content' / 'state.json'
+    path.parent.mkdir(parents=True)
+    path.write_text('broken')
+
+    result = client.post(BASE + '/assets/' + aid + '/delete', json={'revision': 1})
+
+    assert result.status_code == 503
+    assert result.json()['detail']['code'] == 'asset_references_unavailable'
+
+
+def test_unreadable_batch_state_fails_closed(tmp_path):
+    client, _, aid = imported(tmp_path)
+    path = BatchStore(tmp_path).path(PROJECT_ID, 'state.json')
+    path.parent.mkdir(parents=True)
+    path.write_text('broken')
+
+    result = client.post(BASE + '/assets/' + aid + '/delete', json={'revision': 1})
+
     assert result.status_code == 503
     assert result.json()['detail']['code'] == 'asset_references_unavailable'
 
