@@ -29,6 +29,7 @@ from app.shot_preparation_api import create_shot_preparation_router
 from app.shot_analysis import analyze_preparation_shot
 from app.reproduction_api import create_reproduction_router
 from app.character_motion_api import create_character_motion_router
+from app.final_generation_policy import FINAL_GENERATION_DISABLED
 from app.prompt_generation import generate_prompts
 
 from app.reference_video import (
@@ -1246,6 +1247,11 @@ def create_app(
 
     @app.middleware("http")
     async def reject_invalid_reference_video_request(request, call_next):
+        if request.method == "POST" and re.fullmatch(
+            r"/api/projects/[^/]+/(?:reproduction|character-motion)/runs(?:/[^/]+/(?:resolve|refresh))?",
+            request.url.path,
+        ):
+            return JSONResponse(status_code=410, content={"detail": FINAL_GENERATION_DISABLED})
         if is_character_motion_upload_request(request) or (request.method == "POST" and re.fullmatch(r"/api/projects/[^/]+/preproduction/assets", request.url.path)):
             origin = request.headers.get("origin")
             if origin is not None and origin not in _ALLOWED_ANALYSIS_MUTATION_ORIGINS:
@@ -1256,11 +1262,6 @@ def create_app(
             rejection = sensitive_mutation_rejection(request)
             if rejection is not None:
                 return rejection
-        if request.method == "POST" and re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|character-motion)/runs", request.url.path):
-            return JSONResponse(status_code=410, content={"detail": {
-                "code": "final_generation_disabled",
-                "message": "当前工作台只准备素材与方案，请导出后在外部工具执行视频生成。",
-            }})
         if not is_reference_media_request(request):
             return await call_next(request)
 

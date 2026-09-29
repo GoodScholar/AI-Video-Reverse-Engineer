@@ -60,7 +60,7 @@ function duration(settings: ReproductionSettings) {
 }
 
 function statusLabel(status: ReproductionRun["status"]) {
-  return ({ submitting: "正在提交", queued: "队列中", running: "生成中", completed: "已完成", failed: "失败", unknown: "状态未知" })[status];
+  return ({ submitting: "提交状态未核实", queued: "队列状态未核实", running: "运行状态未核实", completed: "已完成", failed: "失败", unknown: "状态未知" })[status];
 }
 
 function activeRun(run: ReproductionRun) {
@@ -431,9 +431,9 @@ export function ReproductionPanel({ project, analysisProviders, preparationOnly 
       {copyFeedback && <p className="reproduction-copy-feedback" role="status" aria-live="polite">{copyFeedback}</p>}
       {actionError && <div className="reproduction-error" role="alert"><CircleAlert size={17} aria-hidden="true" /><span>{actionError}</span></div>}
 
-      {!preparationOnly && <div className="reproduction-section reproduction-runs"><div className="reproduction-section-heading"><h3>生成记录与预览</h3><span>{state.runs.length} 次</span></div>
-        {state.runs.length === 0 ? <p className="reproduction-empty">尚未提交生成。保存方案并完成本机检查后，可从这里跟踪队列和预览输出。</p> : <ul className="reproduction-run-list">{state.runs.map((item) => <li key={item.id} className={`reproduction-run reproduction-run--${item.status}`}><div><strong>{activeRun(item) && <LoaderCircle className="loading-spinner" size={16} aria-hidden="true" />}{statusLabel(item.status)}</strong><span>{formatTime(item.createdAt)} · 方案版本 {item.revision}</span>{item.error && <p>{item.error}</p>}{item.status === "unknown" && isDesktop && <UnknownRunRecovery value={resolutionDrafts[item.id] ?? { promptId: "", confirmedNotQueued: false }} disabled={action !== null} onChange={(next) => setResolutionDrafts((current) => ({ ...current, [item.id]: next }))} onResolve={(confirmedNotQueued) => void resolveUnknownRun(item, confirmedNotQueued)} />}</div>{item.outputs.length > 0 && <div className="reproduction-output-list">{item.outputs.map((output) => <figure key={output.url}><video controls preload="metadata" src={output.url} aria-label={`生成结果 ${output.filename}`} style={item.width && item.height ? { aspectRatio: `${item.width} / ${item.height}` } : undefined} /><figcaption>{output.filename}</figcaption></figure>)}</div>}</li>)}</ul>}
-      </div>}
+      <div className="reproduction-section reproduction-runs"><div className="reproduction-section-heading"><h3>历史生成记录与预览（只读）</h3><span>{state.runs.length} 次</span></div>
+        {state.runs.length === 0 ? <p className="reproduction-empty">当前没有历史生成记录。最终生成已停用，仍可导出工作流供外部工具执行。</p> : <ul className="reproduction-run-list">{state.runs.map((item) => <li key={item.id} className={`reproduction-run reproduction-run--${item.status}`}><div><strong>{statusLabel(item.status)}</strong><span>{formatTime(item.createdAt)} · 方案版本 {item.revision}</span>{item.error && <p>{item.error}</p>}{!preparationOnly && item.status === "unknown" && isDesktop && <UnknownRunRecovery value={resolutionDrafts[item.id] ?? { promptId: "", confirmedNotQueued: false }} disabled={action !== null} onChange={(next) => setResolutionDrafts((current) => ({ ...current, [item.id]: next }))} onResolve={(confirmedNotQueued) => void resolveUnknownRun(item, confirmedNotQueued)} />}</div>{item.outputs.length > 0 && <div className="reproduction-output-list">{item.outputs.map((output) => <figure key={output.url}><video controls preload="metadata" src={output.url} aria-label={`生成结果 ${output.filename}`} style={item.width && item.height ? { aspectRatio: `${item.width} / ${item.height}` } : undefined} /><figcaption>{output.filename}</figcaption></figure>)}</div>}</li>)}</ul>}
+      </div>
     </>}
   </section>;
 }

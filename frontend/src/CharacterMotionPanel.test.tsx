@@ -136,13 +136,17 @@ describe("CharacterMotionPanel", () => {
   });
 });
 
-it("前置模式保留动作方案和导出，关闭生成与外部轮询", async () => {
+it("前置模式保留角色动作方案、离线包和只读历史", async () => {
+  vi.mocked(getCharacterMotion).mockResolvedValue(motion({ runs: [{ id: "old-run", promptId: "p-1", status: "completed", createdAt: "now", error: null, outputs: [{ filename: "result.mp4", url: "/result.mp4" }], revision: 4 }] }));
   render(<CharacterMotionPanel project={project("p1")} preparationOnly />);
   await screen.findByDisplayValue("walk");
   expect(screen.getByRole("button", { name: "导出离线包" })).toBeEnabled();
+  expect(screen.getByText("准备角色、动作驱动与提示词，导出候选工作流和素材包。此处不执行视频生成，无需安装 ComfyUI。")).toBeVisible();
   expect(screen.queryByRole("button", { name: "提交本地生成" })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "检查 ComfyUI" })).not.toBeInTheDocument();
   expect(screen.queryByLabelText("本地 ComfyUI 地址")).not.toBeInTheDocument();
+  expect(screen.getByLabelText("历史生成记录（只读）")).toBeVisible();
+  expect(screen.getByLabelText("生成结果 result.mp4")).toBeVisible();
   expect(checkCharacterMotion).not.toHaveBeenCalled();
   expect(refreshCharacterMotion).not.toHaveBeenCalled();
 });

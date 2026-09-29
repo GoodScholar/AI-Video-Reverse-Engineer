@@ -7,7 +7,6 @@ import zipfile
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from threading import RLock
-from typing import Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
@@ -15,11 +14,11 @@ from fastapi.responses import FileResponse, Response
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field
 
-from .character_motion import (CharacterImage, CharacterMotionState, CharacterMotionStore, MotionRun,
+from .character_motion import (CharacterImage, CharacterMotionState, CharacterMotionStore,
                                MotionSettings, OFFICIAL_TEMPLATE, driver_for, source_hash, utc_now)
 from .character_motion_templates import build_workflow, template_info
-from .character_motion_media import normalize_driver, validate_video
-from .durable_runs import EXTERNAL_RUN_POLICY
+from .character_motion_media import normalize_driver
+from .final_generation_policy import reject_final_generation
 from .reference_media_storage import managed_reference_media_is_safe, resolve_reference_media_path
 
 MAX_CHARACTER_BYTES = 20 * 1024 * 1024
@@ -33,17 +32,6 @@ class SavePlan(BaseModel):
     comfyUrl: str = Field(max_length=512)
 
 
-class ConfirmAction(BaseModel):
-    revision: int = Field(ge=0)
-    disclosureAccepted: bool
-    preprocessorConfirmed: bool = False
-
-
-class ResolveRun(BaseModel):
-    promptId: Optional[str] = Field(default=None, min_length=1, max_length=200)
-    confirmedNotQueued: bool = False
-
-
 def _fail(code, message, status=409):
     raise HTTPException(status_code=status, detail={"code": code, "message": message})
 
@@ -54,7 +42,6 @@ def create_character_motion_router(data_dir, get_project, *, client_factory=None
     router = APIRouter(prefix="/api/projects/{project_id}/character-motion")
     store = CharacterMotionStore(data_dir)
     lock = RLock()
-    submissions = set()
     make_client = client_factory or ComfyUIClient
 
     def load(project_id):
@@ -63,13 +50,6 @@ def create_character_motion_router(data_dir, get_project, *, client_factory=None
             state = store.load(project)
         except (OSError, ValueError):
             _fail("character_motion_storage_failed", "角色动作方案或素材无法读取，请检查本地文件后重试。", 503)
-        changed = False
-        for run in state.runs:
-            if run.status == "submitting" and run.id not in submissions:
-                run.status = EXTERNAL_RUN_POLICY.recover_after_restart(run.status).status
-                run.error, changed = "上次提交被中断，请在 ComfyUI 中核对是否已排队。", True
-        if changed:
-            store.save(project_id, state)
         return project, state
 
     def save(project_id, state):
@@ -255,131 +235,16 @@ def create_character_motion_router(data_dir, get_project, *, client_factory=None
             return result
 
     @router.post("/runs")
-    def start_run(project_id: str, body: ConfirmAction):
-        if not body.disclosureAccepted:
-            _fail("motion_confirmation_required", "请确认后再提交本地 ComfyUI 生成。", 422)
-        if not body.preprocessorConfirmed:
-            _fail("motion_preprocessor_unconfirmed", "请先确认目标 ComfyUI 已缓存 yolox_l.onnx 和 dw-ll_ucoco_384_bs5.torchscript.pt 预处理权重。", 422)
-        with lock:
-            project, state = load(project_id)
-            checked_revision(state, body.revision)
-            ready(project, state)
-            if any(EXTERNAL_RUN_POLICY.active(run.status) for run in state.runs):
-                _fail("motion_generation_in_progress", "已有未结束或状态未知的生成，请先刷新或人工恢复。")
-            asset_paths = assets(project, state)
-            driver_key = next(name for name in asset_paths if name.startswith("input/driver."))
-            workflow = graph(state, "character.png", driver_key[6:])
-            run = MotionRun(id=str(uuid4()), status=EXTERNAL_RUN_POLICY.initial_status, createdAt=utc_now(), revision=state.revision,
-                            sourceHash=state.sourceHash or "", comfyUrl=state.comfyUrl, workflow=workflow)
-            state.runs.append(run); submissions.add(run.id); save(project_id, state)
-        submission_attempted = False
-        try:
-            with client_for(run.comfyUrl) as client:
-                check = client.check(workflow)
-                if not check.get("ready"):
-                    _fail("comfy_not_ready", "ComfyUI 环境不完整，请先检查缺失模型和节点。", 422)
-                names = {name: client.upload_image(path, f"{run.id}-{path.name}") for name, path in asset_paths.items()}
-                run.workflow = graph(state, names["input/character.png"], names[driver_key])
-                submission_attempted = True
-                prompt_id = client.submit(run.workflow)
-            with lock:
-                project, current = load(project_id)
-                saved = next(item for item in current.runs if item.id == run.id)
-                saved.status = EXTERNAL_RUN_POLICY.validate("queued")
-                saved.promptId, saved.workflow, saved.error = prompt_id, run.workflow, None
-                save(project_id, current)
-                return view(project, current)
-        except HTTPException as error:
-            with lock:
-                project, current = load(project_id)
-                saved = next(item for item in current.runs if item.id == run.id)
-                uncertain = submission_attempted and error.detail.get("outcomeUnknown") is True
-                saved.status = (EXTERNAL_RUN_POLICY.mark_outcome_unknown(saved.status) if uncertain
-                                else EXTERNAL_RUN_POLICY.fail(saved.status))
-                saved.error = error.detail.get("message")
-                save(project_id, current)
-            raise
-        except Exception as error:
-            with lock:
-                project, current = load(project_id)
-                saved = next(item for item in current.runs if item.id == run.id)
-                if submission_attempted:
-                    saved.status = EXTERNAL_RUN_POLICY.mark_outcome_unknown(saved.status)
-                    saved.error = "无法确认请求是否进入 ComfyUI 队列。"
-                else:
-                    saved.status = EXTERNAL_RUN_POLICY.fail(saved.status)
-                    saved.error = "连接或准备 ComfyUI 请求失败。"
-                save(project_id, current)
-            message = ("无法确认 ComfyUI 是否已接收工作流。" if submission_attempted
-                       else "连接或准备 ComfyUI 请求失败。")
-            raise HTTPException(status_code=502, detail={"code": "comfy_request_failed", "message": message,
-                                                         "outcomeUnknown": submission_attempted}) from None
-        finally:
-            submissions.discard(run.id)
+    def start_run(project_id: str):
+        reject_final_generation()
 
     @router.post("/runs/{run_id}/refresh")
     def refresh_run(project_id: str, run_id: str):
-        with lock:
-            project, state = load(project_id)
-            run = next((item for item in state.runs if item.id == run_id), None)
-            if run is None:
-                _fail("motion_run_not_found", "生成记录不存在。", 404)
-            if run.status in {"completed", "failed"} or not run.promptId:
-                return view(project, state)
-            prompt_id, url = run.promptId, run.comfyUrl
-        with client_for(url) as client:
-            result = client.poll(prompt_id)
-            outputs = []
-            if result["status"] == "completed":
-                for index, output in enumerate(result.get("outputs", [])):
-                    data = client.fetch_output(output)
-                    suffix = Path(output["filename"]).suffix.lower()
-                    if suffix not in (".mp4", ".webm", ".mov"):
-                        continue
-                    filename = f"output-{index}{suffix}"
-                    target = store.path(project_id, "runs", run_id, "outputs", filename)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    temporary = store.path(project_id, "runs", run_id, "outputs", f".{uuid4()}{suffix}")
-                    try:
-                        temporary.write_bytes(data)
-                        validate_video(temporary, ffprobe_path)
-                        os.replace(temporary, target)
-                    except (OSError, ValueError):
-                        result = {"status": "failed", "error": "生成服务返回的文件不是有效视频。"}
-                        outputs = []
-                        break
-                    finally:
-                        temporary.unlink(missing_ok=True)
-                    outputs.append({"filename": filename, "url": f"/api/projects/{project_id}/character-motion/runs/{run_id}/output/{len(outputs)}"})
-                if not outputs:
-                    result = {"status": "failed", "error": result.get("error") or "ComfyUI 已结束，但未返回可预览视频文件。"}
-        with lock:
-            project, state = load(project_id)
-            saved = next(item for item in state.runs if item.id == run_id)
-            if saved.promptId != prompt_id or saved.status in {"completed", "failed"}:
-                return view(project, state)
-            saved.status = EXTERNAL_RUN_POLICY.validate(result["status"])
-            saved.error, saved.outputs = result.get("error"), outputs
-            save(project_id, state)
-            return view(project, state)
+        reject_final_generation()
 
     @router.post("/runs/{run_id}/resolve")
-    def resolve_run(project_id: str, run_id: str, body: ResolveRun):
-        with lock:
-            project, state = load(project_id)
-            run = next((item for item in state.runs if item.id == run_id), None)
-            if run is None:
-                _fail("motion_run_not_found", "生成记录不存在。", 404)
-            if run.status != "unknown":
-                return view(project, state)
-            if body.promptId:
-                run.status, run.promptId, run.error = "queued", body.promptId, None
-            elif body.confirmedNotQueued:
-                run.status, run.error = "failed", "已人工确认未进入 ComfyUI 队列。"
-            else:
-                _fail("motion_resolution_required", "请填写 ComfyUI prompt ID，或确认该任务未排队。", 422)
-            save(project_id, state)
-            return view(project, state)
+    def resolve_run(project_id: str, run_id: str):
+        reject_final_generation()
 
     @router.get("/runs/{run_id}/output/{index}")
     def output_file(project_id: str, run_id: str, index: int, download: bool = False):

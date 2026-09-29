@@ -243,7 +243,7 @@ describe("ReproductionPanel", () => {
     mockedRefresh.mockResolvedValue(state({ runs: [{ id: "run-1", promptId: "p-1", status: "completed", createdAt: "2026-09-14T10:00:00Z", error: null, outputs: [{ filename: "fresh.mp4", url: "/fresh.mp4" }], revision: 3 }] }));
     render(<ReproductionPanel project={project()} />);
     await act(async () => { await Promise.resolve(); });
-    expect(screen.getByText("生成中")).toBeVisible();
+    expect(screen.getByText("运行状态未核实")).toBeVisible();
     await act(async () => { await vi.advanceTimersByTimeAsync(1_500); });
     expect(mockedRefresh).toHaveBeenCalledWith("project-001", "run-1");
     expect(screen.getByLabelText("生成结果 fresh.mp4")).toBeVisible();
@@ -251,14 +251,17 @@ describe("ReproductionPanel", () => {
   });
 });
 
-it("前置模式只保留提示词与离线工作流，不显示最终生成入口", async () => {
-  mockedGet.mockResolvedValue(state());
+it("前置模式只保留提示词、离线工作流与只读历史", async () => {
+  mockedGet.mockResolvedValue(state({ runs: [{ id: "old-run", promptId: "p-1", status: "completed", createdAt: "2026-09-14T10:00:00Z", error: null, outputs: [{ filename: "result.mp4", url: "/result.mp4" }], revision: 3, width: 720, height: 960 }] }));
   render(<ReproductionPanel project={project()} preparationOnly />);
   expect(await screen.findByRole("button", { name: "导出复刻包" })).toBeEnabled();
   expect(screen.getByRole("heading", { name: "提示词与工作流准备" })).toBeVisible();
+  expect(screen.getByText("编辑提示词、选择候选模板并导出离线工作流；最终生成由外部工具完成。")).toBeVisible();
   expect(screen.queryByRole("button", { name: "提交实验性生成" })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "检查 ComfyUI" })).not.toBeInTheDocument();
   expect(screen.queryByLabelText("本地 ComfyUI 地址")).not.toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "历史生成记录与预览（只读）" })).toBeVisible();
+  expect(screen.getByLabelText("生成结果 result.mp4")).toBeVisible();
   expect(mockedCheck).not.toHaveBeenCalled();
   expect(mockedStart).not.toHaveBeenCalled();
 });

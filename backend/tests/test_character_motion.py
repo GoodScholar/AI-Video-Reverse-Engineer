@@ -86,7 +86,9 @@ def test_export_includes_offline_assets_and_official_preprocess_snapshot(tmp_pat
 
 
 class _Comfy:
+    instances = 0
     def __init__(self, url):
+        type(self).instances += 1
         self.url = url
     def close(self):
         pass
@@ -104,35 +106,49 @@ class _Comfy:
         return _Comfy.video_bytes
 
 
-def test_run_persists_completed_output_and_unknown_submission_is_not_false_completion(tmp_path):
+def test_final_generation_write_routes_are_disabled_without_side_effects(tmp_path):
+    _Comfy.instances = 0
     client, _ = _setup(tmp_path, _Comfy)
-    client.post(BASE + "/character", files={"file": ("role.png", _png_bytes(), "image/png")})
-    state = client.get(BASE).json()
-    state = client.put(BASE, json={"revision": state["revision"], "prompt": "dancer", "settings": state["settings"], "comfyUrl": state["comfyUrl"]}).json()
-    started = client.post(BASE + "/runs", json={"revision": state["revision"], "disclosureAccepted": True, "preprocessorConfirmed": True})
-    assert started.status_code == 200
-    run = started.json()["runs"][0]
-    completed = client.post(f"{BASE}/runs/{run['id']}/refresh", json={}).json()["runs"][0]
-    assert completed["status"] == "completed"
-    assert client.get(completed["outputs"][0]["url"]).content == _Comfy.video_bytes
-
-    class Timeout(_Comfy):
-        def submit(self, workflow):
-            raise TimeoutError("network")
-    timeout_client, _ = _setup(tmp_path / "timeout", Timeout)
-    timeout_client.post(BASE + "/character", files={"file": ("role.png", _png_bytes(), "image/png")})
-    timeout_state = timeout_client.get(BASE).json()
-    timeout_state = timeout_client.put(BASE, json={"revision": timeout_state["revision"], "prompt": "dancer", "settings": timeout_state["settings"], "comfyUrl": timeout_state["comfyUrl"]}).json()
-    assert timeout_client.post(BASE + "/runs", json={"revision": timeout_state["revision"], "disclosureAccepted": True, "preprocessorConfirmed": True}).status_code == 502
-    assert timeout_client.get(BASE).json()["runs"][0]["status"] == "unknown"
+    responses = [
+        client.post(BASE + '/runs'),
+        client.post(BASE + '/runs', json={'revision': 0, 'disclosureAccepted': True, 'preprocessorConfirmed': True}),
+        client.post(BASE + '/runs/old-run/refresh', json={}),
+        client.post(BASE + '/runs/old-run/resolve', json={'confirmedNotQueued': True}),
+    ]
+    assert [response.status_code for response in responses] == [410, 410, 410, 410]
+    assert {response.json()['detail']['code'] for response in responses} == {'final_generation_disabled'}
+    assert {response.json()['detail']['message'] for response in responses} == {'当前工作台只准备素材与方案，请导出后在外部工具执行视频生成。'}
+    assert client.get(BASE).json()['runs'] == []
+    assert _Comfy.instances == 0
 
 
-def test_main_middleware_rejects_foreign_origin_for_character_mutations(tmp_path):
+def test_historical_generation_records_and_outputs_remain_read_only(tmp_path):
+    from app.character_motion import CharacterMotionStore, MotionRun
+
+    client, project = _setup(tmp_path)
+    store = CharacterMotionStore(tmp_path)
+    state = store.load(project)
+    state.runs.append(MotionRun(id='old-run', status='completed', createdAt='2026-09-14T00:00:00Z',
+        revision=1, sourceHash='old-hash', comfyUrl='http://127.0.0.1:8188', workflow={},
+        outputs=[{'filename': 'output-0.mp4'}]))
+    output = store.path(project.id, 'runs', 'old-run', 'outputs', 'output-0.mp4')
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b'historical-video')
+    store.save(project.id, state)
+
+    history = client.get(BASE).json()['runs']
+    assert history[0]['id'] == 'old-run'
+    assert history[0]['status'] == 'completed'
+    assert client.get(BASE + '/runs/old-run/output/0').content == b'historical-video'
+
+
+def test_final_generation_disablement_precedes_character_motion_origin_checks(tmp_path):
     from app.main import create_app
 
     client = TestClient(create_app(data_dir=tmp_path))
     response = client.post("/api/projects/unknown/character-motion/runs", json={"revision": 0, "disclosureAccepted": True, "preprocessorConfirmed": True}, headers={"origin": "https://untrusted.example", "x-aivre-intent": "semantic-analysis"})
-    assert response.status_code == 403
+    assert response.status_code == 410
+    assert response.json()["detail"]["code"] == "final_generation_disabled"
     upload = client.post("/api/projects/unknown/character-motion/character", files={"file": ("role.png", _png_bytes(), "image/png")}, headers={"origin": "https://untrusted.example"})
     assert upload.status_code == 403
 
@@ -140,53 +156,6 @@ def _ready_plan(client):
     client.post(BASE+'/character',files={'file':('role.png',_png_bytes(),'image/png')})
     state=client.get(BASE).json()
     return client.put(BASE,json={'revision':state['revision'],'prompt':'dancer','settings':state['settings'],'comfyUrl':state['comfyUrl']}).json()
-
-
-def test_explicit_preprocessor_confirmation_required(tmp_path):
-    client,_=_setup(tmp_path,_Comfy);state=_ready_plan(client)
-    response=client.post(BASE+'/runs',json={'revision':state['revision'],'disclosureAccepted':True})
-    assert response.status_code==422
-    assert not client.get(BASE).json()['runs']
-
-
-def test_filtered_output_indexes_are_contiguous(tmp_path):
-    class Preview(_Comfy):
-        def poll(self,prompt_id):
-            return {'status':'completed','outputs':[{'filename':'preview.png','type':'output','subfolder':''},{'filename':'video.mp4','type':'output','subfolder':''}],'error':None}
-    client,_=_setup(tmp_path,Preview);state=_ready_plan(client)
-    state=client.post(BASE+'/runs',json={'revision':state['revision'],'disclosureAccepted':True,'preprocessorConfirmed':True}).json()
-    run=state['runs'][0]
-    completed=client.post(BASE+f'/runs/{run["id"]}/refresh',json={}).json()['runs'][0]
-    assert completed['outputs'][0]['url'].endswith('/output/0')
-    assert client.get(completed['outputs'][0]['url']).status_code==200
-
-
-def test_definite_environment_failure_is_retryable_not_unknown(tmp_path):
-    class Missing(_Comfy):
-        def check(self,workflow):return {'ready':False}
-    client,_=_setup(tmp_path,Missing);state=_ready_plan(client)
-    assert client.post(BASE+'/runs',json={'revision':state['revision'],'disclosureAccepted':True,'preprocessorConfirmed':True}).status_code==422
-    assert client.get(BASE).json()['runs'][0]['status']=='failed'
-
-
-def test_failure_before_submission_does_not_create_an_unknown_run(tmp_path):
-    class CheckFailed(_Comfy):
-        def check(self, workflow):
-            raise TimeoutError('environment check failed')
-
-    client, _ = _setup(tmp_path, CheckFailed)
-    state = _ready_plan(client)
-    response = client.post(
-        BASE + '/runs',
-        json={
-            'revision': state['revision'],
-            'disclosureAccepted': True,
-            'preprocessorConfirmed': True,
-        },
-    )
-
-    assert response.status_code == 502
-    assert client.get(BASE).json()['runs'][0]['status'] == 'failed'
 
 
 def test_package_symlink_does_not_overwrite_outside_file(tmp_path):
