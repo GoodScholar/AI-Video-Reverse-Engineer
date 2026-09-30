@@ -176,8 +176,22 @@ def retain_server_reframe_facts(existing_tracks: list, submitted_tracks: list) -
     existing = {clip.get("id"): clip for track in existing_tracks for clip in track.get("clips", [])}
     for track in submitted_tracks:
         for clip in track.get("clips", []):
+            previous = existing.get(clip.get("id"), {})
             submitted = clip.get("reframe")
-            stored = existing.get(clip.get("id"), {}).get("reframe")
+            stored = previous.get("reframe")
+            # A reframe fact is tied to the decoded source *and* the source-time
+            # range.  A clip id survives candidate replacement, so retaining the
+            # old fact by id would make the new asset render with stale evidence.
+            if isinstance(stored, dict) and any(clip.get(key) != previous.get(key)
+                                                for key in ("assetId", "inPoint", "duration", "speed")):
+                aspect = stored.get("targetAspect")
+                if not isinstance(aspect, dict) or not _positive_int(aspect.get("width")) or not _positive_int(aspect.get("height")):
+                    raise ReframeError("已存主体裁剪缺少可用目标比例。")
+                clip["reframe"] = pending_reframe(
+                    target_width=aspect["width"], target_height=aspect["height"],
+                    reason="素材或源时间已改变，请重新主体分析或设置人工构图。",
+                )
+                continue
             if submitted is None:
                 if isinstance(stored, dict):
                     clip["reframe"] = stored

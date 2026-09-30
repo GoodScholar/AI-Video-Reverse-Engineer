@@ -105,6 +105,41 @@ def test_timeline_reframe_analyze_cancel_and_retry_are_durable(tmp_path):
     assert client.put(BASE, json={"revision": completed["revision"], "settings": completed["settings"], "tracks": forged}).status_code == 422
 
 
+def test_candidate_replacement_persists_pending_reframe_and_manual_render(tmp_path):
+    """Saving a replacement must never resurrect old facts on read or render."""
+    from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint
+    def analyzer(source, _identity):
+        return {"schemaVersion": 1, "sourceFingerprint": source_fingerprint(source), "sourceWidth": 64, "sourceHeight": 48,
+                "targetAspect": {"width": 1280, "height": 720}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+                "samples": [{"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+                            {"timeSeconds": 2, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9}],
+                "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []}}
+    client, queue = setup(tmp_path, reframe_analyzer=analyzer)
+    assets = tmp_path / "project-files" / PROJECT_ID / "preproduction" / "assets"
+    (assets / "replacement.mp4").write_bytes((assets / "video.mp4").read_bytes())
+    state_path = tmp_path / "project-files" / PROJECT_ID / "preproduction" / "state.json"
+    preproduction = json.loads(state_path.read_text())
+    preproduction["assets"].append({"id": "replacement", "name": "替换画面", "kind": "video", "file": "replacement.mp4", "duration": 10.0, "width": 64, "height": 48})
+    state_path.write_text(json.dumps(preproduction))
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    queue.run()
+    analyzed = client.get(BASE).json()
+    replacement = analyzed["tracks"]
+    replacement[0]["clips"][0]["assetId"] = "replacement"
+    replacement[0]["clips"][0].pop("reframe")
+    saved = client.put(BASE, json={"revision": analyzed["revision"], "settings": analyzed["settings"], "tracks": replacement}).json()
+    pending = saved["tracks"][0]["clips"][0]["reframe"]
+    assert pending["sourceFingerprint"] == "" and pending["samples"] == []
+    assert client.get(BASE).json()["tracks"][0]["clips"][0]["reframe"] == pending
+    pending["override"] = {"mode": "center", "keyframes": []}
+    rendered = client.put(BASE, json={"revision": saved["revision"], "settings": saved["settings"], "tracks": saved["tracks"]}).json()
+    queued = client.post(BASE + "/runs", json={"revision": rendered["revision"], "format": "preview"})
+    assert queued.status_code == 202
+    queue.run()
+    assert client.get(BASE).json()["runs"][-1]["status"] == "completed"
+
+
 def test_timeline_reframe_invalidates_when_source_changes_while_queued(tmp_path):
     from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint
     initial = tmp_path / "project-files" / PROJECT_ID / "preproduction" / "assets" / "video.mp4"

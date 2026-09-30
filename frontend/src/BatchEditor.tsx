@@ -235,7 +235,8 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
       (!contentDrafts[task.id] || (contentDrafts[task.id].sellingPoint === task.sellingPoint && contentDrafts[task.id].script === task.script)) &&
       (!drafts[task.id] || JSON.stringify(drafts[task.id]) === JSON.stringify(task.variant.tracks)) &&
       (!transitionDrafts[task.id] || JSON.stringify(transitionDrafts[task.id]) === JSON.stringify(task.variant.transitions ?? [])) &&
-      (!subtitleDrafts[task.id] || JSON.stringify(subtitleDrafts[task.id]) === JSON.stringify(task.variant.subtitles?.cues ?? []));
+      (!subtitleDrafts[task.id] || JSON.stringify(subtitleDrafts[task.id]) === JSON.stringify(task.variant.subtitles?.cues ?? [])) &&
+      (!packagingDrafts[task.id] || JSON.stringify(packagingDrafts[task.id]) === JSON.stringify(task.variant.packaging ?? null));
   }
 
   const childTasks = tasks.filter(task => task.batchId);
@@ -246,7 +247,8 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
       (transitionDrafts[task.id] && JSON.stringify(transitionDrafts[task.id]) !== JSON.stringify(task.variant.transitions ?? [])) ||
       (aspectDrafts[task.id] && (aspectDrafts[task.id].aspectMode !== (task.variant.aspectMode ?? "9:16") ||
         JSON.stringify(aspectDrafts[task.id].settings) !== JSON.stringify(task.variant.settings))) ||
-      (subtitleDrafts[task.id] && JSON.stringify(subtitleDrafts[task.id]) !== JSON.stringify(task.variant.subtitles?.cues ?? []));
+      (subtitleDrafts[task.id] && JSON.stringify(subtitleDrafts[task.id]) !== JSON.stringify(task.variant.subtitles?.cues ?? [])) ||
+      (packagingDrafts[task.id] && JSON.stringify(packagingDrafts[task.id]) !== JSON.stringify(task.variant.packaging ?? null));
     const status = task.reviewStatus ?? "pending";
     return (status === "approved" || status === "rejected") && (changed || hasPendingVoice(task) || !isCurrentPreview(task, task.variant.runs[task.variant.runs.length - 1])) ? "stale" : status;
   }
@@ -884,7 +886,7 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
             {([ ["start", "起点（秒）"], ["inPoint", "入点（秒）"], ["duration", "时长（秒）"], ["speed", "速度"], ["volume", "音量"], ["fadeIn", "淡入（秒）"], ["fadeOut", "淡出（秒）"] ] as const).map(([key, label]) =>
               <label key={key}>{clipName(clip, assets)} {label}<input type="number" min="0" step="0.1" value={clip[key]} onChange={(event) => changeClips(track.id, (clips) => clips.map((item) => item.id === clip.id ? { ...item, [key]: Number(event.target.value) } : item))} /></label>)}
           </div>
-          {track.kind === "video" && <ReframeControls clipId={clip.id} assetUrl={assets.find((asset) => asset.id === clip.assetId)?.url ?? ""}
+          {track.kind === "video" && <ReframeControls clipId={clip.id} assetUrl={assets.find((asset) => asset.id === clip.assetId)?.url ?? ""} mediaKind={assets.find((asset) => asset.id === clip.assetId)?.kind === "image" ? "image" : "video"} sourceStart={clip.inPoint} sourceEnd={clip.inPoint + clip.duration * clip.speed}
             reframe={clip.reframe as Reframe | undefined} analysis={selected.variant.reframeAnalysis?.[clip.id]} disabled={busy}
             onChange={(reframe) => changeClips(track.id, (clips) => clips.map((item) => item.id === clip.id ? { ...item, reframe } : item))}
             onAnalyze={() => void updateReframe(clip.id, "analyze")} onCancel={() => void updateReframe(clip.id, "cancel")}

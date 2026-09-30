@@ -334,6 +334,15 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             checked = {"revision": body["revision"], "settings": settings, "tracks": tracks}
             if "transitions" in body:
                 checked["transitions"] = validate_transitions(body["transitions"], tracks)
+            if "packaging" in body:
+                if body["packaging"] is None:
+                    checked["packaging"] = None
+                else:
+                    from .montage_packaging import PackagingError, validate_packaging
+                    try:
+                        checked["packaging"] = validate_packaging(body["packaging"], [], tracks)
+                    except PackagingError as error:
+                        fail("timeline_packaging_invalid", str(error), 422)
             return checked
 
     @router.put("")

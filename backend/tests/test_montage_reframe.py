@@ -7,7 +7,7 @@ import time
 from types import SimpleNamespace
 
 from app import montage_reframe
-from app.montage_reframe import MODEL_SHA256, ReframeError, SourceTiming, normalize_reframe, pending_reframe, probe_source_timing, reframe_filter, run_local_detector
+from app.montage_reframe import MODEL_SHA256, ReframeError, SourceTiming, normalize_reframe, pending_reframe, probe_source_timing, reframe_filter, retain_server_reframe_facts, run_local_detector
 
 
 def _analysis(*, override=None, samples=None, status="ready"):
@@ -41,6 +41,20 @@ def test_normalize_reframe_preserves_detection_facts_when_manual_override_is_sel
     assert reframe["override"] == {"mode": "manual", "keyframes": [{"timeSeconds": 2.0, "x": .8, "y": .4}]}
     assert reframe["samples"][0]["boxes"][0]["label"] == "person"
     assert reframe["samples"][1]["center"] == {"x": .7, "y": .5}
+
+
+@pytest.mark.parametrize("field,value", [("assetId", "replacement"), ("inPoint", 1), ("duration", 3), ("speed", 1.25)])
+def test_replacement_or_source_range_change_resets_server_reframe_to_pending(field, value):
+    """A stable clip id must never carry detector facts to another source identity."""
+    existing = [{"id": "v", "clips": [{"id": "clip", "assetId": "original", "inPoint": 0, "duration": 2, "speed": 1, "reframe": _analysis()}]}]
+    submitted_clip = {"id": "clip", "assetId": "original", "inPoint": 0, "duration": 2, "speed": 1, "reframe": None}
+    submitted_clip[field] = value
+    result = retain_server_reframe_facts(existing, [{"id": "v", "clips": [submitted_clip]}])
+    reframe = result[0]["clips"][0]["reframe"]
+    assert reframe["status"] == "review_required"
+    assert reframe["sourceFingerprint"] == ""
+    assert reframe["samples"] == []
+    assert "素材或源时间已改变" in reframe["uncertaintyReasons"][0]
 
 
 @pytest.mark.parametrize("field, value", [

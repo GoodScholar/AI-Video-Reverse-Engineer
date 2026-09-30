@@ -3,7 +3,7 @@
  * dashboard/src/components/ReframeEditor.jsx at 89f030934388d5167b3b0ede164ef893dad09ae9 (MIT).
  * See studioPrototype.LICENSE.md for the upstream license notice.
  */
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { BatchCue } from "./batchEditingApi";
 import type { TimelineClip, TimelineTrack } from "./timelineApi";
 import "./reframeControls.css";
@@ -32,56 +32,87 @@ function clamp(value: number, minimum = 0, maximum = 1) { return Math.min(maximu
 function formatTime(value: number) { return `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, "0")}`; }
 function keyframeAt(override: ReframeOverride, time: number) { return [...override.keyframes].sort((left, right) => Math.abs(left.timeSeconds - time) - Math.abs(right.timeSeconds - time))[0]; }
 
-export function ReframeControls({ clipId, assetUrl, reframe, analysis, disabled, onChange, onAnalyze, onCancel, candidates = [], onReplace }: {
+export function ReframeControls({ clipId, assetUrl, mediaKind = "video", sourceStart = 0, sourceEnd, reframe, analysis, disabled, onChange, onAnalyze, onCancel, candidates = [], onReplace }: {
   clipId: string; assetUrl: string; reframe?: Reframe; analysis?: ReframeAnalysis; disabled: boolean;
+  mediaKind?: "video" | "image"; sourceStart?: number; sourceEnd?: number;
   onChange: (value: Reframe) => void; onAnalyze: () => void; onCancel: () => void; candidates?: Array<{ id: string; name: string }>; onReplace?: (assetId: string) => void;
 }) {
   const stage = useRef<HTMLDivElement>(null);
+  const source = useRef<HTMLVideoElement>(null);
   const dragging = useRef(false);
   const [selectedTime, setSelectedTime] = useState<number | null>(null);
-  const currentTime = selectedTime ?? reframe?.samples[0]?.timeSeconds ?? 0;
+  const [visibleFrame, setVisibleFrame] = useState({ left: 0, top: 0, width: 0, height: 0 });
+  const isVideo = mediaKind === "video";
+  const maximumSourceTime = sourceEnd ?? Math.max(sourceStart, ...(reframe?.samples.map((sample) => sample.timeSeconds) ?? [sourceStart]));
+  const currentTime = Math.min(maximumSourceTime, Math.max(sourceStart, selectedTime ?? reframe?.samples[0]?.timeSeconds ?? sourceStart));
   const override = reframe?.override ?? { mode: "auto" as const, keyframes: [] };
   const active = keyframeAt(override, currentTime) ?? { timeSeconds: currentTime, x: .5, y: .5 };
-  const cropFraction = reframe ? clamp((reframe.targetAspect.width / reframe.targetAspect.height) / (reframe.sourceWidth / reframe.sourceHeight), .12, 1) : .5625;
+  const cropFraction = reframe && reframe.sourceWidth && reframe.sourceHeight ? clamp((reframe.targetAspect.width / reframe.targetAspect.height) / (reframe.sourceWidth / reframe.sourceHeight), .12, 1) : .5625;
   const reviewReason = reframe?.uncertaintyReasons?.join("；");
   const setOverride = (next: ReframeOverride) => { if (reframe) onChange({ ...reframe, override: next }); };
+  const measureVisibleFrame = () => {
+    const stageRect = stage.current?.getBoundingClientRect();
+    const sourceRect = source.current?.getBoundingClientRect();
+    if (!stageRect || !sourceRect || !sourceRect.width || !sourceRect.height) return;
+    setVisibleFrame({ left: sourceRect.left - stageRect.left, top: sourceRect.top - stageRect.top, width: sourceRect.width, height: sourceRect.height });
+  };
+  useEffect(() => {
+    const node = source.current;
+    if (!node || !isVideo) return;
+    const sync = () => { measureVisibleFrame(); if (node.currentTime < sourceStart) node.currentTime = sourceStart; };
+    node.addEventListener("loadedmetadata", sync);
+    window.addEventListener("resize", measureVisibleFrame);
+    sync();
+    return () => { node.removeEventListener("loadedmetadata", sync); window.removeEventListener("resize", measureVisibleFrame); };
+  }, [assetUrl, isVideo, sourceStart]);
   const move = (clientX: number) => {
     if (!reframe || disabled) return;
-    const rect = stage.current?.getBoundingClientRect();
-    if (!rect?.width) return;
-    const x = clamp((clientX - rect.left) / rect.width, cropFraction / 2, 1 - cropFraction / 2);
-    const keyframes = [...override.keyframes.filter((item) => item.timeSeconds !== currentTime), { timeSeconds: currentTime, x: Number(x.toFixed(3)), y: .5 }]
+    const sourceRect = source.current?.getBoundingClientRect();
+    const stageRect = stage.current?.getBoundingClientRect();
+    const interactiveRect = sourceRect?.width ? sourceRect : stageRect;
+    if (!interactiveRect?.width) return;
+    const x = clamp((clientX - interactiveRect.left) / interactiveRect.width, cropFraction / 2, 1 - cropFraction / 2);
+    const keyframes = [...override.keyframes.filter((item) => item.timeSeconds !== active.timeSeconds), { timeSeconds: currentTime, x: Number(x.toFixed(3)), y: .5 }]
       .sort((left, right) => left.timeSeconds - right.timeSeconds);
     setOverride({ mode: "manual", keyframes });
+  };
+  const selectPlaybackTime = () => {
+    const value = source.current?.currentTime;
+    if (!Number.isFinite(value)) return;
+    setSelectedTime(Math.min(maximumSourceTime, Math.max(sourceStart, value!)));
+  };
+  const overlay = (interactive: boolean) => {
+    const frame = visibleFrame.width ? visibleFrame : { left: 0, top: 0, width: stage.current?.getBoundingClientRect().width ?? 0, height: stage.current?.getBoundingClientRect().height ?? 0 };
+    const left = frame.left + Math.max(0, active.x - cropFraction / 2) * frame.width;
+    const right = frame.left + Math.max(0, 1 - active.x - cropFraction / 2) * frame.width;
+    return <><div className="reframe-dim reframe-dim-left" style={{ left: frame.left, top: frame.top, width: Math.max(0, left - frame.left), height: frame.height }} />
+      <div className="reframe-dim reframe-dim-right" style={{ left: right, top: frame.top, width: Math.max(0, frame.left + frame.width - right), height: frame.height }} />
+      <div className="reframe-window" role="slider" aria-label={`${clipId} 裁剪框`} aria-disabled={interactive ? undefined : "true"} aria-valuemin={0} aria-valuemax={1} aria-valuenow={active.x} tabIndex={interactive ? 0 : undefined}
+        style={{ left, top: frame.top, width: cropFraction * frame.width, height: frame.height }} onPointerDown={interactive ? (event) => { dragging.current = true; event.currentTarget.setPointerCapture?.(event.pointerId); move(event.clientX); } : undefined}
+        onKeyDown={interactive ? (event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); const x = clamp(active.x + (event.key === "ArrowLeft" ? -.02 : .02), cropFraction / 2, 1 - cropFraction / 2); setOverride({ mode: "manual", keyframes: [...override.keyframes.filter((item) => item.timeSeconds !== active.timeSeconds), { timeSeconds: currentTime, x: Number(x.toFixed(3)), y: .5 }].sort((a, b) => a.timeSeconds - b.timeSeconds) }); } } : undefined} />
+    </>;
   };
 
   return <section className="reframe-controls" aria-label="主体裁剪">
     <header><div><h5>主体裁剪与满幅构图</h5><p>播放原片并拖动明亮裁剪框；框外区域会变暗。人工关键点只保存在草稿中，分析完成不会覆盖它。</p></div>
-      <div className="reframe-actions">{analysis?.status === "queued" || analysis?.status === "running"
+      <div className="reframe-actions">{isVideo && (analysis?.status === "queued" || analysis?.status === "running"
         ? <button type="button" className="secondary-action" disabled={disabled} onClick={onCancel}>取消主体分析</button>
-        : <button type="button" className="secondary-action" disabled={disabled} onClick={onAnalyze}>{analysis?.status === "failed" ? "重新分析主体" : "分析主体"}</button>}</div></header>
+        : <button type="button" className="secondary-action" disabled={disabled} onClick={onAnalyze}>{analysis?.status === "failed" ? "重新分析主体" : "分析主体"}</button>)}</div></header>
     {analysis?.status === "failed" && <p className="reframe-error" role="alert">主体分析失败：{analysis.error ?? "请检查本地模型和原片后重试。"}</p>}
     {analysis && (analysis.status === "queued" || analysis.status === "running") && <p role="status">主体分析{analysis.status === "queued" ? "排队中" : "进行中"}；可以取消，当前人工草稿不会丢失。</p>}
     {reviewReason && <p className="reframe-review" role="status">需人工确认：{reviewReason}</p>}
-    {!reframe && assetUrl && <><p role="status">原片已就绪；完成主体分析后即可拖动裁剪框并保存人工关键点。</p><div ref={stage} className="reframe-stage" aria-label={`${clipId} 主体裁剪原片`}>
-      <video controls playsInline preload="metadata" src={assetUrl} aria-label={`${clipId} 原片`} />
-      <div className="reframe-dim reframe-dim-left" style={{ width: `${Math.max(0, active.x - cropFraction / 2) * 100}%` }} />
-      <div className="reframe-dim reframe-dim-right" style={{ width: `${Math.max(0, 1 - active.x - cropFraction / 2) * 100}%` }} />
-      <div className="reframe-window" role="slider" aria-label={`${clipId} 裁剪框`} aria-disabled="true" aria-valuemin={0} aria-valuemax={1} aria-valuenow={active.x} style={{ left: `${(active.x - cropFraction / 2) * 100}%`, width: `${cropFraction * 100}%` }} />
+    {mediaKind === "image" && assetUrl && <><p role="status">静态图片按原始像素显示；主体分析仅支持视频素材。</p><div className="reframe-stage" aria-label={`${clipId} 静态图片`}><img src={assetUrl} alt={`${clipId} 原片`} /></div></>}
+    {!reframe && assetUrl && isVideo && <><p role="status">原片已就绪；完成主体分析后即可拖动裁剪框并保存人工关键点。</p><div ref={stage} className="reframe-stage" aria-label={`${clipId} 主体裁剪原片`}>
+      <video ref={source} controls playsInline preload="metadata" src={assetUrl} aria-label={`${clipId} 原片`} onTimeUpdate={selectPlaybackTime} />{overlay(false)}
     </div></>}
-    {reframe ? <>
+    {reframe && isVideo ? <>
       <div className="reframe-keyframes" aria-label="源时间关键点">{reframe.samples.map((sample) => <button key={sample.timeSeconds} type="button" className="secondary-action" disabled={disabled}
         aria-pressed={sample.timeSeconds === currentTime} onClick={() => setSelectedTime(sample.timeSeconds)}>{formatTime(sample.timeSeconds)}</button>)}<label>关键点秒<input aria-label="关键点秒" type="number" min="0" step=".01" value={active.timeSeconds} disabled={disabled}
-          onChange={(event) => { const timeSeconds = Number(event.target.value); if (!Number.isFinite(timeSeconds)) return; setSelectedTime(timeSeconds); setOverride({ mode: "manual", keyframes: [...override.keyframes.filter((item) => item.timeSeconds !== active.timeSeconds), { ...active, timeSeconds }].sort((a, b) => a.timeSeconds - b.timeSeconds) }); }} /></label>
-        <button type="button" className="secondary-action" disabled={disabled} onClick={() => setOverride({ mode: "manual", keyframes: [...override.keyframes, { ...active, timeSeconds: currentTime }].sort((a, b) => a.timeSeconds - b.timeSeconds) })}>新增关键点</button>
-        <button type="button" className="secondary-action" disabled={disabled || !override.keyframes.length} onClick={() => setOverride({ ...override, keyframes: override.keyframes.filter((item) => item.timeSeconds !== active.timeSeconds) })}>删除关键点</button></div>
+          onChange={(event) => { const input = Number(event.target.value); if (!Number.isFinite(input)) return; const timeSeconds = Math.min(maximumSourceTime, Math.max(sourceStart, input)); setSelectedTime(timeSeconds); setOverride({ mode: "manual", keyframes: [...override.keyframes.filter((item) => item.timeSeconds !== active.timeSeconds && item.timeSeconds !== timeSeconds), { ...active, timeSeconds }].sort((a, b) => a.timeSeconds - b.timeSeconds) }); }} /></label>
+        <button type="button" className="secondary-action" disabled={disabled} onClick={() => setOverride({ mode: "manual", keyframes: [...override.keyframes.filter((item) => item.timeSeconds !== currentTime), { ...active, timeSeconds: currentTime }].sort((a, b) => a.timeSeconds - b.timeSeconds) })}>新增关键点</button>
+        <button type="button" className="secondary-action" disabled={disabled || override.keyframes.length <= 1} onClick={() => setOverride({ ...override, keyframes: override.keyframes.filter((item) => item.timeSeconds !== active.timeSeconds) })}>删除关键点</button></div>
       <div ref={stage} className="reframe-stage" aria-label={`${clipId} 主体裁剪原片`} onPointerMove={(event) => { if (dragging.current) move(event.clientX); }} onPointerUp={() => { dragging.current = false; }} onPointerCancel={() => { dragging.current = false; }}>
-        <video controls playsInline preload="metadata" src={assetUrl} aria-label={`${clipId} 原片`} />
-        <div className="reframe-dim reframe-dim-left" style={{ width: `${Math.max(0, active.x - cropFraction / 2) * 100}%` }} />
-        <div className="reframe-dim reframe-dim-right" style={{ width: `${Math.max(0, 1 - active.x - cropFraction / 2) * 100}%` }} />
-        <div className="reframe-window" role="slider" aria-label={`${clipId} 裁剪框`} aria-valuemin={0} aria-valuemax={1} aria-valuenow={active.x} tabIndex={0}
-          style={{ left: `${(active.x - cropFraction / 2) * 100}%`, width: `${cropFraction * 100}%` }} onPointerDown={(event) => { dragging.current = true; event.currentTarget.setPointerCapture?.(event.pointerId); move(event.clientX); }}
-          onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); const x = clamp(active.x + (event.key === "ArrowLeft" ? -.02 : .02), cropFraction / 2, 1 - cropFraction / 2); setOverride({ mode: "manual", keyframes: [...override.keyframes.filter((item) => item.timeSeconds !== currentTime), { timeSeconds: currentTime, x: Number(x.toFixed(3)), y: .5 }].sort((a, b) => a.timeSeconds - b.timeSeconds) }); } }} />
+        <video ref={source} controls playsInline preload="metadata" src={assetUrl} aria-label={`${clipId} 原片`} onLoadedMetadata={measureVisibleFrame} onTimeUpdate={selectPlaybackTime} />{overlay(true)}
       </div>
       <div className="reframe-modes" role="group" aria-label="裁剪模式"><button type="button" className="secondary-action" aria-pressed={override.mode === "auto"} disabled={disabled} onClick={() => setOverride({ mode: "auto", keyframes: [] })}>自动</button>
         <button type="button" className="secondary-action" aria-pressed={override.mode === "center"} disabled={disabled} onClick={() => setOverride({ mode: "center", keyframes: [] })}>中心裁剪</button>
@@ -106,7 +137,9 @@ export function PackagingControls({ value, cues, onChange, disabled }: { value: 
   const update = (change: Partial<Packaging>) => onChange({ ...value, ...change });
   const updateElement = (id: string, change: Partial<PackagingElement>) => update({ elements: value.elements.map((item) => item.id === id ? { ...item, ...change } as PackagingElement : item) });
   const add = (kind: PackagingElement["kind"]) => {
-    const id = `${kind}-${value.elements.length + 1}`;
+    let serial = 1;
+    while (value.elements.some((item) => item.id === `${kind}-${serial}`)) serial += 1;
+    const id = `${kind}-${serial}`;
     const base = { id, kind, enabled: true, position: kind === "subtitle" ? "bottom" : "top", style: kind === "title" ? "banner" : "plain" } as const;
     update({ elements: [...value.elements, kind === "subtitle" ? { ...base, cueId: cues[0]?.id ?? "" } : { ...base, start: 0, end: 2, text: kind === "cta" ? "立即了解" : "" }] });
   };
@@ -127,12 +160,16 @@ export function PackagingControls({ value, cues, onChange, disabled }: { value: 
 
 export function reframeForClip(clip: TimelineClip) { return clip.reframe as Reframe | undefined; }
 
-/** Server analysis facts win; a local non-auto override remains the user's draft. */
+function sameReframeIdentity(left: TimelineClip, right: TimelineClip) {
+  return ["assetId", "inPoint", "duration", "speed"].every((key) => left[key as keyof TimelineClip] === right[key as keyof TimelineClip]);
+}
+
+/** Server analysis facts win only for the same source identity; a local non-auto override remains the user's draft. */
 export function mergeServerReframeFacts(draftTracks: TimelineTrack[], serverTracks: TimelineTrack[]): TimelineTrack[] {
   const serverById = new Map(serverTracks.flatMap((track) => track.clips).map((clip) => [clip.id, clip]));
   return draftTracks.map((track) => ({ ...track, clips: track.clips.map((clip) => {
     const server = serverById.get(clip.id);
-    if (!server?.reframe) return clip;
+    if (!server?.reframe || !sameReframeIdentity(clip, server)) return clip;
     const override = clip.reframe?.override;
     return { ...clip, reframe: { ...server.reframe, ...(override && override.mode !== "auto" ? { override } : {}) } };
   }) }));

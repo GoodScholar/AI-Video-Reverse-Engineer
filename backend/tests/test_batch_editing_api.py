@@ -727,6 +727,37 @@ def test_variant_edits_keep_other_tasks_and_project_timeline_unchanged(tmp_path)
         assert client.put(path, json={"revision": 1, "tracks": tracks}, headers=INTENT).status_code == 422
 
 
+def test_variant_candidate_replacement_reads_back_pending_reframe(tmp_path):
+    """Batch variant save shares the replacement contract with Timeline."""
+    with TestClient(create_app(tmp_path)) as client:
+        project_id = client.post("/api/projects", json={"name": "替换主体素材"}).json()["id"]
+        asset_root = tmp_path / "project-files" / project_id / "preproduction"
+        (asset_root / "assets").mkdir(parents=True)
+        for name in ("old.mp4", "new.mp4"):
+            (asset_root / "assets" / name).write_bytes(b"video")
+        (asset_root / "state.json").write_text(json.dumps({"schemaVersion": 1, "revision": 1, "brief": {}, "shots": [], "assets": [
+            {"id": "old", "name": "旧素材", "kind": "video", "file": "old.mp4", "duration": 4},
+            {"id": "new", "name": "新素材", "kind": "video", "file": "new.mp4", "duration": 4},
+        ]}), encoding="utf-8")
+        base = f"/api/projects/{project_id}/batch-edits"
+        task = client.post(base, json={"sellingPoint": "省时", "script": "演示"}, headers=INTENT).json()["task"]
+        state_path = tmp_path / "project-files" / project_id / "batch-edits" / "state.json"
+        state = json.loads(state_path.read_text())
+        clip = {"id": "clip-a", "assetId": "old", "start": 0, "inPoint": 0, "duration": 2, "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0,
+                "reframe": {"schemaVersion": 1, "sourceFingerprint": "", "sourceWidth": 0, "sourceHeight": 0, "targetAspect": {"width": 720, "height": 1280}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256, "samples": [], "uncertaintyReasons": ["待分析"], "status": "review_required", "override": {"mode": "auto", "keyframes": []}}}
+        state["tasks"][0]["variant"]["tracks"][0]["clips"] = [clip]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        reopened = client.get(base).json()["tasks"][0]
+        tracks = reopened["variant"]["tracks"]
+        tracks[0]["clips"][0]["assetId"] = "new"
+        tracks[0]["clips"][0].pop("reframe")
+        saved = client.put(f"{base}/{task['id']}/variant", json={"revision": 0, "tracks": tracks}, headers=INTENT)
+        assert saved.status_code == 200, saved.text
+        pending = saved.json()["variant"]["tracks"][0]["clips"][0]["reframe"]
+        assert pending["sourceFingerprint"] == "" and pending["samples"] == []
+        assert client.get(base).json()["tasks"][0]["variant"]["tracks"][0]["clips"][0]["reframe"] == pending
+
+
 def test_script_recommendation_uses_asset_notes_and_never_replaces_saved_variant(tmp_path):
     with TestClient(create_app(tmp_path)) as client:
         project_id = client.post("/api/projects", json={"name": "营销视频"}).json()["id"]
