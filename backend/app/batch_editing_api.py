@@ -724,13 +724,26 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             for item, clip, source, source_fact, aspect in confirmed:
                 identity = {**item["identity"], "sourceFingerprint": source_fact["fingerprint"], "targetAspect": aspect}
                 existing = analysis.get(item["id"])
+                force_retry = False
                 if item["id"] in progressed:
                     if existing is None or existing.get("status") == "cancelled":
                         raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "主体分析状态已更新，请刷新后重试。"})
                     if existing.get("identity") == identity:
-                        continue
+                        if existing.get("status") in ("queued", "running", "completed"):
+                            continue
+                        # A late failed draft is retryable; it must not be
+                        # silently retained as an adopted terminal record.
+                        force_retry = True
                     if existing.get("status") in ("queued", "running"):
                         raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "主体分析状态已更新，请刷新后重试。"})
+                elif existing is not None and existing.get("status") in ("queued", "running"):
+                    if existing.get("identity") == identity:
+                        continue
+                    # This staged apply tentatively marked the old draft as
+                    # adopted before the current source proof was available.
+                    # A different full identity must start fresh, never adopt it.
+                    existing.pop("adopted", None)
+                    force_retry = True
                 previous_reframe = clip.get("reframe", {})
                 previous_fingerprint = previous_reframe.get("sourceFingerprint")
                 reusable = (reuse_existing and previous_fingerprint == source_fact["fingerprint"]
@@ -738,7 +751,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                             and previous_reframe.get("targetAspect") == aspect
                             and (previous_reframe.get("sourceWidth"), previous_reframe.get("sourceHeight"))
                             == tuple(source_fact["size"]))
-                if reusable:
+                if reusable and not force_retry:
                     # A full lock-free proof confirms that these saved facts
                     # (including a deliberate manual decision) still bind the source.
                     continue

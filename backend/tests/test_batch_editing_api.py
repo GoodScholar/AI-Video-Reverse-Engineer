@@ -2417,3 +2417,28 @@ def test_batch_reframe_worker_rejects_asset_identity_change_with_same_file(tmp_p
 
         variant = client.get(base).json()["tasks"][0]["variant"]
         assert variant["reframeAnalysis"][proposal["clips"][0]["id"]]["status"] == "failed"
+
+
+def test_explicit_batch_reanalysis_preserves_matching_manual_and_clears_changed_source(tmp_path):
+    app, queue = _proposal_reframe_app(tmp_path)
+    with TestClient(app) as client:
+        project_id, base, task, proposal = _create_montage_proposal(client, tmp_path)
+        assert client.post(f"{base}/{task['id']}/montage-proposals/{proposal['id']}/apply", json={
+            "revision": 0, "proposalRevision": 0, "strategy": "overwrite",
+        }, headers=INTENT).status_code == 200
+        _kind, pid, handler = queue.jobs.pop(0); handler(pid)
+        variant = client.get(base).json()["tasks"][0]["variant"]
+        clip = variant["tracks"][0]["clips"][0]
+        clip["reframe"]["override"] = {"mode": "manual", "keyframes": [{"timeSeconds": 1, "x": .3, "y": .6}]}
+        saved = client.put(f"{base}/{task['id']}/variant", json={"revision": variant["revision"], "tracks": variant["tracks"]}, headers=INTENT).json()["variant"]
+        url = f"{base}/{task['id']}/variant/reframes/{clip['id']}"
+        assert client.post(url + "/analyze", json={"revision": saved["revision"]}, headers=INTENT).status_code == 202
+        _kind, pid, handler = queue.jobs.pop(0); handler(pid)
+        preserved = client.get(base).json()["tasks"][0]["variant"]["tracks"][0]["clips"][0]["reframe"]
+        assert preserved["override"]["mode"] == "manual"
+
+        source = tmp_path / "project-files" / project_id / "preproduction" / "assets" / "lid.mp4"
+        source.write_bytes(b"changed-source")
+        assert client.post(url + "/analyze", json={"revision": client.get(base).json()["tasks"][0]["variant"]["revision"]}, headers=INTENT).status_code == 202
+        changed = client.get(base).json()["tasks"][0]["variant"]["tracks"][0]["clips"][0]["reframe"]
+        assert changed["override"]["mode"] == "auto"
