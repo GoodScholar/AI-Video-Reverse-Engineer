@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 import subprocess
 import tempfile
@@ -26,6 +27,7 @@ DETECTOR_VERSION = "mediapipe-object-detector-0.10.21"
 SCHEMA_VERSION = 1
 MODEL_SHA256 = "2e04c53bfeac0ac2a30c057c7e2a777594ce39baaac35a92f74fb1e8c4fc4e0b"
 _OVERRIDE_MODES = frozenset(("auto", "center", "manual", "replace"))
+_TIMING_TICKS_PER_SECOND = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -339,6 +341,15 @@ def _finite_float(value: Any) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
+def _timing_ticks(value: Any) -> int | None:
+    """Use the persisted worker/ffprobe six-decimal PTS timebase for boundaries."""
+    try:
+        parsed = Decimal(str(value)) * _TIMING_TICKS_PER_SECOND
+        return int(parsed.to_integral_value(rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError):
+        return None
+
+
 def _review_required(value: dict[str, Any], samples: list[dict[str, Any]], override: dict[str, Any], reason: str) -> dict[str, Any]:
     reasons = list(value["uncertaintyReasons"])
     if reason not in reasons:
@@ -352,26 +363,29 @@ def _source_samples_cover(timing: SourceTiming | None, samples: list[dict[str, A
     """Authorize auto framing only from the server's real PTS table."""
     if timing is None or not timing.cfr or len(timing.elapsed) != len(timing.durations) or not timing.elapsed:
         return False
-    if any(duration <= 0 or not math.isfinite(duration) for duration in timing.durations):
+    timing_points = [_timing_ticks(point) for point in timing.elapsed]
+    timing_durations = [_timing_ticks(duration) for duration in timing.durations]
+    if any(point is None for point in timing_points) or any(duration is None or duration <= 0 for duration in timing_durations):
         return False
-    if any(not any(abs(sample["timeSeconds"] - pts) <= .001 for pts in timing.elapsed) for sample in samples):
+    sample_points = [_timing_ticks(sample["timeSeconds"]) for sample in samples]
+    if any(point is None or point not in timing_points for point in sample_points):
         return False
     if start is None or end is None:
         return True
-    if not (_finite_number(start) and _finite_number(end) and 0 <= start < end):
+    start_tick, end_tick = _timing_ticks(start), _timing_ticks(end)
+    if not (_finite_number(start) and _finite_number(end) and 0 <= start < end and start_tick is not None and end_tick is not None):
         return False
-    intersecting = [index for index, (pts, duration) in enumerate(zip(timing.elapsed, timing.durations))
-                    if pts < end and pts + duration > start]
+    intersecting = [index for index, (pts, duration) in enumerate(zip(timing_points, timing_durations))
+                    if pts < end_tick and pts + duration > start_tick]
     if not intersecting:
         return False
     first, last = intersecting[0], intersecting[-1]
-    if abs(samples[0]["timeSeconds"] - timing.elapsed[first]) > .001 or abs(samples[-1]["timeSeconds"] - timing.elapsed[last]) > .001:
+    if sample_points[0] != timing_points[first] or sample_points[-1] != timing_points[last]:
         return False
-    frame_duration = max(timing.durations)
-    if any(right["timeSeconds"] - left["timeSeconds"] > .5 + frame_duration + .001
-           for left, right in zip(samples, samples[1:])):
+    max_gap = _timing_ticks(.5) + max(timing_durations) + _timing_ticks(.001)
+    if any(right - left > max_gap for left, right in zip(sample_points, sample_points[1:])):
         return False
-    return timing.elapsed[first] + timing.durations[first] > start and timing.elapsed[last] < end
+    return timing_points[first] + timing_durations[first] > start_tick and timing_points[last] < end_tick
 
 
 def _samples(value: Any) -> list[dict[str, Any]]:

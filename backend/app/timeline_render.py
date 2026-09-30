@@ -239,7 +239,9 @@ def _collect_clips(tracks: list, sources: Dict[str, Path], ffprobe_path: str, fo
             if clip.get("reframe") is not None and media.has_video and not media.image:
                 from .montage_reframe import probe_source_timing, source_fingerprint
                 fingerprint = source_fingerprint(source)
-                source_timing = timing_cache.setdefault(fingerprint, probe_source_timing(source, ffprobe_path))
+                if fingerprint not in timing_cache:
+                    timing_cache[fingerprint] = probe_source_timing(source, ffprobe_path)
+                source_timing = timing_cache[fingerprint]
             start = _nonnegative_number(clip.get("start"), "片段起点")
             in_point = _nonnegative_number(clip.get("inPoint"), "片段入点")
             clip_duration = _positive_number(clip.get("duration"), "片段时长")

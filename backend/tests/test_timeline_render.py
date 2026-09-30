@@ -99,6 +99,29 @@ def _probe(path: Path):
     return json.loads(result.stdout)
 
 
+def test_collect_clips_probes_reframe_timing_once_per_source(monkeypatch, tmp_path):
+    """A dict cache must not evaluate its default probe on a cache hit."""
+    source = tmp_path / "shared.mp4"
+    source.write_bytes(b"shared")
+    calls = []
+    monkeypatch.setattr(timeline_render, "_probe_media", lambda *_: timeline_render._Media(
+        4, 4, None, True, False, False, 64, 48, 24, "1:1", 0,
+    ))
+    from app import montage_reframe
+    timing = montage_reframe.SourceTiming((0, 1), (1, 1), True, None)
+    monkeypatch.setattr(montage_reframe, "probe_source_timing", lambda path, probe: calls.append((path, probe)) or timing)
+    reframe = {"schemaVersion": 1, "sourceFingerprint": source_fingerprint(source), "sourceWidth": 64, "sourceHeight": 48,
+               "targetAspect": {"width": 64, "height": 48}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+               "samples": [{"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9}],
+               "uncertaintyReasons": ["人工构图"], "status": "review_required", "override": {"mode": "center", "keyframes": []}}
+    tracks = [_track("video", [_clip("shared", 0, 1, id="one", reframe=reframe),
+                                _clip("shared", 1, 1, id="two", reframe=reframe)])]
+
+    timeline_render._collect_clips(tracks, {"shared": source}, "ffprobe", "mp4")
+
+    assert calls == [(source, "ffprobe")]
+
+
 def _rgb_at(path: Path, second: float):
     result = subprocess.run(
         ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-ss", str(second), "-i", str(path),

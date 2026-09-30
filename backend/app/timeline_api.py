@@ -121,6 +121,10 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 save(project_id, state)
             try:
                 from .montage_reframe import normalize_reframe, run_local_detector, source_fingerprint
+                if not source.is_file():
+                    raise ValueError("分析期间素材已变化，请重新主体分析。")
+                if not all(type(value) is int and value > 0 for value in trusted_size):
+                    raise ValueError("无法获取可信源尺寸，不能完成主体分析。")
                 raw = reframe_analyzer(source, identity) if reframe_analyzer else run_local_detector(
                     source, start=identity["inPoint"], end=identity["inPoint"] + identity["duration"] * identity["speed"],
                     target_width=state["settings"]["width"], target_height=state["settings"]["height"],
@@ -128,8 +132,7 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                     cancelled=lambda: (state_for(project_id).get("reframeAnalysis", {}).get(clip_id, {}).get("id") != run_id
                                        or state_for(project_id).get("reframeAnalysis", {}).get(clip_id, {}).get("status") == "cancelled"))
                 result = normalize_reframe(raw, source_fingerprint=identity["sourceFingerprint"],
-                                           source_width=trusted_size[0] or raw["sourceWidth"],
-                                           source_height=trusted_size[1] or raw["sourceHeight"], source_timing=source_timing,
+                                           source_width=trusted_size[0], source_height=trusted_size[1], source_timing=source_timing,
                                            required_start=identity["inPoint"],
                                            required_end=identity["inPoint"] + identity["duration"] * identity["speed"])
                 error = None

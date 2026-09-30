@@ -99,9 +99,13 @@ def install_montage_indexes(root, project_id):
     preproduction = root / "project-files" / project_id / "preproduction"
     (preproduction / "assets").mkdir(parents=True)
     assets = []
-    for asset_id, name in (("lid", "杯盖防泼溅"), ("commute", "通勤携带")):
+    for asset_id, name, color in (("lid", "杯盖防泼溅", "red"), ("commute", "通勤携带", "blue")):
         filename = f"{asset_id}.mp4"
-        (preproduction / "assets" / filename).write_bytes((asset_id * 20).encode())
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
+            f"color={color}:size=64x48:rate=24:duration=6", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            str(preproduction / "assets" / filename),
+        ], check=True, capture_output=True, text=True)
         assets.append({"id": asset_id, "name": name, "kind": "video", "file": filename, "duration": 6})
     (preproduction / "state.json").write_text(json.dumps({
         "schemaVersion": 1, "revision": 1, "brief": {}, "shots": [], "assets": assets,
@@ -892,7 +896,10 @@ def test_batch_reframe_repeat_cancel_retry_and_source_cas(tmp_path):
     root = tmp_path / "project-files" / project_id / "preproduction"
     (root / "assets").mkdir(parents=True)
     source = root / "assets" / "source.mp4"
-    source.write_bytes(b"source")
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
+        "color=red:size=64x48:rate=24:duration=4", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+    ], check=True, capture_output=True, text=True)
     (root / "state.json").write_text(json.dumps({"schemaVersion": 1, "revision": 1, "brief": {}, "shots": [],
         "assets": [{"id": "source", "name": "source", "kind": "video", "file": "source.mp4", "duration": 8}]}, ensure_ascii=False), encoding="utf-8")
     jobs = []
@@ -934,6 +941,120 @@ def test_batch_reframe_repeat_cancel_retry_and_source_cas(tmp_path):
         deleted = client.get(base).json()["tasks"][0]["variant"]["reframeAnalysis"]["clip"]
         assert deleted["status"] == "failed"
         assert "素材" in deleted["error"]
+
+
+def test_batch_reframe_never_accepts_worker_dimensions_when_the_source_probe_has_none(tmp_path, monkeypatch):
+    """A batch analysis cannot become ready from self-reported worker dimensions."""
+    from app import timeline_render
+    project_id = "reframe-size-batch"
+    root = tmp_path / "project-files" / project_id / "preproduction"
+    (root / "assets").mkdir(parents=True)
+    source = root / "assets" / "source.mp4"
+    source.write_bytes(b"source")
+    (root / "state.json").write_text(json.dumps({"schemaVersion": 1, "revision": 1, "brief": {}, "shots": [],
+        "assets": [{"id": "source", "name": "source", "kind": "video", "file": "source.mp4", "duration": 8}]}), encoding="utf-8")
+    monkeypatch.setattr(timeline_render, "_probe_media", lambda *_: SimpleNamespace(width=None, height=None))
+    jobs = []
+
+    class Queue:
+        def submit(self, _kind, pid, handler):
+            jobs.append((pid, handler)); return True
+
+    def analyzer(path, _start, _end, aspect):
+        return {"schemaVersion": 1, "sourceFingerprint": source_fingerprint(path), "sourceWidth": 64, "sourceHeight": 48,
+                "targetAspect": aspect, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+                "samples": [{"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9}],
+                "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []}}
+
+    app = FastAPI()
+    app.include_router(create_batch_editing_router(tmp_path, lambda _: SimpleNamespace(id=project_id), Queue(), reframe_analyzer=analyzer))
+    with TestClient(app) as client:
+        base = f"/api/projects/{project_id}/batch-edits"
+        task = client.post(base, json={"sellingPoint": "x", "script": "x"}).json()["task"]
+        tracks = task["variant"]["tracks"]
+        tracks[0]["clips"] = [{"id": "clip", "assetId": "source", "start": 0, "inPoint": 0, "duration": 2,
+                               "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0}]
+        assert client.put(f"{base}/{task['id']}/variant", json={"revision": 0, "tracks": tracks}).status_code == 200
+        assert client.post(f"{base}/{task['id']}/variant/reframes/clip/analyze", json={"revision": 1}).status_code == 202
+        jobs.pop()[1](project_id)
+        record = client.get(base).json()["tasks"][0]["variant"]["reframeAnalysis"]["clip"]
+        assert record["status"] == "failed"
+        assert "可信源尺寸" in record["error"]
+
+
+def test_completed_export_download_rechecks_real_reframe_sources_but_keeps_center_and_legacy_available(tmp_path, monkeypatch):
+    """The output route must not trust a completed status when a new source probe downgrades auto framing."""
+    from copy import deepcopy
+    from app import montage_reframe
+    from app.montage_reframe import normalize_reframe, probe_source_timing
+    project_id = "reframe-delivery"
+    root = tmp_path / "project-files" / project_id / "preproduction"
+    (root / "assets").mkdir(parents=True)
+    source = root / "assets" / "source.mp4"
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
+        "color=red:size=64x48:rate=30:duration=2", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+    ], check=True, capture_output=True, text=True)
+    (root / "state.json").write_text(json.dumps({"schemaVersion": 1, "revision": 1, "brief": {}, "shots": [],
+        "assets": [{"id": "source", "name": "source", "kind": "video", "file": "source.mp4", "duration": 2}]}), encoding="utf-8")
+    timing = probe_source_timing(source, "ffprobe")
+    assert timing.cfr
+    raw = {"schemaVersion": 1, "sourceFingerprint": source_fingerprint(source), "sourceWidth": 64, "sourceHeight": 48,
+           "targetAspect": {"width": 720, "height": 1280}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+           "samples": [{"timeSeconds": point, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9}
+                       for point in timing.elapsed], "uncertaintyReasons": [], "status": "ready",
+           "override": {"mode": "auto", "keyframes": []}}
+    ready = normalize_reframe(raw, source_fingerprint=source_fingerprint(source), source_width=64, source_height=48,
+                              source_timing=timing, required_start=0, required_end=2)
+    assert ready["status"] == "ready"
+
+    app = FastAPI()
+    app.include_router(create_batch_editing_router(tmp_path, lambda value: SimpleNamespace(id=value) if value == project_id else None, DeferredComputeQueue()))
+    with TestClient(app) as client:
+        base = f"/api/projects/{project_id}/batch-edits"
+        task = client.post(base, json={"sellingPoint": "x", "script": "x"}).json()["task"]
+        state_path = tmp_path / "project-files" / project_id / "batch-edits" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        stored = state["tasks"][0]
+        clip = {"id": "clip", "assetId": "source", "start": 0, "inPoint": 0, "duration": 2,
+                "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0, "reframe": ready}
+        stored["variant"].update(revision=1, tracks=[{**stored["variant"]["tracks"][0], "clips": [clip]}, stored["variant"]["tracks"][1]])
+        snapshot = {"settings": deepcopy(stored["variant"]["settings"]), "tracks": deepcopy(stored["variant"]["tracks"])}
+        preview = {"id": "preview", "revision": 1, "contentRevision": 0, "subtitleRevision": 0, "subtitleCues": [],
+                   "status": "completed", "error": None, "output": "preview.mp4", "snapshot": deepcopy(snapshot), "sources": {"source": "source.mp4"}}
+        review = {"id": "review", "runId": "preview", "decision": "approved", "reason": "确认",
+                  "contentRevision": 0, "variantRevision": 1, "subtitleRevision": 0}
+        def delivery(run_id, snap):
+            return {"id": run_id, "status": "completed", "error": None, "output": run_id + ".mp4",
+                    "contentRevision": 0, "variantRevision": 1, "subtitleRevision": 0, "previewRunId": "preview",
+                    "review": deepcopy(review), "sellingPoint": "x", "script": "x", "snapshot": snap,
+                    "subtitles": [], "assets": [{"id": "source", "name": "source", "kind": "video"}], "sources": {"source": "source.mp4"}}
+        stored["variant"]["runs"] = [preview]
+        stored["reviews"] = [review]
+        stored["variant"]["exports"] = [delivery("delivery", deepcopy(snapshot)), delivery("legacy", {**snapshot, "tracks": [{**snapshot["tracks"][0], "clips": [{key: value for key, value in clip.items() if key != "reframe"}]}, snapshot["tracks"][1]]})]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        for directory in ("runs/preview", "exports/delivery", "exports/legacy"):
+            destination = tmp_path / "project-files" / project_id / "batch-edits" / directory / "sources"
+            destination.mkdir(parents=True)
+            shutil.copyfile(source, destination / "source.mp4")
+        deliverables = tmp_path / "project-files" / project_id / "batch-edits" / "deliverables"
+        deliverables.mkdir()
+        (deliverables / "delivery.mp4").write_bytes(b"delivery")
+        (deliverables / "legacy.mp4").write_bytes(b"legacy")
+        assert client.get(f"{base}/{task['id']}/exports/delivery/output").content == b"delivery"
+
+        original_probe = montage_reframe.probe_source_timing
+        monkeypatch.setattr(montage_reframe, "probe_source_timing", lambda path, probe:
+                            montage_reframe.SourceTiming((), (), False, "新 probe 发现 VFR") if path == source else original_probe(path, probe))
+        blocked = client.get(f"{base}/{task['id']}/exports/delivery/output")
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"]["code"] == "batch_export_reframe_review_required"
+        assert client.get(f"{base}/{task['id']}/exports/legacy/output").content == b"legacy"
+
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["tasks"][0]["variant"]["exports"][0]["snapshot"]["tracks"][0]["clips"][0]["reframe"]["override"] = {"mode": "center", "keyframes": []}
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        assert client.get(f"{base}/{task['id']}/exports/delivery/output").content == b"delivery"
 
 
 def test_montage_candidate_replacement_keeps_pending_reframe_and_queues_analysis(tmp_path):

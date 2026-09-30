@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,7 +30,11 @@ def _asset_root(tmp_path):
     root = tmp_path / "project-files" / PROJECT_ID / "preproduction"
     (root / "assets").mkdir(parents=True, exist_ok=True)
     if not (root / "assets" / "video.mp4").exists():
-        (root / "assets" / "video.mp4").write_bytes(b"video")
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
+            "color=red:size=64x48:rate=24:duration=4", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            str(root / "assets" / "video.mp4"),
+        ], check=True, capture_output=True, text=True)
     if not (root / "assets" / "audio.wav").exists():
         (root / "assets" / "audio.wav").write_bytes(b"audio")
     (root / "state.json").write_text(json.dumps({
@@ -142,6 +147,28 @@ def test_timeline_reframe_source_deleted_while_queued_becomes_retryable_failure(
     assert "素材" in record["error"]
 
 
+def test_timeline_reframe_never_accepts_worker_dimensions_when_the_source_probe_has_none(tmp_path, monkeypatch):
+    """Only ffprobe dimensions may authorize detector facts for a timeline clip."""
+    from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint
+    from app import timeline_render
+    monkeypatch.setattr(timeline_render, "_probe_media", lambda *_: SimpleNamespace(width=None, height=None))
+
+    def analyzer(source, _identity):
+        return {"schemaVersion": 1, "sourceFingerprint": source_fingerprint(source), "sourceWidth": 64, "sourceHeight": 48,
+                "targetAspect": {"width": 1280, "height": 720}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+                "samples": [{"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9}],
+                "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []}}
+
+    client, queue = setup(tmp_path, reframe_analyzer=analyzer)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    queue.run()
+
+    record = client.get(BASE).json()["reframeAnalysis"]["clip1"]
+    assert record["status"] == "failed"
+    assert "可信源尺寸" in record["error"]
+
+
 def test_timeline_reframe_restart_recovers_queued_analysis_as_retryable(tmp_path):
     client, queue = setup(tmp_path)
     assert client.put(BASE, json=_workspace()).status_code == 200
@@ -188,7 +215,7 @@ def test_run_uses_saved_snapshot_and_publishes_only_completed_output(tmp_path):
 
     def renderer(timeline, sources, output, **kwargs):
         received.append((timeline, sources))
-        assert sources["video"].read_bytes() == b"video"
+        assert sources["video"].read_bytes() != b"changed"
         output.write_bytes(b"rendered")
 
     client, queue = setup(tmp_path, renderer)

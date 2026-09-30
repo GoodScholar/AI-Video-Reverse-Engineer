@@ -334,6 +334,28 @@ def test_export_reuses_the_current_version_delivery_without_copying_sources_agai
     assert delivery["id"] == "delivery" and created is False
 
 
+def test_export_does_not_reuse_a_completed_frozen_delivery_when_current_reframe_preflight_requires_review():
+    """A completed record is not an authorization once its source timing is no longer safe."""
+    task = create_batch("省时", "操作演示", id_factory=ids("task", "variant"))
+    task["variant"].update(revision=2, tracks=video_tracks())
+    preview = completed_preview(task)
+    task["variant"]["runs"].append(preview)
+    task["reviews"].append(approved_review(task, preview))
+    task["variant"]["exports"].append({"id": "delivery", "status": "completed", "contentRevision": 0,
+        "variantRevision": 2, "subtitleRevision": 0, "previewRunId": "preview"})
+
+    with pytest.raises(BatchProductionError) as error:
+        export_approved_version(
+            task, assets={"shot": {"id": "shot", "name": "镜头", "kind": "video"}},
+            snapshot_sources=lambda *_: pytest.fail("不应重渲染来验证旧交付"),
+            reframe_safe=lambda _run: (_ for _ in ()).throw(BatchProductionError(
+                "batch_export_reframe_review_required", "源时间已变化，请重新主体分析。")),
+            id_factory=ids("unused"),
+        )
+
+    assert error.value.code == "batch_export_reframe_review_required"
+
+
 def test_export_does_not_reuse_a_delivery_from_an_older_preview():
     task = create_batch("省时", "操作演示", id_factory=ids("task", "variant"))
     task["variant"].update(revision=2, tracks=video_tracks())

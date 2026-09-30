@@ -569,7 +569,8 @@ def review_current_version(task: dict[str, Any], *, run_id: str, decision: str, 
     return review
 
 
-def _approved_export_context(task: dict[str, Any], preview_available: Callable[[dict[str, Any]], bool]):
+def _approved_export_context(task: dict[str, Any], preview_available: Callable[[dict[str, Any]], bool],
+                             reframe_safe: Callable[[dict[str, Any]], None] = lambda _run: None):
     variant = task["variant"]
     version = current_version(task)
     lifecycle = inspect_variant(task)
@@ -584,12 +585,14 @@ def _approved_export_context(task: dict[str, Any], preview_available: Callable[[
         raise BatchProductionError("batch_export_not_approved", "仅能导出当前版本已预览并通过审核的变体。")
     if not preview_available(preview):
         raise BatchProductionError("batch_export_preview_unavailable", "当前预览文件不可用，请重新生成。")
+    reframe_safe(preview)
     previous = next((delivery for delivery in reversed(exports_for(variant))
                      if delivery.get("status") in ("queued", "running", "completed")
                      and (delivery.get("contentRevision", 0), delivery.get("variantRevision", 0),
                           delivery.get("subtitleRevision", 0)) == version
                      and delivery.get("previewRunId") == preview["id"]), None)
     if previous is not None:
+        reframe_safe(previous)
         return version, review, preview, frozen, previous
     return version, review, preview, frozen, None
 
@@ -597,9 +600,10 @@ def _approved_export_context(task: dict[str, Any], preview_available: Callable[[
 def export_approved_version(task: dict[str, Any], *, assets: dict[str, dict[str, Any]],
                             snapshot_sources: Callable[[str, dict, dict], dict[str, str]],
                             preview_available: Callable[[dict[str, Any]], bool] = lambda run: True,
+                            reframe_safe: Callable[[dict[str, Any]], None] = lambda _run: None,
                             id_factory: Callable[[], str] = _new_id) -> tuple[dict[str, Any], bool]:
     variant = task["variant"]
-    version, review, preview, frozen, previous = _approved_export_context(task, preview_available)
+    version, review, preview, frozen, previous = _approved_export_context(task, preview_available, reframe_safe)
     if previous is not None:
         return previous, False
     run_id = id_factory()
@@ -628,13 +632,15 @@ def export_approved_versions(parent: dict[str, Any], selected: list[dict[str, An
                              assets: dict[str, dict[str, Any]],
                              snapshot_sources: Callable[[str, dict, dict, dict], dict[str, str]],
                              preview_available: Callable[[dict[str, Any], dict[str, Any]], bool],
+                             reframe_safe: Callable[[dict[str, Any], dict[str, Any]], None] = lambda _task, _run: None,
                              id_factory: Callable[[], str] = _new_id) -> list[tuple[dict[str, Any], dict[str, Any], bool]]:
     if "batchId" in parent:
         raise BatchProductionError("batch_export_parent_invalid", "请从批量任务选择变体。", 422)
     for task in selected:
         if task.get("batchId") != parent["id"]:
             raise BatchProductionError("batch_export_selection_invalid", "所选变体不属于此批量任务。", 422)
-        _approved_export_context(task, lambda preview, item=task: preview_available(item, preview))
+        _approved_export_context(task, lambda preview, item=task: preview_available(item, preview),
+                                 lambda run, item=task: reframe_safe(item, run))
 
     results = []
     for task in selected:
@@ -643,6 +649,7 @@ def export_approved_versions(parent: dict[str, Any], selected: list[dict[str, An
             snapshot_sources=lambda run_id, preview, available, item=task:
                 snapshot_sources(run_id, item, preview, available),
             preview_available=lambda preview, item=task: preview_available(item, preview),
+            reframe_safe=lambda run, item=task: reframe_safe(item, run),
             id_factory=id_factory,
         )
         results.append((task, run, created))

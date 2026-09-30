@@ -510,12 +510,16 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                         if record is None or record.get("id") != run_id or record.get("status") == "cancelled":
                             continue
                     from .montage_reframe import normalize_reframe, run_local_detector
+                    if not source.is_file():
+                        raise ValueError("分析期间素材已变化，请重新主体分析。")
+                    if not all(type(value) is int and value > 0 for value in trusted_size):
+                        raise ValueError("无法获取可信源尺寸，不能完成主体分析。")
                     raw = reframe_analyzer(source, identity["inPoint"], identity["inPoint"] + identity["duration"] * identity["speed"], aspect) if reframe_analyzer else run_local_detector(
                         source, start=identity["inPoint"], end=identity["inPoint"] + identity["duration"] * identity["speed"],
                         target_width=aspect["width"], target_height=aspect["height"], source_timing=source_timing,
                         cancelled=lambda cid=clip_id: cancelled(cid))
                     completed[clip_id] = normalize_reframe(raw, source_fingerprint=identity["sourceFingerprint"],
-                        source_width=trusted_size[0] or raw["sourceWidth"], source_height=trusted_size[1] or raw["sourceHeight"],
+                        source_width=trusted_size[0], source_height=trusted_size[1],
                         source_timing=source_timing,
                         required_start=identity["inPoint"], required_end=identity["inPoint"] + identity["duration"] * identity["speed"])
                 except Exception as error:
@@ -620,6 +624,32 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             )
         except (RenderInputError, KeyError, ValueError):
             raise HTTPException(409, detail={"code": "batch_asset_unavailable", "message": "原素材缺失或变化，请重新预览审核。"}) from None
+
+    def require_current_reframe_safety(project_id: str, task: dict, run: dict) -> None:
+        """Recheck only reframed clips against frozen and current real media before delivery."""
+        snapshot = run.get("snapshot")
+        tracks = snapshot.get("tracks") if isinstance(snapshot, dict) else None
+        reframe_clip_ids = {clip.get("id") for track in tracks or [] if isinstance(track, dict)
+                            for clip in track.get("clips", []) if isinstance(clip, dict) and clip.get("reframe") is not None}
+        if not reframe_clip_ids:
+            return
+        from .timeline_render import inspect_timeline_media
+        assets = assets_for(project_id)
+        try:
+            frozen_directory = store.path(project_id, "exports" if run.get("previewRunId") else "runs", run["id"])
+            frozen_sources = render_inputs.resolve(frozen_directory, run["sources"])
+            state = {"revision": run.get("revision", task["variant"]["revision"]), **snapshot}
+            frozen_issues = inspect_timeline_media(state, assets, lambda asset: frozen_sources[asset["id"]], "mp4", ffprobe_path)
+            current_issues = inspect_timeline_media(
+                state, assets, lambda asset: project_assets.file(project_id, asset), "mp4", ffprobe_path)
+        except (KeyError, OSError, ValueError, RenderInputError) as error:
+            raise BatchProductionError("batch_export_reframe_review_required",
+                                       "主体构图关联素材不可验证，请重新主体分析并预览审核。") from error
+        failed = next((issue for issue in [*frozen_issues, *current_issues]
+                       if issue.get("level") == "error" and issue.get("clipId") in reframe_clip_ids), None)
+        if failed is not None:
+            raise BatchProductionError("batch_export_reframe_review_required",
+                                       "主体构图或源时间已变化，请重新主体分析或选择居中/手工构图后重新预览审核。")
 
     def find_run(variant: dict[str, Any], run_id: str):
         run = next((item for item in variant["runs"] if item["id"] == run_id), None)
@@ -1710,6 +1740,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             prepared = production_call(
                 export_approved_versions, parent, children, assets=assets,
                 snapshot_sources=export_sources, preview_available=preview_available,
+                reframe_safe=lambda child, run: require_current_reframe_safety(project_id, child, run),
             )
             results = []
             for child, run, created in prepared:
@@ -1742,14 +1773,18 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
     def download_export(project_id: str, task_id: str, run_id: str):
         project_for(project_id)
         with lock:
-            run = find_export(task_for(state_for(project_id), task_id)["variant"], run_id)
+            task = task_for(state_for(project_id), task_id)
+            run = find_export(task["variant"], run_id)
             if run["status"] != "completed":
                 raise HTTPException(409, detail={"code": "batch_export_unavailable", "message": "成片尚不可用。"})
             try:
+                require_current_reframe_safety(project_id, task, run)
                 if run["output"] != run_id + ".mp4":
                     raise ValueError("成片关联无效")
                 path = store.path(project_id, "deliverables", run["output"])
                 regular_file(path)
+            except BatchProductionError as error:
+                raise HTTPException(409, detail={"code": error.code, "message": error.message}) from None
             except (OSError, ValueError, KeyError):
                 raise HTTPException(409, detail={"code": "batch_export_unavailable", "message": "成片文件不可用。"}) from None
         return FileResponse(path, media_type="video/mp4", filename=f"short-video-{run_id}.mp4")

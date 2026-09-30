@@ -6,6 +6,7 @@ cancellation; this process never uploads media or downloads model weights.
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import hashlib
 import json
 import math
@@ -18,6 +19,16 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 MODEL_SHA256 = "2e04c53bfeac0ac2a30c057c7e2a777594ce39baaac35a92f74fb1e8c4fc4e0b"
 DETECTOR_VERSION = "mediapipe-object-detector-0.10.21"
+_TIMING_TICKS_PER_SECOND = 1_000_000
+
+
+def _timing_ticks(value: float) -> int | None:
+    """Quantize the worker's six-decimal PTS contract without binary drift."""
+    try:
+        parsed = Decimal(str(value)) * _TIMING_TICKS_PER_SECOND
+        return int(parsed.to_integral_value(rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError):
+        return None
 
 
 def parser() -> argparse.ArgumentParser:
@@ -56,8 +67,14 @@ def cfr_frame_time(frame_index: int, fps: float, previous_index: int) -> float |
 
 def select_sample_indices(frames: list[dict], start: float, end: float, sample_fps: float) -> list[int]:
     """Keep first/last intersecting real frames and an at-most-2Hz interior."""
-    intersecting = [index for index, frame in enumerate(frames)
-                    if frame["elapsedSeconds"] < end and frame["elapsedSeconds"] + frame["durationSeconds"] > start]
+    start_tick, end_tick = _timing_ticks(start), _timing_ticks(end)
+    if start_tick is None or end_tick is None or start_tick >= end_tick:
+        return []
+    intersecting = []
+    for index, frame in enumerate(frames):
+        point, duration = _timing_ticks(frame["elapsedSeconds"]), _timing_ticks(frame["durationSeconds"])
+        if point is not None and duration is not None and point < end_tick and point + duration > start_tick:
+            intersecting.append(index)
     if not intersecting:
         return []
     selected = [intersecting[0]]

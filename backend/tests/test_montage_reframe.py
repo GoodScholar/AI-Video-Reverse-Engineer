@@ -178,6 +178,21 @@ def test_normalize_reframe_requires_server_pts_evidence_for_auto_ready():
     assert any("需重新分析源时间" in reason for reason in stored["uncertaintyReasons"])
 
 
+def test_normalize_reframe_uses_the_same_integer_half_open_boundary_as_the_worker():
+    """A non-zero container PTS can encode 2.1 as 4.1 - 2.0 just below 2.1 in binary."""
+    analysis = _analysis(samples=[
+        {"timeSeconds": 2.033334, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 2.066667, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+    ])
+    timing = SourceTiming((0.0, 4.033334 - 2.0, 4.066667 - 2.0, 4.1 - 2.0),
+                          (.033333, .033333, .033333, .033333), True, None)
+
+    stored = normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
+                               source_timing=timing, required_start=2.0, required_end=2.1)
+
+    assert stored["status"] == "ready"
+
+
 def test_probe_rejects_vfr_from_pts_even_when_nominal_rates_would_agree(monkeypatch, tmp_path):
     """avg/r 元数据并未参与授权；逐帧 PTS 不均必须转人工。"""
     payload = {"streams": [{"start_time": "2", "duration": "1"}], "frames": [

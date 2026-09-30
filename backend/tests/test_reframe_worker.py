@@ -41,3 +41,20 @@ def test_worker_selects_real_pts_intersections_not_index_divided_by_fps():
     ], 0.1, 1.99, 2.0)
 
     assert selected == [1, 2, 3, 4]
+
+
+def test_worker_uses_the_ffprobe_microsecond_boundary_for_the_last_half_open_frame():
+    """30fps PTS strings must keep 2.066667's display interval ending at 2.1."""
+    worker = Path(__file__).parents[1] / "person_worker" / "run_reframe.py"
+    spec = importlib.util.spec_from_file_location("reframe_worker_half_open_boundary", worker)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    selected = module.select_sample_indices([
+        {"elapsedSeconds": 0.0, "durationSeconds": .033333},
+        {"elapsedSeconds": 4.033334 - 2.0, "durationSeconds": .033333},
+        {"elapsedSeconds": 4.066667 - 2.0, "durationSeconds": .033333},
+        {"elapsedSeconds": 4.1 - 2.0, "durationSeconds": .033333},
+    ], 2.0, 2.1, 2.0)
+
+    assert selected == [1, 2]
