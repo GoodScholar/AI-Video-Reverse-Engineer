@@ -684,6 +684,8 @@ def _run_ffmpeg(command: List[str], cancelled: Callable[[], bool], cwd: Optional
         if process.returncode != 0:
             message = (stderr or "").strip().splitlines()
             detail = message[-1] if message else "FFmpeg 未能完成编码。"
+            if "No such filter: 'ass'" in (stderr or "") or "No such filter: ass" in (stderr or ""):
+                raise TimelineRenderError("本地 FFmpeg 未启用 libass/ass filter；请配置 ffmpeg-full。")
             raise TimelineRenderError("时间线渲染失败：%s" % detail)
     finally:
         if process.poll() is None:

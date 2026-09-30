@@ -11,6 +11,7 @@ import hashlib
 import math
 from copy import deepcopy
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 
@@ -25,7 +26,8 @@ KINDS = {"subtitle", "keyword", "title", "selling-point", "cta"}
 POSITIONS = {"auto", "top", "middle", "bottom"}
 STYLES = {"plain", "emphasis", "banner"}
 _FONT = Path(__file__).with_name("fonts") / "controlled" / "NotoSansCJKsc-Regular.otf"
-_FONT_INFO: tuple[str, dict[int, str], dict[int, str], dict[str, tuple[int, int]], int] | None = None
+_FONT_INFO: tuple[str, str, dict[int, str], dict[int, str], dict[str, tuple[int, int]], int] | None = None
+_FONT_LOCK = RLock()
 
 
 class PackagingError(ValueError):
@@ -34,28 +36,35 @@ class PackagingError(ValueError):
 
 def private_font_path() -> Path:
     """Return the only allowed font after hash and metadata verification."""
-    actual_hash = hashlib.sha256(_FONT.read_bytes()).hexdigest() if _FONT.is_file() else None
-    if actual_hash != FONT_SHA256:
-        raise PackagingError("受控字体不可用或哈希不匹配。")
     global _FONT_INFO
-    if _FONT_INFO is not None and _FONT_INFO[0] == actual_hash:
-        return _FONT
-    try:
-        from fontTools.ttLib import TTFont
-        face = TTFont(_FONT, lazy=True)
-        names = {entry.nameID: entry.toUnicode() for entry in face["name"].names if entry.nameID in (1, 4, 6)}
-        if names.get(1) != FONT_FAMILY or names.get(4) != FONT_FAMILY or names.get(6) != FONT_POSTSCRIPT:
-            raise PackagingError("受控字体身份无效。")
-        os2 = face["OS/2"]
-        real_dim = os2.usWinAscent + os2.usWinDescent
-        if real_dim <= 0:
-            raise PackagingError("受控字体真实尺寸无效。")
-        _FONT_INFO = (actual_hash, names, face.getBestCmap(), dict(face["hmtx"].metrics), real_dim)
-        face.close()
-    except PackagingError:
-        raise
-    except Exception as error:
-        raise PackagingError("无法验证受控字体。") from error
+    with _FONT_LOCK:
+        actual_hash = hashlib.sha256(_FONT.read_bytes()).hexdigest() if _FONT.is_file() else None
+        if actual_hash != FONT_SHA256:
+            raise PackagingError("受控字体不可用或哈希不匹配。")
+        identity = str(_FONT.resolve())
+        if _FONT_INFO is not None and _FONT_INFO[:2] == (identity, actual_hash):
+            return _FONT
+        face = None
+        try:
+            from fontTools.ttLib import TTFont
+            face = TTFont(_FONT, lazy=True)
+            names = {entry.nameID: entry.toUnicode() for entry in face["name"].names if entry.nameID in (1, 4, 6)}
+            if names.get(1) != FONT_FAMILY or names.get(4) != FONT_FAMILY or names.get(6) != FONT_POSTSCRIPT:
+                raise PackagingError("受控字体身份无效。")
+            os2 = face["OS/2"]
+            real_dim = os2.usWinAscent + os2.usWinDescent
+            if real_dim <= 0:
+                raise PackagingError("受控字体真实尺寸无效。")
+            if hashlib.sha256(_FONT.read_bytes()).hexdigest() != actual_hash:
+                raise PackagingError("受控字体在验证期间发生变化。")
+            _FONT_INFO = (identity, actual_hash, names, face.getBestCmap(), dict(face["hmtx"].metrics), real_dim)
+        except PackagingError:
+            raise
+        except Exception as error:
+            raise PackagingError("无法验证受控字体。") from error
+        finally:
+            if face is not None:
+                face.close()
     return _FONT
 
 
@@ -98,7 +107,7 @@ def _glyphs(text: str) -> None:
     try:
         private_font_path()
         assert _FONT_INFO is not None
-        cmap = _FONT_INFO[2]
+        cmap = _FONT_INFO[3]
     except PackagingError:
         raise
     except Exception as error:
@@ -187,7 +196,7 @@ def _advance(text: str, size: float) -> float:
     """libass/FreeType REAL_DIM advance in ASS script pixels."""
     private_font_path()
     assert _FONT_INFO is not None
-    cmap, metrics, real_dim = _FONT_INFO[2], _FONT_INFO[3], _FONT_INFO[4]
+    cmap, metrics, real_dim = _FONT_INFO[3], _FONT_INFO[4], _FONT_INFO[5]
     return sum(metrics[cmap[ord(char)]][0] for char in text if char not in "\n\t" and ord(char) in cmap) * size / real_dim
 
 
