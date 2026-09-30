@@ -112,13 +112,13 @@ def render_timeline(
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     commands_dir = output.parent / (".reframe-" + uuid.uuid4().hex)
-    command, expected = _build_command(
-        clips, transitions, duration, render_width, render_height, fps, format, ffmpeg_path, captions,
-        reframe_commands_dir=commands_dir,
-    )
     temporary = output.with_name(".%s.%s%s" % (output.stem, uuid.uuid4().hex, output.suffix))
-    command.append(str(temporary))
     try:
+        command, expected = _build_command(
+            clips, transitions, duration, render_width, render_height, fps, format, ffmpeg_path, captions,
+            reframe_commands_dir=commands_dir,
+        )
+        command.append(str(temporary))
         _run_ffmpeg(command, cancelled, cwd=commands_dir if commands_dir.exists() else (Path(subtitles_path).parent if subtitles_path is not None else None))
         if cancelled():
             raise TimelineRenderError("时间线渲染已取消。")
@@ -155,6 +155,14 @@ def inspect_timeline_media(state: dict, assets: dict, resolve_source, format: st
                 source = resolve_source(asset)
                 collected = _collect_clips([single_track], {clip["assetId"]: source}, ffprobe_path, format, media_cache)[0]
                 media = collected["media"]
+                if clip.get("reframe") is not None:
+                    from .montage_reframe import ReframeError, normalize_reframe, source_fingerprint, validate_stored_reframe
+                    reframe = validate_stored_reframe(clip["reframe"])
+                    if reframe["status"] == "review_required" and reframe["override"]["mode"] == "auto":
+                        raise ReframeError("主体构图待人工确认，不能渲染。")
+                    if reframe["sourceFingerprint"]:
+                        normalize_reframe(reframe, source_fingerprint=source_fingerprint(source),
+                                          source_width=media.width or 0, source_height=media.height or 0)
                 visible |= track["kind"] == "video" and not track["hidden"] and media.has_video
                 audible |= not track["muted"] and clip["volume"] > 0 and media.has_audio
                 if track["kind"] == "video" and asset.get("kind") != "image" and not track["muted"] and clip["volume"] > 0 and not media.has_audio:
@@ -545,6 +553,7 @@ def _video_filter(index: int, clip: dict, width: int, height: int, fps: float, l
                 speed=clip["speed"], duration=clip["duration"], source_hash=source_fingerprint(clip["source"]),
                 crop_name="reframe_" + hashlib.sha256(str(clip["id"]).encode()).hexdigest()[:12],
                 commands_path=reframe_commands_file,
+                trajectory_fps=fps,
             )
         except (OSError, KeyError, ReframeError) as error:
             raise TimelineRenderError(str(error)) from error

@@ -429,6 +429,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
 
     def schedule_reframes(project_id: str, task_id: str, clip_ids: list[str], *, proposal_id: str | None = None):
         """One existing compute job per submit; late workers may only write same clip identity."""
+        run_id = uuid4().hex
         with source_lock or nullcontext(), lock:
             state = state_for(project_id)
             task = task_for(state, task_id)
@@ -447,19 +448,35 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                                                             reason="已提交本地主体分析"))
                 identity = {"assetId": clip["assetId"], "inPoint": clip["inPoint"], "duration": clip["duration"],
                             "speed": clip["speed"], "sourceFingerprint": source_fingerprint(source)}
-                analysis[clip_id] = {"status": "queued", "error": None, "proposalId": proposal_id,
+                analysis[clip_id] = {"id": run_id, "status": "queued", "error": None, "proposalId": proposal_id,
                                      "identity": identity}
                 jobs.append((clip_id, identity, source, dict(clip["reframe"]["targetAspect"])))
             save(project_id, state)
 
         def process(_pid):
             completed, failures = {}, {}
+            def cancelled(clip_id):
+                with lock:
+                    record = task_for(state_for(project_id), task_id)["variant"].get("reframeAnalysis", {}).get(clip_id)
+                    return record is None or record.get("id") != run_id or record.get("status") == "cancelled"
+            with source_lock or nullcontext(), lock:
+                state = state_for(project_id)
+                task = task_for(state, task_id)
+                for clip_id, *_ in jobs:
+                    record = task["variant"].get("reframeAnalysis", {}).get(clip_id)
+                    if record is not None and record.get("id") == run_id and record.get("status") == "queued":
+                        record["status"] = "running"
+                save(project_id, state)
             for clip_id, identity, source, aspect in jobs:
                 try:
+                    with lock:
+                        record = task_for(state_for(project_id), task_id)["variant"].get("reframeAnalysis", {}).get(clip_id)
+                        if record is None or record.get("id") != run_id or record.get("status") == "cancelled":
+                            continue
                     from .montage_reframe import normalize_reframe, run_local_detector
                     raw = reframe_analyzer(source, identity["inPoint"], identity["inPoint"] + identity["duration"] * identity["speed"], aspect) if reframe_analyzer else run_local_detector(
                         source, start=identity["inPoint"], end=identity["inPoint"] + identity["duration"] * identity["speed"],
-                        target_width=aspect["width"], target_height=aspect["height"])
+                        target_width=aspect["width"], target_height=aspect["height"], cancelled=lambda cid=clip_id: cancelled(cid))
                     completed[clip_id] = normalize_reframe(raw, source_fingerprint=identity["sourceFingerprint"],
                         source_width=raw["sourceWidth"], source_height=raw["sourceHeight"],
                         required_start=identity["inPoint"], required_end=identity["inPoint"] + identity["duration"] * identity["speed"])
@@ -472,14 +489,17 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 renderable_changed = False
                 for clip_id, identity, _source, _aspect in jobs:
                     record = task["variant"].get("reframeAnalysis", {}).get(clip_id)
-                    if record is None or record.get("identity") != identity:
+                    if record is None or record.get("id") != run_id or record.get("identity") != identity or record.get("status") == "cancelled":
                         continue
                     try:
                         clip = clip_for(task, clip_id, proposal_id)
                     except ValueError:
                         continue
                     current = {key: clip.get(key) for key in ("assetId", "inPoint", "duration", "speed")}
-                    if current != {key: identity[key] for key in current}:
+                    from .montage_reframe import source_fingerprint
+                    if current != {key: identity[key] for key in current} or source_fingerprint(_source) != identity["sourceFingerprint"]:
+                        record.update(status="failed", error="分析期间素材已变化，请重新主体分析。")
+                        changed = True
                         continue
                     if clip_id in completed:
                         # A user override survives a late automatic result; boxes/reasons stay from the worker.
@@ -498,13 +518,15 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     if proposal_id is None and renderable_changed:
                         task["variant"]["revision"] += 1
                     save(project_id, state)
-        key = "batch-reframe:" + task_id + ":" + (proposal_id or "variant")
+        key = "batch-reframe:" + run_id
         if not compute_queue.submit(key, project_id, process):
             with source_lock or nullcontext(), lock:
                 state = state_for(project_id)
                 task = task_for(state, task_id)
                 for clip_id, *_ in jobs:
-                    task["variant"].get("reframeAnalysis", {}).get(clip_id, {}).update(status="failed", error="本地处理队列不可用。")
+                    record = task["variant"].get("reframeAnalysis", {}).get(clip_id)
+                    if record is not None and record.get("id") == run_id:
+                        record.update(status="failed", error="本地处理队列不可用。")
                 save(project_id, state)
 
     def regular_file(path: Path):
@@ -1080,6 +1102,23 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         with lock:
             return {"variant": public_task(project_id, task_for(state_for(project_id), task_id))["variant"]}
 
+    @router.post("/{task_id}/variant/reframes/{clip_id}/cancel")
+    def cancel_variant_reframe(project_id: str, task_id: str, clip_id: str, body: dict[str, Any]):
+        project_for(project_id)
+        if not isinstance(body, dict) or set(body) != {"revision"} or type(body["revision"]) is not int:
+            raise HTTPException(422, detail={"code": "reframe_request_invalid", "message": "主体分析取消请求无效。"})
+        with lock:
+            state = state_for(project_id)
+            task = task_for(state, task_id)
+            if task["variant"]["revision"] != body["revision"]:
+                raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "变体已更新，请刷新后重试。"})
+            record = task["variant"].get("reframeAnalysis", {}).get(clip_id)
+            if record is None or record.get("status") not in ("queued", "running"):
+                raise HTTPException(409, detail={"code": "reframe_not_active", "message": "主体分析未在运行。"})
+            record.update(status="cancelled", error=None)
+            save(project_id, state)
+            return {"variant": public_task(project_id, task)["variant"]}
+
     @router.put("/{task_id}/montage-proposals/{proposal_id}")
     def update_montage_proposal(project_id: str, task_id: str, proposal_id: str, body: dict[str, Any]):
         project_for(project_id)
@@ -1145,6 +1184,18 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     "id": clip_id, "assetId": candidate["assetId"], "start": (target.get("selectedClip") or {}).get("start", 0),
                     "inPoint": start, "duration": duration, "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0,
                 }
+                previous_reframe = (previous_clip or {}).get("reframe")
+                if (previous_reframe is not None and previous_clip.get("assetId") == candidate["assetId"]
+                        and abs(float(previous_clip["inPoint"]) - start) < 1e-8
+                        and abs(float(previous_clip["duration"]) - duration) < 1e-8):
+                    target["selectedClip"]["reframe"] = deepcopy(previous_reframe)
+                else:
+                    from .montage_reframe import pending_reframe
+                    target["selectedClip"]["reframe"] = pending_reframe(
+                        target_width=task["variant"]["settings"]["width"],
+                        target_height=task["variant"]["settings"]["height"],
+                        reason="候选或源区间已改变，需重新主体分析",
+                    )
                 required_duration = float(target["timing"]["narrationDurationSeconds"])
                 target["unmet"] = [] if duration >= required_duration - 0.001 else [
                     f"人工调整后仅有 {duration:.3f} 秒，短于旁白所需 {required_duration:.3f} 秒"
@@ -1200,6 +1251,10 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                                  for item in proposal["segments"] for message in item.get("unmet", [])]
             proposal.update(revision=proposal["revision"] + 1, status="draft")
             save(project_id, state)
+            changed_reframes = [item["selectedClip"]["id"] for item in proposal["segments"]
+                                if item.get("selectedClip") and item["selectedClip"].get("reframe", {}).get("status") == "review_required"]
+            if changed_reframes:
+                schedule_reframes(project_id, task_id, changed_reframes, proposal_id=proposal_id)
             return {"proposal": deepcopy(proposal)}
 
     @router.post("/{task_id}/montage-proposals/{proposal_id}/apply")
@@ -1275,6 +1330,20 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 target_transitions = [*saved_transitions, connector, *proposed_transitions]
             else:
                 replaced_ids = {clip["id"] for clip in video_track["clips"]}
+                # Reusing the identical source interval must not erase a
+                # deliberate manual/center decision.  Render still validates
+                # the saved fingerprint against the current source.
+                from .montage_reframe import source_fingerprint
+                available_assets = assets_for(project_id)
+                for proposed in proposed_clips:
+                    matched = next((old for old in video_track["clips"]
+                                    if old["assetId"] == proposed["assetId"]
+                                    and abs(old["inPoint"] - proposed["inPoint"]) < 1e-8
+                                    and abs(old["duration"] - proposed["duration"]) < 1e-8
+                                    and old.get("reframe", {}).get("override", {}).get("mode") != "auto"), None)
+                    if matched is not None and matched["reframe"].get("sourceFingerprint") in ("", source_fingerprint(
+                            project_assets.file(project_id, available_assets[proposed["assetId"]]))):
+                        proposed["reframe"] = deepcopy(matched["reframe"])
                 video_track["clips"] = proposed_clips
                 target_transitions = [item for item in saved_transitions
                                       if item["leftClipId"] not in replaced_ids and item["rightClipId"] not in replaced_ids] + proposed_transitions

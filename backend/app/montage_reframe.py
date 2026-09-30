@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from typing import Any
 
 
@@ -28,6 +29,21 @@ class ReframeError(ValueError):
     """A reframe result cannot safely be accepted or rendered."""
 
 
+# Adapted directly from OpenShorts reframe_v2.py, commit
+# 89f030934388d5167b3b0ede164ef893dad09ae9 (MIT; see THIRD_PARTY_NOTICES).
+# The original accepts per-frame x positions.  This is retained verbatim for
+# one coordinate, then called once each for x and y with a per-clip crop name.
+def dedupe_sendcmd_lines(xs, fps, target="crop@c"):
+    """sendcmd lines setting one crop coordinate, deduped to change-points."""
+    lines = []
+    prev = None
+    for i, x in enumerate(xs):
+        if x != prev:
+            lines.append(f"{i / fps:.4f} {target} x {x};")
+            prev = x
+    return lines
+
+
 def source_fingerprint(path: Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
@@ -37,7 +53,8 @@ def source_fingerprint(path: Path) -> str:
 
 
 def run_local_detector(source: Path, *, start: float, end: float, target_width: int, target_height: int,
-                       worker_python: str | None = None, model_path: Path | None = None) -> dict[str, Any]:
+                       worker_python: str | None = None, model_path: Path | None = None,
+                       cancelled=lambda: False) -> dict[str, Any]:
     """Execute the pinned local worker; it never fetches weights or uploads media."""
     root = Path(__file__).resolve().parents[1]
     worker = root / "person_worker" / "run_reframe.py"
@@ -48,13 +65,21 @@ def run_local_detector(source: Path, *, start: float, end: float, target_width: 
     command = [runtime, str(worker), "--input", str(source), "--model", str(model), "--start", f"{start:.6f}",
                "--end", f"{end:.6f}", "--target-width", str(target_width), "--target-height", str(target_height)]
     try:
-        completed = subprocess.run(command, capture_output=True, text=True, timeout=300)
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        deadline = time.monotonic() + 300
+        while process.poll() is None:
+            if cancelled() or time.monotonic() >= deadline:
+                process.terminate()
+                process.communicate(timeout=5)
+                raise ReframeError("本地主体检测已取消或超时。")
+            time.sleep(.05)
+        stdout, _stderr = process.communicate()
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ReframeError("本地主体检测无法启动或超时。") from error
-    if completed.returncode != 0:
+    if process.returncode != 0:
         raise ReframeError("本地主体检测失败，请检查模型与源视频。")
     try:
-        return json.loads(completed.stdout)
+        return json.loads(stdout)
     except json.JSONDecodeError as error:
         raise ReframeError("本地主体检测返回无效结果。") from error
 
@@ -141,40 +166,53 @@ def normalize_reframe(value: Any, *, source_fingerprint: str, source_width: int,
 
 def reframe_filter(value: dict[str, Any], *, source_width: int, source_height: int, output_width: int,
                    output_height: int, in_point: float, speed: float, duration: float,
-                   source_hash: str | None = None, crop_name: str = "reframe", commands_path: Path | None = None) -> str:
+                   source_hash: str | None = None, crop_name: str = "reframe", commands_path: Path | None = None,
+                   trajectory_fps: float = 30) -> str:
     """Return `sendcmd,crop,scale` for source-time samples before setpts speed.
 
     Output command times are local clip times; each one maps to
     ``inPoint + outputTime * speed`` before interpolating its source samples.
     """
     if (not isinstance(crop_name, str) or not crop_name.replace("_", "").isalnum()
-            or not all(_finite_number(item) for item in (in_point, speed, duration)) or speed <= 0 or duration <= 0):
+            or not all(_finite_number(item) for item in (in_point, speed, duration, trajectory_fps))
+            or speed <= 0 or duration <= 0 or not 1 <= trajectory_fps <= 60):
         raise ReframeError("主体裁剪的片段时间无效。")
     source_hash = source_hash or value.get("sourceFingerprint")
     end = in_point + duration * speed
-    result = normalize_reframe(value, source_fingerprint=source_hash, source_width=source_width,
-                               source_height=source_height,
-                               required_start=in_point if value.get("override", {}).get("mode") == "auto" else None,
-                               required_end=end if value.get("override", {}).get("mode") == "auto" else None)
+    stored = validate_stored_reframe(value)
+    # `center`/`manual` is an explicit user risk decision.  A pre-analysis
+    # record intentionally has no fingerprint or dimensions, so bind that
+    # decision to the currently probed source here without manufacturing a
+    # detector result or changing its stored evidence.
+    if (not stored["sourceFingerprint"] and stored["status"] == "review_required"
+            and stored["override"]["mode"] != "auto"):
+        if stored["targetAspect"]["width"] * output_height != stored["targetAspect"]["height"] * output_width:
+            raise ReframeError("主体裁剪目标比例与当前输出不一致。")
+        result = {**stored, "sourceFingerprint": source_hash, "sourceWidth": source_width, "sourceHeight": source_height}
+    else:
+        result = normalize_reframe(stored, source_fingerprint=source_hash, source_width=source_width,
+                                   source_height=source_height,
+                                   required_start=in_point if stored["override"]["mode"] == "auto" else None,
+                                   required_end=end if stored["override"]["mode"] == "auto" else None)
     override = result["override"]
     if result["status"] != "ready" and override["mode"] == "auto":
         raise ReframeError("主体构图待人工确认，不能渲染。")
     crop_width, crop_height = crop_geometry(source_width, source_height, output_width, output_height)
-    times = sorted({0.0, duration, *[_clip_time(sample["timeSeconds"], in_point, speed, duration)
-                                     for sample in result["samples"]]})
+    frame_count = max(1, round(duration * trajectory_fps))
+    times = [index / trajectory_fps for index in range(frame_count + 1)]
+    times[-1] = duration
     positions = [_crop_position(_center_at(result, in_point + time * speed), source_width, source_height,
                                 crop_width, crop_height) for time in times]
-    commands = []
-    last = None
-    for time, (x, y) in zip(times, positions):
-        if (x, y) != last:
-            commands.extend((f"{time:.4f} crop@{crop_name} x {x}", f"{time:.4f} crop@{crop_name} y {y}"))
-            last = (x, y)
+    # `times` is output-frame aligned, so the adapted OpenShorts helper uses
+    # the render fps without losing source-time interpolation.
+    commands = dedupe_sendcmd_lines([item[0] for item in positions], trajectory_fps, f"crop@{crop_name}")
+    commands += [line.replace(" x ", " y ") for line in dedupe_sendcmd_lines(
+        [item[1] for item in positions], trajectory_fps, f"crop@{crop_name}")]
     if commands_path is not None:
-        commands_path.write_text("\n".join(command + ";" for command in commands) + "\n", encoding="ascii")
+        commands_path.write_text("\n".join(commands) + "\n", encoding="ascii")
         sendcmd = "sendcmd=f=" + commands_path.name
     else:
-        escaped = "\\;".join(commands) + "\\;"
+        escaped = "\\;".join(command.removesuffix(";") for command in commands) + "\\;"
         sendcmd = f"sendcmd=c='{escaped}'"
     return (f"{sendcmd},crop@{crop_name}={crop_width}:{crop_height}:0:0,"
             f"scale={output_width}:{output_height}:flags=lanczos,setsar=1")

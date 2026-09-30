@@ -78,8 +78,12 @@ def analyze(source: Path, model: Path, start: float, end: float, target_width: i
         score_threshold=.35, max_results=10,
     )
     samples, reasons, last_timestamp = [], [], -1
+    crop_ratio = min(1.0, (target_width / target_height) / (width / height))
     expected = max(2, round((end - start) * sample_fps) + 1)
-    times = [start + (end - start) * index / (expected - 1) for index in range(expected)]
+    # The requested end is exclusive for FFmpeg/timeline ranges; sampling it
+    # exactly can seek one frame beyond a valid stream.
+    last_time = max(start, end - min(1 / fps, (end - start) / 2))
+    times = [start + (last_time - start) * index / (expected - 1) for index in range(expected)]
     try:
         with vision.ObjectDetector.create_from_options(options) as detector:
             for time_seconds in times:
@@ -107,6 +111,10 @@ def analyze(source: Path, model: Path, start: float, end: float, target_width: i
                     reasons.append("未检测到唯一人物主体" if not person else "检测到多个可能主体")
                     continue
                 subject = person[0]
+                if subject["width"] > crop_ratio or subject["height"] > 1:
+                    reasons.append("主体框大于目标满幅裁剪窗，可能持续被裁切")
+                if any(box["label"].lower() != "person" for box in boxes):
+                    reasons.append("检测到可能商品或遮挡物，无法确认满幅裁剪不会遮挡商品")
                 samples.append({"timeSeconds": round(actual_time, 6), "boxes": boxes,
                                 "center": {"x": round(subject["x"] + subject["width"] / 2, 6),
                                            "y": round(subject["y"] + subject["height"] / 2, 6)},

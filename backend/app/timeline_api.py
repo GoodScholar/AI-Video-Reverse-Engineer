@@ -29,7 +29,7 @@ ACTIVE_STATUSES = LOCAL_RUN_POLICY.active_statuses
 TERMINAL_STATUSES = LOCAL_RUN_POLICY.allowed_statuses - ACTIVE_STATUSES
 
 
-def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", source_lock=None, renderer=None):
+def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", source_lock=None, renderer=None, reframe_analyzer=None):
     root = Path(data_dir)
     store = TimelineStore(root)
     preproduction = PreproductionStore(root)
@@ -82,7 +82,72 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
     def response(project_id, state):
         return {"revision": state["revision"], "settings": state["settings"], "tracks": state["tracks"],
                 "transitions": state.get("transitions", []), "assets": public_assets(project_id),
-                "runs": [public_run(project_id, run) for run in state["runs"]]}
+                "runs": [public_run(project_id, run) for run in state["runs"]],
+                "reframeAnalysis": state.get("reframeAnalysis", {})}
+
+    def schedule_reframe(project_id, clip_id):
+        run_id = uuid4().hex
+        with source_lock or nullcontext(), lock:
+            state = state_for(project_id)
+            clip = next((item for track in state["tracks"] for item in track["clips"] if item["id"] == clip_id), None)
+            if clip is None:
+                fail("reframe_clip_missing", "时间线片段不存在。", 404)
+            asset = asset_index(project_id).get(clip["assetId"])
+            if asset is None or asset.get("kind") != "video":
+                fail("reframe_source_unavailable", "主体分析仅支持可用视频素材。")
+            source = source_path(project_id, asset)
+            from .montage_reframe import pending_reframe, source_fingerprint
+            clip.setdefault("reframe", pending_reframe(target_width=state["settings"]["width"], target_height=state["settings"]["height"], reason="已提交本地主体分析"))
+            identity = {"assetId": clip["assetId"], "inPoint": clip["inPoint"], "duration": clip["duration"],
+                        "speed": clip["speed"], "sourceFingerprint": source_fingerprint(source)}
+            state.setdefault("reframeAnalysis", {})[clip_id] = {"id": run_id, "status": "queued", "error": None, "identity": identity}
+            save(project_id, state)
+        def process(_pid):
+            with lock:
+                state = state_for(project_id)
+                record = state.get("reframeAnalysis", {}).get(clip_id)
+                if record is None or record.get("id") != run_id or record.get("status") != "queued":
+                    return
+                record["status"] = "running"
+                save(project_id, state)
+            try:
+                from .montage_reframe import normalize_reframe, run_local_detector, source_fingerprint
+                raw = reframe_analyzer(source, identity) if reframe_analyzer else run_local_detector(
+                    source, start=identity["inPoint"], end=identity["inPoint"] + identity["duration"] * identity["speed"],
+                    target_width=state["settings"]["width"], target_height=state["settings"]["height"],
+                    cancelled=lambda: (state_for(project_id).get("reframeAnalysis", {}).get(clip_id, {}).get("id") != run_id
+                                       or state_for(project_id).get("reframeAnalysis", {}).get(clip_id, {}).get("status") == "cancelled"))
+                result = normalize_reframe(raw, source_fingerprint=identity["sourceFingerprint"], source_width=raw["sourceWidth"],
+                                           source_height=raw["sourceHeight"], required_start=identity["inPoint"],
+                                           required_end=identity["inPoint"] + identity["duration"] * identity["speed"])
+                error = None
+            except Exception as failure:
+                result, error = None, str(failure)[:300] or "本地主体分析失败。"
+            with source_lock or nullcontext(), lock:
+                state = state_for(project_id)
+                record = state.get("reframeAnalysis", {}).get(clip_id)
+                clip = next((item for track in state["tracks"] for item in track["clips"] if item["id"] == clip_id), None)
+                if record is None or record.get("id") != run_id or record.get("status") == "cancelled" or clip is None:
+                    return
+                if result is None:
+                    record.update(status="failed", error=error)
+                elif ({key: clip.get(key) for key in ("assetId", "inPoint", "duration", "speed")} !=
+                      {key: identity[key] for key in ("assetId", "inPoint", "duration", "speed")} or
+                      source_fingerprint(source) != identity["sourceFingerprint"]):
+                    record.update(status="failed", error="分析期间素材或片段已变化，请重新主体分析。")
+                else:
+                    override = clip.get("reframe", {}).get("override")
+                    clip["reframe"] = {**result, **({"override": override} if isinstance(override, dict) and override.get("mode") != "auto" else {})}
+                    record.update(status="completed", error=None)
+                    state["revision"] += 1
+                save(project_id, state)
+        if not compute_queue.submit("timeline-reframe:" + run_id, project_id, process):
+            with lock:
+                state = state_for(project_id)
+                record = state.get("reframeAnalysis", {}).get(clip_id)
+                if record and record.get("id") == run_id:
+                    record.update(status="failed", error="本地处理队列不可用。")
+                    save(project_id, state)
 
     def find_run(state, run_id):
         try:
@@ -205,6 +270,34 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
         project_for(project_id)
         with lock:
             return response(project_id, state_for(project_id))
+
+    @router.post("/reframes/{clip_id}/analyze", status_code=202)
+    def analyze_reframe(project_id: str, clip_id: str, body: Dict[str, Any]):
+        project_for(project_id)
+        if not isinstance(body, dict) or set(body) != {"revision"} or type(body["revision"]) is not int:
+            fail("reframe_request_invalid", "主体分析请求无效。", 422)
+        with lock:
+            if state_for(project_id)["revision"] != body["revision"]:
+                fail("timeline_conflict", "时间线已更新，请刷新后重试。")
+        schedule_reframe(project_id, clip_id)
+        with lock:
+            return response(project_id, state_for(project_id))
+
+    @router.post("/reframes/{clip_id}/cancel")
+    def cancel_reframe(project_id: str, clip_id: str, body: Dict[str, Any]):
+        project_for(project_id)
+        if not isinstance(body, dict) or set(body) != {"revision"} or type(body["revision"]) is not int:
+            fail("reframe_request_invalid", "主体分析取消请求无效。", 422)
+        with lock:
+            state = state_for(project_id)
+            if state["revision"] != body["revision"]:
+                fail("timeline_conflict", "时间线已更新，请刷新后重试。")
+            record = state.get("reframeAnalysis", {}).get(clip_id)
+            if record is None or record.get("status") not in ("queued", "running"):
+                fail("reframe_not_active", "主体分析未在运行。")
+            record.update(status="cancelled", error=None)
+            save(project_id, state)
+            return response(project_id, state)
 
     @router.post("/validate-draft")
     def validate_draft(project_id: str, body: Dict[str, Any]):
