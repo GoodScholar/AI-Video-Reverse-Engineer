@@ -143,12 +143,13 @@ def render_timeline(
         shutil.rmtree(commands_dir, ignore_errors=True)
 
 
-def inspect_timeline_media(state: dict, assets: dict, resolve_source, format: str, ffprobe_path: str) -> list:
+def inspect_timeline_media(state: dict, assets: dict, resolve_source, format: str, ffprobe_path: str, *,
+                           media_cache=None, timing_cache=None) -> list:
     """Read-only preflight using the same stream/range rules as rendering."""
     from .timeline import validate_workspace
     issues = []
-    media_cache = {}
-    timing_cache = {}
+    media_cache = {} if media_cache is None else media_cache
+    timing_cache = {} if timing_cache is None else timing_cache
     audible = False
     visible = False
     for track in state["tracks"]:

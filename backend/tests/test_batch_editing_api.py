@@ -2,6 +2,7 @@
 import json
 import shutil
 import subprocess
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -1041,9 +1042,74 @@ def test_completed_export_download_rechecks_real_reframe_sources_but_keeps_cente
         deliverables.mkdir()
         (deliverables / "delivery.mp4").write_bytes(b"delivery")
         (deliverables / "legacy.mp4").write_bytes(b"legacy")
+        outputs = tmp_path / "project-files" / project_id / "batch-edits" / "outputs"
+        outputs.mkdir()
+        (outputs / "preview.mp4").write_bytes(b"preview")
         assert client.get(f"{base}/{task['id']}/exports/delivery/output").content == b"delivery"
 
+        # A delivery proof may take a long time to inspect real frame PTS, but
+        # that work must not monopolize the shared project lock.  Submit uses
+        # the same proof path and two variants sharing this source must reuse it.
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        children = []
+        for child_id in ("child-one", "child-two"):
+            child = deepcopy(state["tasks"][0])
+            child.update(id=child_id, batchId=task["id"], generationId="generation",
+                         generation={"status": "ready", "error": None})
+            child["variant"]["exports"] = child["variant"]["exports"][:1]
+            children.append(child)
+        state["tasks"].extend(children)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        entered, release, read_done = threading.Event(), threading.Event(), threading.Event()
         original_probe = montage_reframe.probe_source_timing
+        probes = []
+
+        def delayed_probe(path, probe):
+            probes.append(path)
+            entered.set()
+            assert release.wait(5), "测试未释放逐帧探测"
+            return original_probe(path, probe)
+
+        monkeypatch.setattr(montage_reframe, "probe_source_timing", delayed_probe)
+        result = {}
+        submitted = threading.Thread(target=lambda: result.setdefault(
+            "response", client.post(f"{base}/{task['id']}/exports", json={"taskIds": [child["id"] for child in children]})
+        ))
+        submitted.start()
+        if not entered.wait(2):
+            submitted.join(1)
+            response = result.get("response")
+            pytest.fail(f"导出应在锁外进行真实逐帧探测；实际响应：{response.status_code if response else '未返回'} {response.text if response else ''}")
+        reader = threading.Thread(target=lambda: (client.get(base), read_done.set()))
+        reader.start()
+        try:
+            assert read_done.wait(.5), "逐帧探测期间普通读取不应等待交付锁"
+        finally:
+            release.set()
+        submitted.join(5)
+        reader.join(5)
+        assert not submitted.is_alive() and not reader.is_alive()
+        assert result["response"].status_code == 202, result["response"].text
+        assert len(probes) == 2, "冻结副本与当前源各验证一次，但同请求同源变体不得重复探测"
+
+        # The second lock must consume only the proof for the exact version it
+        # inspected; a concurrent variant edit becomes a retryable conflict.
+        entered.clear()
+        release.clear()
+        stale_result = {}
+        stale = threading.Thread(target=lambda: stale_result.setdefault(
+            "response", client.post(f"{base}/{task['id']}/exports", json={"taskIds": [children[0]["id"]]})
+        ))
+        stale.start()
+        assert entered.wait(2)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        next(item for item in state["tasks"] if item["id"] == children[0]["id"])["variant"]["revision"] += 1
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        release.set()
+        stale.join(5)
+        assert stale_result["response"].status_code == 409
+        assert stale_result["response"].json()["detail"]["code"] == "batch_export_reframe_conflict"
+
         monkeypatch.setattr(montage_reframe, "probe_source_timing", lambda path, probe:
                             montage_reframe.SourceTiming((), (), False, "新 probe 发现 VFR") if path == source else original_probe(path, probe))
         blocked = client.get(f"{base}/{task['id']}/exports/delivery/output")

@@ -625,31 +625,140 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         except (RenderInputError, KeyError, ValueError):
             raise HTTPException(409, detail={"code": "batch_asset_unavailable", "message": "原素材缺失或变化，请重新预览审核。"}) from None
 
-    def require_current_reframe_safety(project_id: str, task: dict, run: dict) -> None:
-        """Recheck only reframed clips against frozen and current real media before delivery."""
+    def reframe_clip_ids(run: dict) -> set[str]:
         snapshot = run.get("snapshot")
         tracks = snapshot.get("tracks") if isinstance(snapshot, dict) else None
-        reframe_clip_ids = {clip.get("id") for track in tracks or [] if isinstance(track, dict)
-                            for clip in track.get("clips", []) if isinstance(clip, dict) and clip.get("reframe") is not None}
-        if not reframe_clip_ids:
-            return
+        return {clip.get("id") for track in tracks or [] if isinstance(track, dict)
+                for clip in track.get("clips", []) if isinstance(clip, dict) and clip.get("reframe") is not None}
+
+    def source_identity(path: Path) -> dict[str, Any]:
+        path = Path(path)
+        regular_file(path)
+        item = os.stat(path)
+        if not stat.S_ISREG(item.st_mode):
+            raise OSError("不是普通文件")
+        return {"path": str(path), "dev": item.st_dev, "ino": item.st_ino, "size": item.st_size,
+                "mtimeNs": item.st_mtime_ns, "ctimeNs": item.st_ctime_ns}
+
+    def stable_source_fact(path: Path) -> dict[str, Any]:
+        """Bind a full content hash to an unchanged real file, outside project locks."""
+        from .montage_reframe import source_fingerprint
+        before = source_identity(path)
+        fingerprint = source_fingerprint(path)
+        after = source_identity(path)
+        if before != after:
+            raise OSError("素材在校验期间变化")
+        return {**before, "fingerprint": fingerprint}
+
+    def safety_run_identity(task: dict, run: dict) -> dict[str, Any]:
+        return {
+            "taskId": task["id"],
+            "version": (task.get("contentRevision", 0), task["variant"]["revision"],
+                        task["variant"].get("subtitles", {}).get("revision", 0)),
+            "run": deepcopy(run),
+        }
+
+    def prepare_reframe_safety(project_id: str, task: dict, run: dict, assets: dict, *, media_cache: dict,
+                               frozen_timing_cache: dict, current_timing_cache: dict) -> dict | None:
+        """Build a one-request delivery proof without holding either project lock."""
+        clip_ids = reframe_clip_ids(run)
+        if not clip_ids:
+            return None
         from .timeline_render import inspect_timeline_media
-        assets = assets_for(project_id)
         try:
+            snapshot = run["snapshot"]
             frozen_directory = store.path(project_id, "exports" if run.get("previewRunId") else "runs", run["id"])
             frozen_sources = render_inputs.resolve(frozen_directory, run["sources"])
             state = {"revision": run.get("revision", task["variant"]["revision"]), **snapshot}
-            frozen_issues = inspect_timeline_media(state, assets, lambda asset: frozen_sources[asset["id"]], "mp4", ffprobe_path)
+            referenced_assets = {clip["assetId"] for track in snapshot["tracks"] for clip in track["clips"]
+                               if clip.get("id") in clip_ids}
+            frozen_facts = {asset_id: stable_source_fact(frozen_sources[asset_id]) for asset_id in referenced_assets}
+            current_paths = {asset_id: project_assets.file(project_id, assets[asset_id]) for asset_id in referenced_assets}
+            current_facts = {asset_id: {**stable_source_fact(path), "assetFile": assets[asset_id].get("file")}
+                             for asset_id, path in current_paths.items()}
+            frozen_issues = inspect_timeline_media(
+                state, assets, lambda asset: frozen_sources[asset["id"]], "mp4", ffprobe_path,
+                media_cache=media_cache, timing_cache=frozen_timing_cache)
             current_issues = inspect_timeline_media(
-                state, assets, lambda asset: project_assets.file(project_id, asset), "mp4", ffprobe_path)
+                state, assets, lambda asset: current_paths[asset["id"]], "mp4", ffprobe_path,
+                media_cache=media_cache, timing_cache=current_timing_cache)
+            if (any(source_identity(frozen_sources[asset_id]) != {key: fact[key] for key in fact if key != "fingerprint"}
+                    for asset_id, fact in frozen_facts.items())
+                    or any(source_identity(current_paths[asset_id]) != {key: fact[key] for key in fact if key not in ("fingerprint", "assetFile")}
+                           for asset_id, fact in current_facts.items())):
+                raise OSError("素材在校验期间变化")
         except (KeyError, OSError, ValueError, RenderInputError) as error:
             raise BatchProductionError("batch_export_reframe_review_required",
                                        "主体构图关联素材不可验证，请重新主体分析并预览审核。") from error
         failed = next((issue for issue in [*frozen_issues, *current_issues]
-                       if issue.get("level") == "error" and issue.get("clipId") in reframe_clip_ids), None)
+                       if issue.get("level") == "error" and issue.get("clipId") in clip_ids), None)
         if failed is not None:
             raise BatchProductionError("batch_export_reframe_review_required",
                                        "主体构图或源时间已变化，请重新主体分析或选择居中/手工构图后重新预览审核。")
+        return {"identity": safety_run_identity(task, run), "frozen": frozen_facts, "current": current_facts}
+
+    def consume_reframe_safety(project_id: str, task: dict, run: dict, proof: dict | None, assets: dict) -> None:
+        """CAS the lock-free proof.  This path must stay limited to state/stat checks."""
+        if not reframe_clip_ids(run):
+            return
+        if proof is None or proof["identity"] != safety_run_identity(task, run):
+            raise BatchProductionError("batch_export_reframe_conflict", "主体构图验证期间版本已变化，请刷新后重试。")
+        try:
+            frozen_directory = store.path(project_id, "exports" if run.get("previewRunId") else "runs", run["id"])
+            frozen_sources = render_inputs.resolve(frozen_directory, run["sources"])
+            for asset_id, fact in proof["frozen"].items():
+                if source_identity(frozen_sources[asset_id]) != {key: fact[key] for key in fact if key != "fingerprint"}:
+                    raise OSError("冻结素材已变化")
+            for asset_id, fact in proof["current"].items():
+                asset = assets.get(asset_id)
+                if not isinstance(asset, dict) or asset.get("file") != fact["assetFile"]:
+                    raise OSError("项目素材引用已变化")
+                if source_identity(project_assets.file(project_id, asset)) != {
+                    key: fact[key] for key in fact if key not in ("fingerprint", "assetFile")
+                }:
+                    raise OSError("项目素材已变化")
+        except (KeyError, OSError, ValueError, RenderInputError) as error:
+            raise BatchProductionError("batch_export_reframe_conflict", "主体构图验证期间素材已变化，请刷新后重试。") from error
+
+    def prepare_approved_source_snapshot(project_id: str, run_id: str, preview: dict, assets: dict) -> dict:
+        """Copy an approved export input outside locks and retain a stat-CAS proof for every source."""
+        try:
+            approved_directory = store.path(project_id, "runs", preview["id"])
+            frozen_sources = render_inputs.resolve(approved_directory, preview["sources"])
+            current_paths = {asset_id: project_assets.file(project_id, assets[asset_id])
+                             for asset_id in preview["sources"]}
+            frozen = {asset_id: stable_source_fact(path) for asset_id, path in frozen_sources.items()}
+            current = {asset_id: {**stable_source_fact(path), "assetFile": assets[asset_id].get("file")}
+                       for asset_id, path in current_paths.items()}
+            sources = snapshot_approved_sources(project_id, store.path(project_id, "exports", run_id), preview, assets)
+            if (any(source_identity(frozen_sources[asset_id]) != {key: fact[key] for key in fact if key != "fingerprint"}
+                    for asset_id, fact in frozen.items())
+                    or any(source_identity(current_paths[asset_id]) != {key: fact[key] for key in fact if key not in ("fingerprint", "assetFile")}
+                           for asset_id, fact in current.items())):
+                raise OSError("素材在快照期间变化")
+            return {"sources": sources, "frozen": frozen, "current": current}
+        except HTTPException:
+            raise BatchProductionError("batch_asset_unavailable", "原素材缺失或变化，请重新预览审核。") from None
+        except (KeyError, OSError, ValueError, RenderInputError) as error:
+            raise BatchProductionError("batch_asset_unavailable", "原素材缺失或变化，请重新预览审核。") from error
+
+    def consume_source_snapshot(project_id: str, preview: dict, proof: dict, assets: dict) -> None:
+        """Stat-check the lock-free approved-source copy without rereading media bytes."""
+        try:
+            frozen_sources = render_inputs.resolve(store.path(project_id, "runs", preview["id"]), preview["sources"])
+            for asset_id, fact in proof["frozen"].items():
+                if source_identity(frozen_sources[asset_id]) != {key: fact[key] for key in fact if key != "fingerprint"}:
+                    raise OSError("冻结素材已变化")
+            for asset_id, fact in proof["current"].items():
+                asset = assets.get(asset_id)
+                if not isinstance(asset, dict) or asset.get("file") != fact["assetFile"]:
+                    raise OSError("项目素材引用已变化")
+                if source_identity(project_assets.file(project_id, asset)) != {
+                    key: fact[key] for key in fact if key not in ("fingerprint", "assetFile")
+                }:
+                    raise OSError("项目素材已变化")
+        except (KeyError, OSError, ValueError, RenderInputError) as error:
+            raise BatchProductionError("batch_asset_unavailable", "原素材在导出准备期间变化，请重新预览审核。") from error
 
     def find_run(variant: dict[str, Any], run_id: str):
         run = next((item for item in variant["runs"] if item["id"] == run_id), None)
@@ -1715,33 +1824,107 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 or not 1 <= len(body["taskIds"]) <= 20 or any(not _valid_id(item) for item in body["taskIds"])
                 or len(set(body["taskIds"])) != len(body["taskIds"])):
             raise HTTPException(422, detail={"code": "batch_export_invalid", "message": "请选择 1–20 条不重复的变体。"})
+        def preview_available(child, preview):
+            try:
+                if preview["output"] != preview["id"] + ".mp4":
+                    raise ValueError("预览文件关联无效")
+                regular_file(store.path(project_id, "outputs", preview["output"]))
+                return True
+            except (OSError, ValueError, KeyError):
+                return False
+
+        # The first production pass reserves any new delivery ids and discovers
+        # the exact preview/delivery records that its two-stage callback will
+        # consume.  It deliberately performs no media inspection or copying.
+        with source_lock or nullcontext(), lock:
+            state = state_for(project_id)
+            parent = task_for(state, task_id)
+            children = [task_for(state, child_id) for child_id in body["taskIds"]]
+            assets = assets_for(project_id)
+            candidates: dict[tuple[str, str], tuple[dict, dict]] = {}
+            planned_snapshots: dict[tuple[str, str], tuple[dict, dict]] = {}
+            planned_ids: list[str] = []
+
+            def reserve_id():
+                run_id = uuid4().hex
+                planned_ids.append(run_id)
+                return run_id
+
+            def reserve_sources(run_id, child, preview, _available):
+                planned_snapshots[(child["id"], run_id)] = (deepcopy(child), deepcopy(preview))
+                return {}
+
+            production_call(
+                export_approved_versions, parent, children, assets=assets,
+                snapshot_sources=reserve_sources, preview_available=preview_available,
+                reframe_safe=lambda child, run: candidates.setdefault((child["id"], run["id"]),
+                                                                        (deepcopy(child), deepcopy(run))),
+                id_factory=reserve_id,
+            )
+        media_cache, frozen_timing_cache, current_timing_cache, proofs = {}, {}, {}, {}
+        for key, (child, run) in candidates.items():
+            proofs[key] = production_call(
+                prepare_reframe_safety, project_id, child, run, assets,
+                media_cache=media_cache, frozen_timing_cache=frozen_timing_cache,
+                current_timing_cache=current_timing_cache,
+            )
+        source_snapshots = {}
+        for (child_id, run_id), (_child, preview) in planned_snapshots.items():
+            source_snapshots[(child_id, run_id)] = production_call(
+                prepare_approved_source_snapshot, project_id, run_id, preview, assets)
+        reserved_ids = iter(planned_ids)
+
         with source_lock or nullcontext(), lock:
             state = state_for(project_id)
             parent = task_for(state, task_id)
             children = [task_for(state, child_id) for child_id in body["taskIds"]]
 
-            def preview_available(child, preview):
-                try:
-                    if preview["output"] != preview["id"] + ".mp4":
-                        raise ValueError("预览文件关联无效")
-                    regular_file(store.path(project_id, "outputs", preview["output"]))
-                    return True
-                except (OSError, ValueError, KeyError):
-                    return False
+            # Report proof staleness as a retryable CAS conflict before the
+            # production lifecycle can collapse it into a generic approval error.
+            current_children = {child["id"]: child for child in children}
+            for (child_id, run_id), proof in proofs.items():
+                if proof is None:
+                    continue
+                child = current_children.get(child_id)
+                current_run = next((item for item in child["variant"]["runs"]
+                                    if item["id"] == run_id), None) if child else None
+                if current_run is None and child is not None:
+                    current_run = next((item for item in child["variant"].get("exports", [])
+                                        if item["id"] == run_id), None)
+                if current_run is None or proof["identity"] != safety_run_identity(child, current_run):
+                    raise HTTPException(409, detail={"code": "batch_export_reframe_conflict",
+                                                     "message": "主体构图验证期间版本已变化，请刷新后重试。"})
 
-            def export_sources(run_id, child, preview, assets):
+            def export_sources(run_id, child, preview, available):
+                proof = source_snapshots.get((child["id"], run_id))
+                if proof is None:
+                    raise BatchProductionError("batch_export_reframe_conflict", "导出准备已变化，请刷新后重试。")
+                consume_source_snapshot(project_id, preview, proof, available)
+                return proof["sources"]
+
+            def actual_id():
                 try:
-                    return snapshot_approved_sources(
-                        project_id, store.path(project_id, "exports", run_id), preview, assets)
-                except HTTPException:
-                    raise BatchProductionError("batch_asset_unavailable", "原素材缺失或变化，请重新预览审核。") from None
+                    return next(reserved_ids)
+                except StopIteration:
+                    raise BatchProductionError("batch_export_reframe_conflict", "导出准备已变化，请刷新后重试。") from None
 
             assets = assets_for(project_id)
-            prepared = production_call(
-                export_approved_versions, parent, children, assets=assets,
-                snapshot_sources=export_sources, preview_available=preview_available,
-                reframe_safe=lambda child, run: require_current_reframe_safety(project_id, child, run),
-            )
+            try:
+                prepared = production_call(
+                    export_approved_versions, parent, children, assets=assets,
+                    snapshot_sources=export_sources, preview_available=preview_available,
+                    reframe_safe=lambda child, run: consume_reframe_safety(
+                        project_id, child, run, proofs.get((child["id"], run["id"])), assets),
+                    id_factory=actual_id,
+                )
+            except BaseException:
+                for _child_id, planned_run_id in source_snapshots:
+                    shutil.rmtree(store.path(project_id, "exports", planned_run_id), ignore_errors=True)
+                raise
+            used_snapshot_ids = {run["id"] for _child, run, created in prepared if created}
+            for _child_id, planned_run_id in source_snapshots:
+                if planned_run_id not in used_snapshot_ids:
+                    shutil.rmtree(store.path(project_id, "exports", planned_run_id), ignore_errors=True)
             results = []
             for child, run, created in prepared:
                 if not created:
@@ -1772,13 +1955,24 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
     @router.get("/{task_id}/exports/{run_id}/output")
     def download_export(project_id: str, task_id: str, run_id: str):
         project_for(project_id)
-        with lock:
+        with source_lock or nullcontext(), lock:
+            task = task_for(state_for(project_id), task_id)
+            run = find_export(task["variant"], run_id)
+            if run["status"] != "completed":
+                raise HTTPException(409, detail={"code": "batch_export_unavailable", "message": "成片尚不可用。"})
+            task, run, assets = deepcopy(task), deepcopy(run), deepcopy(assets_for(project_id))
+        try:
+            proof = prepare_reframe_safety(project_id, task, run, assets, media_cache={}, frozen_timing_cache={},
+                                           current_timing_cache={})
+        except BatchProductionError as error:
+            raise HTTPException(409, detail={"code": error.code, "message": error.message}) from None
+        with source_lock or nullcontext(), lock:
             task = task_for(state_for(project_id), task_id)
             run = find_export(task["variant"], run_id)
             if run["status"] != "completed":
                 raise HTTPException(409, detail={"code": "batch_export_unavailable", "message": "成片尚不可用。"})
             try:
-                require_current_reframe_safety(project_id, task, run)
+                consume_reframe_safety(project_id, task, run, proof, assets_for(project_id))
                 if run["output"] != run_id + ".mp4":
                     raise ValueError("成片关联无效")
                 path = store.path(project_id, "deliverables", run["output"])
