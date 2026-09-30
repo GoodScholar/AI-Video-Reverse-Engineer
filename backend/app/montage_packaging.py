@@ -172,18 +172,24 @@ def _ass_time(seconds: float) -> str:
 
 
 def _advance(text: str, size: float) -> float:
+    """libass/FreeType REAL_DIM advance in ASS script pixels."""
     from fontTools.ttLib import TTFont
     font = TTFont(private_font_path(), lazy=True)
-    cmap, metrics, units = font.getBestCmap(), font["hmtx"].metrics, font["head"].unitsPerEm
-    return sum(metrics[cmap[ord(char)]][0] for char in text if char not in "\n\t" and ord(char) in cmap) * size / units
+    cmap, metrics, os2 = font.getBestCmap(), font["hmtx"].metrics, font["OS/2"]
+    real_dim = os2.usWinAscent + os2.usWinDescent
+    if real_dim <= 0:
+        raise PackagingError("受控字体真实尺寸无效。")
+    return sum(metrics[cmap[ord(char)]][0] for char in text if char not in "\n\t" and ord(char) in cmap) * size / real_dim
 
 
 def _font_height(size: float) -> float:
-    """Use the font's Win ascent/descent, matching libass metric intent."""
+    """FT_SIZE_REQUEST_TYPE_REAL_DIM makes Win ascent+descent equal Fontsize."""
     from fontTools.ttLib import TTFont
     font = TTFont(private_font_path(), lazy=True)
-    os2, units = font["OS/2"], font["head"].unitsPerEm
-    return (os2.usWinAscent + os2.usWinDescent) * size / units
+    os2 = font["OS/2"]
+    if os2.usWinAscent + os2.usWinDescent <= 0:
+        raise PackagingError("受控字体真实尺寸无效。")
+    return size
 
 
 def _interpolated_boxes(samples: list[dict[str, Any]], source_time: float) -> list[dict[str, float]]:
@@ -245,7 +251,8 @@ def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width
             times = [source_start, source_end]
             times.extend(float(sample["timeSeconds"]) for sample in samples if isinstance(sample, dict)
                          and isinstance(sample.get("timeSeconds"), (int, float)) and source_start < sample["timeSeconds"] < source_end)
-            for source_time in sorted(set(times)):
+            def project(source_time: float) -> list[tuple[float, float, float, float]]:
+                projected = []
                 try:
                     crop_x, crop_y = _crop_position(_center_at(reframe, source_time), source_w, source_h, crop_w, crop_h)
                 except (KeyError, TypeError, ValueError):
@@ -258,7 +265,21 @@ def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width
                     left, top = (x * source_w - crop_x) * width / crop_w, (y * source_h - crop_y) * height / crop_h
                     right, bottom = ((x + box_w) * source_w - crop_x) * width / crop_w, ((y + box_h) * source_h - crop_y) * height / crop_h
                     if right > 0 and bottom > 0 and left < width and top < height:
-                        result.append((max(0, left), max(0, top), min(width, right), min(height, bottom)))
+                        projected.append((max(0, left), max(0, top), min(width, right), min(height, bottom)))
+                return projected
+
+            # Between detector samples both the box and Task1 crop centre are
+            # linear/piecewise-linear.  The endpoint union is therefore a
+            # conservative swept envelope; with no stable detector identity we
+            # intentionally retain every endpoint box instead of zip-dropping.
+            sampled = [(source_time, project(source_time)) for source_time in sorted(set(times))]
+            for _source_time, boxes in sampled:
+                result.extend(boxes)
+            for (_left_time, left_boxes), (_right_time, right_boxes) in zip(sampled, sampled[1:]):
+                swept = [*left_boxes, *right_boxes]
+                if swept:
+                    result.append((min(box[0] for box in swept), min(box[1] for box in swept),
+                                   max(box[2] for box in swept), max(box[3] for box in swept)))
     return result
 
 
@@ -294,6 +315,8 @@ def _element_events(packaging: dict[str, Any], cues: list[dict[str, Any]], width
         text, start, end = item["text"], item["start"], item["end"]
         events.append({**item, "text": text, "start": start, "end": end})
     for item in events:
+        # This includes implicit/default batch cues, before any libass call.
+        _glyphs(item["text"])
         size = {"title": 56, "cta": 48, "selling-point": 42, "keyword": 44, "subtitle": 38}[item["kind"]]
         outline = {"plain": 3, "emphasis": 5, "banner": 14}[item["style"]]
         line_widths = [_advance(line, size) for line in item["text"].split("\n")]

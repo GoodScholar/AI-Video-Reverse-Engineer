@@ -283,6 +283,22 @@ def test_packaging_uses_one_ass_subtitle_pass_and_keeps_preview_export_coordinat
     assert all(not path.exists() for path in tmp_path.glob(".packaging.ass"))
 
 
+def test_packaging_rejects_default_missing_glyph_and_cleans_ass_on_renderer_failure(tmp_path, monkeypatch):
+    from app.montage_packaging import default_packaging
+    image, output = _image(tmp_path / "green.png", "green"), tmp_path / "bad-packaging.mp4"
+    timeline = _timeline(width=720, height=1280, tracks=[_track("video", [_clip("green", 0, .5)])])
+    with pytest.raises(TimelineRenderError, match="缺少"):
+        render_timeline(timeline, {"green": image}, output, format="preview", packaging=default_packaging(),
+                        packaging_cues=[{"id": "bad", "start": 0, "end": .4, "text": "\U00020000"}])
+    assert not output.exists() and not list(tmp_path.glob(".packaging.ass"))
+
+    monkeypatch.setattr(timeline_render, "_run_ffmpeg", lambda *_args, **_kwargs: (_ for _ in ()).throw(TimelineRenderError("中断")))
+    with pytest.raises(TimelineRenderError, match="中断"):
+        render_timeline(timeline, {"green": image}, output, format="preview", packaging=default_packaging(),
+                        packaging_cues=[{"id": "ok", "start": 0, "end": .4, "text": "清理"}])
+    assert not output.exists() and not list(tmp_path.glob(".packaging.ass"))
+
+
 @pytest.mark.parametrize(('width', 'height'), [
     (1680, 720), (1280, 720), (960, 720), (720, 720), (720, 960), (720, 1280),
 ])

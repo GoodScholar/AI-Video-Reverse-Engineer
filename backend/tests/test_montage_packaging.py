@@ -90,7 +90,7 @@ def test_auto_layout_avoids_a_moving_reframe_subject_inside_safe_area():
 
     ass = compile_ass(packaging, [], tracks, 720, 1280, private_font_path())
 
-    assert "\\pos(360,95)" in ass
+    assert "\\pos(360,86)" in ass
 
 
 def test_transition_and_full_subject_occupancy_require_manual_review():
@@ -113,6 +113,14 @@ def test_batch_cues_are_emitted_once_with_an_empty_packaging_template():
 
     assert ass.count("唯一正本字幕") == 1
     assert "Dialogue: 0,0:00:00.20,0:00:00.80,G0" in ass
+
+
+def test_default_batch_cue_is_cmap_checked_before_libass():
+    from app.montage_packaging import PackagingError, compile_ass, private_font_path
+
+    with pytest.raises(PackagingError, match="缺少"):
+        compile_ass(_packaging([]), [{"id": "cue-one", "start": .2, "end": .8, "text": "\U00020000"}], [], 720, 1280,
+                    private_font_path())
 
 
 def test_subject_projection_uses_aspect_ratio_clip_time_manual_center_and_even_crop():
@@ -147,3 +155,27 @@ def test_multiline_real_advances_are_not_character_count_estimates():
     with pytest.raises(PackagingError, match="文字超出"):
         compile_ass(_packaging([_element("title", text="全" * 40, position="top")]), [], [], 720, 1280,
                     private_font_path())
+
+
+def test_subject_sweep_blocks_middle_crossing_and_keeps_appearing_boxes():
+    from app.montage_packaging import PackagingError, _subject_boxes, compile_ass, private_font_path
+
+    tracks = _reframed_track()
+    reframe = tracks[0]["clips"][0]["reframe"]
+    reframe["samples"] = [
+        {"timeSeconds": 0, "boxes": [{"x": 0, "y": .42, "width": .12, "height": .18, "label": "person", "confidence": .9}], "center": {"x": .1, "y": .5}, "confidence": .9},
+        {"timeSeconds": 1, "boxes": [{"x": .88, "y": .42, "width": .12, "height": .18, "label": "new-person", "confidence": .9}], "center": {"x": .9, "y": .5}, "confidence": .9},
+    ]
+    swept = _subject_boxes(tracks, 0, 1, 720, 1280)
+    assert any(box[0] < 360 < box[2] for box in swept)
+    with pytest.raises(PackagingError, match="人工"):
+        compile_ass(_packaging([_element("subtitle", position="middle", text="穿越主体")]), [], tracks, 720, 1280,
+                    private_font_path())
+
+    # At a transition both clips contribute independently; no endpoint list is dropped.
+    other = {**tracks[0]["clips"][0], "id": "transition-right", "start": .5,
+             "reframe": {**reframe, "samples": [{"timeSeconds": 0, "boxes": [{"x": .42, "y": .1, "width": .16, "height": .2,
+                 "label": "right", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9}]}}
+    tracks[0]["clips"].append(other)
+    during_transition = _subject_boxes(tracks, .5, .6, 720, 1280)
+    assert any(box[1] < 300 for box in during_transition) and any(box[0] < 360 < box[2] for box in during_transition)
