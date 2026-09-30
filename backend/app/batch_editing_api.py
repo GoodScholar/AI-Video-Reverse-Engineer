@@ -23,6 +23,8 @@ from .batch_production import (
     apply_aigc_handoff,
     complete_voiceover,
     create_batch as new_task,
+    current_delivery_output,
+    current_preview_output,
     create_batch_variants,
     current_version as review_version,
     export_approved_versions,
@@ -174,6 +176,90 @@ def _shared_montage_usage(batch_members: list[dict[str, Any]], current_task_id: 
     return usage
 
 
+def _migrate_legacy_recognition_cues(value: Any) -> bool:
+    """Namespace completed legacy ``line-1`` cues before strict validation.
+
+    Only unambiguous references are rewritten.  Ambiguous legacy references
+    stay invalid rather than being silently attached to a later recognition.
+    """
+    if not isinstance(value, dict) or not isinstance(value.get("tasks"), list):
+        return False
+    changed = False
+    for task in value["tasks"]:
+        variant = task.get("variant") if isinstance(task, dict) else None
+        subtitles = variant.get("subtitles") if isinstance(variant, dict) else None
+        recognitions = subtitles.get("recognitions") if isinstance(subtitles, dict) else None
+        if not isinstance(recognitions, list):
+            continue
+        candidates: dict[str, list[str]] = {}
+        for recognition in recognitions:
+            if not isinstance(recognition, dict) or recognition.get("status") != "completed":
+                continue
+            run_id, cues = recognition.get("id"), recognition.get("cues")
+            if not isinstance(run_id, str) or not isinstance(cues, list):
+                continue
+            for cue in cues:
+                if not isinstance(cue, dict) or not isinstance(cue.get("id"), str) or cue["id"].startswith(run_id + "-"):
+                    continue
+                old_id = cue["id"]
+                new_id = run_id + "-" + old_id
+                candidates.setdefault(old_id, []).append(new_id)
+                cue["id"] = new_id
+                changed = True
+        mapping = {old_id: names[0] for old_id, names in candidates.items() if len(names) == 1}
+        ambiguous = {old_id for old_id, names in candidates.items() if len(names) > 1}
+        def has_ambiguous_cue(cues):
+            return isinstance(cues, list) and any(
+                isinstance(cue, dict) and cue.get("id") in ambiguous for cue in cues
+            )
+        def has_ambiguous_packaging(snapshot):
+            package = snapshot.get("packaging") if isinstance(snapshot, dict) else None
+            return isinstance(package, dict) and any(
+                isinstance(element, dict) and element.get("cueId") in ambiguous
+                for element in package.get("elements", [])
+            )
+        if (has_ambiguous_cue(subtitles.get("cues")) or has_ambiguous_packaging(variant)
+                or has_ambiguous_packaging(task.get("proposal"))
+                or any(has_ambiguous_packaging(proposal) for proposal in task.get("montageProposals", []) if isinstance(proposal, dict))
+                or any(has_ambiguous_cue(run.get("subtitleCues")) or has_ambiguous_packaging(run.get("snapshot"))
+                       for run in variant.get("runs", []) if isinstance(run, dict))
+                or any(has_ambiguous_cue(delivery.get("subtitles")) or has_ambiguous_packaging(delivery.get("snapshot"))
+                       for delivery in variant.get("exports", []) if isinstance(delivery, dict))):
+            raise ValueError("字幕识别 cue 身份歧义")
+        if not mapping:
+            continue
+        def rewrite_cues(cues):
+            nonlocal changed
+            if not isinstance(cues, list):
+                return
+            for cue in cues:
+                if isinstance(cue, dict) and cue.get("id") in mapping:
+                    cue["id"] = mapping[cue["id"]]
+                    changed = True
+        def rewrite_packaging(snapshot):
+            nonlocal changed
+            package = snapshot.get("packaging") if isinstance(snapshot, dict) else None
+            for element in package.get("elements", []) if isinstance(package, dict) else []:
+                if isinstance(element, dict) and element.get("cueId") in mapping:
+                    element["cueId"] = mapping[element["cueId"]]
+                    changed = True
+        rewrite_cues(subtitles.get("cues"))
+        rewrite_packaging(variant)
+        rewrite_packaging(task.get("proposal"))
+        for proposal in task.get("montageProposals", []):
+            if isinstance(proposal, dict):
+                rewrite_packaging(proposal)
+        for run in variant.get("runs", []):
+            if isinstance(run, dict):
+                rewrite_cues(run.get("subtitleCues"))
+                rewrite_packaging(run.get("snapshot"))
+        for delivery in variant.get("exports", []):
+            if isinstance(delivery, dict):
+                rewrite_cues(delivery.get("subtitles"))
+                rewrite_packaging(delivery.get("snapshot"))
+    return changed
+
+
 def _validate_state(value: Any) -> None:
     if not isinstance(value, dict) or value.get("schemaVersion") != 1 or not isinstance(value.get("tasks"), list):
         raise ValueError("批量混剪状态无效")
@@ -188,6 +274,8 @@ def _validate_state(value: Any) -> None:
         ids.add(task["id"])
         if type(task.get("contentRevision", 0)) is not int or task.get("contentRevision", 0) < 0:
             raise ValueError("脚本版本无效")
+        if "cta" in task and (not isinstance(task["cta"], str) or not task["cta"].strip() or len(task["cta"]) > 120):
+            raise ValueError("CTA 无效")
         if "batchId" in task or "generationId" in task or "generation" in task:
             generation = task.get("generation")
             if (not _valid_id(task.get("batchId")) or not _valid_id(task.get("generationId"))
@@ -349,7 +437,10 @@ class BatchStore:
         if path.is_symlink() or not path.is_file():
             raise OSError("批量混剪状态文件无效")
         value = json.loads(path.read_text(encoding="utf-8"))
+        migrated = _migrate_legacy_recognition_cues(value)
         _validate_state(value)
+        if migrated:
+            self.save(project_id, value)
         return value
 
     def save(self, project_id: str, value: dict[str, Any]) -> None:
@@ -1152,10 +1243,13 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
     @router.put("/{task_id}/content")
     def save_content(project_id: str, task_id: str, body: dict[str, Any]):
         project_for(project_id)
-        if (not isinstance(body, dict) or set(body) != {"revision", "sellingPoint", "script"}
+        if (not isinstance(body, dict) or not {"revision", "sellingPoint", "script"} <= set(body)
+                or set(body) - {"revision", "sellingPoint", "script", "cta"}
                 or type(body["revision"]) is not int or any(
                     not isinstance(body[key], str) or not body[key].strip() or len(body[key]) > 4000
-                    for key in ("sellingPoint", "script"))):
+                    for key in ("sellingPoint", "script"))
+                or ("cta" in body and body["cta"] is not None and (
+                    not isinstance(body["cta"], str) or not body["cta"].strip() or len(body["cta"]) > 120))):
             raise HTTPException(422, detail={"code": "batch_content_invalid", "message": "卖点或脚本无效。"})
         with lock:
             state = state_for(project_id)
@@ -1163,6 +1257,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             changed = production_call(
                 save_batch_content, task, expected_revision=body["revision"],
                 selling_point=body["sellingPoint"], script=body["script"],
+                **({"cta": body["cta"]} if "cta" in body else {}),
             )
             if changed:
                 save(project_id, state)
@@ -2139,6 +2234,12 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             run = find_export(task["variant"], run_id)
             if run["status"] != "completed":
                 raise HTTPException(409, detail={"code": "batch_export_unavailable", "message": "成片尚不可用。"})
+            try:
+                require_packaging_font(run.get("snapshot", {}), run.get("subtitles", []), batch=True)
+            except BatchProductionError as error:
+                raise HTTPException(409, detail={"code": error.code, "message": error.message}) from None
+            if not current_delivery_output(task, run):
+                raise HTTPException(409, detail={"code": "batch_export_stale", "message": "成片不是当前已审核版本，请重新预览并导出。"})
             task, run, assets = deepcopy(task), deepcopy(run), deepcopy(assets_for(project_id))
         try:
             proof = prepare_reframe_safety(project_id, task, run, assets, media_cache={}, frozen_timing_cache={},
@@ -2152,6 +2253,11 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 raise HTTPException(409, detail={"code": "batch_export_unavailable", "message": "成片尚不可用。"})
             try:
                 require_packaging_font(run.get("snapshot", {}), run.get("subtitles", []), batch=True)
+            except BatchProductionError as error:
+                raise HTTPException(409, detail={"code": error.code, "message": error.message}) from None
+            if not current_delivery_output(task, run):
+                raise HTTPException(409, detail={"code": "batch_export_stale", "message": "成片不是当前已审核版本，请重新预览并导出。"})
+            try:
                 consume_reframe_safety(project_id, task, run, proof, assets_for(project_id))
                 if run["output"] != run_id + ".mp4":
                     raise ValueError("成片关联无效")
@@ -2181,11 +2287,17 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
     def download_preview(project_id: str, task_id: str, run_id: str):
         project_for(project_id)
         with lock:
-            run = find_run(task_for(state_for(project_id), task_id)["variant"], run_id)
+            task = task_for(state_for(project_id), task_id)
+            run = find_run(task["variant"], run_id)
             if run["status"] != "completed":
                 raise HTTPException(409, detail={"code": "batch_preview_unavailable", "message": "预览尚不可用。"})
             try:
                 require_packaging_font(run.get("snapshot", {}), run.get("subtitleCues", []), batch=True)
+            except BatchProductionError as error:
+                raise HTTPException(409, detail={"code": error.code, "message": error.message}) from None
+            if not current_preview_output(task, run):
+                raise HTTPException(409, detail={"code": "batch_preview_stale", "message": "预览不是当前版本，请重新生成。"})
+            try:
                 output = run["output"]
                 if output != run_id + ".mp4":
                     raise ValueError("输出关联无效")

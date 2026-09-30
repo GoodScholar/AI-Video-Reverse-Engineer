@@ -190,7 +190,7 @@ def test_batch_export_gate_isolation_retry_and_history(tmp_path):
             "sellingPoint": "卖点0", "script": "新脚本"})
         assert changed.status_code == 200
         assert api.post(export_url, json={"taskIds": [first["id"]]}).status_code == 409
-        assert api.get(download).content == b"delivery"
+        assert api.get(download).status_code == 409
         assert api.get(base).json()["tasks"][1]["variant"]["exports"][0]["script"] == "卖点0"
         changed_second = api.put(f"{base}/{second['id']}/content", json={"revision": 0,
             "sellingPoint": "卖点1", "script": "新版卖点1"})
@@ -218,7 +218,7 @@ def test_batch_export_gate_isolation_retry_and_history(tmp_path):
         assert states[2]["variant"]["exports"][-1]["assets"][0]["name"] == "卖点1"
         assert states[3]["variant"]["exports"][-1]["status"] == "failed"
         assert "重启" in states[3]["variant"]["exports"][-1]["error"]
-        assert reopened.get(download).content == b"delivery"
+        assert reopened.get(download).status_code == 409
         changed_source = reopened.post(export_url, json={"taskIds": [second["id"]]})
         assert changed_source.status_code == 202
         assert changed_source.json()["results"][0]["status"] == "failed"

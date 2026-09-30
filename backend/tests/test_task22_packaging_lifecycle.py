@@ -93,6 +93,11 @@ def test_initial_proposal_packaging_uses_confirmed_copy_without_inventing_cta():
     assert all("立即购买" not in item["text"] for item in package["elements"])
     assert package["elements"][0]["text"] == "已确认的脚本标题"
 
+    with_cta = production.initial_proposal_packaging(
+        script="已确认的脚本标题。后续说明", selling_point="已确认卖点", duration=6, cta="立即咨询",
+    )
+    assert [item["text"] for item in with_cta["elements"] if item["kind"] == "cta"] == ["立即咨询"]
+
 
 def test_backup_rejects_a_batch_snapshot_with_a_dangling_packaging_cue(tmp_path):
     import json
@@ -109,3 +114,59 @@ def test_backup_rejects_a_batch_snapshot_with_a_dangling_packaging_cue(tmp_path)
 
     with pytest.raises(ValueError):
         BatchStore(tmp_path).load("project")
+
+
+def test_legacy_recognition_cues_migrate_to_their_run_namespace_idempotently(tmp_path):
+    import json
+    from app.batch_editing_api import BatchStore
+
+    task = create_batch("卖点", "脚本", id_factory=iter(["task", "variant"]).__next__)
+    task["variant"].update(tracks=_tracks(), revision=1)
+    legacy = {"id": "recognition", "status": "completed", "error": None, "language": "zh",
+              "timelineRevision": 1, "subtitleRevision": 0, "cues": _cue("line-1"),
+              "snapshot": {"settings": task["variant"]["settings"], "tracks": _tracks()},
+              "sources": {"shot": "shot.mp4"}}
+    task["variant"]["subtitles"].update(cues=_cue("line-1"), recognitions=[legacy])
+    path = BatchStore(tmp_path).path("project", "state.json")
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"schemaVersion": 1, "tasks": [task]}), encoding="utf-8")
+
+    first = BatchStore(tmp_path).load("project")
+    second = BatchStore(tmp_path).load("project")
+
+    assert first["tasks"][0]["variant"]["subtitles"]["recognitions"][0]["cues"][0]["id"] == "recognition-line-1"
+    assert first["tasks"][0]["variant"]["subtitles"]["cues"][0]["id"] == "recognition-line-1"
+    assert second == first
+
+
+def test_legacy_recognition_migration_rejects_ambiguous_current_cue(tmp_path):
+    import json
+    from app.batch_editing_api import BatchStore
+
+    task = create_batch("卖点", "脚本", id_factory=iter(["task", "variant"]).__next__)
+    task["variant"].update(tracks=_tracks(), revision=1)
+    first = {"id": "recognition-one", "status": "completed", "error": None, "language": "zh",
+             "timelineRevision": 1, "subtitleRevision": 0, "cues": _cue("line-1"),
+             "snapshot": {"settings": task["variant"]["settings"], "tracks": _tracks()}, "sources": {"shot": "shot.mp4"}}
+    second = {**deepcopy(first), "id": "recognition-two"}
+    task["variant"]["subtitles"].update(cues=_cue("line-1"), recognitions=[first, second])
+    path = BatchStore(tmp_path).path("project", "state.json")
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"schemaVersion": 1, "tasks": [task]}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="身份歧义"):
+        BatchStore(tmp_path).load("project")
+
+
+def test_save_content_keeps_or_clears_only_explicit_cta_and_invalidates_completed_artifacts():
+    task = create_batch("卖点", "脚本", id_factory=iter(["task", "variant"]).__next__)
+    task["variant"].update(tracks=_tracks(), revision=1)
+
+    assert save_content(task, expected_revision=0, selling_point="卖点", script="脚本二", cta="立即咨询")
+    assert task["cta"] == "立即咨询" and task["contentRevision"] == 1
+    assert save_content(task, expected_revision=1, selling_point="卖点", script="脚本三")
+    assert task["cta"] == "立即咨询"
+    assert save_content(task, expected_revision=2, selling_point="卖点", script="脚本四", cta=None)
+    assert "cta" not in task
+    with pytest.raises(BatchProductionError, match="脚本已更新"):
+        save_content(task, expected_revision=2, selling_point="卖点", script="脚本四", cta="过期")

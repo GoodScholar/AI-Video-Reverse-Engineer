@@ -63,6 +63,22 @@ def test_export_refuses_active_state_and_symlink(tmp_path):
         assert client.post(f'/api/projects/{pid}/backup', json={}).status_code == 422
 
 
+def test_backup_rejects_invalid_current_timeline_packaging_without_a_render_history(tmp_path):
+    from app.montage_packaging import default_packaging
+    from app.timeline import TimelineStore
+
+    with TestClient(create_app(data_dir=tmp_path)) as client:
+        pid = create(client)
+        client.get(f'/api/projects/{pid}/timeline')
+        timeline = TimelineStore(tmp_path).load(pid)
+        package = default_packaging()
+        package['templateId'] = 'unknown-template'
+        timeline['packaging'] = package
+        TimelineStore(tmp_path).save(pid, timeline)
+
+        assert client.post(f'/api/projects/{pid}/backup', json={}).status_code == 422
+
+
 def test_backup_routes_require_trusted_browser_intent(tmp_path):
     with TestClient(create_app(data_dir=tmp_path)) as client:
         pid = create(client)

@@ -140,8 +140,14 @@ def validate_core(data_root, project):
                 if not prep_store.path(pid, 'artifacts', shot['id'], node['id'], artifact['name']).is_file():
                     fail("备份缺少镜头步骤产物。")
     timeline = TimelineStore(data_root).load(pid)
-    validate_workspace({'revision': timeline['revision'], 'settings': timeline['settings'],
-                        'tracks': timeline['tracks'], 'transitions': timeline.get('transitions', [])}, assets)
+    _, timeline_tracks = validate_workspace({'revision': timeline['revision'], 'settings': timeline['settings'],
+                                             'tracks': timeline['tracks'], 'transitions': timeline.get('transitions', [])}, assets)
+    if timeline.get('packaging') is not None:
+        try:
+            from .montage_packaging import validate_final_events
+            validate_final_events(timeline['packaging'], [], timeline_tracks, batch=False)
+        except ValueError:
+            fail('备份中的当前包装字体或模板无效。')
     validate_timeline_history(TimelineStore(data_root), pid, timeline, assets)
     # BatchStore validates the current variant, recognitions and every frozen
     # preview/export snapshot, including package font/template/cue references.

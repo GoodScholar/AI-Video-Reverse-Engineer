@@ -22,6 +22,31 @@ from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerpri
 INTENT = {"x-aivre-intent": "semantic-analysis"}
 
 
+def test_content_api_persists_explicit_cta_with_omit_null_and_cas(tmp_path):
+    class Queue:
+        def submit(self, *_args):
+            return True
+
+    app = FastAPI()
+    app.include_router(create_batch_editing_router(tmp_path, lambda _project_id: object(), Queue()))
+    with TestClient(app) as client:
+        base = "/api/projects/p1/batch-edits"
+        task = client.post(base, json={"sellingPoint": "卖点", "script": "脚本"}).json()["task"]
+        content = f"{base}/{task['id']}/content"
+
+        saved = client.put(content, json={"revision": 0, "sellingPoint": "卖点", "script": "脚本", "cta": "立即咨询"})
+        assert saved.status_code == 200
+        assert saved.json()["task"]["cta"] == "立即咨询"
+        assert saved.json()["task"]["contentRevision"] == 1
+        retained = client.put(content, json={"revision": 1, "sellingPoint": "新版卖点", "script": "脚本"})
+        assert retained.status_code == 200
+        assert retained.json()["task"]["cta"] == "立即咨询"
+        assert client.put(content, json={"revision": 1, "sellingPoint": "冲突", "script": "脚本"}).status_code == 409
+        cleared = client.put(content, json={"revision": 2, "sellingPoint": "新版卖点", "script": "脚本", "cta": None})
+        assert cleared.status_code == 200
+        assert "cta" not in cleared.json()["task"]
+
+
 def test_shared_montage_usage_counts_each_sibling_once_and_ignores_deleted_or_stale_selections():
     sibling = {
         "id": "task-b",
@@ -1206,14 +1231,14 @@ def test_preview_uses_saved_snapshot_and_old_preview_remains_after_edit(tmp_path
     assert client.get(path + f"/previews/{run_id}/output").content == b"preview"
     tracks[0]["clips"][0]["inPoint"] = 0
     assert client.put(path, json={"revision": 1, "tracks": tracks}).status_code == 200
-    assert client.get(path + f"/previews/{run_id}/output").content == b"preview"
+    assert client.get(path + f"/previews/{run_id}/output").status_code == 409
     broken[0] = True
     newer = client.post(path + "/previews", json={"revision": 2})
     assert newer.status_code == 202
     pid, job = jobs.pop()
     job(pid)
     assert client.get(base).json()["tasks"][0]["variant"]["runs"][-1]["status"] == "failed"
-    assert client.get(path + f"/previews/{run_id}/output").content == b"preview"
+    assert client.get(path + f"/previews/{run_id}/output").status_code == 409
 
 
 @pytest.mark.parametrize("tasks", [
@@ -1600,12 +1625,12 @@ def test_completed_export_download_rechecks_real_reframe_sources_but_keeps_cente
         blocked = client.get(f"{base}/{task['id']}/exports/delivery/output")
         assert blocked.status_code == 409
         assert blocked.json()["detail"]["code"] == "batch_export_reframe_review_required"
-        assert client.get(f"{base}/{task['id']}/exports/legacy/output").content == b"legacy"
+        assert client.get(f"{base}/{task['id']}/exports/legacy/output").status_code == 409
 
         state = json.loads(state_path.read_text(encoding="utf-8"))
         state["tasks"][0]["variant"]["exports"][0]["snapshot"]["tracks"][0]["clips"][0]["reframe"]["override"] = {"mode": "center", "keyframes": []}
         state_path.write_text(json.dumps(state), encoding="utf-8")
-        assert client.get(f"{base}/{task['id']}/exports/delivery/output").content == b"delivery"
+        assert client.get(f"{base}/{task['id']}/exports/delivery/output").status_code == 409
 
 
 def test_montage_candidate_replacement_keeps_pending_reframe_and_queues_analysis(tmp_path):

@@ -12,6 +12,7 @@ from .timeline import validate_transitions, validate_workspace
 from .video_aspect import PRODUCT_PRESETS, ratio_label, resolve_product_aspect, valid_aspect_mode
 
 _PACKAGING_UNSET = object()
+_CTA_UNSET = object()
 
 
 class BatchProductionError(ValueError):
@@ -222,6 +223,24 @@ def review_status(task: dict[str, Any]) -> str:
     return inspect_variant(task).review.status
 
 
+def current_preview_output(task: dict[str, Any], run: dict[str, Any]) -> bool:
+    fact = inspect_variant(task).preview
+    return fact.status == "current" and fact.record is run
+
+
+def current_delivery_output(task: dict[str, Any], run: dict[str, Any]) -> bool:
+    lifecycle = inspect_variant(task)
+    preview, review = lifecycle.preview.record, lifecycle.review.record
+    version = current_version(task)
+    return bool(
+        run.get("status") == "completed" and lifecycle.preview.status == "current"
+        and lifecycle.review.status == "approved" and preview is not None and review is not None
+        and (run.get("contentRevision", 0), run.get("variantRevision", 0), run.get("subtitleRevision", 0)) == version
+        and run.get("previewRunId") == preview.get("id") and run.get("review", {}).get("id") == review.get("id")
+        and run.get("snapshot") == preview.get("snapshot") and run.get("subtitles", []) == preview.get("subtitleCues", [])
+    )
+
+
 def create_batch(selling_point: str, script: str, aspect: dict[str, Any] | None = None,
                  *, id_factory: Callable[[], str] = _new_id) -> dict[str, Any]:
     aspect = aspect or {"mode": "9:16", "resolvedAspect": "9:16", "width": 720, "height": 1280,
@@ -245,11 +264,16 @@ def create_batch(selling_point: str, script: str, aspect: dict[str, Any] | None 
     }
 
 
-def save_content(task: dict[str, Any], *, expected_revision: int, selling_point: str, script: str) -> bool:
+def save_content(task: dict[str, Any], *, expected_revision: int, selling_point: str, script: str,
+                 cta: Any = _CTA_UNSET) -> bool:
     if expected_revision != task.get("contentRevision", 0):
         raise BatchProductionError("batch_content_conflict", "脚本已更新，请刷新后重试。")
     content = (selling_point.strip(), script.strip())
-    if content == (task["sellingPoint"], task["script"]):
+    if cta is not _CTA_UNSET and cta is not None and (not isinstance(cta, str) or not cta.strip() or len(cta.strip()) > 120):
+        raise BatchProductionError("batch_content_invalid", "CTA 无效。", 422)
+    saved_cta = task.get("cta")
+    next_cta = saved_cta if cta is _CTA_UNSET else (cta.strip() if isinstance(cta, str) else None)
+    if content == (task["sellingPoint"], task["script"]) and next_cta == saved_cta:
         return False
     script_changed = content[1] != task["script"]
     packaging = task["variant"].get("packaging")
@@ -259,6 +283,10 @@ def save_content(task: dict[str, Any], *, expected_revision: int, selling_point:
         raise BatchProductionError("batch_packaging_cues_stale", "脚本变更会使包装字幕引用失效，请先移除或更新包装字幕。", 422)
     task.update(sellingPoint=content[0], script=content[1],
                 contentRevision=task.get("contentRevision", 0) + 1)
+    if next_cta is None:
+        task.pop("cta", None)
+    else:
+        task["cta"] = next_cta
     subtitles = task["variant"].get("subtitles")
     if script_changed and subtitles is not None and subtitles.get("cues"):
         subtitles["cues"] = []
