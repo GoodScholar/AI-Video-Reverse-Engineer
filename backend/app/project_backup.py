@@ -143,6 +143,12 @@ def validate_core(data_root, project):
     validate_workspace({'revision': timeline['revision'], 'settings': timeline['settings'],
                         'tracks': timeline['tracks'], 'transitions': timeline.get('transitions', [])}, assets)
     validate_timeline_history(TimelineStore(data_root), pid, timeline, assets)
+    # BatchStore validates the current variant, recognitions and every frozen
+    # preview/export snapshot, including package font/template/cue references.
+    # Keep it in the same restore gate as timeline history so bad references
+    # cannot be silently discarded by a round-trip.
+    from .batch_editing_api import BatchStore
+    BatchStore(data_root).load(pid)
     if project.referenceMedia:
         from .reference_media_storage import resolve_reference_media_path
         if not resolve_reference_media_path(data_root, pid, project.referenceMedia).is_file():

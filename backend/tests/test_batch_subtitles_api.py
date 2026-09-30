@@ -126,6 +126,7 @@ def test_recognition_keeps_existing_edit_as_candidate_then_burns_confirmed_subti
         state = client.get(base).json()["tasks"]
         recognition = state[0]["variant"]["subtitles"]["recognitions"][-1]
         assert recognition["status"] == "completed", recognition
+        assert recognition["cues"][0]["id"] == recognition["id"] + "-line-1"
         assert recognition["cues"][0]["text"] == "识别候选"
         assert recognition["cues"][0]["end"] == 2
         assert "sources" not in recognition and "snapshot" not in recognition

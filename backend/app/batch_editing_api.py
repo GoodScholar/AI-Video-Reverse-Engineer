@@ -208,6 +208,8 @@ def _validate_state(value: Any) -> None:
         if variant.get("packaging") is not None:
             from .montage_packaging import validate_packaging
             validate_packaging(variant["packaging"], variant.get("subtitles", {}).get("cues", []), tracks, batch=True)
+        if variant.get("packagingSource") not in (None, "manual", "proposal"):
+            raise ValueError("包装来源无效")
         subtitles = variant.get("subtitles")
         if subtitles is not None:
             if (not isinstance(subtitles, dict) or type(subtitles.get("revision")) is not int or subtitles["revision"] < 0
@@ -216,7 +218,7 @@ def _validate_state(value: Any) -> None:
             _validate_cues(subtitles.get("cues"), tracks)
             for recognition in subtitles["recognitions"]:
                 if (not isinstance(recognition, dict) or not _valid_id(recognition.get("id"))
-                        or recognition.get("status") not in ("queued", "running", "completed", "failed")
+                        or recognition.get("status") not in ("queued", "running", "completed", "failed", "cancelled")
                         or recognition.get("language") not in ("auto", "zh", "en", "ja", "ko")
                         or type(recognition.get("timelineRevision")) is not int or recognition["timelineRevision"] < 0
                         or type(recognition.get("subtitleRevision")) is not int or recognition["subtitleRevision"] < 0
@@ -225,6 +227,10 @@ def _validate_state(value: Any) -> None:
                     raise ValueError("字幕识别记录无效")
                 _validate_timeline_shape(recognition["timelineRevision"], recognition["snapshot"].get("settings"), recognition["snapshot"].get("tracks"), recognition["snapshot"].get("transitions", []))
                 _validate_cues(recognition.get("cues"), recognition["snapshot"]["tracks"])
+                if recognition.get("status") == "completed" and any(
+                    not cue["id"].startswith(recognition["id"] + "-") for cue in recognition["cues"]
+                ):
+                    raise ValueError("字幕识别 cue 身份无效")
                 if any(not _valid_id(asset_id) or not _valid_id(filename) for asset_id, filename in recognition["sources"].items()):
                     raise ValueError("字幕识别来源无效")
         proposal = task.get("proposal")
@@ -248,6 +254,15 @@ def _validate_state(value: Any) -> None:
                         or not isinstance(match.get("matchedSellingPointTerms"), list)
                         or any(not isinstance(term, str) or not term for term in match["matchedSellingPointTerms"])):
                     raise ValueError("短视频推荐依据无效")
+        for montage_proposal in task.get("montageProposals", []):
+            if not isinstance(montage_proposal, dict):
+                raise ValueError("混剪提案无效")
+            package = montage_proposal.get("packaging")
+            if package is not None:
+                from .montage_packaging import validate_packaging
+                proposal_tracks = [{**track, "clips": montage_proposal.get("clips", [])}
+                                   if track.get("kind") == "video" else track for track in tracks]
+                validate_packaging(package, [], proposal_tracks)
         for run in runs:
             if not isinstance(run, dict) or not _valid_id(run.get("id")) or type(run.get("revision")) is not int or run["revision"] < 0:
                 raise ValueError("变体预览记录无效")
@@ -264,6 +279,10 @@ def _validate_state(value: Any) -> None:
                 if type(run.get("subtitleRevision")) is not int or run["subtitleRevision"] < 0:
                     raise ValueError("预览字幕版本无效")
                 _validate_cues(run.get("subtitleCues"), run["snapshot"]["tracks"])
+            if run.get("snapshot", {}).get("packaging") is not None:
+                from .montage_packaging import validate_packaging
+                validate_packaging(run["snapshot"]["packaging"], run.get("subtitleCues", []),
+                                   run["snapshot"]["tracks"], batch=True)
             if type(run.get("contentRevision", 0)) is not int or run.get("contentRevision", 0) < 0:
                 raise ValueError("预览脚本版本无效")
             if "media" in run:
@@ -288,6 +307,10 @@ def _validate_state(value: Any) -> None:
                 raise ValueError("成片记录无效")
             _validate_timeline_shape(delivery["variantRevision"], delivery["snapshot"].get("settings"), delivery["snapshot"].get("tracks"), delivery["snapshot"].get("transitions", []))
             _validate_cues(delivery.get("subtitles"), delivery["snapshot"]["tracks"])
+            if delivery.get("snapshot", {}).get("packaging") is not None:
+                from .montage_packaging import validate_packaging
+                validate_packaging(delivery["snapshot"]["packaging"], delivery.get("subtitles", []),
+                                   delivery["snapshot"]["tracks"], batch=True)
             if any(not _valid_id(asset_id) or not _valid_id(filename) for asset_id, filename in delivery["sources"].items()):
                 raise ValueError("成片素材快照无效")
             if delivery["status"] == "completed" and delivery.get("output") != delivery["id"] + ".mp4":
@@ -369,6 +392,10 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     for record in task.get("variant", {}).get("reframeAnalysis", {}).values():
                         if record.get("status") in ("queued", "running"):
                             record.update(status="failed", error="服务重启中断了主体分析，可重新提交。")
+                            changed = True
+                    for record in task.get("variant", {}).get("subtitles", {}).get("recognitions", []):
+                        if record.get("status") in ("queued", "running"):
+                            record.update(status="failed", error="服务重启中断了字幕识别，可重新提交。")
                             changed = True
                 if changed:
                     store.save(project_dir.name, state)
@@ -766,7 +793,21 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             try:
                 sources = render_inputs.freeze_approved(
                     project_id, destination, store.path(project_id, "runs", preview["id"]), preview["sources"], assets)
-            except (RenderInputError, KeyError, ValueError, OSError) as error:
+            except RenderInputError as error:
+                try:
+                    changed = (any(source_identity(frozen_sources[asset_id]) != {
+                        key: fact[key] for key in fact if key != "fingerprint"
+                    } for asset_id, fact in frozen.items()) or any(source_identity(current_paths[asset_id]) != {
+                        key: fact[key] for key in fact if key not in ("fingerprint", "assetFile")
+                    } for asset_id, fact in current.items()))
+                except (OSError, ValueError):
+                    changed = True
+                if changed:
+                    raise SourceProofConflict("素材在快照复制期间变化") from error
+                failure = BatchProductionError("batch_asset_unavailable", "原素材缺失或变化，请重新预览审核。")
+                failure.snapshot_copy_failed = True
+                raise failure from error
+            except (KeyError, ValueError, OSError) as error:
                 raise SourceProofConflict("素材在快照复制期间变化") from error
             try:
                 changed = (any(source_identity(frozen_sources[asset_id]) != {key: fact[key] for key in fact if key != "fingerprint"}
@@ -889,7 +930,11 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 state = state_for(project_id)
                 run = recognition_for(task_for(state, task_id)["variant"], run_id)
                 if run["status"] == "running":
-                    _complete_local_run(run, {"cues": cues})
+                    # parse_srt IDs are only local line numbers. Bind the
+                    # durable cue identity to this recognition attempt so a
+                    # later retry cannot inherit an old style override.
+                    persisted = [{**cue, "id": f"{run_id}-{cue['id']}"} for cue in cues]
+                    _complete_local_run(run, {"cues": persisted})
                     save(project_id, state)
         except Exception as error:
             with lock:
@@ -1173,6 +1218,21 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 save(project_id, state)
             return {"subtitles": public_task(project_id, task_for(state, task_id))["variant"]["subtitles"]}
 
+    @router.post("/{task_id}/subtitles/recognitions/{run_id}/cancel")
+    def cancel_recognition(project_id: str, task_id: str, run_id: str, body: dict[str, Any]):
+        project_for(project_id)
+        if body != {}:
+            raise HTTPException(422, detail={"code": "batch_recognition_invalid", "message": "字幕识别取消请求无效。"})
+        with lock:
+            state = state_for(project_id)
+            task = task_for(state, task_id)
+            run = recognition_for(task["variant"], run_id)
+            if not LOCAL_RUN_POLICY.active(run["status"]):
+                raise HTTPException(409, detail={"code": "batch_recognition_not_active", "message": "字幕识别未在运行。"})
+            run.update(status=LOCAL_RUN_POLICY.cancel(run["status"]), error="字幕识别已取消。")
+            save(project_id, state)
+            return {"subtitles": public_task(project_id, task)["variant"]["subtitles"]}
+
     @router.post("/{task_id}/variants/bulk", status_code=201)
     def create_bulk_variants(project_id: str, task_id: str, body: dict[str, Any]):
         project_for(project_id)
@@ -1341,6 +1401,18 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             proposal.update(revision=0, status="draft", appliedVariantRevision=None)
             for item in proposal["segments"]:
                 item["selectedCandidateId"] = item["suggestion"]["candidateId"] if item["suggestion"] else None
+            # The proposal holds only verified task copy.  No CTA is invented:
+            # it appears only when an upstream confirmed workflow supplied one.
+            from .batch_production import initial_proposal_packaging
+            proposal_tracks = [{**track, "clips": proposal["clips"]} if track["kind"] == "video" else track
+                               for track in task["variant"]["tracks"]]
+            duration = max((clip["start"] + clip["duration"] for clip in proposal["clips"]), default=.01)
+            proposal["packaging"] = initial_proposal_packaging(
+                script=task["script"], selling_point=task["sellingPoint"], duration=duration,
+                cta=task.get("cta") if isinstance(task.get("cta"), str) else None,
+            )
+            from .montage_packaging import validate_packaging
+            proposal["packaging"] = validate_packaging(proposal["packaging"], [], proposal_tracks)
             proposals = task.setdefault("montageProposals", [])
             proposals.append(proposal)
             save(project_id, state)
@@ -1641,7 +1713,13 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 settings=task["variant"]["settings"], aspect_mode=task["variant"].get("aspectMode"),
                 assets=assets_for(project_id), validate_subtitles=_validate_cues, aspect_was_explicit=False,
                 transitions=target_transitions,
+                # Any saved package is assumed human-owned unless this is the
+                # first proposal adoption. Reapply must never overwrite it.
+                **({"packaging": proposal["packaging"]}
+                   if task["variant"].get("packaging") is None and proposal.get("packaging") is not None else {}),
             )
+            if task["variant"].get("packaging") == proposal.get("packaging"):
+                task["variant"]["packagingSource"] = "proposal"
             if adjusted_subtitles is not None:
                 task["variant"]["subtitles"]["cues"] = adjusted_subtitles
                 task["variant"]["subtitles"]["revision"] += 1
@@ -1942,6 +2020,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     # not a lock-free proof/CAS conflict.  A change *during*
                     # proof preparation remains retryable and must escape.
                     if error.code != "batch_asset_unavailable":
+                        raise
+                    if getattr(error, "snapshot_copy_failed", False):
                         raise
                     source_snapshots[(child_id, run_id)] = error
         except BatchProductionError as error:

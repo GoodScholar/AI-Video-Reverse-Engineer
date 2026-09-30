@@ -62,6 +62,45 @@ def current_version(task: dict[str, Any]) -> tuple[int, int, int]:
             variant.get("subtitles", {}).get("revision", 0))
 
 
+def initial_proposal_packaging(*, script: str, selling_point: str, duration: float, cta: str | None = None) -> dict[str, Any]:
+    """Build only copy traceable to confirmed input; absent CTA stays absent."""
+    from .montage_packaging import default_packaging
+
+    package = default_packaging()
+    end = min(max(float(duration), 0.01), 3.0)
+    title = next((part.strip() for part in script.replace("\n", "。 ").split("。")
+                  if part.strip() and len(part.strip()) <= 120), "")
+    elements = []
+    if title:
+        elements.append({"id": "proposal-title", "kind": "title", "enabled": True, "start": 0, "end": end,
+                         "text": title, "position": "top", "style": "emphasis"})
+    if selling_point.strip() and len(selling_point.strip()) <= 120:
+        elements.append({"id": "proposal-selling-point", "kind": "selling-point", "enabled": True,
+                         "start": 0, "end": end, "text": selling_point.strip(), "position": "middle", "style": "banner"})
+        if float(duration) > end + .01:
+            elements.append({"id": "proposal-keyword", "kind": "keyword", "enabled": True,
+                             "start": end, "end": min(float(duration), end + 3),
+                             "text": selling_point.strip(), "position": "top", "style": "emphasis"})
+    if isinstance(cta, str) and cta.strip() and len(cta.strip()) <= 120:
+        elements.append({"id": "proposal-cta", "kind": "cta", "enabled": True,
+                         "start": max(0, float(duration) - end), "end": max(float(duration), .01),
+                         "text": cta.strip(), "position": "bottom", "style": "banner"})
+    package["elements"] = elements
+    return package
+
+
+def _valid_packaging_snapshot(snapshot: dict[str, Any], cues: list[dict[str, Any]]) -> bool:
+    package = snapshot.get("packaging") if isinstance(snapshot, dict) else None
+    if package is None:
+        return True
+    try:
+        from .montage_packaging import validate_final_events
+        validate_final_events(package, cues, snapshot.get("tracks", []), batch=True)
+        return True
+    except ValueError:
+        return False
+
+
 def _voice_is_current(task: dict[str, Any]) -> bool:
     return _voice_fact(task).status in ("absent", "current")
 
@@ -113,7 +152,8 @@ def _preview_fact(task: dict[str, Any], voice: LifecycleFact) -> LifecycleFact:
             or (run.get("contentRevision", 0), run.get("revision"), run.get("subtitleRevision", 0))
             != current_version(task)
             or run.get("snapshot") != frozen["snapshot"]
-            or run.get("subtitleCues", []) != frozen["subtitleCues"]):
+            or run.get("subtitleCues", []) != frozen["subtitleCues"]
+            or not _valid_packaging_snapshot(run.get("snapshot", {}), run.get("subtitleCues", []))):
         return LifecycleFact("stale", "preview_stale")
     return LifecycleFact("current", record=run)
 
@@ -212,6 +252,11 @@ def save_content(task: dict[str, Any], *, expected_revision: int, selling_point:
     if content == (task["sellingPoint"], task["script"]):
         return False
     script_changed = content[1] != task["script"]
+    packaging = task["variant"].get("packaging")
+    if script_changed and isinstance(packaging, dict) and any(
+        item.get("kind") == "subtitle" and item.get("cueId") for item in packaging.get("elements", [])
+    ):
+        raise BatchProductionError("batch_packaging_cues_stale", "脚本变更会使包装字幕引用失效，请先移除或更新包装字幕。", 422)
     task.update(sellingPoint=content[0], script=content[1],
                 contentRevision=task.get("contentRevision", 0) + 1)
     subtitles = task["variant"].get("subtitles")
@@ -391,6 +436,9 @@ def save_subtitles(task: dict[str, Any], *, expected_revision: int, timeline_rev
         raise BatchProductionError("batch_subtitles_conflict", "字幕已更新，请刷新后重试。")
     try:
         saved_cues = validate_cues(cues, variant["tracks"])
+        if variant.get("packaging") is not None:
+            from .montage_packaging import validate_packaging
+            validate_packaging(variant["packaging"], saved_cues, variant["tracks"], batch=True)
     except ValueError as error:
         raise BatchProductionError("batch_subtitles_invalid", str(error), 422) from None
     subtitles["cues"] = saved_cues
@@ -510,6 +558,7 @@ def save_variant(task: dict[str, Any], *, expected_revision: int, tracks: list[d
     variant.update(tracks=tracks, transitions=transitions, settings=settings, aspectMode=mode, resolvedAspect=resolved)
     if packaging is not _PACKAGING_UNSET:
         variant["packaging"] = packaging
+        variant["packagingSource"] = "manual" if packaging is not None else None
     variant["aspectReason"] = (resolution["reason"] if resolution else
                                ("单条作品覆盖批次视频比例。" if aspect_was_explicit else
                                 variant.get("aspectReason", "沿用作品已保存的输出尺寸。")))
