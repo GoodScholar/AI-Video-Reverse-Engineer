@@ -1,9 +1,14 @@
 import { fireEvent, render, screen } from "@testing-library/react";
+// @ts-expect-error Vitest 的 Node 运行时读取 CSS 容器规则。
+import { readFileSync } from "node:fs";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { useState } from "react";
 
 import { PackagingControls, ReframeControls, defaultPackaging, mergeServerReframeFacts, type Packaging, type Reframe } from "./ReframeControls";
+
+const reframeControlsCss = readFileSync("src/reframeControls.css", "utf8");
+const timelineCss = readFileSync("src/timeline.css", "utf8");
 
 const reframe: Reframe = {
   schemaVersion: 1, sourceFingerprint: "a".repeat(64), sourceWidth: 1920, sourceHeight: 1080,
@@ -168,6 +173,11 @@ it("来源素材或源时间变化时拒绝迟到的服务端检测事实", () =
 });
 
 describe("PackagingControls", () => {
+  it("245px 时间线检查器为两种包装网格声明单列容器规则", () => {
+    expect(timelineCss).toContain("container-name: timeline-inspector");
+    expect(reframeControlsCss).toMatch(/@container timeline-inspector \(max-width: 300px\)\s*\{[\s\S]*?\.packaging-safe-area, \.packaging-element \{\s*grid-template-columns: minmax\(0, 1fr\);/);
+  });
+
   it("编辑单个包装文字、禁用和替换字幕 cue，完整保留包装合同", async () => {
     const onChange = vi.fn();
     function Editor() {

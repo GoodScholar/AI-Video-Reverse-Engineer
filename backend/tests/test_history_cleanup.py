@@ -36,13 +36,14 @@ def test_completed_history_preview_and_delete_do_not_touch_assets_or_tracks(tmp_
     queue.run()
     preview = client.get(url + '/cleanup-preview').json()
     source = tmp_path / 'project-files/p1/preproduction/assets/video.mp4'
+    source_bytes = source.read_bytes()
     assert preview['bytes'] == source.stat().st_size + len(b'output') and preview['fileCount'] == 2
     assert client.post(url + '/delete', json={'revision': 0}).status_code == 409
     result = client.post(url + '/delete', json={'revision': 1})
     assert result.status_code == 200, result.text
     assert result.json()['runs'] == []
     assert result.json()['tracks'] == _workspace()['tracks']
-    assert source.exists()
+    assert source.read_bytes() == source_bytes
     assert not (tmp_path / 'project-files/p1/timeline/runs' / run['id']).exists()
     assert client.get(url + '/output').status_code == 404
 

@@ -10,7 +10,7 @@
 .timeline-layout { display: grid; grid-template-columns: 205px minmax(380px, 1fr) 245px; min-height: 450px; }
 .timeline-assets, .timeline-inspector { padding: 18px; background: #eeece4; }
 .timeline-assets { border-right: 1px solid #c7c6bc; }
-.timeline-inspector { border-left: 1px solid #c7c6bc; min-width: 0; container-type: inline-size; }
+.timeline-inspector { border-left: 1px solid #c7c6bc; min-width: 0; container-type: inline-size; container-name: timeline-inspector; }
 .timeline-assets > .secondary-action { width: 100%; justify-content: center; margin-top: 11px; }
 .timeline-assets ul { display: grid; gap: 8px; margin: 18px 0 0; padding: 0; list-style: none; }
 .timeline-assets li { display: grid; gap: 5px; padding: 10px 0; border-top: 1px solid #c7c6bc; }
