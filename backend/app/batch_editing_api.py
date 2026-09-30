@@ -741,7 +741,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                             raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "主体分析状态已更新，请刷新后重试。"})
                 elif existing is not None and existing.get("status") in ("queued", "running"):
                     if existing.get("identity") == identity:
-                        reuse_active = True
+                        reuse_active = reuse_existing
                     else:
                         # This staged apply tentatively marked the old draft as
                         # adopted before the current source proof was available.

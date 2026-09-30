@@ -1538,8 +1538,13 @@ def test_batch_reframe_repeat_cancel_retry_and_source_cas(tmp_path):
                                "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0}]
         assert client.put(f"{base}/{task['id']}/variant", json={"revision": 0, "tracks": tracks}).status_code == 200
         url = f"{base}/{task['id']}/variant/reframes/clip"
-        assert client.post(url + "/analyze", json={"revision": 1}).status_code == 202
-        assert client.post(url + "/analyze", json={"revision": 1}).status_code == 202
+        first = client.post(url + "/analyze", json={"revision": 1})
+        assert first.status_code == 202
+        first_id = first.json()["variant"]["reframeAnalysis"]["clip"]["id"]
+        second = client.post(url + "/analyze", json={"revision": 1})
+        assert second.status_code == 202
+        assert second.json()["variant"]["reframeAnalysis"]["clip"]["id"] != first_id
+        assert len(jobs) == 2
         assert client.post(url + "/cancel", json={"revision": 1}).status_code == 200
         jobs.pop(0)[1](project_id)
         assert client.get(base).json()["tasks"][0]["variant"]["reframeAnalysis"]["clip"]["status"] == "cancelled"
