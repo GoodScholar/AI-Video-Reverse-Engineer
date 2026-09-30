@@ -11,6 +11,8 @@ import re
 import shutil
 import subprocess
 import threading
+import time
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,7 +45,12 @@ def _evidence_dir(name: str) -> Path:
 
 def _commands(directory: Path, text: str) -> None:
     """Keep replay instructions beside durable media instead of pytest's tmpdir."""
-    (directory / "commands.txt").write_text(text + "\n", encoding="utf-8")
+    (directory / "commands.txt").write_text(
+        "PYTHONPATH='/Users/shen/.codex/worktrees/montage-transitions/AI Video Reverse Engineer/backend' "
+        "'/Users/shen/SZG/AI Agent/AI Video Reverse Engineer/backend/.venv/bin/python' -m pytest "
+        "backend/tests/test_task23_packaging_media.py -q\n"
+        f"ffmpeg={FFMPEG} -hide_banner -nostdin -v error -y; ffprobe={FFPROBE}\n"
+        f"stable-input-output-directory={directory}\n{text}\n", encoding="utf-8")
 
 
 def _source(path: Path, *, color: str = "0x172554", duration: float = 5.0) -> Path:
@@ -149,6 +156,36 @@ def _difference_bbox(rendered: Path, control: Path) -> tuple[list[int] | None, t
             return None, actual.size
         return [min(x for x, _y in points), min(y for _x, y in points),
                 max(x for x, _y in points) + 1, max(y for _x, y in points) + 1], actual.size
+
+
+def _diff_metrics(rendered: Path, control: Path) -> dict[str, object]:
+    """Actual ASS-vs-control pixels, normalized for preview/export codec size."""
+    with Image.open(rendered).convert("RGB") as actual, Image.open(control).convert("RGB") as baseline:
+        changed, bins, channels = 0, set(), [0, 0, 0]
+        histogram = [0] * 24
+        dark = 0
+        for y in range(actual.height):
+            for x in range(actual.width):
+                pixel, reference = actual.getpixel((x, y)), baseline.getpixel((x, y))
+                if sum(abs(left - right) for left, right in zip(pixel, reference)) <= 12:
+                    continue
+                changed += 1
+                bins.add((x * 64 // actual.width, y * 64 // actual.height))
+                for index, value in enumerate(pixel):
+                    channels[index] += value
+                    histogram[index * 8 + value * 8 // 256] += 1
+                if max(pixel) < 105:
+                    dark += 1
+        assert changed
+        return {"changedPixels": changed, "normalizedArea": changed / (actual.width * actual.height),
+                "maskBins": sorted([list(item) for item in bins]),
+                "meanRgb": [value / changed for value in channels],
+                "histogram": [value / (changed * 3) for value in histogram], "darkChangedPixels": dark}
+
+
+def _iou(left: list[list[int]], right: list[list[int]]) -> float:
+    first, second = {tuple(item) for item in left}, {tuple(item) for item in right}
+    return len(first & second) / len(first | second) if first or second else 1.0
 
 
 def _normal(box: list[int], size: tuple[int, int]) -> list[float]:
@@ -322,7 +359,8 @@ def test_real_api_lifecycle_renders_downloads_stales_and_regenerates():
         preview_control, export_control = directory / "frozen-preview-control.mp4", directory / "frozen-export-control.mp4"
         render_timeline(control_timeline, {"shot": source}, preview_control, format="preview", ffmpeg_path=str(FFMPEG), ffprobe_path=str(FFPROBE))
         render_timeline(control_timeline, {"shot": source}, export_control, format="mp4", ffmpeg_path=str(FFMPEG), ffprobe_path=str(FFPROBE))
-        api_matrix = {"thresholds": {"eventOutside": "null", "previewExportDelta": .02, "pixelDifference": 12}, "elements": {}}
+        api_matrix = {"thresholds": {"eventOutside": "null", "previewExportBBoxDelta": .02, "pixelDifference": 12,
+                                      "normalizedAreaDelta": .012, "maskGridIoU": .45, "meanRgbDelta": 35, "histogramL1": .50}, "elements": {}}
         for kind, second in {"title": .5, "selling-point": 1.4, "keyword": 2.3, "cta": 3.2, "subtitle": 4.1}.items():
             pframe, eframe = _frame(api_preview, second, directory / f"api-preview-{kind}.png"), _frame(api_export, second, directory / f"api-export-{kind}.png")
             pcontrol, econtrol = _frame(preview_control, second, directory / f"api-preview-control-{kind}.png"), _frame(export_control, second, directory / f"api-export-control-{kind}.png")
@@ -331,13 +369,22 @@ def test_real_api_lifecycle_renders_downloads_stales_and_regenerates():
             assert pbox and ebox, kind
             pn, en = _normal(pbox, psize), _normal(ebox, esize)
             assert max(abs(a - b) for a, b in zip(pn, en)) < .02
-            with Image.open(eframe).convert("RGB") as image, Image.open(econtrol).convert("RGB") as control:
-                changed = sum(sum(abs(a - b) for a, b in zip(image.getpixel((x, y)), control.getpixel((x, y)))) > 12
-                              for y in range(image.height) for x in range(image.width))
-            style = next(item["style"] for item in package["elements"] if item["kind"] == kind)
-            assert changed > 80
+            preview_metrics, export_metrics = _diff_metrics(pframe, pcontrol), _diff_metrics(eframe, econtrol)
+            area_delta = abs(preview_metrics["normalizedArea"] - export_metrics["normalizedArea"])
+            mask_iou = _iou(preview_metrics["maskBins"], export_metrics["maskBins"])
+            mean_delta = max(abs(left - right) for left, right in zip(preview_metrics["meanRgb"], export_metrics["meanRgb"]))
+            histogram_l1 = sum(abs(left - right) for left, right in zip(preview_metrics["histogram"], export_metrics["histogram"]))
+            assert area_delta < .012 and mask_iou > .45 and mean_delta < 35 and histogram_l1 < .50
+            # These are measured pixel groups (not input style labels): dark
+            # changed regions expose libass outline and banner background.
+            if kind in {"title", "keyword"}:
+                assert preview_metrics["darkChangedPixels"] > 100 and export_metrics["darkChangedPixels"] > 100
+            if kind in {"selling-point", "cta"}:
+                assert preview_metrics["darkChangedPixels"] > 1_000 and export_metrics["darkChangedPixels"] > 1_000
             api_matrix["elements"][kind] = {"sample": second, "preview": pn, "export": en,
-                "maxDelta": max(abs(a - b) for a, b in zip(pn, en)), "style": style, "changedPixels": changed}
+                "maxDelta": max(abs(a - b) for a, b in zip(pn, en)), "previewPixels": preview_metrics,
+                "exportPixels": export_metrics, "comparison": {"normalizedAreaDelta": area_delta, "maskGridIoU": mask_iou,
+                "meanRgbDelta": mean_delta, "histogramL1": histogram_l1}}
             for phase, moment in {"before": second - .35, "after": second + .35}.items():
                 for label, video, control in (("preview", api_preview, preview_control), ("export", api_export, export_control)):
                     assert _difference_bbox(_frame(video, moment, directory / f"api-{label}-{kind}-{phase}.png"),
@@ -446,27 +493,50 @@ def test_font_cache_closes_faces_is_path_bound_and_initializes_concurrently(monk
 def test_started_ffmpeg_cancel_and_no_libass_are_explicit_and_leave_no_packaging_files(tmp_path):
     """Cancellation must occur after process start, and missing libass is not a generic encode error."""
     directory = _evidence_dir("failure-runtime")
-    _commands(directory, "render_timeline with executable FFmpeg shims: one writes partial bytes then blocks for cancellation; one returns exact libass filter error")
+    _commands(directory, "render_timeline with executable FFmpeg shims: each fresh marker records pid/time/temporary partial output before polling cancellation; no-ass shim returns exact filter error")
     source = _source(directory / "source.mp4", duration=1)
     timeline, package = _timeline(_tracks(1)), _package()
     package["elements"] = [{"id": "title", "kind": "title", "enabled": True, "start": 0, "end": .8,
                             "text": "取消清理", "position": "top", "style": "plain"}]
-    started, output = directory / "started", directory / "cancelled.mp4"
-    shim = directory / "ffmpeg-shim.py"
-    shim.write_text("#!/usr/bin/env python3\nimport pathlib,sys,time\npathlib.Path(sys.argv[-1]).write_bytes(b'partial')\npathlib.Path(" + repr(str(started)) + ").write_text('started')\ntime.sleep(10)\n", encoding="utf-8")
-    shim.chmod(0o755)
-    with pytest.raises(TimelineRenderError, match="取消") as cancelled:
-        render_timeline(timeline, {"shot": source}, output, format="mp4", packaging=package,
-                        ffmpeg_path=str(shim), ffprobe_path=str(FFPROBE), cancelled=lambda: started.exists())
-    leftovers = sorted(path.name for path in directory.glob(".cancelled.*.mp4"))
-    assert started.exists() and not output.exists() and not leftovers and not (directory / ".packaging.ass").exists()
+    rounds = []
+    for number in (1, 2):
+        run_id = uuid.uuid4().hex
+        started, output = directory / f"started-{run_id}.json", directory / f"cancelled-{run_id}.mp4"
+        test_started_ns = time.time_ns()
+        # Each run has a new marker and output name.  These unlinks are bounded
+        # to that fresh id, never delete a tracked font or shared evidence.
+        for path in (started, output):
+            path.unlink(missing_ok=True)
+        shim = directory / f"ffmpeg-shim-{run_id}.py"
+        shim.write_text("#!/usr/bin/env python3\nimport json,os,pathlib,sys,time\npartial=pathlib.Path(sys.argv[-1])\npartial.write_bytes(b'partial-' + sys.argv[-1].encode())\npathlib.Path(" + repr(str(started)) + ").write_text(json.dumps({'pid': os.getpid(), 'startedNs': time.time_ns(), 'partial': str(partial), 'partialSize': partial.stat().st_size}))\ntime.sleep(10)\n", encoding="utf-8")
+        shim.chmod(0o755)
+        observed = {"started": False, "partial": False, "startedNs": None, "partialSize": 0, "partialMtimeNs": None}
+        def cancelled_after_actual_start() -> bool:
+            if not started.is_file():
+                return False
+            record = json.loads(started.read_text(encoding="utf-8"))
+            partial = Path(record["partial"])
+            if record["startedNs"] <= test_started_ns or not partial.is_file() or partial.stat().st_size <= 0:
+                return False
+            observed.update(started=True, partial=True, startedNs=record["startedNs"], partialSize=partial.stat().st_size,
+                            partialMtimeNs=partial.stat().st_mtime_ns)
+            return True
+        with pytest.raises(TimelineRenderError, match="取消") as cancelled:
+            render_timeline(timeline, {"shot": source}, output, format="mp4", packaging=package,
+                            ffmpeg_path=str(shim), ffprobe_path=str(FFPROBE), cancelled=cancelled_after_actual_start)
+        leftovers = sorted(path.name for path in directory.glob(".cancelled-*.mp4"))
+        assert observed["started"] and observed["partial"] and observed["startedNs"] > test_started_ns
+        assert not output.exists() and not leftovers and not (directory / ".packaging.ass").exists()
+        rounds.append({"runId": run_id, "testStartedNs": test_started_ns, "observed": observed,
+                       "publishedOutput": output.exists(), "temporaryOutputs": leftovers, "ass": (directory / ".packaging.ass").exists(),
+                       "cancelError": str(cancelled.value)})
     no_ass = directory / "ffmpeg-no-ass.py"
     no_ass.write_text("#!/usr/bin/env python3\nimport sys\nsys.stderr.write(\"No such filter: 'ass'\\n\")\nsys.exit(1)\n", encoding="utf-8")
     no_ass.chmod(0o755)
     with pytest.raises(TimelineRenderError, match="libass") as no_libass:
         render_timeline(timeline, {"shot": source}, directory / "no-ass.mp4", format="mp4", packaging=package,
                         ffmpeg_path=str(no_ass), ffprobe_path=str(FFPROBE))
-    (directory / "failure-runtime.json").write_text(json.dumps({"phase": "ffmpeg-started", "partialOutputWritten": True,
-        "finalOutput": output.exists(), "temporaryOutputs": leftovers, "ass": (directory / ".packaging.ass").exists(),
-        "cancelError": str(cancelled.value), "noLibass": str(no_libass.value)}, ensure_ascii=False, indent=2), encoding="utf-8")
-    (directory / "failure-runtime.log").write_text("cancel: " + str(cancelled.value) + "\nno-libass: " + str(no_libass.value) + "\n", encoding="utf-8")
+    (directory / "failure-runtime.json").write_text(json.dumps({"phase": "ffmpeg-started", "cancelRounds": rounds,
+        "noLibass": str(no_libass.value)}, ensure_ascii=False, indent=2), encoding="utf-8")
+    (directory / "failure-runtime.log").write_text("\n".join("run %(runId)s: started=%(startedNs)s partial=%(partialSize)sB mtime=%(partialMtimeNs)s cleanup=%(temporaryOutputs)s" % {**item, **item["observed"]}
+        for item in rounds) + "\nno-libass: " + str(no_libass.value) + "\n", encoding="utf-8")
