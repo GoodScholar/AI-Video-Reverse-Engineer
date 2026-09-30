@@ -644,8 +644,11 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         """Bind a full content hash to an unchanged real file, outside project locks."""
         from .montage_reframe import source_fingerprint
         before = source_identity(path)
-        fingerprint = source_fingerprint(path)
-        after = source_identity(path)
+        try:
+            fingerprint = source_fingerprint(path)
+            after = source_identity(path)
+        except (OSError, ValueError) as error:
+            raise SourceProofConflict("素材在校验期间不可读取") from error
         if before != after:
             raise SourceProofConflict("素材在校验期间变化")
         return {**before, "fingerprint": fingerprint}
@@ -685,10 +688,14 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             current_issues = inspect_timeline_media(
                 state, assets, lambda asset: current_paths[asset["id"]], "mp4", ffprobe_path,
                 media_cache=media_cache, timing_cache=current_timing_cache)
-            if (any(source_identity(frozen_sources[asset_id]) != {key: fact[key] for key in fact if key != "fingerprint"}
-                    for asset_id, fact in frozen_facts.items())
-                    or any(source_identity(current_paths[asset_id]) != {key: fact[key] for key in fact if key not in ("fingerprint", "assetFile")}
-                           for asset_id, fact in current_facts.items())):
+            try:
+                changed = (any(source_identity(frozen_sources[asset_id]) != {key: fact[key] for key in fact if key != "fingerprint"}
+                               for asset_id, fact in frozen_facts.items())
+                           or any(source_identity(current_paths[asset_id]) != {key: fact[key] for key in fact if key not in ("fingerprint", "assetFile")}
+                                  for asset_id, fact in current_facts.items()))
+            except (OSError, ValueError) as error:
+                raise SourceProofConflict("素材在校验期间不可读取") from error
+            if changed:
                 raise SourceProofConflict("素材在校验期间变化")
         except SourceProofConflict as error:
             raise BatchProductionError("batch_export_reframe_conflict", "主体构图验证期间素材已变化，请刷新后重试。") from error
@@ -738,10 +745,14 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             current = {asset_id: {**stable_source_fact(path), "assetFile": assets[asset_id].get("file")}
                        for asset_id, path in current_paths.items()}
             sources = snapshot_approved_sources(project_id, destination, preview, assets)
-            if (any(source_identity(frozen_sources[asset_id]) != {key: fact[key] for key in fact if key != "fingerprint"}
-                    for asset_id, fact in frozen.items())
-                    or any(source_identity(current_paths[asset_id]) != {key: fact[key] for key in fact if key not in ("fingerprint", "assetFile")}
-                           for asset_id, fact in current.items())):
+            try:
+                changed = (any(source_identity(frozen_sources[asset_id]) != {key: fact[key] for key in fact if key != "fingerprint"}
+                               for asset_id, fact in frozen.items())
+                           or any(source_identity(current_paths[asset_id]) != {key: fact[key] for key in fact if key not in ("fingerprint", "assetFile")}
+                                  for asset_id, fact in current.items()))
+            except (OSError, ValueError) as error:
+                raise SourceProofConflict("素材在快照期间不可读取") from error
+            if changed:
                 raise SourceProofConflict("素材在快照期间变化")
             completed = True
             return {"sources": sources, "frozen": frozen, "current": current}
@@ -1958,12 +1969,17 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             results = []
             persisted_snapshot_ids = set()
             try:
+                created_runs = [(child, run) for child, run, created in prepared if created]
+                if created_runs:
+                    # export_approved_versions appended every created run before
+                    # this first atomic save, so it persists all their source
+                    # directories together rather than one loop iteration at a time.
+                    save(project_id, state)
+                    persisted_snapshot_ids.update(used_snapshot_ids)
                 for child, run, created in prepared:
                     if not created:
                         results.append({"taskId": child["id"], "runId": run["id"], "status": run["status"]})
                         continue
-                    save(project_id, state)
-                    persisted_snapshot_ids.add(run["id"])
                     if run["status"] == "queued" and not compute_queue.submit("batch-export:" + run["id"], project_id,
                                                                               lambda pid, cid=child["id"], rid=run["id"]: process_export(pid, cid, rid)):
                         run.update(status=LOCAL_RUN_POLICY.fail(run["status"]), error="本地处理队列不可用。")

@@ -157,8 +157,15 @@ class DeferredComputeQueue:
         pass
 
 
+class _ThrowingComputeQueue(DeferredComputeQueue):
+    """Simulate a queue failure after export state was durably written."""
+
+    def submit(self, _kind, _project_id, _handler):
+        raise RuntimeError("队列提交失败")
+
+
 @contextmanager
-def _reframe_delivery_client(tmp_path, *, source_lock=None):
+def _reframe_delivery_client(tmp_path, *, source_lock=None, queue=None):
     """One approved reframed delivery, ready for focused delivery-gate races."""
     from copy import deepcopy
     from app.montage_reframe import normalize_reframe, probe_source_timing
@@ -182,8 +189,9 @@ def _reframe_delivery_client(tmp_path, *, source_lock=None):
     ready = normalize_reframe(raw, source_fingerprint=source_fingerprint(source), source_width=64, source_height=48,
                               source_timing=timing, required_start=0, required_end=2)
     app = FastAPI()
+    queue = queue or DeferredComputeQueue()
     app.include_router(create_batch_editing_router(tmp_path, lambda value: SimpleNamespace(id=value) if value == project_id else None,
-                                                  DeferredComputeQueue(), source_lock=source_lock))
+                                                  queue, source_lock=source_lock))
     with TestClient(app) as client:
         base = f"/api/projects/{project_id}/batch-edits"
         task = client.post(base, json={"sellingPoint": "x", "script": "x"}).json()["task"]
@@ -214,7 +222,8 @@ def _reframe_delivery_client(tmp_path, *, source_lock=None):
         (state_path.parent / "outputs" / "preview.mp4").write_bytes(b"preview")
         (state_path.parent / "deliverables").mkdir()
         (state_path.parent / "deliverables" / "delivery.mp4").write_bytes(b"delivery")
-        yield SimpleNamespace(client=client, base=base, task=task, source=source, state_path=state_path, snapshot=snapshot)
+        yield SimpleNamespace(client=client, base=base, task=task, source=source, state_path=state_path, snapshot=snapshot,
+                              queue=queue)
 
 
 def _add_export_child(fixture, child_id, *, reframed=True):
@@ -287,13 +296,11 @@ def test_submit_terminal_source_cas_conflict_returns_409_without_failed_run_or_o
         before = {item.name for item in exports.iterdir()}
         lock.entries = 0
 
-        def replace_after_precopy(entry):
+        def delete_after_precopy(entry):
             if entry == 2:
-                replacement = fixture.source.with_name("terminal-replacement.mp4")
-                replacement.write_bytes(fixture.source.read_bytes())
-                os.replace(replacement, fixture.source)
+                fixture.source.unlink()
 
-        lock.hook = replace_after_precopy
+        lock.hook = delete_after_precopy
         response = fixture.client.post(f"{fixture.base}/{fixture.task['id']}/exports", json={"taskIds": ["child"]})
 
         assert response.status_code == 409
@@ -341,6 +348,23 @@ def test_submit_keeps_the_prepared_directory_after_a_successful_commit(tmp_path)
         state = json.loads(fixture.state_path.read_text(encoding="utf-8"))
         child = next(item for item in state["tasks"] if item["id"] == "child")
         assert child["variant"]["exports"][0]["id"] == run_id
+
+
+def test_submit_keeps_every_durably_referenced_variant_source_when_queue_submit_raises(tmp_path):
+    queue = _ThrowingComputeQueue()
+    with _reframe_delivery_client(tmp_path, queue=queue) as fixture:
+        _add_export_child(fixture, "first", reframed=False)
+        _add_export_child(fixture, "second", reframed=False)
+
+        with pytest.raises(RuntimeError, match="队列提交失败"):
+            fixture.client.post(f"{fixture.base}/{fixture.task['id']}/exports", json={"taskIds": ["first", "second"]})
+
+        state = json.loads(fixture.state_path.read_text(encoding="utf-8"))
+        children = [next(task for task in state["tasks"] if task["id"] == child_id) for child_id in ("first", "second")]
+        run_ids = {child["variant"]["exports"][0]["id"] for child in children}
+        assert all((fixture.state_path.parent / "exports" / run_id / "sources" / "source.mp4").is_file()
+                   for run_id in run_ids)
+        assert {item.name for item in (fixture.state_path.parent / "exports").iterdir()} == {"delivery", *run_ids}
 
 
 def test_download_probe_does_not_block_get_or_cancelling_another_export(tmp_path, monkeypatch):
@@ -499,6 +523,58 @@ def test_download_treats_same_hash_source_replacement_during_probe_as_conflict(t
 
         assert result["response"].status_code == 409
         assert result["response"].json()["detail"]["code"] == "batch_export_reframe_conflict"
+
+
+def test_download_treats_source_deleted_after_hash_as_conflict(tmp_path, monkeypatch):
+    from app import montage_reframe
+
+    with _reframe_delivery_client(tmp_path) as fixture:
+        original = montage_reframe.source_fingerprint
+
+        def hash_then_delete(path):
+            value = original(path)
+            if path == fixture.source:
+                fixture.source.unlink()
+            return value
+
+        monkeypatch.setattr(montage_reframe, "source_fingerprint", hash_then_delete)
+        response = fixture.client.get(f"{fixture.base}/{fixture.task['id']}/exports/delivery/output")
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "batch_export_reframe_conflict"
+
+
+def test_submit_treats_source_deleted_during_probe_as_conflict_without_orphan(tmp_path, monkeypatch):
+    from app import montage_reframe
+
+    with _reframe_delivery_client(tmp_path) as fixture:
+        _add_export_child(fixture, "child")
+        before = {item.name for item in (fixture.state_path.parent / "exports").iterdir()}
+        entered, release = threading.Event(), threading.Event()
+        original = montage_reframe.probe_source_timing
+
+        def blocked_probe(path, probe):
+            entered.set()
+            assert release.wait(5), "测试未释放删除源探测"
+            return original(path, probe)
+
+        monkeypatch.setattr(montage_reframe, "probe_source_timing", blocked_probe)
+        result = {}
+        thread = threading.Thread(target=lambda: result.setdefault(
+            "response", fixture.client.post(f"{fixture.base}/{fixture.task['id']}/exports", json={"taskIds": ["child"]})
+        ))
+        thread.start()
+        assert entered.wait(2)
+        fixture.source.unlink()
+        release.set()
+        thread.join(5)
+
+        assert result["response"].status_code == 409
+        assert result["response"].json()["detail"]["code"] == "batch_export_reframe_conflict"
+        assert {item.name for item in (fixture.state_path.parent / "exports").iterdir()} == before
+        state = json.loads(fixture.state_path.read_text(encoding="utf-8"))
+        child = next(item for item in state["tasks"] if item["id"] == "child")
+        assert child["variant"]["exports"] == []
 
 
 def _proposal_reframe_app(root):
