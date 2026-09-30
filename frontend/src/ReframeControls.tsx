@@ -212,6 +212,22 @@ function sameReframeIdentity(left: TimelineClip, right: TimelineClip) {
   return ["assetId", "inPoint", "duration", "speed"].every((key) => left[key as keyof TimelineClip] === right[key as keyof TimelineClip]);
 }
 
+function normalizedTargetAspect(value: unknown) {
+  if (!value || typeof value !== "object") return null;
+  const aspect = value as { width?: unknown; height?: unknown };
+  const width = Number(aspect.width), height = Number(aspect.height);
+  return Number.isSafeInteger(width) && width > 0 && Number.isSafeInteger(height) && height > 0 ? `${width}:${height}` : null;
+}
+
+function mayKeepLocalOverride(local: Reframe | undefined, server: Reframe) {
+  if (!local || normalizedTargetAspect(local.targetAspect) !== normalizedTargetAspect(server.targetAspect)) return false;
+  const localHash = local.sourceFingerprint, serverHash = server.sourceFingerprint;
+  // An empty local hash is the only unbound state: it belongs to this first
+  // request while facts move from queued/pending to ready. A persisted hash
+  // must match the server's hash before its manual decision can follow it.
+  return !localHash || (Boolean(serverHash) && localHash === serverHash);
+}
+
 /** Server analysis facts win only for the same source identity; a local non-auto override remains the user's draft. */
 export function mergeServerReframeFacts(draftTracks: TimelineTrack[], serverTracks: TimelineTrack[]): TimelineTrack[] {
   const serverById = new Map(serverTracks.flatMap((track) => track.clips).map((clip) => [clip.id, clip]));
@@ -219,6 +235,6 @@ export function mergeServerReframeFacts(draftTracks: TimelineTrack[], serverTrac
     const server = serverById.get(clip.id);
     if (!server?.reframe || !sameReframeIdentity(clip, server)) return clip;
     const override = clip.reframe?.override;
-    return { ...clip, reframe: { ...server.reframe, ...(override && override.mode !== "auto" ? { override } : {}) } };
+    return { ...clip, reframe: { ...server.reframe, ...(override && override.mode !== "auto" && mayKeepLocalOverride(clip.reframe as Reframe | undefined, server.reframe as Reframe) ? { override } : {}) } };
   }) }));
 }
