@@ -52,11 +52,11 @@ def _workspace(revision=0, tracks=None):
     }
 
 
-def setup(tmp_path, renderer=None):
+def setup(tmp_path, renderer=None, reframe_analyzer=None):
     _asset_root(tmp_path)
     queue = Queue()
     app = FastAPI()
-    app.include_router(create_timeline_router(tmp_path, lambda project_id: SimpleNamespace(id=project_id) if project_id == PROJECT_ID else None, queue, renderer=renderer))
+    app.include_router(create_timeline_router(tmp_path, lambda project_id: SimpleNamespace(id=project_id) if project_id == PROJECT_ID else None, queue, renderer=renderer, reframe_analyzer=reframe_analyzer))
     return TestClient(app), queue
 
 
@@ -71,6 +71,51 @@ def test_workspace_reads_preproduction_assets_and_uses_revision_cas(tmp_path):
     assert saved.status_code == 200
     assert saved.json()["revision"] == 1
     assert client.put(BASE, json=_workspace()).status_code == 409
+
+
+def test_timeline_reframe_analyze_cancel_and_retry_are_durable(tmp_path):
+    """A cancelled queued reframe must not write back; retry owns a new job."""
+    from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint
+    def analyzer(source, identity):
+        return {"schemaVersion": 1, "sourceFingerprint": source_fingerprint(source), "sourceWidth": 64, "sourceHeight": 48,
+                "targetAspect": {"width": 1280, "height": 720}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+                "samples": [{"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+                            {"timeSeconds": 2, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9}],
+                "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []}}
+    client, queue = setup(tmp_path, reframe_analyzer=analyzer)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    started = client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1})
+    assert started.status_code == 202
+    assert started.json()["reframeAnalysis"]["clip1"]["status"] == "queued"
+    assert client.post(BASE + "/reframes/clip1/cancel", json={"revision": 1}).status_code == 200
+    queue.run()
+    assert client.get(BASE).json()["reframeAnalysis"]["clip1"]["status"] == "cancelled"
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    queue.run()
+    completed = client.get(BASE).json()
+    assert completed["reframeAnalysis"]["clip1"]["status"] == "completed"
+    assert completed["tracks"][0]["clips"][0]["reframe"]["status"] == "ready"
+
+
+def test_timeline_reframe_invalidates_when_source_changes_while_queued(tmp_path):
+    from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint
+    initial = tmp_path / "project-files" / PROJECT_ID / "preproduction" / "assets" / "video.mp4"
+    _asset_root(tmp_path)
+    old_hash = source_fingerprint(initial)
+    def analyzer(_source, _identity):
+        return {"schemaVersion": 1, "sourceFingerprint": old_hash, "sourceWidth": 64, "sourceHeight": 48,
+                "targetAspect": {"width": 1280, "height": 720}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+                "samples": [{"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+                            {"timeSeconds": 2, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9}],
+                "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []}}
+    client, queue = setup(tmp_path, reframe_analyzer=analyzer)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    path = tmp_path / "project-files" / PROJECT_ID / "preproduction" / "assets" / "video.mp4"
+    path.write_bytes(b"changed")
+    queue.run()
+    record = client.get(BASE).json()["reframeAnalysis"]["clip1"]
+    assert record["status"] == "failed"
 
 
 def test_rejects_overlapping_video_clips_and_wrong_asset_track_kind(tmp_path):
