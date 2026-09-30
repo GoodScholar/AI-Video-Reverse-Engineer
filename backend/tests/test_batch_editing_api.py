@@ -12,6 +12,7 @@ from PIL import Image
 from app.batch_editing_api import _shared_montage_usage, create_batch_editing_router
 from app.batch_recommendation import recommend
 from app.main import create_app
+from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint
 
 
 INTENT = {"x-aivre-intent": "semantic-analysis"}
@@ -126,6 +127,60 @@ def install_montage_indexes(root, project_id):
                 "inPointSeconds": 1.0, "outPointSeconds": 5.0,
                 "keyframe": {"timeSeconds": 3.0, "_filename": "keyframe-1.jpg"}}],
         }), encoding="utf-8")
+
+
+class DeferredComputeQueue:
+    """Keep proposal analysis jobs controllable so adoption races are reproducible."""
+
+    def __init__(self):
+        self.jobs = []
+
+    def submit(self, kind, project_id, handler):
+        self.jobs.append((kind, project_id, handler))
+        return True
+
+    def is_active(self, _kind, _project_id):
+        return False
+
+    def is_project_active(self, _project_id):
+        return False
+
+    def shutdown(self):
+        pass
+
+
+def _proposal_reframe_app(root):
+    queue = DeferredComputeQueue()
+
+    def analyzer(path, start, end, aspect):
+        return {
+            "schemaVersion": 1, "sourceFingerprint": source_fingerprint(path),
+            "sourceWidth": 64, "sourceHeight": 48, "targetAspect": aspect,
+            "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+            "samples": [
+                {"timeSeconds": start, "boxes": [], "center": {"x": .35, "y": .5}, "confidence": .9},
+                {"timeSeconds": end, "boxes": [], "center": {"x": .65, "y": .5}, "confidence": .9},
+            ],
+            "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []},
+        }
+
+    return create_app(root, segment_visual_vectorizer=MontageVectorizer(),
+                      local_compute_queue=queue, reframe_analyzer=analyzer), queue
+
+
+def _create_montage_proposal(client, root, *, script="展示杯盖防泼溅。", narration=None):
+    project_id = client.post("/api/projects", json={"name": "主体混剪回归"}).json()["id"]
+    install_montage_indexes(root, project_id)
+    queries = ["展示杯盖防泼溅"] if script.count("。") <= 1 else ["展示杯盖防泼溅", "展示通勤携带效果"]
+    searches = [client.post(f"/api/projects/{project_id}/segment-searches", json={"query": query, "limit": 2},
+                            headers=INTENT).json() for query in queries]
+    base = f"/api/projects/{project_id}/batch-edits"
+    task = client.post(base, json={"sellingPoint": "防泼溅", "script": script}, headers=INTENT).json()["task"]
+    narration = narration or [{"durationSeconds": 2, "wordBoundariesSeconds": []} for _ in searches]
+    proposal = client.post(f"{base}/{task['id']}/montage-proposals", json={
+        "revision": 0, "searchIds": [item["id"] for item in searches], "narration": narration, "beatTimes": [],
+    }, headers=INTENT).json()["proposal"]
+    return project_id, base, task, proposal
 
 
 def test_team_can_create_a_batch_task_and_reopen_its_script(tmp_path):
@@ -870,3 +925,154 @@ def test_batch_reframe_repeat_cancel_retry_and_source_cas(tmp_path):
         variant = client.get(base).json()["tasks"][0]["variant"]
         assert variant["revision"] == 2
         assert variant["tracks"][0]["clips"][0]["reframe"]["status"] == "ready"
+
+
+def test_montage_candidate_replacement_keeps_pending_reframe_and_queues_analysis(tmp_path):
+    app, queue = _proposal_reframe_app(tmp_path)
+    with TestClient(app) as client:
+        _project_id, base, _task, proposal = _create_montage_proposal(client, tmp_path)
+        segment = proposal["segments"][0]
+        assert len(queue.jobs) == 1
+
+        replaced = client.put(f"{base}/{_task['id']}/montage-proposals/{proposal['id']}", json={
+            "revision": proposal["revision"],
+            "segments": [{"segmentId": segment["id"], "candidateId": "segment-commute",
+                          "inPointSeconds": 1.0, "durationSeconds": 2.0}],
+        }, headers=INTENT)
+
+        assert replaced.status_code == 200, replaced.text
+        selected = replaced.json()["proposal"]["segments"][0]["selectedClip"]
+        assert selected["assetId"] == "commute"
+        assert selected["reframe"]["status"] == "review_required"
+        assert selected["reframe"]["samples"] == []
+        assert "重新主体分析" in selected["reframe"]["uncertaintyReasons"][0]
+        assert len(queue.jobs) == 2
+
+        _kind, pid, handler = queue.jobs[-1]
+        handler(pid)
+        task = client.get(base).json()["tasks"][0]
+        selected = task["montageProposals"][0]["segments"][0]["selectedClip"]
+        assert selected["reframe"]["status"] == "ready"
+        assert task["variant"]["reframeAnalysis"][selected["id"]]["status"] == "completed"
+
+
+def test_two_clip_proposal_adoption_publishes_one_aggregate_reframe_revision(tmp_path):
+    app, queue = _proposal_reframe_app(tmp_path)
+    with TestClient(app) as client:
+        _project_id, base, task, proposal = _create_montage_proposal(
+            client, tmp_path, script="展示杯盖防泼溅。展示通勤携带效果。",
+        )
+        assert len(proposal["clips"]) == 2
+        assert len(queue.jobs) == 1
+
+        applied = client.post(f"{base}/{task['id']}/montage-proposals/{proposal['id']}/apply", json={
+            "revision": 0, "proposalRevision": 0, "strategy": "overwrite",
+        }, headers=INTENT)
+
+        assert applied.status_code == 200, applied.text
+        assert applied.json()["variant"]["revision"] == 1
+        assert len(queue.jobs) == 2
+        _kind, pid, handler = queue.jobs[-1]
+        handler(pid)
+        variant = client.get(base).json()["tasks"][0]["variant"]
+        assert variant["revision"] == 2
+        clips = variant["tracks"][0]["clips"]
+        assert len(clips) == 2
+        assert [clip["reframe"]["status"] for clip in clips] == ["ready", "ready"]
+        assert [variant["reframeAnalysis"][clip["id"]]["status"] for clip in clips] == ["completed", "completed"]
+
+
+def test_pending_proposal_apply_publishes_to_variant_without_overwriting_later_manual_reframe(tmp_path):
+    app, queue = _proposal_reframe_app(tmp_path)
+    with TestClient(app) as client:
+        _project_id, base, task, proposal = _create_montage_proposal(client, tmp_path)
+        applied = client.post(f"{base}/{task['id']}/montage-proposals/{proposal['id']}/apply", json={
+            "revision": 0, "proposalRevision": 0, "strategy": "overwrite",
+        }, headers=INTENT)
+        assert applied.status_code == 200, applied.text
+        assert len(queue.jobs) == 2
+
+        tracks = applied.json()["variant"]["tracks"]
+        clip = tracks[0]["clips"][0]
+        clip["reframe"]["override"] = {
+            "mode": "manual", "keyframes": [{"timeSeconds": clip["inPoint"], "x": .2, "y": .7}],
+        }
+        manual = client.put(f"{base}/{task['id']}/variant", json={"revision": 1, "tracks": tracks}, headers=INTENT)
+        assert manual.status_code == 200, manual.text
+
+        _kind, pid, handler = queue.jobs[-1]
+        handler(pid)
+        variant = client.get(base).json()["tasks"][0]["variant"]
+        stored = variant["tracks"][0]["clips"][0]["reframe"]
+        assert variant["revision"] == 3
+        assert stored["status"] == "ready"
+        assert stored["override"] == {"mode": "manual", "keyframes": [{"timeSeconds": 1.0, "x": .2, "y": .7}]}
+        assert len(stored["samples"]) == 2
+
+
+def test_reapplying_identical_source_preserves_manual_reframe_but_changed_range_or_source_does_not(tmp_path):
+    app, queue = _proposal_reframe_app(tmp_path)
+    with TestClient(app) as client:
+        _project_id, base, task, first = _create_montage_proposal(client, tmp_path)
+        first_applied = client.post(f"{base}/{task['id']}/montage-proposals/{first['id']}/apply", json={
+            "revision": 0, "proposalRevision": 0, "strategy": "overwrite",
+        }, headers=INTENT)
+        assert first_applied.status_code == 200, first_applied.text
+        tracks = first_applied.json()["variant"]["tracks"]
+        clip = tracks[0]["clips"][0]
+        clip["reframe"]["override"] = {
+            "mode": "manual", "keyframes": [{"timeSeconds": clip["inPoint"], "x": .25, "y": .65}],
+        }
+        assert client.put(f"{base}/{task['id']}/variant", json={"revision": 1, "tracks": tracks}, headers=INTENT).status_code == 200
+
+        same = client.post(f"{base}/{task['id']}/montage-proposals", json={
+            "revision": 2, "searchIds": [first["inputSnapshot"]["segments"][0]["searchId"]],
+            "narration": [{"durationSeconds": 2, "wordBoundariesSeconds": []}], "beatTimes": [],
+        }, headers=INTENT)
+        assert same.status_code == 201, same.text
+        same_proposal = same.json()["proposal"]
+        same_applied = client.post(f"{base}/{task['id']}/montage-proposals/{same_proposal['id']}/apply", json={
+            "revision": 2, "proposalRevision": 0, "strategy": "overwrite",
+        }, headers=INTENT)
+        assert same_applied.status_code == 200, same_applied.text
+        assert same_applied.json()["variant"]["tracks"][0]["clips"][0]["reframe"]["override"]["mode"] == "manual"
+
+        changed_range = client.post(f"{base}/{task['id']}/montage-proposals", json={
+            "revision": 3, "searchIds": [first["inputSnapshot"]["segments"][0]["searchId"]],
+            "narration": [{"durationSeconds": 2, "wordBoundariesSeconds": []}], "beatTimes": [],
+        }, headers=INTENT).json()["proposal"]
+        range_edit = client.put(f"{base}/{task['id']}/montage-proposals/{changed_range['id']}", json={
+            "revision": 0,
+            "segments": [{"segmentId": changed_range["segments"][0]["id"], "candidateId": "segment-lid",
+                          "inPointSeconds": 1.5, "durationSeconds": 2.0}],
+        }, headers=INTENT)
+        assert range_edit.status_code == 200, range_edit.text
+        range_applied = client.post(f"{base}/{task['id']}/montage-proposals/{changed_range['id']}/apply", json={
+            "revision": 3, "proposalRevision": 1, "strategy": "overwrite",
+        }, headers=INTENT)
+        assert range_applied.status_code == 200, range_applied.text
+        assert range_applied.json()["variant"]["tracks"][0]["clips"][0]["reframe"]["override"]["mode"] == "auto"
+
+        tracks = range_applied.json()["variant"]["tracks"]
+        clip = tracks[0]["clips"][0]
+        clip["reframe"]["override"] = {
+            "mode": "manual", "keyframes": [{"timeSeconds": clip["inPoint"], "x": .3, "y": .6}],
+        }
+        assert client.put(f"{base}/{task['id']}/variant", json={"revision": 4, "tracks": tracks}, headers=INTENT).status_code == 200
+        changed_source = client.post(f"{base}/{task['id']}/montage-proposals", json={
+            "revision": 5, "searchIds": [first["inputSnapshot"]["segments"][0]["searchId"]],
+            "narration": [{"durationSeconds": 2, "wordBoundariesSeconds": []}], "beatTimes": [],
+        }, headers=INTENT).json()["proposal"]
+        source_edit = client.put(f"{base}/{task['id']}/montage-proposals/{changed_source['id']}", json={
+            "revision": 0,
+            "segments": [{"segmentId": changed_source["segments"][0]["id"], "candidateId": "segment-commute",
+                          "inPointSeconds": 1.0, "durationSeconds": 2.0}],
+        }, headers=INTENT)
+        assert source_edit.status_code == 200, source_edit.text
+        source_applied = client.post(f"{base}/{task['id']}/montage-proposals/{changed_source['id']}/apply", json={
+            "revision": 5, "proposalRevision": 1, "strategy": "overwrite",
+        }, headers=INTENT)
+        assert source_applied.status_code == 200, source_applied.text
+        stored = source_applied.json()["variant"]["tracks"][0]["clips"][0]
+        assert stored["assetId"] == "commute"
+        assert stored["reframe"]["override"]["mode"] == "auto"

@@ -351,6 +351,7 @@ def create_app(
     source_segment_runner: Optional[Callable] = None,
     segment_visual_vectorizer=None,
     segment_reranker=None,
+    reframe_analyzer=None,
     analysis_provider_registry=None,
     provider_registry=None,
     clock: Optional[Callable[[], datetime]] = None,
@@ -2532,6 +2533,7 @@ def create_app(
         ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, source_lock=project_write_lock, voice_service=voice_service,
         segment_reranker=resolved_segment_reranker,
         segment_vectorizer_version=resolved_segment_vectorizer.version,
+        reframe_analyzer=reframe_analyzer,
     ))
     from .aigc_content_api import create_aigc_content_router
 
