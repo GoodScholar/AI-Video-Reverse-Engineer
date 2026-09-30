@@ -215,12 +215,16 @@ function sameReframeIdentity(left: TimelineClip, right: TimelineClip) {
 function normalizedTargetAspect(value: unknown) {
   if (!value || typeof value !== "object") return null;
   const aspect = value as { width?: unknown; height?: unknown };
-  const width = Number(aspect.width), height = Number(aspect.height);
-  return Number.isSafeInteger(width) && width > 0 && Number.isSafeInteger(height) && height > 0 ? `${width}:${height}` : null;
+  const { width, height } = aspect;
+  if (typeof width !== "number" || !Number.isFinite(width) || !Number.isSafeInteger(width) || width <= 0) return null;
+  if (typeof height !== "number" || !Number.isFinite(height) || !Number.isSafeInteger(height) || height <= 0) return null;
+  return `${width}:${height}`;
 }
 
 function mayKeepLocalOverride(local: Reframe | undefined, server: Reframe) {
-  if (!local || normalizedTargetAspect(local.targetAspect) !== normalizedTargetAspect(server.targetAspect)) return false;
+  const localTarget = local && normalizedTargetAspect(local.targetAspect);
+  const serverTarget = normalizedTargetAspect(server.targetAspect);
+  if (!localTarget || !serverTarget || localTarget !== serverTarget) return false;
   const localHash = local.sourceFingerprint, serverHash = server.sourceFingerprint;
   // An empty local hash is the only unbound state: it belongs to this first
   // request while facts move from queued/pending to ready. A persisted hash

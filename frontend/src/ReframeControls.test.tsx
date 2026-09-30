@@ -228,6 +228,24 @@ it("同片段的 source hash 或输出目标改变时清除旧人工关键点", 
   }
 });
 
+it("本地或服务端目标宽高不是合法整数时清除人工构图", () => {
+  const tracks = [{ id: "video", name: "画面", kind: "video" as const, muted: false, hidden: false, clips: [{ id: "clip-a", assetId: "a", start: 0, inPoint: 0, duration: 2, speed: 1, volume: 1, fadeIn: 0, fadeOut: 0, reframe: { ...reframe, override: { mode: "center" as const, keyframes: [] } } }] }];
+  const malformed = ["720", true, [720], Number.NaN, Number.POSITIVE_INFINITY, 720.5];
+
+  for (const value of malformed) {
+    for (const field of ["width", "height"] as const) {
+      const invalidTarget = { ...reframe.targetAspect, [field]: value };
+      for (const [localTarget, serverTarget] of [[invalidTarget, reframe.targetAspect], [reframe.targetAspect, invalidTarget]]) {
+        const result = mergeServerReframeFacts(
+          [{ ...tracks[0], clips: [{ ...tracks[0].clips[0], reframe: { ...tracks[0].clips[0].reframe!, targetAspect: localTarget as Reframe["targetAspect"] } }] }],
+          [{ ...tracks[0], clips: [{ ...tracks[0].clips[0], reframe: { ...reframe, targetAspect: serverTarget as Reframe["targetAspect"], override: { mode: "auto", keyframes: [] } } }] }],
+        );
+        expect(result[0].clips[0].reframe?.override).toEqual({ mode: "auto", keyframes: [] });
+      }
+    }
+  }
+});
+
 it("来源素材或源时间变化时拒绝迟到的服务端检测事实", () => {
   const local = { ...reframe, override: { mode: "manual" as const, keyframes: [{ timeSeconds: 0, x: .72, y: .5 }] } };
   const server = { ...reframe, samples: [{ timeSeconds: 0, boxes: [{ x: .4, y: .1, width: .3, height: .7 }] }] };
