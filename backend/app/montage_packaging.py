@@ -248,38 +248,41 @@ def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width
                 raise PackagingError("主体构图窗口无效，需人工确认。")
             source_start = float(in_point) + (overlap_start - clip_start) * float(speed)
             source_end = float(in_point) + (overlap_end - clip_start) * float(speed)
-            times = [source_start, source_end]
-            times.extend(float(sample["timeSeconds"]) for sample in samples if isinstance(sample, dict)
-                         and isinstance(sample.get("timeSeconds"), (int, float)) and source_start < sample["timeSeconds"] < source_end)
-            def project(source_time: float) -> list[tuple[float, float, float, float]]:
-                projected = []
+            usable = [sample for sample in samples if isinstance(sample, dict) and isinstance(sample.get("timeSeconds"), (int, float))]
+            usable.sort(key=lambda sample: float(sample["timeSeconds"]))
+            def project(source_time: float, box: dict[str, Any]) -> tuple[float, float, float, float] | None:
                 try:
                     crop_x, crop_y = _crop_position(_center_at(reframe, source_time), source_w, source_h, crop_w, crop_h)
                 except (KeyError, TypeError, ValueError):
                     raise PackagingError("主体构图轨迹无效，需人工确认。") from None
-                for box in _interpolated_boxes(samples, source_time):
-                    try:
-                        x, y, box_w, box_h = (float(box[key]) for key in ("x", "y", "width", "height"))
-                    except (AttributeError, KeyError, TypeError, ValueError):
-                        continue
-                    left, top = (x * source_w - crop_x) * width / crop_w, (y * source_h - crop_y) * height / crop_h
-                    right, bottom = ((x + box_w) * source_w - crop_x) * width / crop_w, ((y + box_h) * source_h - crop_y) * height / crop_h
-                    if right > 0 and bottom > 0 and left < width and top < height:
-                        projected.append((max(0, left), max(0, top), min(width, right), min(height, bottom)))
-                return projected
+                try:
+                    x, y, box_w, box_h = (float(box[key]) for key in ("x", "y", "width", "height"))
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    return None
+                return ((x * source_w - crop_x) * width / crop_w, (y * source_h - crop_y) * height / crop_h,
+                        ((x + box_w) * source_w - crop_x) * width / crop_w,
+                        ((y + box_h) * source_h - crop_y) * height / crop_h)
 
-            # Between detector samples both the box and Task1 crop centre are
-            # linear/piecewise-linear.  The endpoint union is therefore a
-            # conservative swept envelope; with no stable detector identity we
-            # intentionally retain every endpoint box instead of zip-dropping.
-            sampled = [(source_time, project(source_time)) for source_time in sorted(set(times))]
-            for _source_time, boxes in sampled:
-                result.extend(boxes)
-            for (_left_time, left_boxes), (_right_time, right_boxes) in zip(sampled, sampled[1:]):
-                swept = [*left_boxes, *right_boxes]
-                if swept:
-                    result.append((min(box[0] for box in swept), min(box[1] for box in swept),
-                                   max(box[2] for box in swept), max(box[3] for box in swept)))
+            # Detector boxes have no durable per-person ID.  For every sampled
+            # segment that overlaps the event, retain *all* boxes at both ends
+            # and form their swept canvas envelope before clipping it.  This
+            # catches two outside endpoints crossing the screen and an A+B→A
+            # disappearance without the unsafe zip-by-list-index assumption.
+            segments = [(left_sample, right_sample) for left_sample, right_sample in zip(usable, usable[1:])
+                        if float(left_sample["timeSeconds"]) < source_end and float(right_sample["timeSeconds"]) > source_start]
+            if not segments:
+                segments = [(sample, sample) for sample in usable
+                            if source_start <= float(sample["timeSeconds"]) <= source_end]
+            for left_sample, right_sample in segments:
+                swept = [project(float(sample["timeSeconds"]), box)
+                         for sample in (left_sample, right_sample) for box in sample.get("boxes", []) if isinstance(box, dict)]
+                swept = [box for box in swept if box is not None]
+                if not swept:
+                    continue
+                left, top = min(box[0] for box in swept), min(box[1] for box in swept)
+                right, bottom = max(box[2] for box in swept), max(box[3] for box in swept)
+                if right > 0 and bottom > 0 and left < width and top < height:
+                    result.append((max(0, left), max(0, top), min(width, right), min(height, bottom)))
     return result
 
 
@@ -327,13 +330,21 @@ def _element_events(packaging: dict[str, Any], cues: list[dict[str, Any]], width
     return events
 
 
+def validate_final_events(packaging: dict[str, Any], cues: list[dict[str, Any]], tracks: list[dict[str, Any]], *, batch: bool) -> dict[str, Any]:
+    """Validate every final ASS event, including default canonical cues."""
+    checked = validate_packaging(packaging, cues, tracks, batch=batch)
+    _element_events(checked, cues, 0, 0)
+    return checked
+
+
 def compile_ass(packaging: dict[str, Any], cues: list[dict[str, Any]], tracks: list[dict[str, Any]], width: int, height: int, font_path: Path | str | None = None) -> str:
     """Compile all graphics into a single normalized PlayRes ASS document."""
     if type(width) is not int or type(height) is not int or width < 2 or height < 2:
         raise PackagingError("包装画布无效。")
     if font_path is not None and Path(font_path).resolve() != private_font_path().resolve():
         raise PackagingError("只能使用受控字体。")
-    checked = validate_packaging(packaging, cues, tracks, batch=any("cueId" in item for item in packaging.get("elements", []) if isinstance(item, dict)))
+    checked = validate_final_events(packaging, cues, tracks,
+                                    batch=any("cueId" in item for item in packaging.get("elements", []) if isinstance(item, dict)))
     safe = checked["safeArea"]
     left, right = width * safe["left"], width * (1 - safe["right"])
     top, bottom = height * safe["top"], height * (1 - safe["bottom"])

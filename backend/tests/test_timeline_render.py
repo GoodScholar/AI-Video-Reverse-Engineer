@@ -257,7 +257,7 @@ def test_packaging_uses_one_ass_subtitle_pass_and_keeps_preview_export_coordinat
     from app.montage_packaging import default_packaging
     image = _image(tmp_path / "green.png", "green")
     subtitles = tmp_path / "subtitles.srt"
-    write_srt(subtitles, [{"id": "cue", "start": .1, "end": .45, "text": "唯一烧录"}])
+    write_srt(subtitles, [{"id": "cue", "start": .1, "end": .3, "text": "唯一烧录"}])
     captured, real_build = [], timeline_render._build_command
     def capture(*args, **kwargs):
         captured.append((args[8], Path(kwargs["ass_path"]).read_text(encoding="utf-8")))
@@ -265,7 +265,7 @@ def test_packaging_uses_one_ass_subtitle_pass_and_keeps_preview_export_coordinat
     monkeypatch.setattr(timeline_render, "_build_command", capture)
     monkeypatch.setattr("app.batch_subtitles.caption_images", lambda *_: pytest.fail("包装不得走 PNG 字幕"))
     timeline = _timeline(width=720, height=1280, tracks=[_track("video", [_clip("green", 0, .5)])])
-    cues = [{"id": "cue", "start": .1, "end": .45, "text": "唯一烧录"}]
+    cues = [{"id": "cue", "start": .1, "end": .3, "text": "唯一烧录"}]
     preview, export = tmp_path / "pack-preview.mp4", tmp_path / "pack-export.mp4"
 
     ffmpeg = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"
@@ -281,6 +281,28 @@ def test_packaging_uses_one_ass_subtitle_pass_and_keeps_preview_export_coordinat
     assert [items for items, _ass in captured] == [[], []]
     assert all(ass.count("唯一烧录") == 1 and "\\pos(360," in ass for _items, ass in captured)
     assert all(not path.exists() for path in tmp_path.glob(".packaging.ass"))
+
+    def text_bbox(video, second):
+        frame = tmp_path / (video.stem + f"-{second}.png")
+        _run(ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-y", "-i", str(video), "-ss", str(second),
+             "-frames:v", "1", str(frame))
+        with Image.open(frame).convert("RGB") as pixels:
+            points = [(x, y) for y in range(pixels.height) for x in range(pixels.width)
+                      if all(channel > 210 for channel in pixels.getpixel((x, y)))]
+            if not points:
+                return None, (pixels.width, pixels.height)
+            return (min(x for x, _y in points), min(y for _x, y in points),
+                    max(x for x, _y in points) + 1, max(y for _x, y in points) + 1), (pixels.width, pixels.height)
+
+    preview_box, preview_size = text_bbox(preview, .2)
+    export_box, export_size = text_bbox(export, .2)
+    assert preview_box and export_box
+    preview_normalized = [preview_box[0] / preview_size[0], preview_box[1] / preview_size[1],
+                          preview_box[2] / preview_size[0], preview_box[3] / preview_size[1]]
+    export_normalized = [export_box[0] / export_size[0], export_box[1] / export_size[1],
+                         export_box[2] / export_size[0], export_box[3] / export_size[1]]
+    assert max(abs(left - right) for left, right in zip(preview_normalized, export_normalized)) < .012
+    assert text_bbox(preview, .4)[0] is None and text_bbox(export, .4)[0] is None
 
 
 def test_packaging_rejects_default_missing_glyph_and_cleans_ass_on_renderer_failure(tmp_path, monkeypatch):

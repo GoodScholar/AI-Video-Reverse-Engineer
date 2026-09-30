@@ -163,6 +163,17 @@ def test_batch_export_gate_isolation_retry_and_history(tmp_path):
         assert states[1]["variant"]["exports"][0]["url"]
         download = f"{base}/{first['id']}/exports/{first_export['id']}/output"
         assert api.get(download).content == b"delivery"
+        # A completed old export must revalidate its final default cue events,
+        # not merely explicit packaging elements; legacy snapshots stay valid.
+        from app.montage_packaging import default_packaging
+        completed_state = json.loads(state_path.read_text(encoding="utf-8"))
+        invalid_completed = json.loads(json.dumps(completed_state))
+        invalid_completed["tasks"][1]["variant"]["exports"][0]["snapshot"]["packaging"] = default_packaging()
+        invalid_completed["tasks"][1]["variant"]["exports"][0]["subtitles"] = [{"id": "old", "start": .1, "end": .5, "text": "\U00020000"}]
+        state_path.write_text(json.dumps(invalid_completed), encoding="utf-8")
+        blocked = api.get(download)
+        assert blocked.status_code == 409 and blocked.json()["detail"]["code"] == "batch_packaging_invalid"
+        state_path.write_text(json.dumps(completed_state), encoding="utf-8")
         assert api.get(f"{base}/{second['id']}/exports/{second_export['id']}/output").status_code == 409
 
         broken.clear()

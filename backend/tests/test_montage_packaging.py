@@ -179,3 +179,29 @@ def test_subject_sweep_blocks_middle_crossing_and_keeps_appearing_boxes():
     tracks[0]["clips"].append(other)
     during_transition = _subject_boxes(tracks, .5, .6, 720, 1280)
     assert any(box[1] < 300 for box in during_transition) and any(box[0] < 360 < box[2] for box in during_transition)
+
+
+def test_sweep_keeps_offscreen_endpoints_and_short_lifecycle_boxes_conservatively():
+    from app.montage_packaging import _subject_boxes
+
+    tracks = _reframed_track()
+    reframe = tracks[0]["clips"][0]["reframe"]
+    reframe["samples"] = [
+        {"timeSeconds": 0, "boxes": [
+            {"x": 0, "y": .45, "width": .05, "height": .1, "label": "A", "confidence": .9},
+            {"x": .45, "y": .45, "width": .1, "height": .1, "label": "B", "confidence": .9}],
+         "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 1, "boxes": [{"x": .95, "y": .45, "width": .05, "height": .1,
+                                          "label": "A", "confidence": .9}],
+         "center": {"x": .5, "y": .5}, "confidence": .9},
+    ]
+    # Both A endpoints are outside after target crop, but its sweep crosses;
+    # B's disappearance remains occupied for this short interval too.
+    occupied = _subject_boxes(tracks, .45, .55, 720, 1280)
+    assert any(box[0] < 360 < box[2] for box in occupied)
+    assert any(box[0] < 360 < box[2] and box[1] < 640 < box[3] for box in occupied)
+
+    later = {**tracks[0]["clips"][0], "id": "later", "start": 2, "duration": 1}
+    tracks[0]["clips"].append(later)
+    assert _subject_boxes(tracks, 0, .2, 720, 1280)  # current clip only
+    assert not _subject_boxes(tracks, 1.1, 1.2, 720, 1280)  # neither clip covers the gap

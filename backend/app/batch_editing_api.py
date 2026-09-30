@@ -442,9 +442,9 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         packaging = snapshot.get("packaging") if isinstance(snapshot, dict) else None
         if packaging is None:
             return
-        from .montage_packaging import PackagingError, validate_packaging
+        from .montage_packaging import PackagingError, validate_final_events
         try:
-            validate_packaging(packaging, cues, snapshot.get("tracks", []), batch=batch)
+            validate_final_events(packaging, cues, snapshot.get("tracks", []), batch=batch)
         except PackagingError as error:
             raise BatchProductionError("batch_packaging_invalid", str(error)) from error
 
