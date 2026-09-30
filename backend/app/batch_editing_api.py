@@ -619,11 +619,15 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         return clip
 
     def schedule_reframes(project_id: str, task_id: str, clip_ids: list[str], *, proposal_id: str | None = None,
-                          expected_revision: int | None = None):
+                          expected_revision: int | None = None, staged_state: dict | None = None,
+                          expected_state: dict | None = None):
         """One existing compute job per submit; late workers may only write same clip identity."""
         run_id = uuid4().hex
         with source_lock or nullcontext(), lock:
-            state = state_for(project_id)
+            persisted = state_for(project_id)
+            if expected_state is not None and not batch_state_cas_equal(persisted, expected_state):
+                raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "变体已更新，请刷新后重试。"})
+            state = deepcopy(staged_state) if staged_state is not None else persisted
             task = task_for(state, task_id)
             variant = task["variant"]
             if expected_revision is not None and variant["revision"] != expected_revision:
@@ -639,11 +643,15 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 asset = assets.get(clip["assetId"])
                 if asset is None or asset.get("kind") not in ("video", "image"):
                     raise ValueError("主体裁剪仅支持可用图片或视频素材。")
-                source = project_assets.file(project_id, asset)
+                try:
+                    source = project_assets.file(project_id, asset)
+                    source_fact = source_identity(source)
+                except (OSError, ValueError, KeyError):
+                    raise HTTPException(409, detail={"code": "reframe_source_unavailable", "message": "主体分析素材不可用。"}) from None
                 request["clips"].append({
                     "id": clip_id,
                     "identity": {key: clip[key] for key in ("assetId", "inPoint", "duration", "speed")},
-                    "asset": reframe_asset_identity(asset), "source": source_identity(source),
+                    "asset": reframe_asset_identity(asset), "source": source_fact,
                     "targetAspect": {"width": variant["settings"]["width"], "height": variant["settings"]["height"]},
                     "stillImage": asset.get("kind") == "image",
                 })
@@ -665,7 +673,10 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             raise HTTPException(409, detail={"code": "reframe_source_unavailable", "message": "主体分析素材在校验期间变化或不可用，请刷新后重试。"}) from None
 
         with source_lock or nullcontext(), lock:
-            state = state_for(project_id)
+            persisted = state_for(project_id)
+            if expected_state is not None and not batch_state_cas_equal(persisted, expected_state):
+                raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "变体已更新，请刷新后重试。"})
+            state = deepcopy(staged_state) if staged_state is not None else persisted
             task = task_for(state, task_id)
             variant = task["variant"]
             if variant["revision"] != request["variantRevision"]:
@@ -686,9 +697,12 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 asset = assets.get(item["identity"]["assetId"])
                 if asset is None or reframe_asset_identity(asset) != item["asset"]:
                     raise HTTPException(409, detail={"code": "reframe_source_unavailable", "message": "主体分析素材引用已变化，请刷新后重试。"})
-                source = project_assets.file(project_id, asset)
+                try:
+                    source = project_assets.file(project_id, asset)
+                    current_source_identity = source_identity(source)
+                except (OSError, ValueError, KeyError):
+                    raise HTTPException(409, detail={"code": "reframe_source_unavailable", "message": "主体分析素材不可用。"}) from None
                 source_fact = source_proofs[item["sourceKey"]]
-                current_source_identity = source_identity(source)
                 if (current_source_identity != item["source"]
                         or source_stat_identity(current_source_identity) != source_stat_identity(source_fact["identity"])):
                     raise HTTPException(409, detail={"code": "reframe_source_unavailable", "message": "主体分析素材已变化，请刷新后重试。"})
@@ -709,7 +723,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 analysis[item["id"]] = {"id": run_id, "status": "queued", "error": None, "proposalId": proposal_id,
                                         "identity": identity}
                 jobs.append((item["id"], identity, source, dict(aspect),
-                             (None if item["stillImage"] else source_fact["timing"], source_fact["size"]), item["stillImage"]))
+                             (None if item["stillImage"] else source_fact["timing"], source_fact["size"]), item["stillImage"],
+                             source_fact["identity"]))
             save(project_id, state)
 
         def process(_pid):
@@ -726,7 +741,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     if record is not None and record.get("id") == run_id and record.get("status") == "queued":
                         record["status"] = "running"
                 save(project_id, state)
-            for clip_id, identity, source, aspect, (source_timing, trusted_size), still_image in jobs:
+            for clip_id, identity, source, aspect, (source_timing, trusted_size), still_image, _proof_identity in jobs:
                 try:
                     with lock:
                         record = task_for(state_for(project_id), task_id)["variant"].get("reframeAnalysis", {}).get(clip_id)
@@ -748,7 +763,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 except Exception as error:
                     failures[clip_id] = str(error)[:300] or "本地主体分析失败。"
             current_source_facts = {}
-            for clip_id, _identity, source, _aspect, _probe, _still_image in jobs:
+            for clip_id, _identity, source, _aspect, _probe, _still_image, _proof_identity in jobs:
                 if str(source) in current_source_facts:
                     continue
                 try:
@@ -760,7 +775,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 task = task_for(state, task_id)
                 changed = False
                 renderable_changed = False
-                for clip_id, identity, _source, _aspect, _probe, _still_image in jobs:
+                for clip_id, identity, _source, _aspect, _probe, _still_image, proof_identity in jobs:
                     record = task["variant"].get("reframeAnalysis", {}).get(clip_id)
                     if record is None or record.get("id") != run_id or record.get("identity") != identity or record.get("status") == "cancelled":
                         continue
@@ -770,8 +785,16 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                         continue
                     current = {key: clip.get(key) for key in ("assetId", "inPoint", "duration", "speed")}
                     current_source_fact = current_source_facts.get(str(_source))
+                    try:
+                        current_asset = assets_for(project_id).get(identity["assetId"])
+                        current_source = project_assets.file(project_id, current_asset) if current_asset else None
+                        current_source_identity = source_identity(current_source) if current_source else None
+                    except (OSError, ValueError, KeyError):
+                        current_source_identity = None
                     if (current != {key: identity[key] for key in current}
                             or current_source_fact is None
+                            or current_source_identity != proof_identity
+                            or current_source_identity != {key: current_source_fact[key] for key in proof_identity}
                             or current_source_fact["fingerprint"] != identity["sourceFingerprint"]):
                         record.update(status="failed", error="分析期间素材已变化，请重新主体分析。")
                         changed = True
@@ -836,6 +859,22 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                         record.update(status="failed", error="本地处理队列不可用。")
                 save(project_id, state)
 
+    def commit_staged_batch_state(project_id: str, expected_state: dict, staged_state: dict) -> None:
+        """Persist a lock-free proposal staging result only if its base is still current."""
+        with source_lock or nullcontext(), lock:
+            if not batch_state_cas_equal(state_for(project_id), expected_state):
+                raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "变体已更新，请刷新后重试。"})
+            save(project_id, staged_state)
+
+    def batch_state_cas_equal(current: dict, expected: dict) -> bool:
+        """Ignore asynchronous analysis progress but protect every editable business fact."""
+        def comparable(state):
+            state = deepcopy(state)
+            for task in state.get("tasks", []):
+                task.get("variant", {}).pop("reframeAnalysis", None)
+            return state
+        return comparable(current) == comparable(expected)
+
     def regular_file(path: Path):
         descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         try:
@@ -883,8 +922,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
     def stable_source_fact(path: Path) -> dict[str, Any]:
         """Bind a full content hash to an unchanged real file, outside project locks."""
         from .montage_reframe import source_fingerprint
-        before = source_identity(path)
         try:
+            before = source_identity(path)
             fingerprint = source_fingerprint(path)
             after = source_identity(path)
         except (OSError, ValueError) as error:
@@ -903,8 +942,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         """Bind analysis hash, dimensions and video timing outside project/source locks."""
         from .montage_reframe import probe_source_timing, source_fingerprint
 
-        before = source_identity(path)
         try:
+            before = source_identity(path)
             fingerprint = source_fingerprint(path)
             try:
                 from .timeline_render import _probe_media
@@ -1633,7 +1672,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 or any(not _valid_id(value) for value in body["searchIds"])):
             raise HTTPException(422, detail={"code": "montage_request_invalid", "message": "混剪提案输入无效。"})
         with source_lock or nullcontext(), lock:
-            state = state_for(project_id)
+            expected_state = state_for(project_id)
+            state = deepcopy(expected_state)
             task = task_for(state, task_id)
             if body["revision"] != task["variant"]["revision"]:
                 raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "变体已更新，请刷新后重试。"})
@@ -1696,10 +1736,15 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             proposal["packaging"] = validate_packaging(proposal["packaging"], [], proposal_tracks)
             proposals = task.setdefault("montageProposals", [])
             proposals.append(proposal)
-            save(project_id, state)
-            # Queue all chosen first-pass clips together; users never need to click each one.
-            schedule_reframes(project_id, task_id, [clip["id"] for clip in proposal["clips"]], proposal_id=proposal["id"])
-            return {"proposal": deepcopy(proposal)}
+            staged_state = state
+            response = {"proposal": deepcopy(proposal)}
+        # Queue all chosen first-pass clips together; users never need to click each one.
+        if proposal["clips"]:
+            schedule_reframes(project_id, task_id, [clip["id"] for clip in proposal["clips"]], proposal_id=proposal["id"],
+                              staged_state=staged_state, expected_state=expected_state)
+        else:
+            commit_staged_batch_state(project_id, expected_state, staged_state)
+        return response
 
     @router.post("/{task_id}/variant/reframes/{clip_id}/analyze", status_code=202)
     def analyze_variant_reframe(project_id: str, task_id: str, clip_id: str, body: dict[str, Any]):
@@ -1737,7 +1782,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 or not isinstance(body.get("segments"), list)):
             raise HTTPException(422, detail={"code": "montage_adjustment_invalid", "message": "提案调整无效。"})
         with source_lock or nullcontext(), lock:
-            state = state_for(project_id)
+            expected_state = state_for(project_id)
+            state = deepcopy(expected_state)
             task = task_for(state, task_id)
             proposal = montage_proposal_for(task, proposal_id)
             if body["revision"] != proposal["revision"]:
@@ -1796,13 +1842,11 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     "inPoint": start, "duration": duration, "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0,
                 }
                 previous_reframe = (previous_clip or {}).get("reframe")
-                current_source = project_assets.file(project_id, assets_for(project_id)[candidate["assetId"]])
-                from .montage_reframe import source_fingerprint
                 if (previous_reframe is not None and previous_clip.get("assetId") == candidate["assetId"]
                         and abs(float(previous_clip["inPoint"]) - start) < 1e-8
                         and abs(float(previous_clip["duration"]) - duration) < 1e-8
                         and float(previous_clip.get("speed", 1)) == 1
-                        and previous_reframe.get("sourceFingerprint") == source_fingerprint(current_source)):
+                        and previous_reframe.get("sourceFingerprint")):
                     target["selectedClip"]["reframe"] = deepcopy(previous_reframe)
                 else:
                     from .montage_reframe import pending_reframe
@@ -1865,12 +1909,16 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             proposal["unmet"] = [{"segmentId": item["id"], "message": message}
                                  for item in proposal["segments"] for message in item.get("unmet", [])]
             proposal.update(revision=proposal["revision"] + 1, status="draft")
-            save(project_id, state)
             changed_reframes = [item["selectedClip"]["id"] for item in proposal["segments"]
                                 if item.get("selectedClip") and item["selectedClip"].get("reframe", {}).get("status") == "review_required"]
-            if changed_reframes:
-                schedule_reframes(project_id, task_id, changed_reframes, proposal_id=proposal_id)
-            return {"proposal": deepcopy(proposal)}
+            staged_state = state
+            response = {"proposal": deepcopy(proposal)}
+        if changed_reframes:
+            schedule_reframes(project_id, task_id, changed_reframes, proposal_id=proposal_id,
+                              staged_state=staged_state, expected_state=expected_state)
+        else:
+            commit_staged_batch_state(project_id, expected_state, staged_state)
+        return response
 
     @router.post("/{task_id}/montage-proposals/{proposal_id}/apply")
     def apply_montage_proposal(project_id: str, task_id: str, proposal_id: str, body: dict[str, Any]):
@@ -1880,7 +1928,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 or body.get("strategy") not in ("overwrite", "merge", "abandon")):
             raise HTTPException(422, detail={"code": "montage_apply_invalid", "message": "请选择覆盖、合并或放弃提案。"})
         with source_lock or nullcontext(), lock:
-            state = state_for(project_id)
+            expected_state = state_for(project_id)
+            state = deepcopy(expected_state)
             task = task_for(state, task_id)
             proposal = montage_proposal_for(task, proposal_id)
             if body["revision"] != task["variant"]["revision"]:
@@ -1893,8 +1942,26 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 raise HTTPException(409, detail={"code": "montage_proposal_stale", "message": "脚本已变化，请重新生成混剪提案。"})
             if body["strategy"] == "abandon":
                 proposal.update(status="abandoned", revision=proposal["revision"] + 1)
-                save(project_id, state)
-                return {"proposal": deepcopy(proposal), "variant": public_task(project_id, task)["variant"]}
+                response = {"proposal": deepcopy(proposal), "variant": public_task(project_id, task)["variant"]}
+                staged_state = state
+            else:
+                response = None
+                staged_state = None
+        if response is not None:
+            commit_staged_batch_state(project_id, expected_state, staged_state)
+            return response
+        with source_lock or nullcontext(), lock:
+            persisted = state_for(project_id)
+            if not batch_state_cas_equal(persisted, expected_state):
+                raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "变体已更新，请刷新后重试。"})
+            state = deepcopy(expected_state)
+            task = task_for(state, task_id)
+            proposal = montage_proposal_for(task, proposal_id)
+            if (body["revision"] != task["variant"]["revision"] or body["proposalRevision"] != proposal["revision"]
+                    or proposal.get("status") != "draft"):
+                raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "混剪提案已更新，请刷新后重试。"})
+            # All remaining validation and construction below operates on an
+            # unpersisted copy.  Source proof commits it atomically.
             try:
                 for segment in proposal["inputSnapshot"]["segments"]:
                     search = planning_search(project_id, segment["searchId"], segment.get("rerankId"))
@@ -1945,11 +2012,9 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 target_transitions = [*saved_transitions, connector, *proposed_transitions]
             else:
                 replaced_ids = {clip["id"] for clip in video_track["clips"]}
-                # Reusing the identical source interval must not erase a
-                # deliberate manual/center decision.  Render still validates
-                # the saved fingerprint against the current source.
-                from .montage_reframe import source_fingerprint
-                available_assets = assets_for(project_id)
+                # Reusing an identical interval keeps a deliberate manual
+                # decision provisionally. schedule_reframes proves the source
+                # outside this lock before the staged copy becomes visible.
                 for proposed in proposed_clips:
                     matched = next((old for old in video_track["clips"]
                                     if old["assetId"] == proposed["assetId"]
@@ -1957,8 +2022,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                                     and abs(old["duration"] - proposed["duration"]) < 1e-8
                                     and abs(old["speed"] - proposed["speed"]) < 1e-8
                                     and old.get("reframe", {}).get("override", {}).get("mode") != "auto"), None)
-                    if matched is not None and matched["reframe"].get("sourceFingerprint") == source_fingerprint(
-                            project_assets.file(project_id, available_assets[proposed["assetId"]])):
+                    if matched is not None and matched["reframe"].get("sourceFingerprint"):
                         proposed["reframe"] = deepcopy(matched["reframe"])
                 video_track["clips"] = proposed_clips
                 target_transitions = [item for item in saved_transitions
@@ -2023,13 +2087,16 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                         and all(clip.get(key) == identity.get(key) for key in ("assetId", "inPoint", "duration", "speed"))):
                     record["adopted"] = True
                     adopted_pending.append(clip["id"])
-            save(project_id, state)
             # Keep an in-flight draft as the authoritative job; only clips
             # without that exact draft identity need a new variant analysis.
             missing = [clip["id"] for clip in proposed_clips if clip["id"] not in adopted_pending]
-            if missing:
-                schedule_reframes(project_id, task_id, missing)
-            return {"proposal": deepcopy(proposal), "variant": public_task(project_id, task)["variant"]}
+            staged_state = state
+            response = {"proposal": deepcopy(proposal), "variant": public_task(project_id, task)["variant"]}
+        if missing:
+            schedule_reframes(project_id, task_id, missing, staged_state=staged_state, expected_state=expected_state)
+        else:
+            commit_staged_batch_state(project_id, expected_state, staged_state)
+        return response
 
     def process_voiceover(project_id, task_id, job_id):
         directory = store.path(project_id, "voiceovers", job_id, task_id)

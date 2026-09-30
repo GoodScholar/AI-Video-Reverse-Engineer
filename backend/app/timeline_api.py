@@ -101,8 +101,8 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
         """Read costly source facts outside timeline/source locks, bound to one stat identity."""
         from .montage_reframe import probe_source_timing, source_fingerprint
 
-        before = reframe_source_identity(source)
         try:
+            before = reframe_source_identity(source)
             fingerprint = source_fingerprint(source)
             try:
                 from .timeline_render import _probe_media
@@ -124,8 +124,8 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
         """Recheck content outside locks before a worker publishes its result."""
         from .montage_reframe import source_fingerprint
 
-        before = reframe_source_identity(source)
         try:
+            before = reframe_source_identity(source)
             fingerprint = source_fingerprint(source)
             after = reframe_source_identity(source)
         except (OSError, ValueError) as error:
@@ -149,11 +149,18 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             asset = asset_index(project_id).get(clip["assetId"])
             if asset is None or asset.get("kind") not in ("video", "image"):
                 fail("reframe_source_unavailable", "主体分析仅支持可用图片或视频素材。")
-            source = source_path(project_id, asset)
+            try:
+                source = source_path(project_id, asset)
+            except HTTPException:
+                fail("reframe_source_unavailable", "主体分析素材不可用。")
             still_image = asset.get("kind") == "image"
+            try:
+                source_identity = reframe_source_identity(source)
+            except OSError:
+                fail("reframe_source_unavailable", "主体分析素材不可用。")
             request = {"revision": state["revision"], "clip": {
                 key: clip[key] for key in ("assetId", "inPoint", "duration", "speed")
-            }, "asset": reframe_asset_identity(asset), "source": reframe_source_identity(source),
+            }, "asset": reframe_asset_identity(asset), "source": source_identity,
                        "targetAspect": {"width": state["settings"]["width"], "height": state["settings"]["height"]},
                        "stillImage": still_image}
 
@@ -172,7 +179,10 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             asset = asset_index(project_id).get(request["clip"]["assetId"])
             if asset is None or reframe_asset_identity(asset) != request["asset"]:
                 fail("reframe_source_unavailable", "主体分析素材已变化，请刷新后重试。")
-            current_source = source_path(project_id, asset)
+            try:
+                current_source = source_path(project_id, asset)
+            except HTTPException:
+                fail("reframe_source_unavailable", "主体分析素材不可用。")
             try:
                 current_source_identity = reframe_source_identity(current_source)
             except OSError:
@@ -234,9 +244,17 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 if result is None:
                     record.update(status="failed", error=error)
                 else:
+                    try:
+                        current_asset = asset_index(project_id).get(identity["assetId"])
+                        current_source = source_path(project_id, current_asset) if current_asset else None
+                        current_source_identity = reframe_source_identity(current_source) if current_source else None
+                    except (HTTPException, OSError, ValueError):
+                        current_source_identity = None
                     if ({key: clip.get(key) for key in ("assetId", "inPoint", "duration", "speed")} !=
                             {key: identity[key] for key in ("assetId", "inPoint", "duration", "speed")}
                             or current_source_fact is None
+                            or current_source_identity != proof["identity"]
+                            or current_source_identity != current_source_fact["identity"]
                             or current_source_fact["identity"] != proof["identity"]
                             or current_source_fact["fingerprint"] != identity["sourceFingerprint"]):
                         record.update(status="failed", error="分析期间素材或片段已变化，请重新主体分析。")

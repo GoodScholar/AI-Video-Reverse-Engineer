@@ -1702,6 +1702,7 @@ def test_batch_reframe_multi_clip_proof_failure_never_queues_a_subset(tmp_path, 
         state = json.loads(state_path.read_text(encoding="utf-8"))
         state["tasks"][0]["variant"]["reframeAnalysis"] = {}
         state_path.write_text(json.dumps(state), encoding="utf-8")
+        before = json.loads(state_path.read_text(encoding="utf-8"))
         original = montage_reframe.source_fingerprint
 
         def fail_second_source(path):
@@ -1716,6 +1717,7 @@ def test_batch_reframe_multi_clip_proof_failure_never_queues_a_subset(tmp_path, 
 
         assert applied.status_code == 409
         assert applied.json()["detail"]["code"] == "reframe_source_unavailable"
+        assert json.loads(state_path.read_text(encoding="utf-8")) == before
         variant = client.get(base).json()["tasks"][0]["variant"]
         assert variant.get("reframeAnalysis", {}) == {}
         assert queue.jobs == []
