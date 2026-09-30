@@ -2442,3 +2442,44 @@ def test_explicit_batch_reanalysis_preserves_matching_manual_and_clears_changed_
         assert client.post(url + "/analyze", json={"revision": client.get(base).json()["tasks"][0]["variant"]["revision"]}, headers=INTENT).status_code == 202
         changed = client.get(base).json()["tasks"][0]["variant"]["tracks"][0]["clips"][0]["reframe"]
         assert changed["override"]["mode"] == "auto"
+
+
+def test_apply_clears_stale_manual_before_reusing_matching_active_analysis(tmp_path):
+    """A current proposal job must not carry a manual override from another source hash."""
+    app, queue = _proposal_reframe_app(tmp_path)
+    with TestClient(app) as client:
+        project_id, base, task, proposal = _create_montage_proposal(client, tmp_path)
+        state_path = tmp_path / "project-files" / project_id / "batch-edits" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        selected = state["tasks"][0]["montageProposals"][0]["segments"][0]["selectedClip"]
+        stale = deepcopy(selected)
+        stale["reframe"] = {
+            "schemaVersion": 1,
+            "sourceFingerprint": "0" * 64,
+            "sourceWidth": 64,
+            "sourceHeight": 48,
+            "targetAspect": {
+                "width": state["tasks"][0]["variant"]["settings"]["width"],
+                "height": state["tasks"][0]["variant"]["settings"]["height"],
+            },
+            "detectorVersion": DETECTOR_VERSION,
+            "modelSha256": MODEL_SHA256,
+            "samples": [],
+            "uncertaintyReasons": ["旧来源人工构图"],
+            "status": "review_required",
+            "override": {"mode": "manual", "keyframes": [
+                {"timeSeconds": stale["inPoint"], "x": .2, "y": .7},
+            ]},
+        }
+        state["tasks"][0]["variant"]["tracks"][0]["clips"] = [stale]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        applied = client.post(f"{base}/{task['id']}/montage-proposals/{proposal['id']}/apply", json={
+            "revision": 0, "proposalRevision": 0, "strategy": "overwrite",
+        }, headers=INTENT)
+
+        assert applied.status_code == 200, applied.text
+        reframe = applied.json()["variant"]["tracks"][0]["clips"][0]["reframe"]
+        assert reframe["override"]["mode"] == "auto"
+        assert reframe["sourceFingerprint"] == ""
+        assert len(queue.jobs) == 1
