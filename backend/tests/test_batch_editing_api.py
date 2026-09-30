@@ -925,6 +925,12 @@ def test_batch_reframe_repeat_cancel_retry_and_source_cas(tmp_path):
         variant = client.get(base).json()["tasks"][0]["variant"]
         assert variant["revision"] == 2
         assert variant["tracks"][0]["clips"][0]["reframe"]["status"] == "ready"
+        assert client.post(url + "/analyze", json={"revision": 2}).status_code == 202
+        source.unlink()
+        jobs.pop()[1](project_id)
+        deleted = client.get(base).json()["tasks"][0]["variant"]["reframeAnalysis"]["clip"]
+        assert deleted["status"] == "failed"
+        assert "素材" in deleted["error"]
 
 
 def test_montage_candidate_replacement_keeps_pending_reframe_and_queues_analysis(tmp_path):
@@ -971,8 +977,8 @@ def test_two_clip_proposal_adoption_publishes_one_aggregate_reframe_revision(tmp
 
         assert applied.status_code == 200, applied.text
         assert applied.json()["variant"]["revision"] == 1
-        assert len(queue.jobs) == 2
-        _kind, pid, handler = queue.jobs[-1]
+        assert len(queue.jobs) == 1
+        _kind, pid, handler = queue.jobs[0]
         handler(pid)
         variant = client.get(base).json()["tasks"][0]["variant"]
         assert variant["revision"] == 2
@@ -990,7 +996,7 @@ def test_pending_proposal_apply_publishes_to_variant_without_overwriting_later_m
             "revision": 0, "proposalRevision": 0, "strategy": "overwrite",
         }, headers=INTENT)
         assert applied.status_code == 200, applied.text
-        assert len(queue.jobs) == 2
+        assert len(queue.jobs) == 1
 
         tracks = applied.json()["variant"]["tracks"]
         clip = tracks[0]["clips"][0]
@@ -1000,7 +1006,7 @@ def test_pending_proposal_apply_publishes_to_variant_without_overwriting_later_m
         manual = client.put(f"{base}/{task['id']}/variant", json={"revision": 1, "tracks": tracks}, headers=INTENT)
         assert manual.status_code == 200, manual.text
 
-        _kind, pid, handler = queue.jobs[-1]
+        _kind, pid, handler = queue.jobs[0]
         handler(pid)
         variant = client.get(base).json()["tasks"][0]["variant"]
         stored = variant["tracks"][0]["clips"][0]["reframe"]
@@ -1018,27 +1024,29 @@ def test_reapplying_identical_source_preserves_manual_reframe_but_changed_range_
             "revision": 0, "proposalRevision": 0, "strategy": "overwrite",
         }, headers=INTENT)
         assert first_applied.status_code == 200, first_applied.text
-        tracks = first_applied.json()["variant"]["tracks"]
+        _kind, pid, handler = queue.jobs[0]
+        handler(pid)
+        tracks = client.get(base).json()["tasks"][0]["variant"]["tracks"]
         clip = tracks[0]["clips"][0]
         clip["reframe"]["override"] = {
             "mode": "manual", "keyframes": [{"timeSeconds": clip["inPoint"], "x": .25, "y": .65}],
         }
-        assert client.put(f"{base}/{task['id']}/variant", json={"revision": 1, "tracks": tracks}, headers=INTENT).status_code == 200
+        assert client.put(f"{base}/{task['id']}/variant", json={"revision": 2, "tracks": tracks}, headers=INTENT).status_code == 200
 
         same = client.post(f"{base}/{task['id']}/montage-proposals", json={
-            "revision": 2, "searchIds": [first["inputSnapshot"]["segments"][0]["searchId"]],
+            "revision": 3, "searchIds": [first["inputSnapshot"]["segments"][0]["searchId"]],
             "narration": [{"durationSeconds": 2, "wordBoundariesSeconds": []}], "beatTimes": [],
         }, headers=INTENT)
         assert same.status_code == 201, same.text
         same_proposal = same.json()["proposal"]
         same_applied = client.post(f"{base}/{task['id']}/montage-proposals/{same_proposal['id']}/apply", json={
-            "revision": 2, "proposalRevision": 0, "strategy": "overwrite",
+            "revision": 3, "proposalRevision": 0, "strategy": "overwrite",
         }, headers=INTENT)
         assert same_applied.status_code == 200, same_applied.text
         assert same_applied.json()["variant"]["tracks"][0]["clips"][0]["reframe"]["override"]["mode"] == "manual"
 
         changed_range = client.post(f"{base}/{task['id']}/montage-proposals", json={
-            "revision": 3, "searchIds": [first["inputSnapshot"]["segments"][0]["searchId"]],
+            "revision": 4, "searchIds": [first["inputSnapshot"]["segments"][0]["searchId"]],
             "narration": [{"durationSeconds": 2, "wordBoundariesSeconds": []}], "beatTimes": [],
         }, headers=INTENT).json()["proposal"]
         range_edit = client.put(f"{base}/{task['id']}/montage-proposals/{changed_range['id']}", json={
@@ -1048,7 +1056,7 @@ def test_reapplying_identical_source_preserves_manual_reframe_but_changed_range_
         }, headers=INTENT)
         assert range_edit.status_code == 200, range_edit.text
         range_applied = client.post(f"{base}/{task['id']}/montage-proposals/{changed_range['id']}/apply", json={
-            "revision": 3, "proposalRevision": 1, "strategy": "overwrite",
+            "revision": 4, "proposalRevision": 1, "strategy": "overwrite",
         }, headers=INTENT)
         assert range_applied.status_code == 200, range_applied.text
         assert range_applied.json()["variant"]["tracks"][0]["clips"][0]["reframe"]["override"]["mode"] == "auto"
@@ -1058,9 +1066,9 @@ def test_reapplying_identical_source_preserves_manual_reframe_but_changed_range_
         clip["reframe"]["override"] = {
             "mode": "manual", "keyframes": [{"timeSeconds": clip["inPoint"], "x": .3, "y": .6}],
         }
-        assert client.put(f"{base}/{task['id']}/variant", json={"revision": 4, "tracks": tracks}, headers=INTENT).status_code == 200
+        assert client.put(f"{base}/{task['id']}/variant", json={"revision": 5, "tracks": tracks}, headers=INTENT).status_code == 200
         changed_source = client.post(f"{base}/{task['id']}/montage-proposals", json={
-            "revision": 5, "searchIds": [first["inputSnapshot"]["segments"][0]["searchId"]],
+            "revision": 6, "searchIds": [first["inputSnapshot"]["segments"][0]["searchId"]],
             "narration": [{"durationSeconds": 2, "wordBoundariesSeconds": []}], "beatTimes": [],
         }, headers=INTENT).json()["proposal"]
         source_edit = client.put(f"{base}/{task['id']}/montage-proposals/{changed_source['id']}", json={
@@ -1070,7 +1078,7 @@ def test_reapplying_identical_source_preserves_manual_reframe_but_changed_range_
         }, headers=INTENT)
         assert source_edit.status_code == 200, source_edit.text
         source_applied = client.post(f"{base}/{task['id']}/montage-proposals/{changed_source['id']}/apply", json={
-            "revision": 5, "proposalRevision": 1, "strategy": "overwrite",
+            "revision": 6, "proposalRevision": 1, "strategy": "overwrite",
         }, headers=INTENT)
         assert source_applied.status_code == 200, source_applied.text
         stored = source_applied.json()["variant"]["tracks"][0]["clips"][0]

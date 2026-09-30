@@ -118,6 +118,27 @@ def test_timeline_reframe_invalidates_when_source_changes_while_queued(tmp_path)
     assert record["status"] == "failed"
 
 
+def test_timeline_reframe_source_deleted_while_queued_becomes_retryable_failure(tmp_path):
+    from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint
+    _asset_root(tmp_path)
+    source = tmp_path / "project-files" / PROJECT_ID / "preproduction" / "assets" / "video.mp4"
+    initial_hash = source_fingerprint(source)
+    def analyzer(_source, _identity):
+        return {"schemaVersion": 1, "sourceFingerprint": initial_hash, "sourceWidth": 64, "sourceHeight": 48,
+                "targetAspect": {"width": 1280, "height": 720}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+                "samples": [{"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+                            {"timeSeconds": 2, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9}],
+                "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []}}
+    client, queue = setup(tmp_path, reframe_analyzer=analyzer)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    source.unlink()
+    queue.run()
+    record = client.get(BASE).json()["reframeAnalysis"]["clip1"]
+    assert record["status"] == "failed"
+    assert "素材" in record["error"]
+
+
 def test_rejects_overlapping_video_clips_and_wrong_asset_track_kind(tmp_path):
     client, _ = setup(tmp_path)
     overlapping = _workspace(tracks=[{

@@ -2523,6 +2523,7 @@ def create_app(
     app.include_router(create_timeline_router(
         data_dir, ensure_project_exists, compute_jobs,
         ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, source_lock=project_write_lock,
+        reframe_analyzer=reframe_analyzer,
     ))
     from .batch_editing_api import create_batch_editing_router
     from .local_voice import LocalVoiceService, create_voice_router

@@ -14,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 import sys
 import time
 from typing import Any
@@ -54,32 +55,42 @@ def source_fingerprint(path: Path) -> str:
 
 def run_local_detector(source: Path, *, start: float, end: float, target_width: int, target_height: int,
                        worker_python: str | None = None, model_path: Path | None = None,
+                       worker_path: Path | None = None,
                        cancelled=lambda: False) -> dict[str, Any]:
     """Execute the pinned local worker; it never fetches weights or uploads media."""
     root = Path(__file__).resolve().parents[1]
-    worker = root / "person_worker" / "run_reframe.py"
+    worker = worker_path or root / "person_worker" / "run_reframe.py"
     model = model_path or Path(os.environ.get("AIVRE_REFRAME_MODEL", root / "person_worker" / "models" / "efficientdet_lite0.tflite"))
     runtime = worker_python or os.environ.get("AIVRE_PERSON_WORKER_PYTHON") or str(root / "person_worker" / ".venv" / "bin" / "python")
     if not Path(runtime).is_file() or not model.is_file():
         raise ReframeError("本地主体检测环境或固定模型未就绪；不会自动下载。")
     command = [runtime, str(worker), "--input", str(source), "--model", str(model), "--start", f"{start:.6f}",
                "--end", f"{end:.6f}", "--target-width", str(target_width), "--target-height", str(target_height)]
+    process = None
     try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-        deadline = time.monotonic() + 300
-        while process.poll() is None:
-            if cancelled() or time.monotonic() >= deadline:
-                process.terminate()
-                process.communicate(timeout=5)
-                raise ReframeError("本地主体检测已取消或超时。")
-            time.sleep(.05)
-        stdout, _stderr = process.communicate()
+        # Spool streams while polling: a large successful JSON result must
+        # never fill an OS pipe before the parent drains it.
+        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stdout, tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr:
+            process = subprocess.Popen(command, stdout=stdout, stderr=stderr, text=True, start_new_session=True)
+            deadline = time.monotonic() + 300
+            while process.poll() is None:
+                if cancelled() or time.monotonic() >= deadline:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                    raise ReframeError("本地主体检测已取消或超时。")
+                time.sleep(.05)
+            stdout.seek(0)
+            payload = stdout.read()
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ReframeError("本地主体检测无法启动或超时。") from error
-    if process.returncode != 0:
+    if process is None or process.returncode != 0:
         raise ReframeError("本地主体检测失败，请检查模型与源视频。")
     try:
-        return json.loads(stdout)
+        return json.loads(payload)
     except json.JSONDecodeError as error:
         raise ReframeError("本地主体检测返回无效结果。") from error
 
@@ -154,8 +165,15 @@ def normalize_reframe(value: Any, *, source_fingerprint: str, source_width: int,
     if value["status"] == "ready":
         if value["uncertaintyReasons"] or not samples:
             raise ReframeError("完成的主体裁剪必须有连续检测证据。")
+        # Analysis uses a half-open [start, end) source interval.  The final
+        # decoded frame therefore precedes end; its measured sampling cadence
+        # proves coverage without inventing a timestamp at the exclusive end.
+        sample_step = max((right["timeSeconds"] - left["timeSeconds"]
+                           for left, right in zip(samples, samples[1:])), default=0.0)
         if required_start is not None and required_end is not None and (
-            samples[0]["timeSeconds"] > required_start + .001 or samples[-1]["timeSeconds"] < required_end - .001
+            samples[0]["timeSeconds"] > required_start + .001
+            or samples[-1]["timeSeconds"] > required_end + .001
+            or samples[-1]["timeSeconds"] < required_end - sample_step - .001
         ):
             raise ReframeError("主体裁剪结果未覆盖当前素材区间。")
     elif not value["uncertaintyReasons"]:

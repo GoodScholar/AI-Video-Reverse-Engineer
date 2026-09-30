@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import pytest
+import sys
+import time
 
-from app.montage_reframe import MODEL_SHA256, ReframeError, normalize_reframe, pending_reframe, reframe_filter
+from app.montage_reframe import MODEL_SHA256, ReframeError, normalize_reframe, pending_reframe, reframe_filter, run_local_detector
 
 
 def _analysis(*, override=None, samples=None, status="ready"):
@@ -52,6 +54,24 @@ def test_normalize_reframe_rejects_analysis_for_another_or_invalid_source(field,
         normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080)
 
 
+def test_normalize_reframe_accepts_a_real_half_open_final_frame_only_when_sampling_cadence_covers_it():
+    analysis = _analysis(samples=[
+        {"timeSeconds": 0.0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 1.0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 1.966667, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+    ])
+
+    stored = normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
+                               required_start=0, required_end=2)
+
+    assert stored["samples"][-1]["timeSeconds"] == 1.966667
+    analysis["samples"][1]["timeSeconds"] = .1
+    analysis["samples"][-1]["timeSeconds"] = .9
+    with pytest.raises(ReframeError, match="未覆盖"):
+        normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
+                          required_start=0, required_end=2)
+
+
 def test_reframe_filter_maps_output_time_to_source_time_and_crops_before_scaling():
     """Applying crop after speed conversion would track the wrong source instant."""
     graph = reframe_filter(
@@ -90,3 +110,22 @@ def test_pending_reframe_binds_center_override_to_the_current_real_source_withou
     assert "crop@reframe" in graph
     assert pending["samples"] == []
     assert pending["sourceFingerprint"] == ""
+
+
+def test_local_detector_spools_large_child_output_and_reaps_cancelled_child(tmp_path):
+    source, model = tmp_path / "source.mp4", tmp_path / "model.tflite"
+    source.write_bytes(b"source")
+    model.write_bytes(b"model")
+    writer = tmp_path / "writer.py"
+    writer.write_text("import json; print(json.dumps({'payload': 'x' * 200000}))", encoding="utf-8")
+    result = run_local_detector(source, start=0, end=1, target_width=9, target_height=16,
+                                worker_python=sys.executable, worker_path=writer, model_path=model)
+    assert len(result["payload"]) == 200000
+
+    sleeper = tmp_path / "sleeper.py"
+    sleeper.write_text("import time; time.sleep(30)", encoding="utf-8")
+    started = time.monotonic()
+    with pytest.raises(ReframeError, match="取消"):
+        run_local_detector(source, start=0, end=1, target_width=9, target_height=16,
+                           worker_python=sys.executable, worker_path=sleeper, model_path=model, cancelled=lambda: True)
+    assert time.monotonic() - started < 6

@@ -156,13 +156,19 @@ def inspect_timeline_media(state: dict, assets: dict, resolve_source, format: st
                 collected = _collect_clips([single_track], {clip["assetId"]: source}, ffprobe_path, format, media_cache)[0]
                 media = collected["media"]
                 if clip.get("reframe") is not None:
-                    from .montage_reframe import ReframeError, normalize_reframe, source_fingerprint, validate_stored_reframe
+                    from .montage_reframe import ReframeError, reframe_filter, source_fingerprint, validate_stored_reframe
                     reframe = validate_stored_reframe(clip["reframe"])
                     if reframe["status"] == "review_required" and reframe["override"]["mode"] == "auto":
                         raise ReframeError("主体构图待人工确认，不能渲染。")
-                    if reframe["sourceFingerprint"]:
-                        normalize_reframe(reframe, source_fingerprint=source_fingerprint(source),
-                                          source_width=media.width or 0, source_height=media.height or 0)
+                    # Call the same crop builder as rendering.  It checks
+                    # target aspect, source identity, dimensions, and the
+                    # explicit pending-manual binding path before FFmpeg.
+                    reframe_filter(
+                        reframe, source_width=media.width or 0, source_height=media.height or 0,
+                        output_width=state["settings"]["width"], output_height=state["settings"]["height"],
+                        in_point=clip["inPoint"], speed=clip["speed"], duration=clip["duration"],
+                        source_hash=source_fingerprint(source), crop_name="preflight",
+                    )
                 visible |= track["kind"] == "video" and not track["hidden"] and media.has_video
                 audible |= not track["muted"] and clip["volume"] > 0 and media.has_audio
                 if track["kind"] == "video" and asset.get("kind") != "image" and not track["muted"] and clip["volume"] > 0 and not media.has_audio:

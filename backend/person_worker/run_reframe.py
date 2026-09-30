@@ -40,6 +40,12 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def crop_window_ratios(source_width: int, source_height: int, target_width: int, target_height: int) -> tuple[float, float]:
+    """Normalized width/height retained by the largest full-bleed crop."""
+    target_ratio, source_ratio = target_width / target_height, source_width / source_height
+    return min(1.0, target_ratio / source_ratio), min(1.0, source_ratio / target_ratio)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
@@ -78,7 +84,7 @@ def analyze(source: Path, model: Path, start: float, end: float, target_width: i
         score_threshold=.35, max_results=10,
     )
     samples, reasons, last_timestamp = [], [], -1
-    crop_ratio = min(1.0, (target_width / target_height) / (width / height))
+    crop_width_ratio, crop_height_ratio = crop_window_ratios(width, height, target_width, target_height)
     expected = max(2, round((end - start) * sample_fps) + 1)
     # The requested end is exclusive for FFmpeg/timeline ranges; sampling it
     # exactly can seek one frame beyond a valid stream.
@@ -111,7 +117,7 @@ def analyze(source: Path, model: Path, start: float, end: float, target_width: i
                     reasons.append("未检测到唯一人物主体" if not person else "检测到多个可能主体")
                     continue
                 subject = person[0]
-                if subject["width"] > crop_ratio or subject["height"] > 1:
+                if subject["width"] > crop_width_ratio or subject["height"] > crop_height_ratio:
                     reasons.append("主体框大于目标满幅裁剪窗，可能持续被裁切")
                 if any(box["label"].lower() != "person" for box in boxes):
                     reasons.append("检测到可能商品或遮挡物，无法确认满幅裁剪不会遮挡商品")

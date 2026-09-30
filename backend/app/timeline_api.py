@@ -85,10 +85,12 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 "runs": [public_run(project_id, run) for run in state["runs"]],
                 "reframeAnalysis": state.get("reframeAnalysis", {})}
 
-    def schedule_reframe(project_id, clip_id):
+    def schedule_reframe(project_id, clip_id, *, expected_revision=None):
         run_id = uuid4().hex
         with source_lock or nullcontext(), lock:
             state = state_for(project_id)
+            if expected_revision is not None and state["revision"] != expected_revision:
+                fail("timeline_conflict", "时间线已更新，请刷新后重试。")
             clip = next((item for track in state["tracks"] for item in track["clips"] if item["id"] == clip_id), None)
             if clip is None:
                 fail("reframe_clip_missing", "时间线片段不存在。", 404)
@@ -131,15 +133,20 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                     return
                 if result is None:
                     record.update(status="failed", error=error)
-                elif ({key: clip.get(key) for key in ("assetId", "inPoint", "duration", "speed")} !=
-                      {key: identity[key] for key in ("assetId", "inPoint", "duration", "speed")} or
-                      source_fingerprint(source) != identity["sourceFingerprint"]):
-                    record.update(status="failed", error="分析期间素材或片段已变化，请重新主体分析。")
                 else:
-                    override = clip.get("reframe", {}).get("override")
-                    clip["reframe"] = {**result, **({"override": override} if isinstance(override, dict) and override.get("mode") != "auto" else {})}
-                    record.update(status="completed", error=None)
-                    state["revision"] += 1
+                    try:
+                        current_fingerprint = source_fingerprint(source)
+                    except OSError:
+                        current_fingerprint = None
+                    if ({key: clip.get(key) for key in ("assetId", "inPoint", "duration", "speed")} !=
+                            {key: identity[key] for key in ("assetId", "inPoint", "duration", "speed")}
+                            or current_fingerprint != identity["sourceFingerprint"]):
+                        record.update(status="failed", error="分析期间素材或片段已变化，请重新主体分析。")
+                    else:
+                        override = clip.get("reframe", {}).get("override")
+                        clip["reframe"] = {**result, **({"override": override} if isinstance(override, dict) and override.get("mode") != "auto" else {})}
+                        record.update(status="completed", error=None)
+                        state["revision"] += 1
                 save(project_id, state)
         if not compute_queue.submit("timeline-reframe:" + run_id, project_id, process):
             with lock:
@@ -258,6 +265,10 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                     if recovery.reason == "interrupted":
                         run.update(status=recovery.status, error="服务重启中断了渲染，可重新提交。")
                         changed = True
+                for record in state.get("reframeAnalysis", {}).values():
+                    if record.get("status") in ("queued", "running"):
+                        record.update(status="failed", error="服务重启中断了主体分析，可重新提交。")
+                        changed = True
                 if changed:
                     store.save(project_dir.name, state)
             except (OSError, ValueError):
@@ -276,10 +287,7 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
         project_for(project_id)
         if not isinstance(body, dict) or set(body) != {"revision"} or type(body["revision"]) is not int:
             fail("reframe_request_invalid", "主体分析请求无效。", 422)
-        with lock:
-            if state_for(project_id)["revision"] != body["revision"]:
-                fail("timeline_conflict", "时间线已更新，请刷新后重试。")
-        schedule_reframe(project_id, clip_id)
+        schedule_reframe(project_id, clip_id, expected_revision=body["revision"])
         with lock:
             return response(project_id, state_for(project_id))
 
