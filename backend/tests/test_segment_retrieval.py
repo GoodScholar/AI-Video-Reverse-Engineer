@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -19,6 +20,8 @@ from app.segment_retrieval import (
     SegmentRerankError,
     Siglip2VisualVectorizer,
     create_segment_retrieval_router,
+    load_planning_search,
+    PlanningSearchError,
 )
 from app.source_segment_index import KEYFRAME_MODEL_VERSION, SEGMENT_ALGORITHM_VERSION
 
@@ -260,6 +263,39 @@ def test_disclosed_rerank_sends_only_selected_keyframes_and_binds_provider_revis
     assert sent.contact_sheet_bytes.startswith(b"\xff\xd8")
     assert sent.contact_sheet_bytes.endswith(b"\xff\xd9")
     assert b"source-video" not in sent.contact_sheet_bytes
+
+
+def test_planning_search_expected_no_rerank_becomes_stale_when_rerank_is_added(tmp_path):
+    install_completed_index(tmp_path)
+    reranker = FakeReranker()
+    client = client_for(tmp_path, reranker=reranker)
+    search = client.post(
+        f"/api/projects/{PROJECT_ID}/segment-searches",
+        json={"query": "咖啡产品动作", "limit": 3}, headers=INTENT,
+    ).json()
+
+    assert load_planning_search(
+        tmp_path, PROJECT_ID, search["id"], reranker=reranker,
+        vectorizer_version=FixedVectorizer.version, expected_rerank_id=None,
+    )["rerankId"] is None
+    selected = ["segment-1", "segment-3"]
+    disclosure = client.post(
+        f"/api/projects/{PROJECT_ID}/segment-searches/{search['id']}/rerank-disclosure",
+        json={"candidateIds": selected}, headers=INTENT,
+    ).json()
+    completed = client.post(
+        f"/api/projects/{PROJECT_ID}/segment-searches/{search['id']}/rerank",
+        json={"candidateIds": selected, "digest": disclosure["digest"], "disclosureAccepted": True},
+        headers=INTENT,
+    )
+    assert completed.status_code == 200, completed.text
+
+    with pytest.raises(PlanningSearchError) as caught:
+        load_planning_search(
+            tmp_path, PROJECT_ID, search["id"], reranker=reranker,
+            vectorizer_version=FixedVectorizer.version, expected_rerank_id=None,
+        )
+    assert caught.value.code == "segment_rerank_stale"
 
 
 def start_search_and_disclose(client: TestClient):

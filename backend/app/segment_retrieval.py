@@ -7,6 +7,7 @@ import json
 import math
 import os
 import tempfile
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -85,6 +86,18 @@ class SegmentRerankError(Exception):
         if self.code == "provider_unconfigured":
             return 422
         return 502
+
+
+class PlanningSearchError(Exception):
+    """A saved retrieval result can no longer support a montage proposal."""
+
+    def __init__(self, code: str, message: str):
+        self.code = code
+        self.message = message
+        super().__init__(message)
+
+
+_EXPECTED_RERANK_UNSET = object()
 
 
 class AnalysisProviderSegmentReranker:
@@ -336,6 +349,116 @@ class _RetrievalStore:
         return sorted(values, key=lambda item: (item.get("createdAt", ""), item.get("id", "")), reverse=True)
 
 
+def _current_segment_candidates(
+    root: Path,
+    project_id: str,
+    assets: ProjectAssets,
+    algorithm_version: str,
+    keyframe_model_version: str,
+) -> list[_Candidate]:
+    segment_root = safe_child(root, "project-files", project_id, "source-segments")
+    values: list[_Candidate] = []
+    for state_path in segment_root.glob("*/state.json") if segment_root.is_dir() else []:
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            asset_id = validate_storage_id(state_path.parent.name)
+            asset = assets.get(project_id, asset_id)
+            source = assets.file(project_id, asset)
+            if (
+                state.get("status") != "completed"
+                or state.get("assetId") != asset_id
+                or state.get("sourceFingerprint") != source_fingerprint(source)
+                or state.get("algorithmVersion") != algorithm_version
+                or state.get("keyframeModelVersion") != keyframe_model_version
+            ):
+                continue
+            run_id = validate_storage_id(state["runId"])
+            for item in state.get("candidates", []):
+                filename = validate_storage_id(item["keyframe"]["_filename"])
+                keyframe_path = safe_child(state_path.parent, "runs", run_id, filename)
+                if not keyframe_path.is_file() or keyframe_path.is_symlink():
+                    continue
+                values.append(_Candidate(
+                    candidate_id=validate_storage_id(item["id"]),
+                    asset_id=asset_id,
+                    source_fingerprint=state["sourceFingerprint"],
+                    algorithm_version=state["algorithmVersion"],
+                    keyframe_model_version=state["keyframeModelVersion"],
+                    in_point=float(item["inPointSeconds"]),
+                    out_point=float(item["outPointSeconds"]),
+                    keyframe_time=float(item["keyframe"]["timeSeconds"]),
+                    keyframe_path=keyframe_path,
+                ))
+        except (AssetFileUnavailableError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return sorted(values, key=lambda item: (item.asset_id, item.in_point, item.candidate_id))
+
+
+def load_planning_search(
+    data_dir: Path,
+    project_id: str,
+    search_id: str,
+    *,
+    reranker: Any = None,
+    vectorizer_version: str | None = None,
+    expected_rerank_id: Any = _EXPECTED_RERANK_UNSET,
+) -> dict[str, Any]:
+    """Load a current search and freeze the candidate order used by the planner."""
+    root = Path(data_dir).absolute()
+    validate_storage_id(project_id)
+    validate_storage_id(search_id)
+    store = _RetrievalStore(root)
+    try:
+        state = store.load(project_id, f"searches/{search_id}.json")
+    except FileNotFoundError as error:
+        raise PlanningSearchError("segment_search_not_found", "片段检索结果不存在。") from error
+    except OSError as error:
+        raise PlanningSearchError("segment_search_invalid", "片段检索记录无法读取。") from error
+    if state.get("id") != search_id or not isinstance(state.get("localCandidates"), list):
+        raise PlanningSearchError("segment_search_invalid", "片段检索记录无法读取。")
+    candidates = _current_segment_candidates(
+        root, project_id, ProjectAssets(root), SEGMENT_ALGORITHM_VERSION, KEYFRAME_MODEL_VERSION,
+    )
+    active_vectorizer_version = vectorizer_version or state.get("vectorizerVersion", "")
+    current_index = _catalog_version(candidates, active_vectorizer_version)
+    if not candidates or state.get("indexVersion") != current_index:
+        raise PlanningSearchError("segment_search_stale", "片段索引已变化，请重新执行本地检索。")
+    ranked = None
+    completed = [item for item in state.get("rerankHistory", []) if item.get("status") == "completed"]
+    latest = completed[-1] if completed else None
+    if latest is not None and latest.get("indexVersion") == current_index and reranker is not None:
+        try:
+            snapshot = reranker.snapshot()
+            if latest.get("model") == snapshot.model and latest.get("configurationRevision") == snapshot.configuration_revision:
+                ranked = latest
+        except Exception:
+            ranked = None
+    current_rerank_id = ranked.get("id") if ranked is not None else None
+    if expected_rerank_id is not _EXPECTED_RERANK_UNSET and current_rerank_id != expected_rerank_id:
+        raise PlanningSearchError("segment_rerank_stale", "豆包复排结果已变化，请重新生成混剪提案。")
+    by_id = {item.get("candidateId"): deepcopy(item) for item in state["localCandidates"]}
+    ordered = []
+    if ranked is not None:
+        for item in ranked.get("ranking", []):
+            candidate = by_id.pop(item.get("candidateId"), None)
+            if candidate is not None:
+                candidate["rerank"] = {
+                    "id": ranked["id"], "reason": item["reason"], "confidence": item["confidence"],
+                    "model": ranked["model"], "configurationRevision": ranked["configurationRevision"],
+                }
+                ordered.append(candidate)
+    ordered.extend(by_id.values())
+    return {
+        "id": search_id,
+        "query": state.get("query"),
+        "indexVersion": current_index,
+        "retrievalVersion": state.get("retrievalVersion"),
+        "vectorizerVersion": state.get("vectorizerVersion"),
+        "rerankId": ranked.get("id") if ranked is not None else None,
+        "candidates": ordered,
+    }
+
+
 def _cosine(left: list[float], right: list[float]) -> float:
     if len(left) != len(right) or not left:
         raise ValueError("视觉向量维度不一致")
@@ -455,42 +578,9 @@ def create_segment_retrieval_router(
             fail("project_not_found", "内容项目不存在。", 404)
 
     def current_candidates(project_id: str) -> list[_Candidate]:
-        segment_root = safe_child(root, "project-files", project_id, "source-segments")
-        values: list[_Candidate] = []
-        for state_path in segment_root.glob("*/state.json") if segment_root.is_dir() else []:
-            try:
-                state = json.loads(state_path.read_text(encoding="utf-8"))
-                asset_id = validate_storage_id(state_path.parent.name)
-                asset = assets.get(project_id, asset_id)
-                source = assets.file(project_id, asset)
-                if (
-                    state.get("status") != "completed"
-                    or state.get("assetId") != asset_id
-                    or state.get("sourceFingerprint") != source_fingerprint(source)
-                    or state.get("algorithmVersion") != algorithm_version
-                    or state.get("keyframeModelVersion") != keyframe_model_version
-                ):
-                    continue
-                run_id = validate_storage_id(state["runId"])
-                for item in state.get("candidates", []):
-                    filename = validate_storage_id(item["keyframe"]["_filename"])
-                    keyframe_path = safe_child(state_path.parent, "runs", run_id, filename)
-                    if not keyframe_path.is_file() or keyframe_path.is_symlink():
-                        continue
-                    values.append(_Candidate(
-                        candidate_id=validate_storage_id(item["id"]),
-                        asset_id=asset_id,
-                        source_fingerprint=state["sourceFingerprint"],
-                        algorithm_version=state["algorithmVersion"],
-                        keyframe_model_version=state["keyframeModelVersion"],
-                        in_point=float(item["inPointSeconds"]),
-                        out_point=float(item["outPointSeconds"]),
-                        keyframe_time=float(item["keyframe"]["timeSeconds"]),
-                        keyframe_path=keyframe_path,
-                    ))
-            except (AssetFileUnavailableError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
-                continue
-        return sorted(values, key=lambda item: (item.asset_id, item.in_point, item.candidate_id))
+        return _current_segment_candidates(
+            root, project_id, assets, algorithm_version, keyframe_model_version,
+        )
 
     def load_or_build_index(project_id: str, candidates: list[_Candidate]) -> tuple[str, dict[str, dict[str, Any]]]:
         version = _catalog_version(candidates, visual.version)

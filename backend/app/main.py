@@ -2505,11 +2505,15 @@ def create_app(
         runner=source_segment_runner, ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
         source_lock=project_write_lock,
     ))
-    from .segment_retrieval import AnalysisProviderSegmentReranker, create_segment_retrieval_router
+    from .segment_retrieval import AnalysisProviderSegmentReranker, Siglip2VisualVectorizer, create_segment_retrieval_router
+    resolved_segment_vectorizer = segment_visual_vectorizer or Siglip2VisualVectorizer(
+        Path(data_dir) / "models" / "siglip2-base-p16-224",
+    )
+    resolved_segment_reranker = segment_reranker or AnalysisProviderSegmentReranker(analysis_provider_configurations)
     app.include_router(create_segment_retrieval_router(
         data_dir, ensure_project_exists,
-        vectorizer=segment_visual_vectorizer,
-        reranker=segment_reranker or AnalysisProviderSegmentReranker(analysis_provider_configurations),
+        vectorizer=resolved_segment_vectorizer,
+        reranker=resolved_segment_reranker,
         source_lock=project_write_lock,
     ))
     from .product_images_api import create_product_images_router
@@ -2526,6 +2530,8 @@ def create_app(
     app.include_router(create_batch_editing_router(
         data_dir, ensure_project_exists, compute_jobs,
         ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, source_lock=project_write_lock, voice_service=voice_service,
+        segment_reranker=resolved_segment_reranker,
+        segment_vectorizer_version=resolved_segment_vectorizer.version,
     ))
     from .aigc_content_api import create_aigc_content_router
 

@@ -203,8 +203,13 @@ def save_content(task: dict[str, Any], *, expected_revision: int, selling_point:
     content = (selling_point.strip(), script.strip())
     if content == (task["sellingPoint"], task["script"]):
         return False
+    script_changed = content[1] != task["script"]
     task.update(sellingPoint=content[0], script=content[1],
                 contentRevision=task.get("contentRevision", 0) + 1)
+    subtitles = task["variant"].get("subtitles")
+    if script_changed and subtitles is not None and subtitles.get("cues"):
+        subtitles["cues"] = []
+        subtitles["revision"] += 1
     task.pop("proposal", None)
     return True
 

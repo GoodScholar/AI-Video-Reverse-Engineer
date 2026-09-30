@@ -7,13 +7,125 @@ from types import SimpleNamespace
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from PIL import Image
 
-from app.batch_editing_api import create_batch_editing_router
+from app.batch_editing_api import _shared_montage_usage, create_batch_editing_router
 from app.batch_recommendation import recommend
 from app.main import create_app
 
 
 INTENT = {"x-aivre-intent": "semantic-analysis"}
+
+
+def test_shared_montage_usage_counts_each_sibling_once_and_ignores_deleted_or_stale_selections():
+    sibling = {
+        "id": "task-b",
+        "variant": {"tracks": [{"clips": [{
+            "id": "clip-a", "assetId": "asset-a", "inPoint": 1, "duration": 2,
+        }]}]},
+        "montageProposals": [
+            {
+                "status": "applied",
+                "appliedSelections": [
+                    {"segmentId": "segment-a", "candidateId": "candidate-a", "clipId": "clip-a",
+                     "assetId": "asset-a", "inPoint": 1, "duration": 2},
+                    {"segmentId": "segment-b", "candidateId": "candidate-b", "clipId": "clip-b",
+                     "assetId": "asset-b", "inPoint": 1, "duration": 2},
+                ],
+            },
+            {
+                "status": "draft",
+                "segments": [{"selectedCandidateId": "candidate-a"}],
+            },
+        ],
+    }
+
+    legacy_sibling = {
+        "id": "task-c",
+        "contentRevision": 1,
+        "variant": {"tracks": [{"clips": [{"id": "legacy-a"}]}]},
+        "montageProposals": [
+            {
+                "status": "applied",
+                "segments": [
+                    {"selectedCandidateId": "candidate-c"},
+                    {"selectedCandidateId": "candidate-d"},
+                ],
+                "appliedClipIds": ["legacy-a", "legacy-deleted"],
+            },
+            {
+                "status": "draft",
+                "inputSnapshot": {"contentRevision": 0},
+                "segments": [{"selectedCandidateId": "stale-candidate"}],
+            },
+        ],
+    }
+    replaced_sibling = {
+        "id": "task-d",
+        "variant": {"tracks": [{"clips": [{
+            "id": "clip-x", "assetId": "replacement", "inPoint": 0, "duration": 2,
+        }]}]},
+        "montageProposals": [{
+            "status": "applied",
+            "appliedSelections": [{
+                "segmentId": "segment-x", "candidateId": "candidate-x", "clipId": "clip-x",
+                "assetId": "original", "inPoint": 1, "duration": 2,
+            }],
+        }],
+    }
+
+    assert _shared_montage_usage([{"id": "task-a"}, sibling, legacy_sibling, replaced_sibling], "task-a") == {
+        "candidate-a": 1, "candidate-c": 1,
+    }
+
+
+class MontageVectorizer:
+    version = "montage-test-v1"
+    evidence_basis = "测试关键帧视觉证据"
+
+    def embed_text(self, query):
+        return [1.0, 0.0] if "杯盖" in query else [0.0, 1.0]
+
+    def embed_image(self, path):
+        with Image.open(path) as image:
+            red, _green, blue = image.convert("RGB").resize((1, 1)).getpixel((0, 0))
+        return [1.0, 0.0] if red > blue else [0.0, 1.0]
+
+
+def install_montage_indexes(root, project_id):
+    from app.source_segment_index import KEYFRAME_MODEL_VERSION, SEGMENT_ALGORITHM_VERSION, source_fingerprint
+
+    preproduction = root / "project-files" / project_id / "preproduction"
+    (preproduction / "assets").mkdir(parents=True)
+    assets = []
+    for asset_id, name in (("lid", "杯盖防泼溅"), ("commute", "通勤携带")):
+        filename = f"{asset_id}.mp4"
+        (preproduction / "assets" / filename).write_bytes((asset_id * 20).encode())
+        assets.append({"id": asset_id, "name": name, "kind": "video", "file": filename, "duration": 6})
+    (preproduction / "state.json").write_text(json.dumps({
+        "schemaVersion": 1, "revision": 1, "brief": {}, "shots": [], "assets": assets,
+    }), encoding="utf-8")
+    for asset, color in zip(assets, ((220, 20, 20), (20, 20, 220))):
+        source = preproduction / "assets" / asset["file"]
+        run_id = f"run-{asset['id']}"
+        directory = root / "project-files" / project_id / "source-segments" / asset["id"]
+        keyframe = directory / "runs" / run_id / "keyframe-1.jpg"
+        keyframe.parent.mkdir(parents=True)
+        Image.new("RGB", (160, 90), color).save(keyframe)
+        fingerprint = source_fingerprint(source)
+        candidate_id = f"segment-{asset['id']}"
+        (directory / "state.json").write_text(json.dumps({
+            "schemaVersion": 1, "assetId": asset["id"], "runId": run_id, "attemptId": f"attempt-{asset['id']}",
+            "status": "completed", "sourceFingerprint": fingerprint,
+            "algorithmVersion": SEGMENT_ALGORITHM_VERSION, "keyframeModelVersion": KEYFRAME_MODEL_VERSION,
+            "queuedAt": "2026-09-30T00:00:00+00:00", "startedAt": "2026-09-30T00:00:01+00:00",
+            "completedAt": "2026-09-30T00:00:02+00:00", "updatedAt": "2026-09-30T00:00:02+00:00",
+            "error": None, "validity": {"status": "current", "reason": None}, "durationSeconds": 6,
+            "candidates": [{"id": candidate_id, "assetId": asset["id"], "sourceFingerprint": fingerprint,
+                "algorithmVersion": SEGMENT_ALGORITHM_VERSION, "keyframeModelVersion": KEYFRAME_MODEL_VERSION,
+                "inPointSeconds": 1.0, "outPointSeconds": 5.0,
+                "keyframe": {"timeSeconds": 3.0, "_filename": "keyframe-1.jpg"}}],
+        }), encoding="utf-8")
 
 
 def test_team_can_create_a_batch_task_and_reopen_its_script(tmp_path):
@@ -178,6 +290,323 @@ def test_recommendation_rejects_script_without_content(tmp_path):
                              json={"revision": 0, "assetIds": ["a", "b"]}, headers=INTENT)
         assert result.status_code == 422
         assert result.json()["detail"]["code"] == "batch_script_empty"
+
+
+def test_montage_proposal_is_traceable_and_applies_through_variant_revision_rules(tmp_path):
+    with TestClient(create_app(tmp_path, segment_visual_vectorizer=MontageVectorizer())) as client:
+        project_id = client.post("/api/projects", json={"name": "可解释混剪"}).json()["id"]
+        install_montage_indexes(tmp_path, project_id)
+        searches = [client.post(
+            f"/api/projects/{project_id}/segment-searches",
+            json={"query": query, "limit": 2}, headers=INTENT,
+        ).json() for query in ("展示杯盖防泼溅", "展示通勤携带效果")]
+        base = f"/api/projects/{project_id}/batch-edits"
+        task = client.post(base, json={
+            "sellingPoint": "通勤防泼溅", "script": "展示杯盖防泼溅。展示通勤携带效果。",
+        }, headers=INTENT).json()["task"]
+
+        proposal_request = {
+            "revision": 0,
+            "searchIds": [item["id"] for item in searches],
+            "narration": [
+                {"durationSeconds": 2.4, "wordBoundariesSeconds": [1.2, 2.4]},
+                {"durationSeconds": 2.0, "wordBoundariesSeconds": [1.0, 2.0]},
+            ],
+            "beatTimes": [2.18, 4.4],
+        }
+        created = client.post(f"{base}/{task['id']}/montage-proposals", json=proposal_request, headers=INTENT)
+
+        assert created.status_code == 201, created.text
+        proposal = created.json()["proposal"]
+        assert [item["text"] for item in proposal["segments"]] == ["展示杯盖防泼溅", "展示通勤携带效果"]
+        assert [item["suggestion"]["candidateId"] for item in proposal["segments"]] == ["segment-lid", "segment-commute"]
+        assert proposal["inputSnapshot"]["segments"][0]["searchId"] == searches[0]["id"]
+        assert proposal["revision"] == 0
+        reopened = client.get(base).json()["tasks"][0]["montageProposals"][0]
+        assert reopened["id"] == proposal["id"]
+
+        abandoned = client.post(f"{base}/{task['id']}/montage-proposals/{proposal['id']}/apply", json={
+            "revision": 0, "proposalRevision": 0, "strategy": "abandon",
+        }, headers=INTENT)
+        assert abandoned.status_code == 200
+        assert abandoned.json()["variant"]["revision"] == 0
+        assert abandoned.json()["proposal"]["status"] == "abandoned"
+
+        proposal = client.post(f"{base}/{task['id']}/montage-proposals", json=proposal_request, headers=INTENT).json()["proposal"]
+        assert proposal["id"] != abandoned.json()["proposal"]["id"]
+        assert len(client.get(base).json()["tasks"][0]["montageProposals"]) == 2
+        applied = client.post(f"{base}/{task['id']}/montage-proposals/{proposal['id']}/apply", json={
+            "revision": 0, "proposalRevision": 0, "strategy": "overwrite",
+        }, headers=INTENT)
+        assert applied.status_code == 200, applied.text
+        assert applied.json()["variant"]["revision"] == 1
+        assert [clip["assetId"] for clip in applied.json()["variant"]["tracks"][0]["clips"]] == ["lid", "commute"]
+        conflict = client.post(f"{base}/{task['id']}/montage-proposals/{proposal['id']}/apply", json={
+            "revision": 0, "proposalRevision": 1, "strategy": "overwrite",
+        }, headers=INTENT)
+        assert conflict.status_code == 409
+        assert conflict.json()["detail"]["code"] == "batch_variant_conflict"
+
+        regenerated = client.post(f"{base}/{task['id']}/montage-proposals", json={
+            **proposal_request, "revision": 1,
+        }, headers=INTENT).json()["proposal"]
+        merged = client.post(f"{base}/{task['id']}/montage-proposals/{regenerated['id']}/apply", json={
+            "revision": 1, "proposalRevision": 0, "strategy": "merge",
+        }, headers=INTENT)
+        assert merged.status_code == 200, merged.text
+        merged_clips = merged.json()["variant"]["tracks"][0]["clips"]
+        assert len(merged_clips) == 4
+        assert len({clip["id"] for clip in merged_clips}) == 4
+
+
+def test_montage_proposal_replacement_preserves_suggestion_and_stale_source_blocks_apply(tmp_path):
+    with TestClient(create_app(tmp_path, segment_visual_vectorizer=MontageVectorizer())) as client:
+        project_id = client.post("/api/projects", json={"name": "人工微调"}).json()["id"]
+        install_montage_indexes(tmp_path, project_id)
+        search = client.post(f"/api/projects/{project_id}/segment-searches", json={
+            "query": "展示杯盖防泼溅", "limit": 2,
+        }, headers=INTENT).json()
+        base = f"/api/projects/{project_id}/batch-edits"
+        task = client.post(base, json={"sellingPoint": "防泼溅", "script": "展示杯盖防泼溅。"}, headers=INTENT).json()["task"]
+        proposal = client.post(f"{base}/{task['id']}/montage-proposals", json={
+            "revision": 0, "searchIds": [search["id"]],
+            "narration": [{"durationSeconds": 2.0, "wordBoundariesSeconds": [2.0]}], "beatTimes": [2.05],
+        }, headers=INTENT).json()["proposal"]
+        assert proposal["segments"][0]["timing"]["beatSnap"] == 2.05
+        original_clip = proposal["segments"][0]["selectedClip"]
+
+        changed = client.put(f"{base}/{task['id']}/montage-proposals/{proposal['id']}", json={
+            "revision": 0,
+            "segments": [{"segmentId": proposal["segments"][0]["id"], "candidateId": "segment-commute",
+                "inPointSeconds": 1.5, "durationSeconds": 2.0}],
+        }, headers=INTENT)
+
+        assert changed.status_code == 200, changed.text
+        adjusted = changed.json()["proposal"]
+        assert adjusted["segments"][0]["suggestion"]["candidateId"] == "segment-lid"
+        assert adjusted["segments"][0]["selectedCandidateId"] == "segment-commute"
+        assert adjusted["segments"][0]["selectedClip"]["inPoint"] == 1.5
+        assert adjusted["segments"][0]["selectedClip"]["duration"] == 2.0
+        assert adjusted["segments"][0]["timing"]["beatSnap"] is None
+        assert "人工时长调整改变了节奏位置，已取消原节拍吸附" in adjusted["segments"][0]["reasons"]
+        assert any("人工选择候选 segment-commute" in reason for reason in adjusted["segments"][0]["reasons"])
+        assert any("当前候选本地视觉相关度" in reason for reason in adjusted["segments"][0]["reasons"])
+        assert adjusted["revision"] == 1
+
+        restored = client.put(f"{base}/{task['id']}/montage-proposals/{proposal['id']}", json={
+            "revision": 1,
+            "segments": [{"segmentId": proposal["segments"][0]["id"], "candidateId": "segment-lid",
+                "inPointSeconds": original_clip["inPoint"], "durationSeconds": original_clip["duration"]}],
+        }, headers=INTENT)
+        assert restored.status_code == 200, restored.text
+        restored_proposal = restored.json()["proposal"]
+        assert restored_proposal["segments"][0]["selectedClip"]["id"] == original_clip["id"]
+        assert restored_proposal["revision"] == 2
+
+        source = tmp_path / "project-files" / project_id / "preproduction" / "assets" / "lid.mp4"
+        source.write_bytes(b"changed-source")
+        stale = client.post(f"{base}/{task['id']}/montage-proposals/{proposal['id']}/apply", json={
+            "revision": 0, "proposalRevision": 2, "strategy": "overwrite",
+        }, headers=INTENT)
+        assert stale.status_code == 409
+        assert stale.json()["detail"]["code"] == "montage_proposal_stale"
+
+
+def test_montage_gap_can_be_reallocated_and_short_proposal_cannot_be_applied(tmp_path):
+    with TestClient(create_app(tmp_path, segment_visual_vectorizer=MontageVectorizer())) as client:
+        project_id = client.post("/api/projects", json={"name": "缺口补齐"}).json()["id"]
+        install_montage_indexes(tmp_path, project_id)
+        search = client.post(f"/api/projects/{project_id}/segment-searches", json={
+            "query": "展示杯盖防泼溅", "limit": 2,
+        }, headers=INTENT).json()
+        restricted_search = client.post(f"/api/projects/{project_id}/segment-searches", json={
+            "query": "展示杯盖防泼溅", "limit": 2,
+        }, headers=INTENT).json()
+        restricted_path = (tmp_path / "project-files" / project_id / "segment-retrieval" / "searches"
+                           / f"{restricted_search['id']}.json")
+        restricted_state = json.loads(restricted_path.read_text(encoding="utf-8"))
+        restricted_state["localCandidates"] = [
+            item for item in restricted_state["localCandidates"] if item["candidateId"] == "segment-lid"
+        ]
+        restricted_path.write_text(json.dumps(restricted_state), encoding="utf-8")
+        base = f"/api/projects/{project_id}/batch-edits"
+        task = client.post(base, json={
+            "sellingPoint": "防泼溅", "script": "展示杯盖防泼溅。展示杯盖防泼溅。",
+        }, headers=INTENT).json()["task"]
+        proposal = client.post(f"{base}/{task['id']}/montage-proposals", json={
+            "revision": 0, "searchIds": [search["id"], restricted_search["id"]],
+            "narration": [
+                {"durationSeconds": 2.0, "wordBoundariesSeconds": [2.0]},
+                {"durationSeconds": 2.0, "wordBoundariesSeconds": [2.0]},
+            ], "beatTimes": [],
+        }, headers=INTENT).json()["proposal"]
+
+        assert proposal["segments"][1]["status"] == "gap"
+        assert [item["candidate"]["candidateId"] for item in proposal["segments"][1]["alternatives"]] == ["segment-lid"]
+        changed = client.put(f"{base}/{task['id']}/montage-proposals/{proposal['id']}", json={
+            "revision": 0,
+            "segments": [
+                {"segmentId": "script-segment-1", "candidateId": "segment-commute",
+                    "inPointSeconds": 1.0, "durationSeconds": 2.0},
+                {"segmentId": "script-segment-2", "candidateId": "segment-lid",
+                    "inPointSeconds": 1.0, "durationSeconds": 2.0},
+            ],
+        }, headers=INTENT)
+        assert changed.status_code == 200, changed.text
+        assert [item["status"] for item in changed.json()["proposal"]["segments"]] == ["planned", "planned"]
+        assert changed.json()["proposal"]["unmet"] == []
+
+        short_task = client.post(base, json={"sellingPoint": "时长门禁", "script": "展示杯盖防泼溅。"}, headers=INTENT).json()["task"]
+        short = client.post(f"{base}/{short_task['id']}/montage-proposals", json={
+            "revision": 0, "searchIds": [search["id"]],
+            "narration": [{"durationSeconds": 5.0, "wordBoundariesSeconds": [5.0]}], "beatTimes": [],
+        }, headers=INTENT).json()["proposal"]
+        assert short["unmet"]
+        refused = client.post(f"{base}/{short_task['id']}/montage-proposals/{short['id']}/apply", json={
+            "revision": 0, "proposalRevision": 0, "strategy": "overwrite",
+        }, headers=INTENT)
+        assert refused.status_code == 422
+        assert refused.json()["detail"]["code"] == "montage_proposal_incomplete"
+
+
+def test_montage_merge_appends_after_existing_manual_edit(tmp_path):
+    with TestClient(create_app(tmp_path, segment_visual_vectorizer=MontageVectorizer())) as client:
+        project_id = client.post("/api/projects", json={"name": "合并提案"}).json()["id"]
+        install_montage_indexes(tmp_path, project_id)
+        search = client.post(f"/api/projects/{project_id}/segment-searches", json={
+            "query": "展示杯盖防泼溅", "limit": 2,
+        }, headers=INTENT).json()
+        base = f"/api/projects/{project_id}/batch-edits"
+        task = client.post(base, json={"sellingPoint": "防泼溅", "script": "展示杯盖防泼溅。"}, headers=INTENT).json()["task"]
+        tracks = task["variant"]["tracks"]
+        tracks[0]["clips"] = [{
+            "id": "manual-clip", "assetId": "commute", "start": 0, "inPoint": 0, "duration": 1,
+            "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0,
+        }]
+        saved = client.put(f"{base}/{task['id']}/variant", json={"revision": 0, "tracks": tracks}, headers=INTENT)
+        assert saved.status_code == 200, saved.text
+        proposal = client.post(f"{base}/{task['id']}/montage-proposals", json={
+            "revision": 1, "searchIds": [search["id"]],
+            "narration": [{"durationSeconds": 2.0, "wordBoundariesSeconds": [1.0, 2.0]}], "beatTimes": [],
+        }, headers=INTENT).json()["proposal"]
+
+        merged = client.post(f"{base}/{task['id']}/montage-proposals/{proposal['id']}/apply", json={
+            "revision": 1, "proposalRevision": 0, "strategy": "merge",
+        }, headers=INTENT)
+
+        assert merged.status_code == 200, merged.text
+        clips = merged.json()["variant"]["tracks"][0]["clips"]
+        assert [clip["id"] for clip in clips[:1]] == ["manual-clip"]
+        assert clips[1]["start"] == 1
+        assert merged.json()["variant"]["revision"] == 2
+
+
+def test_montage_beat_spacing_keeps_existing_voiceover_and_subtitles_aligned(tmp_path):
+    with TestClient(create_app(tmp_path, segment_visual_vectorizer=MontageVectorizer())) as client:
+        project_id = client.post("/api/projects", json={"name": "节拍配音同步"}).json()["id"]
+        install_montage_indexes(tmp_path, project_id)
+        preproduction = tmp_path / "project-files" / project_id / "preproduction"
+        asset_state = json.loads((preproduction / "state.json").read_text(encoding="utf-8"))
+        asset_state["assets"].extend([
+            {"id": "voice-a", "name": "第一段配音", "kind": "audio", "file": "voice-a.wav", "duration": 2},
+            {"id": "voice-b", "name": "第二段配音", "kind": "audio", "file": "voice-b.wav", "duration": 2},
+        ])
+        (preproduction / "state.json").write_text(json.dumps(asset_state), encoding="utf-8")
+        searches = [client.post(f"/api/projects/{project_id}/segment-searches", json={
+            "query": query, "limit": 2,
+        }, headers=INTENT).json() for query in ("展示杯盖防泼溅", "展示通勤携带效果")]
+        base = f"/api/projects/{project_id}/batch-edits"
+        task = client.post(base, json={
+            "sellingPoint": "同步", "script": "展示杯盖防泼溅。展示通勤携带效果。",
+        }, headers=INTENT).json()["task"]
+        tracks = task["variant"]["tracks"]
+        tracks[0]["clips"] = [
+            {"id": "old-a", "assetId": "lid", "start": 0, "inPoint": 1, "duration": 2,
+             "speed": 1, "volume": 0, "fadeIn": 0, "fadeOut": 0},
+            {"id": "old-b", "assetId": "commute", "start": 2, "inPoint": 1, "duration": 2,
+             "speed": 1, "volume": 0, "fadeIn": 0, "fadeOut": 0},
+        ]
+        tracks.append({"id": "voiceover", "name": "AI 配音", "kind": "audio", "muted": False, "hidden": False,
+                       "clips": [
+                           {"id": "voice-clip-a", "assetId": "voice-a", "start": 0, "inPoint": 0, "duration": 2,
+                            "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0},
+                           {"id": "voice-clip-b", "assetId": "voice-b", "start": 2, "inPoint": 0, "duration": 2,
+                            "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0},
+                       ]})
+        saved = client.put(f"{base}/{task['id']}/variant", json={"revision": 0, "tracks": tracks}, headers=INTENT)
+        assert saved.status_code == 200, saved.text
+        subtitles = client.put(f"{base}/{task['id']}/subtitles", json={
+            "revision": 0, "timelineRevision": 1, "cues": [
+                {"id": "cue-a", "start": 0, "end": 2, "text": "展示杯盖防泼溅"},
+                {"id": "cue-b", "start": 2, "end": 4, "text": "展示通勤携带效果"},
+            ],
+        }, headers=INTENT)
+        assert subtitles.status_code == 200, subtitles.text
+        proposal = client.post(f"{base}/{task['id']}/montage-proposals", json={
+            "revision": 1, "searchIds": [item["id"] for item in searches],
+            "narration": [
+                {"durationSeconds": 2, "wordBoundariesSeconds": [], "source": "measured_voiceover"},
+                {"durationSeconds": 2, "wordBoundariesSeconds": [], "source": "measured_voiceover"},
+            ], "beatTimes": [2.05, 4.1],
+        }, headers=INTENT).json()["proposal"]
+
+        applied = client.post(f"{base}/{task['id']}/montage-proposals/{proposal['id']}/apply", json={
+            "revision": 1, "proposalRevision": 0, "strategy": "overwrite",
+        }, headers=INTENT)
+
+        assert applied.status_code == 200, applied.text
+        variant = applied.json()["variant"]
+        video = next(track for track in variant["tracks"] if track["id"] == "video")
+        voice = next(track for track in variant["tracks"] if track["id"] == "voiceover")
+        assert [clip["start"] for clip in video["clips"]] == [0, 2.05]
+        assert [clip["start"] for clip in voice["clips"]] == [0, 2.05]
+        assert [cue["start"] for cue in variant["subtitles"]["cues"]] == [0, 2.05]
+
+
+def test_montage_beat_spacing_moves_saved_subtitles_without_a_voiceover_track(tmp_path):
+    with TestClient(create_app(tmp_path, segment_visual_vectorizer=MontageVectorizer())) as client:
+        project_id = client.post("/api/projects", json={"name": "节拍字幕同步"}).json()["id"]
+        install_montage_indexes(tmp_path, project_id)
+        searches = [client.post(f"/api/projects/{project_id}/segment-searches", json={
+            "query": query, "limit": 2,
+        }, headers=INTENT).json() for query in ("展示杯盖防泼溅", "展示通勤携带效果")]
+        base = f"/api/projects/{project_id}/batch-edits"
+        task = client.post(base, json={
+            "sellingPoint": "同步", "script": "展示杯盖防泼溅。展示通勤携带效果。",
+        }, headers=INTENT).json()["task"]
+        tracks = task["variant"]["tracks"]
+        tracks[0]["clips"] = [
+            {"id": "old-a", "assetId": "lid", "start": 0, "inPoint": 1, "duration": 2,
+             "speed": 1, "volume": 0, "fadeIn": 0, "fadeOut": 0},
+            {"id": "old-b", "assetId": "commute", "start": 2, "inPoint": 1, "duration": 2,
+             "speed": 1, "volume": 0, "fadeIn": 0, "fadeOut": 0},
+        ]
+        saved = client.put(f"{base}/{task['id']}/variant", json={"revision": 0, "tracks": tracks}, headers=INTENT)
+        assert saved.status_code == 200, saved.text
+        subtitles = client.put(f"{base}/{task['id']}/subtitles", json={
+            "revision": 0, "timelineRevision": 1, "cues": [
+                {"id": "cue-a", "start": 0, "end": 2, "text": "展示杯盖防泼溅"},
+                {"id": "cue-b", "start": 2, "end": 4, "text": "展示通勤携带效果"},
+            ],
+        }, headers=INTENT)
+        assert subtitles.status_code == 200, subtitles.text
+        proposal = client.post(f"{base}/{task['id']}/montage-proposals", json={
+            "revision": 1, "searchIds": [item["id"] for item in searches],
+            "narration": [
+                {"durationSeconds": 2, "wordBoundariesSeconds": [1, 2], "source": "provided"},
+                {"durationSeconds": 2, "wordBoundariesSeconds": [1, 2], "source": "provided"},
+            ], "beatTimes": [2.05, 4.1],
+        }, headers=INTENT).json()["proposal"]
+
+        applied = client.post(f"{base}/{task['id']}/montage-proposals/{proposal['id']}/apply", json={
+            "revision": 1, "proposalRevision": 0, "strategy": "overwrite",
+        }, headers=INTENT)
+
+        assert applied.status_code == 200, applied.text
+        variant = applied.json()["variant"]
+        video = next(track for track in variant["tracks"] if track["id"] == "video")
+        assert [clip["start"] for clip in video["clips"]] == [0, 2.05]
+        assert [cue["start"] for cue in variant["subtitles"]["cues"]] == [0, 2.05]
 
 
 def test_english_sentences_get_distinct_matches_and_selling_point_evidence():

@@ -192,6 +192,9 @@ def test_review_and_export_reject_a_preview_after_the_edit_version_changes():
 
 def test_saving_changed_content_advances_its_version_and_invalidates_the_review():
     task = create_batch("省时", "操作演示", id_factory=ids("task", "variant"))
+    task["variant"]["subtitles"].update(revision=2, cues=[{
+        "id": "old-cue", "start": 0, "end": 1, "text": "旧脚本字幕",
+    }])
     task["reviews"].append({"id": "review", "runId": "missing", "decision": "approved", "reason": "旧审核",
                             "contentRevision": 0, "variantRevision": 0, "subtitleRevision": 0})
 
@@ -199,6 +202,8 @@ def test_saving_changed_content_advances_its_version_and_invalidates_the_review(
 
     assert changed is True
     assert (task["sellingPoint"], task["script"], task["contentRevision"]) == ("更省时", "新脚本", 1)
+    assert task["variant"]["subtitles"]["cues"] == []
+    assert task["variant"]["subtitles"]["revision"] == 3
     assert review_status(task) == "stale"
     with pytest.raises(BatchProductionError) as error:
         save_content(task, expected_revision=0, selling_point="冲突", script="冲突")

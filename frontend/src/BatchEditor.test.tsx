@@ -331,6 +331,139 @@ describe("BatchEditor", () => {
     expect(screen.getByText("素材选择已变化，请重新推荐后再应用。")).toBeVisible();
   });
 
+  it("生成可解释混剪提案后可保留原建议、替换候选并显式覆盖现有编辑", async () => {
+    const montageTask = { ...task, script: "展示杯盖防泼溅。展示通勤效果。", contentRevision: 0,
+      voiceover: { id: "voice-run", voiceId: "serena", status: "completed", error: null, contentRevision: 0,
+        variantRevision: 0, model: "qwen3-tts", modelRevision: "v1", assetIds: ["voice-1", "voice-2"] } };
+    const clipA = { id: "montage-a", assetId: "lid", start: 0, inPoint: 1, duration: 2,
+      speed: 1, volume: 1, fadeIn: 0, fadeOut: 0 };
+    const clipB = { id: "montage-b", assetId: "alt", start: 0, inPoint: 2, duration: 2,
+      speed: 1, volume: 1, fadeIn: 0, fadeOut: 0 };
+    const secondClip = { id: "montage-c", assetId: "commute", start: 2, inPoint: 1, duration: 2,
+      speed: 1, volume: 1, fadeIn: 0, fadeOut: 0 };
+    const proposal = { id: "montage-proposal-a", revision: 0, status: "draft", plannerVersion: "montage-planner-v1",
+      baseRevision: 0, appliedVariantRevision: null, unmet: [], inputSnapshot: { contentRevision: 0, variantRevision: 0 },
+      clips: [clipA, secondClip], segments: [
+        { id: "script-segment-1", text: "展示杯盖防泼溅", status: "planned", selectedCandidateId: "segment-lid",
+          suggestion: { candidateId: "segment-lid", assetId: "lid", inPointSeconds: 1, outPointSeconds: 5,
+            visualRelevance: .95, quality: { score: .8, evidence: {} }, evidence: { basis: "关键帧视觉证据" } },
+          selectedClip: clipA, alternatives: [{ candidate: { candidateId: "segment-alt", assetId: "alt",
+            inPointSeconds: 1, outPointSeconds: 5, visualRelevance: .75, quality: { score: .8, evidence: {} } }, clip: clipB, unmet: [] }],
+          timing: { narrationDurationSeconds: 2, wordBoundarySeconds: 2, beatSnap: null },
+          reasons: ["本地视觉相关度 0.950"], unmet: [] },
+        { id: "script-segment-2", text: "展示通勤效果", status: "planned", selectedCandidateId: "segment-commute",
+          suggestion: { candidateId: "segment-commute", assetId: "commute", inPointSeconds: 1, outPointSeconds: 5,
+            visualRelevance: .94, quality: { score: .8, evidence: {} }, evidence: { basis: "关键帧视觉证据" } },
+          selectedClip: secondClip, alternatives: [], timing: { narrationDurationSeconds: 2, wordBoundarySeconds: 2, beatSnap: null },
+          reasons: ["本地视觉相关度 0.940"], unmet: [] },
+      ] };
+    const adjusted = { ...proposal, revision: 1, clips: [{ ...clipB, inPoint: 1.5, duration: 2 }, secondClip], segments: [
+      { ...proposal.segments[0], selectedCandidateId: "segment-alt", selectedClip: { ...clipB, inPoint: 1.5, duration: 2 } },
+      proposal.segments[1],
+    ] };
+    vi.mocked(fetch).mockResolvedValueOnce(response({ tasks: [montageTask], assets: [
+      { id: "lid", name: "杯盖画面", kind: "video", duration: 6 },
+      { id: "commute", name: "通勤画面", kind: "video", duration: 6 },
+      { id: "alt", name: "备用画面", kind: "video", duration: 6 },
+      { id: "voice-1", name: "第一段配音", kind: "audio", duration: 2 },
+      { id: "voice-2", name: "第二段配音", kind: "audio", duration: 2 },
+    ] })).mockResolvedValueOnce(response({ id: "search-1" }))
+      .mockResolvedValueOnce(response({ id: "search-2" }))
+      .mockResolvedValueOnce(response({ proposal }))
+      .mockResolvedValueOnce(response({ proposal: adjusted }))
+      .mockResolvedValueOnce(response({ proposal: { ...adjusted, revision: 2, status: "applied" },
+        variant: { ...task.variant, revision: 1, tracks: [{ ...task.variant.tracks[0], clips: adjusted.clips }, task.variant.tracks[1]] } }));
+    render(<BatchEditor projectId="p1" presentation="edit" />);
+    await screen.findByRole("heading", { name: "省时 · 短视频变体" });
+
+    await userEvent.click(screen.getByRole("button", { name: "生成可解释混剪提案" }));
+
+    expect(await screen.findByText("系统原建议：杯盖画面 1.000–5.000 秒")).toBeVisible();
+    expect(JSON.parse(String(vi.mocked(fetch).mock.calls[3][1]?.body))).toEqual(expect.objectContaining({
+      revision: 0, searchIds: ["search-1", "search-2"],
+    }));
+    expect(JSON.parse(String(vi.mocked(fetch).mock.calls[3][1]?.body)).narration[0]).toEqual({
+      durationSeconds: 2, wordBoundariesSeconds: [], source: "measured_voiceover",
+    });
+    await userEvent.selectOptions(screen.getByLabelText("第 1 段候选片段"), "segment-alt");
+    expect(screen.getByRole("button", { name: "生成可解释混剪提案" })).toBeDisabled();
+    await userEvent.clear(screen.getByLabelText("第 1 段源入点（秒）"));
+    await userEvent.type(screen.getByLabelText("第 1 段源入点（秒）"), "1.5");
+    await userEvent.clear(screen.getByLabelText("第 1 段画面时长（秒）"));
+    await userEvent.type(screen.getByLabelText("第 1 段画面时长（秒）"), "2");
+    await userEvent.click(screen.getByRole("button", { name: "保存提案调整" }));
+    expect(JSON.parse(String(vi.mocked(fetch).mock.calls[4][1]?.body))).toEqual({ revision: 0, segments: [
+      { segmentId: "script-segment-1", candidateId: "segment-alt", inPointSeconds: 1.5, durationSeconds: 2 },
+      { segmentId: "script-segment-2", candidateId: "segment-commute", inPointSeconds: 1, durationSeconds: 2 },
+    ] });
+    expect(screen.getByText("系统原建议：杯盖画面 1.000–5.000 秒")).toBeVisible();
+    await userEvent.click(screen.getByRole("radio", { name: "覆盖当前人工编辑" }));
+    await userEvent.click(screen.getByRole("button", { name: "采用混剪提案" }));
+    expect(JSON.parse(String(vi.mocked(fetch).mock.calls[5][1]?.body))).toEqual({
+      revision: 0, proposalRevision: 1, strategy: "overwrite",
+    });
+    expect(await screen.findByText("提案已写入变体第 1 版，可继续编辑。" )).toBeVisible();
+  });
+
+  it("没有既有镜头或配音时仍可用明确标记的估时生成首轮提案", async () => {
+    const taskWithStaleCue = { ...task, variant: { ...task.variant, subtitles: {
+      revision: 1, recognitions: [], cues: [{ id: "old-cue", start: 0, end: 9, text: "旧脚本字幕" }],
+    } } };
+    const proposal = { id: "montage-estimated", revision: 0, status: "draft", plannerVersion: "montage-planner-v1",
+      baseRevision: 0, appliedVariantRevision: null,
+      inputSnapshot: { contentRevision: 0, variantRevision: 0 }, clips: [],
+      unmet: [{ segmentId: "script-segment-1", message: "没有可用素材" }],
+      segments: [{ id: "script-segment-1", text: task.script, status: "gap", selectedCandidateId: null,
+        suggestion: null, selectedClip: null, alternatives: [],
+        timing: { narrationDurationSeconds: 2.42, wordBoundarySeconds: 2.42, beatSnap: null },
+        reasons: ["旁白总时长来自文本估算"], unmet: ["没有可用素材"] }] };
+    vi.mocked(fetch).mockResolvedValueOnce(response({ tasks: [taskWithStaleCue], assets: [] }))
+      .mockResolvedValueOnce(response({ id: "search-estimated" }))
+      .mockResolvedValueOnce(response({ proposal }));
+    render(<BatchEditor projectId="p1" presentation="edit" />);
+    await screen.findByRole("heading", { name: "省时 · 短视频变体" });
+
+    await userEvent.click(screen.getByRole("button", { name: "生成可解释混剪提案" }));
+
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[2][1]?.body));
+    expect(body.narration).toEqual([{
+      durationSeconds: 2.42, wordBoundariesSeconds: [], source: "estimated_text",
+    }]);
+    expect(await screen.findByText(/首轮提案使用明确标记的文本估时/)).toBeVisible();
+  });
+
+  it("放弃混剪提案时保留未保存的人工时间线草稿", async () => {
+    const existingClip = { id: "existing", assetId: "existing-asset", start: 0, inPoint: 0, duration: 2,
+      speed: 1, volume: 1, fadeIn: 0, fadeOut: 0 };
+    const proposedClip = { ...existingClip, id: "proposed", inPoint: 1 };
+    const proposal = { id: "montage-proposal-abandon", revision: 0, status: "draft", plannerVersion: "montage-planner-v1",
+      baseRevision: 0, appliedVariantRevision: null, unmet: [], inputSnapshot: { contentRevision: 0, variantRevision: 0 },
+      clips: [proposedClip], segments: [{ id: "script-segment-1", text: "展示产品", status: "planned",
+        selectedCandidateId: "candidate-a", suggestion: { candidateId: "candidate-a", assetId: "existing-asset",
+          inPointSeconds: 1, outPointSeconds: 4, visualRelevance: .9, quality: { score: .8, evidence: {} } },
+        selectedClip: proposedClip, alternatives: [], timing: { narrationDurationSeconds: 2, wordBoundarySeconds: 2, beatSnap: null },
+        reasons: ["本地视觉相关度 0.900"], unmet: [] }] };
+    const variant = { ...task.variant, tracks: [{ ...task.variant.tracks[0], clips: [existingClip] }, task.variant.tracks[1]] };
+    const withProposal = { ...task, script: "展示产品。", variant, montageProposals: [proposal] };
+    vi.mocked(fetch).mockResolvedValueOnce(response({ tasks: [withProposal], assets: [
+      { id: "existing-asset", name: "现有画面", kind: "video", duration: 6 },
+    ] })).mockResolvedValueOnce(response({ proposal: { ...proposal, revision: 1, status: "abandoned" }, variant }));
+    render(<BatchEditor projectId="p1" presentation="edit" />);
+    await screen.findByRole("heading", { name: "省时 · 短视频变体" });
+
+    const start = screen.getByLabelText("现有画面 起点（秒）");
+    await userEvent.clear(start);
+    await userEvent.type(start, "1");
+    await userEvent.click(screen.getByRole("radio", { name: "合并到当前编辑末尾" }));
+    expect(screen.getByRole("button", { name: "采用混剪提案" })).toBeDisabled();
+    await userEvent.click(screen.getByRole("radio", { name: "放弃本次提案" }));
+    expect(screen.getByRole("button", { name: "采用混剪提案" })).toBeEnabled();
+    await userEvent.click(screen.getByRole("button", { name: "采用混剪提案" }));
+
+    expect(await screen.findByText("已放弃本次混剪提案，当前编辑未改变。")).toBeVisible();
+    expect(screen.getByLabelText("现有画面 起点（秒）")).toHaveValue(1);
+  });
+
   it("一次提交五条脚本并集中比较每条的卖点、镜头和预览状态", async () => {
     const assets = Array.from({ length: 5 }, (_, index) => ({ id: `shot${index}`, name: `素材${index + 1}`,
       kind: "video", duration: 3, url: `/shot${index}.mp4` }));

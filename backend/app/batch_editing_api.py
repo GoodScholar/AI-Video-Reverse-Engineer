@@ -1,6 +1,7 @@
 """Project-scoped batch editing tasks and independent short-video variants."""
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -40,10 +41,12 @@ from .batch_production import (
 from .batch_recommendation import RecommendationError, recommend
 from .batch_subtitles import milliseconds, parse_srt, write_srt
 from .durable_runs import LOCAL_RUN_POLICY, freeze_run_input
+from .montage_planner import MontagePlanningError, plan_montage, split_script_segments
 from .preproduction import safe_child
 from .project_assets import ProjectAssets
 from .reference_video import validate_storage_id
 from .render_inputs import RenderInputError, RenderInputPreparation
+from .segment_retrieval import PlanningSearchError, load_planning_search
 from .timeline import validate_workspace
 from .video_aspect import PRODUCT_PRESETS, ratio_label, valid_aspect_mode
 
@@ -113,6 +116,61 @@ def _validate_media_properties(media: Any, message: str) -> None:
             or type(media.get("fps")) not in (int, float) or media["fps"] <= 0
             or type(media.get("duration")) not in (int, float) or media["duration"] <= 0):
         raise ValueError(message)
+
+
+def _shared_montage_usage(batch_members: list[dict[str, Any]], current_task_id: str) -> dict[str, int]:
+    usage: dict[str, int] = {}
+    for sibling in (item for item in batch_members if item["id"] != current_task_id):
+        sibling_proposals = sibling.get("montageProposals", [])
+        current_clips = {
+            clip["id"]: clip for track in sibling["variant"]["tracks"] for clip in track.get("clips", [])
+        }
+        current_clip_ids = set(current_clips)
+        candidate_ids = set()
+        latest_draft = next((item for item in reversed(sibling_proposals)
+                             if item.get("status") == "draft"
+                             and item.get("inputSnapshot", {}).get("contentRevision")
+                             == sibling.get("contentRevision", 0)), None)
+        if latest_draft is not None:
+            candidate_ids.update(
+                item["selectedCandidateId"] for item in latest_draft.get("segments", [])
+                if item.get("selectedCandidateId")
+            )
+        for applied_proposal in (item for item in sibling_proposals if item.get("status") == "applied"):
+            selections = applied_proposal.get("appliedSelections")
+            if isinstance(selections, list):
+                segments_by_id = {item.get("id"): item for item in applied_proposal.get("segments", [])}
+                for selection in selections:
+                    current_clip = current_clips.get(selection.get("clipId"))
+                    segment_clip = (segments_by_id.get(selection.get("segmentId")) or {}).get("selectedClip") or {}
+                    expected = {
+                        "assetId": selection.get("assetId", segment_clip.get("assetId")),
+                        "inPoint": selection.get("inPoint", segment_clip.get("inPoint")),
+                        "duration": selection.get("duration", segment_clip.get("duration")),
+                    }
+                    identity_matches = current_clip is not None and all(
+                        expected[key] is None or current_clip.get(key) == expected[key]
+                        for key in expected
+                    )
+                    if identity_matches and selection.get("candidateId"):
+                        candidate_ids.add(selection["candidateId"])
+            else:
+                segments = applied_proposal.get("segments", [])
+                applied_clip_ids = applied_proposal.get("appliedClipIds")
+                if isinstance(applied_clip_ids, list) and len(applied_clip_ids) == len(segments):
+                    candidate_ids.update(
+                        segment["selectedCandidateId"] for segment, clip_id in zip(segments, applied_clip_ids)
+                        if clip_id in current_clip_ids and segment.get("selectedCandidateId")
+                    )
+                else:
+                    candidate_ids.update(
+                        segment["selectedCandidateId"] for segment in segments
+                        if (segment.get("selectedClip") or {}).get("id") in current_clip_ids
+                        and segment.get("selectedCandidateId")
+                    )
+        for candidate_id in candidate_ids:
+            usage[candidate_id] = usage.get(candidate_id, 0) + 1
+    return usage
 
 
 def _validate_state(value: Any) -> None:
@@ -285,7 +343,7 @@ class BatchStore:
                 temporary.unlink(missing_ok=True)
 
 
-def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", source_lock=None, renderer=None, voice_service=None):
+def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", source_lock=None, renderer=None, voice_service=None, segment_reranker=None, segment_vectorizer_version=None):
     store = BatchStore(Path(data_dir))
     project_assets = ProjectAssets(Path(data_dir))
     render_inputs = RenderInputPreparation(project_assets)
@@ -814,6 +872,292 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             task["proposal"] = proposal
             save(project_id, state)
             return {"proposal": proposal}
+
+    def montage_proposal_for(task: dict[str, Any], proposal_id: str) -> dict[str, Any]:
+        try:
+            validate_storage_id(proposal_id)
+            return next(item for item in task.get("montageProposals", []) if item.get("id") == proposal_id)
+        except (ValueError, StopIteration):
+            raise HTTPException(404, detail={"code": "montage_proposal_missing", "message": "混剪提案不存在。"}) from None
+
+    rerank_expectation_unset = object()
+
+    def planning_search(project_id: str, search_id: str, expected_rerank_id: Any = rerank_expectation_unset) -> dict[str, Any]:
+        try:
+            kwargs = {
+                "reranker": segment_reranker,
+                "vectorizer_version": segment_vectorizer_version,
+            }
+            if expected_rerank_id is not rerank_expectation_unset:
+                kwargs["expected_rerank_id"] = expected_rerank_id
+            return load_planning_search(data_dir, project_id, search_id, **kwargs)
+        except PlanningSearchError as error:
+            status = 404 if error.code == "segment_search_not_found" else 409
+            raise HTTPException(status, detail={"code": error.code, "message": error.message}) from None
+
+    @router.post("/{task_id}/montage-proposals", status_code=201)
+    def create_montage_proposal(project_id: str, task_id: str, body: dict[str, Any]):
+        project_for(project_id)
+        if (not isinstance(body, dict) or set(body) != {"revision", "searchIds", "narration", "beatTimes"}
+                or type(body.get("revision")) is not int
+                or not isinstance(body.get("searchIds"), list)
+                or not isinstance(body.get("narration"), list)
+                or not isinstance(body.get("beatTimes"), list)
+                or any(not _valid_id(value) for value in body["searchIds"])):
+            raise HTTPException(422, detail={"code": "montage_request_invalid", "message": "混剪提案输入无效。"})
+        with source_lock or nullcontext(), lock:
+            state = state_for(project_id)
+            task = task_for(state, task_id)
+            if body["revision"] != task["variant"]["revision"]:
+                raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "变体已更新，请刷新后重试。"})
+            texts = split_script_segments(task["script"])
+            if not texts or len(texts) != len(body["searchIds"]) or len(texts) != len(body["narration"]):
+                raise HTTPException(422, detail={"code": "montage_script_mismatch", "message": "每个脚本段落都需要一份检索结果和旁白时长。"})
+            segment_inputs = []
+            for index, (text, search_id, narration) in enumerate(zip(texts, body["searchIds"], body["narration"]), start=1):
+                if (not isinstance(narration, dict)
+                        or set(narration) not in ({"durationSeconds", "wordBoundariesSeconds"},
+                                                  {"durationSeconds", "wordBoundariesSeconds", "source"})
+                        or type(narration.get("durationSeconds")) not in (int, float)
+                        or not isinstance(narration.get("wordBoundariesSeconds"), list)
+                        or narration.get("source", "provided") not in (
+                            "provided", "measured_voiceover", "subtitle_cue", "estimated_text",
+                        )):
+                    raise HTTPException(422, detail={"code": "montage_narration_invalid", "message": "旁白时长或词边界无效。"})
+                search = planning_search(project_id, search_id)
+                if search["query"].strip() != text:
+                    raise HTTPException(422, detail={"code": "montage_search_mismatch", "message": f"脚本第 {index} 段的检索文字不一致，请重新检索。"})
+                segment_inputs.append({
+                    "id": f"script-segment-{index}", "text": text,
+                    "narrationDurationSeconds": narration["durationSeconds"],
+                    "wordBoundariesSeconds": narration["wordBoundariesSeconds"],
+                    "narrationSource": narration.get("source", "provided"),
+                    "searchId": search["id"], "indexVersion": search["indexVersion"],
+                    "retrievalVersion": search["retrievalVersion"], "vectorizerVersion": search["vectorizerVersion"],
+                    "rerankId": search["rerankId"], "candidates": search["candidates"],
+                })
+            batch_members = [item for item in state["tasks"] if item.get("batchId") == task.get("batchId")] if task.get("batchId") else [task]
+            shared_usage = _shared_montage_usage(batch_members, task["id"])
+            variant_ordinal = next((position for position, item in enumerate(batch_members) if item["id"] == task["id"]), 0)
+            try:
+                proposal = plan_montage(
+                    task_id=task["id"], variant_id=task["variant"]["id"],
+                    content_revision=task.get("contentRevision", 0), variant_revision=task["variant"]["revision"],
+                    segments=segment_inputs, beat_times=body["beatTimes"], shared_usage=shared_usage,
+                    variant_ordinal=variant_ordinal,
+                    proposal_generation=len(task.get("montageProposals", [])),
+                )
+            except MontagePlanningError as error:
+                raise HTTPException(422, detail={"code": error.code, "message": error.message}) from None
+            proposal.update(revision=0, status="draft", appliedVariantRevision=None)
+            for item in proposal["segments"]:
+                item["selectedCandidateId"] = item["suggestion"]["candidateId"] if item["suggestion"] else None
+            proposals = task.setdefault("montageProposals", [])
+            proposals.append(proposal)
+            save(project_id, state)
+            return {"proposal": deepcopy(proposal)}
+
+    @router.put("/{task_id}/montage-proposals/{proposal_id}")
+    def update_montage_proposal(project_id: str, task_id: str, proposal_id: str, body: dict[str, Any]):
+        project_for(project_id)
+        if (not isinstance(body, dict) or set(body) != {"revision", "segments"} or type(body.get("revision")) is not int
+                or not isinstance(body.get("segments"), list)):
+            raise HTTPException(422, detail={"code": "montage_adjustment_invalid", "message": "提案调整无效。"})
+        with source_lock or nullcontext(), lock:
+            state = state_for(project_id)
+            task = task_for(state, task_id)
+            proposal = montage_proposal_for(task, proposal_id)
+            if body["revision"] != proposal["revision"]:
+                raise HTTPException(409, detail={"code": "montage_proposal_conflict", "message": "混剪提案已更新，请刷新后重试。"})
+            if proposal.get("status") != "draft":
+                raise HTTPException(409, detail={"code": "montage_proposal_closed", "message": "混剪提案已采用或放弃，请重新生成。"})
+            by_segment = {item["id"]: item for item in proposal["segments"]}
+            input_by_segment = {item["id"]: item for item in proposal["inputSnapshot"]["segments"]}
+            seen = set()
+            for adjustment in body["segments"]:
+                if (not isinstance(adjustment, dict) or set(adjustment) != {"segmentId", "candidateId", "inPointSeconds", "durationSeconds"}
+                        or adjustment["segmentId"] in seen or adjustment["segmentId"] not in by_segment
+                        or type(adjustment["inPointSeconds"]) not in (int, float)
+                        or type(adjustment["durationSeconds"]) not in (int, float)):
+                    raise HTTPException(422, detail={"code": "montage_adjustment_invalid", "message": "提案段落调整无效。"})
+                seen.add(adjustment["segmentId"])
+                source = input_by_segment[adjustment["segmentId"]]
+                candidate = next((item for item in source["candidates"] if item.get("candidateId") == adjustment["candidateId"]), None)
+                start = float(adjustment["inPointSeconds"])
+                duration = float(adjustment["durationSeconds"])
+                if (candidate is None or not math.isfinite(start) or not math.isfinite(duration) or duration <= 0
+                        or start < candidate["inPointSeconds"] or start + duration > candidate["outPointSeconds"] + 1e-8):
+                    raise HTTPException(422, detail={"code": "montage_adjustment_out_of_range", "message": "调整后的入点或时长超出候选源区间。"})
+                target = by_segment[adjustment["segmentId"]]
+                previous_clip = target.get("selectedClip")
+                selection_changed = (
+                    target.get("selectedCandidateId") != candidate["candidateId"]
+                    or previous_clip is None
+                    or abs(float(previous_clip["inPoint"]) - start) > 1e-8
+                    or abs(float(previous_clip["duration"]) - duration) > 1e-8
+                )
+                clip_id = (
+                    (target.get("suggestionClip") or {}).get("id")
+                    or f"montage-clip-{hashlib.sha256((target['id'] + ':' + candidate['candidateId']).encode()).hexdigest()[:20]}"
+                    if (target.get("suggestion") or {}).get("candidateId") == candidate["candidateId"]
+                    else next((item["clip"]["id"] for item in target["alternatives"]
+                               if item["candidate"]["candidateId"] == candidate["candidateId"]),
+                              (target.get("selectedClip") or {}).get("id"))
+                )
+                target["selectedCandidateId"] = candidate["candidateId"]
+                target["selectedClip"] = {
+                    "id": clip_id, "assetId": candidate["assetId"], "start": (target.get("selectedClip") or {}).get("start", 0),
+                    "inPoint": start, "duration": duration, "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0,
+                }
+                required_duration = float(target["timing"]["narrationDurationSeconds"])
+                target["unmet"] = [] if duration >= required_duration - 0.001 else [
+                    f"人工调整后仅有 {duration:.3f} 秒，短于旁白所需 {required_duration:.3f} 秒"
+                ]
+                target["status"] = "gap" if target["unmet"] else "planned"
+                if selection_changed:
+                    timing_reasons = [reason for reason in target.get("reasons", [])
+                                      if reason.startswith(("按旁白", "镜头结束", "节拍"))]
+                    target["reasons"] = timing_reasons + [
+                        f"人工选择候选 {candidate['candidateId']}，系统原建议保留用于对照",
+                        f"当前候选本地视觉相关度 {candidate['visualRelevance']:.3f}，素材质量 {candidate['quality']['score']:.3f}",
+                        str(candidate.get("evidence", {}).get("basis") or "使用片段关键帧视觉证据"),
+                        f"相似构图风险：{candidate.get('duplicateRisk', {}).get('level', 'unknown')}",
+                    ]
+                    if isinstance(candidate.get("rerank"), dict):
+                        target["reasons"].append(
+                            f"豆包复排置信度 {candidate['rerank']['confidence']:.3f}：{candidate['rerank']['reason']}"
+                        )
+            used_candidates = set()
+            used_ranges: dict[str, list[tuple[float, float]]] = {}
+            timeline_position = 0.0
+            for item in proposal["segments"]:
+                clip = item.get("selectedClip")
+                candidate_id = item.get("selectedCandidateId")
+                if clip is None or candidate_id is None:
+                    timeline_position += item["timing"]["narrationDurationSeconds"]
+                    continue
+                source_start = float(clip["inPoint"])
+                source_end = source_start + float(clip["duration"])
+                if candidate_id in used_candidates or any(
+                    source_start < end and source_end > start for start, end in used_ranges.get(clip["assetId"], [])
+                ):
+                    raise HTTPException(422, detail={"code": "montage_adjustment_overlap", "message": "同一提案不能重复或重叠使用素材片段。"})
+                used_candidates.add(candidate_id)
+                used_ranges.setdefault(clip["assetId"], []).append((source_start, source_end))
+                clip["start"] = round(timeline_position, 6)
+                timeline_position += float(clip["duration"])
+                beat_snap = item["timing"].get("beatSnap")
+                if beat_snap is not None and abs(float(beat_snap) - timeline_position) > 0.001:
+                    item["timing"]["beatSnap"] = None
+                    item["reasons"] = [reason for reason in item.get("reasons", [])
+                                       if not reason.startswith("镜头结束")]
+                    item["reasons"].append("人工时长调整改变了节奏位置，已取消原节拍吸附")
+            proposal["clips"] = [item["selectedClip"] for item in proposal["segments"] if item.get("selectedClip")]
+            proposal["unmet"] = [{"segmentId": item["id"], "message": message}
+                                 for item in proposal["segments"] for message in item.get("unmet", [])]
+            proposal.update(revision=proposal["revision"] + 1, status="draft")
+            save(project_id, state)
+            return {"proposal": deepcopy(proposal)}
+
+    @router.post("/{task_id}/montage-proposals/{proposal_id}/apply")
+    def apply_montage_proposal(project_id: str, task_id: str, proposal_id: str, body: dict[str, Any]):
+        project_for(project_id)
+        if (not isinstance(body, dict) or set(body) != {"revision", "proposalRevision", "strategy"}
+                or type(body.get("revision")) is not int or type(body.get("proposalRevision")) is not int
+                or body.get("strategy") not in ("overwrite", "merge", "abandon")):
+            raise HTTPException(422, detail={"code": "montage_apply_invalid", "message": "请选择覆盖、合并或放弃提案。"})
+        with source_lock or nullcontext(), lock:
+            state = state_for(project_id)
+            task = task_for(state, task_id)
+            proposal = montage_proposal_for(task, proposal_id)
+            if body["revision"] != task["variant"]["revision"]:
+                raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "变体已更新，请刷新后重试。"})
+            if body["proposalRevision"] != proposal["revision"]:
+                raise HTTPException(409, detail={"code": "montage_proposal_conflict", "message": "混剪提案已更新，请刷新后重试。"})
+            if proposal.get("status") != "draft":
+                raise HTTPException(409, detail={"code": "montage_proposal_closed", "message": "混剪提案已采用或放弃，请重新生成。"})
+            if proposal["inputSnapshot"]["contentRevision"] != task.get("contentRevision", 0):
+                raise HTTPException(409, detail={"code": "montage_proposal_stale", "message": "脚本已变化，请重新生成混剪提案。"})
+            if body["strategy"] == "abandon":
+                proposal.update(status="abandoned", revision=proposal["revision"] + 1)
+                save(project_id, state)
+                return {"proposal": deepcopy(proposal), "variant": public_task(project_id, task)["variant"]}
+            try:
+                for segment in proposal["inputSnapshot"]["segments"]:
+                    search = planning_search(project_id, segment["searchId"], segment.get("rerankId"))
+                    if search["indexVersion"] != segment["indexVersion"]:
+                        raise PlanningSearchError("segment_search_stale", "片段索引已变化，请重新执行本地检索。")
+            except (PlanningSearchError, HTTPException) as error:
+                message = error.message if isinstance(error, PlanningSearchError) else error.detail.get("message", "提案来源已过期。")
+                raise HTTPException(409, detail={"code": "montage_proposal_stale", "message": message}) from None
+            if (proposal.get("unmet") or any(item.get("unmet") for item in proposal["segments"])
+                    or len(proposal["clips"]) != len(proposal["segments"])):
+                raise HTTPException(422, detail={"code": "montage_proposal_incomplete", "message": "提案仍有未满足段落，请先补齐候选。"})
+            tracks = deepcopy(task["variant"]["tracks"])
+            video_track = next((track for track in tracks if track["kind"] == "video"), None)
+            if video_track is None:
+                raise HTTPException(422, detail={"code": "batch_variant_invalid", "message": "变体缺少画面轨道。"})
+            proposed_clips = deepcopy(proposal["clips"])
+            adjusted_subtitles = None
+            if body["strategy"] == "merge" and video_track["clips"]:
+                offset = max(clip["start"] + clip["duration"] for clip in video_track["clips"])
+                used_clip_ids = {clip["id"] for track in tracks for clip in track.get("clips", [])}
+                remapped = []
+                for index, clip in enumerate(proposed_clips, start=1):
+                    clip_id = clip["id"]
+                    if clip_id in used_clip_ids:
+                        clip_id = f"{clip_id}-{proposal['id'][-8:]}-{index}"
+                    remapped.append({**clip, "id": clip_id, "start": round(clip["start"] + offset, 6)})
+                    used_clip_ids.add(clip_id)
+                proposed_clips = remapped
+                video_track["clips"].extend(proposed_clips)
+            else:
+                video_track["clips"] = proposed_clips
+                voice_track = next((track for track in tracks if track.get("id") == "voiceover"
+                                    and track.get("kind") == "audio"), None)
+                subtitle_timing = proposed_clips
+                use_voice_timing = voice_track is not None and len(voice_track.get("clips", [])) == len(proposed_clips)
+                if use_voice_timing:
+                    ordered_voice = sorted(voice_track["clips"], key=lambda clip: clip["start"])
+                    for audio_clip, visual_clip in zip(ordered_voice, proposed_clips):
+                        audio_clip["start"] = visual_clip["start"]
+                    subtitle_timing = ordered_voice
+                saved_cues = sorted(task["variant"].get("subtitles", {}).get("cues", []),
+                                    key=lambda cue: cue["start"])
+                if len(saved_cues) == len(subtitle_timing):
+                    adjusted_subtitles = [
+                        {**cue, "start": timing_clip["start"],
+                         "end": round(timing_clip["start"] + (
+                             timing_clip["duration"] if use_voice_timing
+                             else cue["end"] - cue["start"]
+                         ), 6)}
+                        for cue, timing_clip in zip(saved_cues, subtitle_timing)
+                    ]
+                    try:
+                        _validate_cues(adjusted_subtitles, tracks)
+                    except ValueError as error:
+                        raise HTTPException(422, detail={
+                            "code": "montage_subtitle_timing_invalid", "message": str(error),
+                        }) from None
+            production_call(
+                save_batch_variant, task, expected_revision=body["revision"], tracks=tracks,
+                settings=task["variant"]["settings"], aspect_mode=task["variant"].get("aspectMode"),
+                assets=assets_for(project_id), validate_subtitles=_validate_cues, aspect_was_explicit=False,
+            )
+            if adjusted_subtitles is not None:
+                task["variant"]["subtitles"]["cues"] = adjusted_subtitles
+                task["variant"]["subtitles"]["revision"] += 1
+            proposal.update(
+                status="applied", appliedVariantRevision=task["variant"]["revision"],
+                appliedClipIds=[clip["id"] for clip in proposed_clips], revision=proposal["revision"] + 1,
+                appliedSelections=[{
+                    "segmentId": segment["id"], "candidateId": segment["selectedCandidateId"],
+                    "clipId": clip["id"], "assetId": clip["assetId"],
+                    "inPoint": clip["inPoint"], "duration": clip["duration"],
+                } for segment, clip in zip(proposal["segments"], proposed_clips)],
+            )
+            save(project_id, state)
+            return {"proposal": deepcopy(proposal), "variant": public_task(project_id, task)["variant"]}
 
     def process_voiceover(project_id, task_id, job_id):
         directory = store.path(project_id, "voiceovers", job_id, task_id)

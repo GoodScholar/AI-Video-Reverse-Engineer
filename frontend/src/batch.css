@@ -12,6 +12,19 @@
 .batch-editor-recommendation { padding: 18px; margin-bottom: 16px; border: 1px solid #c7c6bc; background: #f7f5ee; }
 .batch-editor-recommendation p { margin: 8px 0 12px; line-height: 1.5; }
 .batch-editor-recommendation ol { padding-left: 24px; line-height: 1.7; overflow-wrap: anywhere; }
+.batch-editor-montage { padding: 18px; margin-bottom: 16px; border: 1px solid #dce1e9; border-radius: 10px; background: #fff; }
+.batch-editor-montage-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.batch-editor-montage-heading p, .batch-editor-montage-proposal > p { margin: 6px 0 14px; color: #596579; line-height: 1.6; }
+.batch-editor-montage-beats { display: grid; max-width: 430px; gap: 6px; margin: 14px 0; }
+.batch-editor-montage-proposal article { padding: 16px; margin: 12px 0; border: 1px solid #dce1e9; border-radius: 8px; background: #f6f7fb; }
+.batch-editor-montage-proposal article.is-gap { border-color: #f1cebf; background: #fff1ec; }
+.batch-editor-montage-proposal article header { display: flex; justify-content: space-between; gap: 12px; }
+.batch-editor-montage-proposal article header p { margin: 4px 0; }
+.batch-editor-montage-controls { display: grid; grid-template-columns: minmax(200px, 2fr) repeat(2, minmax(120px, 1fr)); gap: 12px; margin: 12px 0; }
+.batch-editor-montage-controls label { display: grid; gap: 6px; min-width: 0; }
+.batch-editor-montage-controls input, .batch-editor-montage-controls select { width: 100%; min-width: 0; }
+.batch-editor-montage-proposal fieldset { display: flex; flex-wrap: wrap; gap: 12px 20px; margin: 16px 0; border: 1px solid #dce1e9; border-radius: 8px; }
+.batch-editor-montage-proposal fieldset label { display: inline-flex; align-items: center; min-height: 44px; gap: 7px; }
 .batch-editor-bulk { padding: 18px; margin-bottom: 16px; border: 1px solid #c7c6bc; background: #f7f5ee; }
 .batch-editor-bulk > p { line-height: 1.5; }
 .batch-editor-bulk > label { display: inline-flex; align-items: center; gap: 8px; margin: 8px 0 16px; }
@@ -51,5 +64,5 @@
 .batch-editor-aigc article button { margin: 5px 8px 5px 0; }
 .batch-editor-disclosure { min-width: 0; padding: 14px; border: 1px solid #365d58; background: #fff; }
 .batch-editor-disclosure pre { max-height: 300px; padding: 12px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: #eeeae0; }
-@media (max-width: 720px) { .batch-editor-clip, .batch-editor-bulk-row, .batch-editor-subtitle-row { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (max-width: 520px) { .batch-editor-bulk-row, .batch-editor-subtitle-row { grid-template-columns: 1fr; } }
+@media (max-width: 720px) { .batch-editor-clip, .batch-editor-bulk-row, .batch-editor-subtitle-row, .batch-editor-montage-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); } .batch-editor-montage-heading { display: grid; } }
+@media (max-width: 520px) { .batch-editor-bulk-row, .batch-editor-subtitle-row, .batch-editor-montage-controls { grid-template-columns: 1fr; } }

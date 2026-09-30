@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { cancelBatchExport, cancelBatchPreview, createBatchTask, createBulkVariants, getBatchWorkspace, recognizeBatchSubtitles, recommendBatchVariant, reviewBatchVariant, saveBatchContent, saveBatchSubtitles, saveBatchVariant, startBatchPreview, startGenerationPreviews, submitBatchExports, type BatchAsset, type BatchCue, type BatchReview, type BatchTask, type BatchVariant } from "./batchEditingApi";
+import { applyMontageProposal, cancelBatchExport, cancelBatchPreview, createBatchTask, createBulkVariants, createMontageProposal, getBatchWorkspace, recognizeBatchSubtitles, recommendBatchVariant, reviewBatchVariant, saveBatchContent, saveBatchSubtitles, saveBatchVariant, startBatchPreview, startGenerationPreviews, submitBatchExports, updateMontageProposal, type BatchAsset, type BatchCue, type BatchReview, type BatchTask, type BatchVariant, type MontageProposal } from "./batchEditingApi";
 import type { TimelineAsset, TimelineClip, TimelineTrack } from "./timelineApi";
 import { AigcCreator } from "./AigcCreator";
 import { AspectRatioPicker } from "./AspectRatioPicker";
 import "./batch.css";
 import { VoiceSelector } from "./VoiceSelector";
 import { ratioLabel, resolveProductAspect, type AspectMode } from "./videoAspect";
+import { searchSegments } from "./segmentRetrievalApi";
 
 function clipName(clip: TimelineClip, assets: TimelineAsset[]) { return assets.find((asset) => asset.id === clip.assetId)?.name ?? "缺失素材"; }
 function isCurrentPreview(task: BatchTask, run: BatchVariant["runs"][number] | undefined): boolean {
@@ -22,6 +23,15 @@ function previewCategory(task: BatchTask): "completed" | "queued" | "failed" | "
   return "pending";
 }
 function nextId() { return `clip-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; }
+function scriptSegments(value: string) { return value.split(/[。！？；;!?\n]|\.(?!\d)/).map((item) => item.trim()).filter(Boolean); }
+function parseBeatTimes(value: string): number[] | null {
+  if (!value.trim()) return [];
+  const times = value.split(/[，,\s]+/).filter(Boolean).map(Number);
+  return times.every((item) => Number.isFinite(item) && item >= 0) ? [...new Set(times)].sort((a, b) => a - b) : null;
+}
+function estimatedNarrationDuration(text: string): number {
+  return Math.max(1.5, Math.min(6, [...text].length * .22));
+}
 const reviewLabel = { pending: "待审核", approved: "已通过", rejected: "已退回", stale: "旧审核已失效" };
 const exportLabel = { queued: "排队中", running: "导出中", completed: "已完成", failed: "失败", cancelled: "已取消" };
 function invalidatedReviewStatus(task: BatchTask): BatchTask["reviewStatus"] {
@@ -29,6 +39,12 @@ function invalidatedReviewStatus(task: BatchTask): BatchTask["reviewStatus"] {
 }
 type BulkItem = { sellingPoint: string; script: string };
 type VariantAspectDraft = { aspectMode: AspectMode; settings: BatchVariant["settings"]; resolvedAspect: string; aspectReason: string };
+type MontageAdjustment = { candidateId: string; inPointSeconds: number; durationSeconds: number };
+function savedMontageAdjustments(proposal: MontageProposal | undefined): Record<string, MontageAdjustment> {
+  return Object.fromEntries((proposal?.segments ?? []).filter((item) => item.selectedClip && item.selectedCandidateId).map((item) => [item.id, {
+    candidateId: item.selectedCandidateId!, inPointSeconds: item.selectedClip!.inPoint, durationSeconds: item.selectedClip!.duration,
+  }]));
+}
 function reorder(clips: TimelineClip[], index: number, direction: -1 | 1, kind: TimelineTrack["kind"]): TimelineClip[] {
   const gaps = clips.map((clip, position) => position === 0 ? clip.start : Math.max(0, clip.start - clips[position - 1].start - clips[position - 1].duration));
   const next = [...clips];
@@ -54,6 +70,10 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
   const [selectedExportIds, setSelectedExportIds] = useState<string[]>([]);
   const [subtitleDrafts, setSubtitleDrafts] = useState<Record<string, BatchCue[]>>({});
   const [recommendationSelections, setRecommendationSelections] = useState<Record<string, string[]>>({});
+  const [montageAdjustments, setMontageAdjustments] = useState<Record<string, Record<string, MontageAdjustment>>>({});
+  const [montageStrategies, setMontageStrategies] = useState<Record<string, "overwrite" | "merge" | "abandon">>({});
+  const [montageBeatInputs, setMontageBeatInputs] = useState<Record<string, string>>({});
+  const [montageMessage, setMontageMessage] = useState("");
   const [bulkCount, setBulkCount] = useState(5);
   const [bulkInputs, setBulkInputs] = useState<Record<string, BulkItem[]>>({});
   const [sellingPoint, setSellingPoint] = useState("");
@@ -73,7 +93,7 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
 
   useEffect(() => {
     let active = true;
-    setTasks([]); setAssets([]); setSelectedId(null); setDrafts({}); setAspectDrafts({}); setContentDrafts({}); setReviewReasons({}); setSelectedExportIds([]); setSubtitleDrafts({}); setRecommendationSelections({}); setBulkCount(5); setBulkInputs({}); setReviewFilter("all"); setLoading(true); setBusy(false); setError("");
+    setTasks([]); setAssets([]); setSelectedId(null); setDrafts({}); setAspectDrafts({}); setContentDrafts({}); setReviewReasons({}); setSelectedExportIds([]); setSubtitleDrafts({}); setRecommendationSelections({}); setMontageAdjustments({}); setMontageStrategies({}); setMontageBeatInputs({}); setMontageMessage(""); setBulkCount(5); setBulkInputs({}); setReviewFilter("all"); setLoading(true); setBusy(false); setError("");
     void getBatchWorkspace(projectId).then((result) => { if (active) { setTasks(result.tasks); setAssets(result.assets); if(presentation) setSelectedId(focusTaskId ?? [...result.tasks].reverse().find(task => !task.batchId)?.id ?? null); } })
       .catch((reason) => { if (active) setError(reason instanceof Error ? reason.message : "无法读取批量任务。"); })
       .finally(() => { if (active) setLoading(false); });
@@ -137,7 +157,8 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
     (drafts[task.id] && JSON.stringify(drafts[task.id]) !== JSON.stringify(task.variant.tracks)) ||
     (aspectDrafts[task.id] && (aspectDrafts[task.id].aspectMode !== (task.variant.aspectMode ?? "9:16") ||
       JSON.stringify(aspectDrafts[task.id].settings) !== JSON.stringify(task.variant.settings))) ||
-    (subtitleDrafts[task.id] && JSON.stringify(subtitleDrafts[task.id]) !== JSON.stringify(task.variant.subtitles?.cues ?? [])));
+    (subtitleDrafts[task.id] && JSON.stringify(subtitleDrafts[task.id]) !== JSON.stringify(task.variant.subtitles?.cues ?? [])) ||
+    (montageAdjustments[task.id] && JSON.stringify(montageAdjustments[task.id]) !== JSON.stringify(savedMontageAdjustments(task.montageProposals?.[task.montageProposals.length - 1]))));
   useEffect(() => { onDraftChange?.(anyDirty || aigcDirty || voicePending); }, [anyDirty, aigcDirty, voicePending, onDraftChange]);
   const latestRun = selected?.variant.runs[selected.variant.runs.length - 1];
   const latestExport = selected?.variant.exports?.[selected.variant.exports.length - 1];
@@ -155,6 +176,29 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
   const selectionChanged = Boolean(selected?.proposal && JSON.stringify(selectedAssets) !== JSON.stringify(selected.proposal.assetIds));
   const savedIncludesRecommendation = Boolean(selected?.proposal?.clips.every((clip) =>
     selected.variant.tracks.some((track) => track.kind === "video" && track.clips.some((item) => item.id === clip.id))));
+  const montageProposal = selected?.montageProposals?.[selected.montageProposals.length - 1];
+  const montageSaved = savedMontageAdjustments(montageProposal);
+  const montageDraft = selected && montageProposal ? montageAdjustments[selected.id] ?? montageSaved : {};
+  const montageAdjustmentDirty = JSON.stringify(montageDraft) !== JSON.stringify(montageSaved);
+  const montageBeatTimes = selected ? parseBeatTimes(montageBeatInputs[selected.id] ?? "") : [];
+  const montageNarration = selected ? (() => {
+    const segments = scriptSegments(selected.script);
+    const voiceCurrent = selected.voiceover?.status === "completed"
+      && selected.voiceover.contentRevision === (selected.contentRevision ?? 0)
+      && selected.voiceover.assetIds.length === segments.length;
+    const voiceDurations = voiceCurrent ? selected.voiceover!.assetIds.map((assetId) => {
+      const asset = assets.find((item) => item.id === assetId);
+      return asset?.kind === "audio" && typeof asset.duration === "number" && Number.isFinite(asset.duration)
+        && asset.duration > 0 ? asset.duration : null;
+    }) : [];
+    if (voiceCurrent && voiceDurations.every((duration) => duration !== null)) return segments.map((_text, index) => ({
+      durationSeconds: voiceDurations[index] as number, wordBoundariesSeconds: [], source: "measured_voiceover" as const,
+    }));
+    return segments.map((text) => ({
+      durationSeconds: estimatedNarrationDuration(text), wordBoundariesSeconds: [], source: "estimated_text" as const,
+    }));
+  })() : [];
+  const montageTimingEstimated = montageNarration.some((item) => item.source === "estimated_text");
 
   function hasPendingVoice(task: BatchTask): boolean {
     return Object.values(voicePendingOwners).some(ids => ids.includes(task.id));
@@ -284,6 +328,93 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
       if (projectRef.current !== projectId) return;
       setTasks((current) => current.map((task) => task.id === selected.id ? { ...task, proposal: result.proposal } : task));
     } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法依据脚本推荐镜头。"); }
+    finally { if (projectRef.current === projectId) setBusy(false); }
+  }
+
+  function rememberMontageProposal(taskId: string, proposal: MontageProposal) {
+    setTasks((current) => current.map((item) => item.id === taskId ? {
+      ...item, montageProposals: [...(item.montageProposals ?? []).filter((saved) => saved.id !== proposal.id), proposal],
+    } : item));
+    setMontageAdjustments((current) => ({ ...current, [taskId]: savedMontageAdjustments(proposal) }));
+  }
+
+  async function generateMontageProposal() {
+    if (!selected || contentDirty || dirty || montageAdjustmentDirty || !montageNarration.length) return;
+    const segments = scriptSegments(selected.script);
+    if (!segments.length) return;
+    setBusy(true); setError(""); setMontageMessage("");
+    try {
+      const searches = [];
+      for (const text of segments) searches.push(await searchSegments(projectId, text, 8));
+      if (projectRef.current !== projectId) return;
+      const result = await createMontageProposal(projectId, selected.id, selected.variant.revision,
+        searches.map((item) => item.id), montageNarration, montageBeatTimes ?? []);
+      if (projectRef.current !== projectId) return;
+      rememberMontageProposal(selected.id, result.proposal);
+      onPersistedChange?.();
+    } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法生成混剪提案。"); }
+    finally { if (projectRef.current === projectId) setBusy(false); }
+  }
+
+  function montageCandidate(proposal: MontageProposal, segmentId: string, candidateId: string) {
+    const segment = proposal.segments.find((item) => item.id === segmentId);
+    if (!segment) return null;
+    if (segment.suggestion?.candidateId === candidateId) return {
+      candidate: segment.suggestion, clip: segment.selectedCandidateId === candidateId && segment.selectedClip
+        ? segment.selectedClip : { ...(segment.suggestionClip ?? segment.selectedClip!), assetId: segment.suggestion.assetId,
+          inPoint: segment.suggestion.inPointSeconds,
+          duration: Math.min(segment.timing.narrationDurationSeconds, segment.suggestion.outPointSeconds - segment.suggestion.inPointSeconds) },
+    };
+    return segment.alternatives.find((item) => item.candidate.candidateId === candidateId) ?? null;
+  }
+
+  function changeMontageCandidate(segmentId: string, candidateId: string) {
+    if (!selected || !montageProposal) return;
+    const found = montageCandidate(montageProposal, segmentId, candidateId);
+    if (!found) return;
+    setMontageAdjustments((current) => ({ ...current, [selected.id]: { ...(current[selected.id] ?? montageDraft), [segmentId]: {
+      candidateId, inPointSeconds: found.clip.inPoint, durationSeconds: found.clip.duration,
+    } } }));
+  }
+
+  function changeMontageTiming(segmentId: string, field: "inPointSeconds" | "durationSeconds", value: number) {
+    if (!selected) return;
+    setMontageAdjustments((current) => ({ ...current, [selected.id]: { ...(current[selected.id] ?? montageDraft),
+      [segmentId]: { ...(current[selected.id] ?? montageDraft)[segmentId], [field]: value },
+    } }));
+  }
+
+  async function saveMontageAdjustments() {
+    if (!selected || !montageProposal) return;
+    const segments = montageProposal.segments.map((item) => ({ segmentId: item.id, ...(montageDraft[item.id] ?? {}) }))
+      .filter((item): item is { segmentId: string } & MontageAdjustment => Boolean(item.candidateId));
+    setBusy(true); setError(""); setMontageMessage("");
+    try {
+      const result = await updateMontageProposal(projectId, selected.id, montageProposal.id, montageProposal.revision, segments);
+      if (projectRef.current !== projectId) return;
+      rememberMontageProposal(selected.id, result.proposal);
+      onPersistedChange?.();
+    } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法保存混剪提案调整。"); }
+    finally { if (projectRef.current === projectId) setBusy(false); }
+  }
+
+  async function applyMontage() {
+    if (!selected || !montageProposal) return;
+    const strategy = montageStrategies[selected.id];
+    if (!strategy) return;
+    setBusy(true); setError(""); setMontageMessage("");
+    try {
+      const result = await applyMontageProposal(projectId, selected.id, montageProposal.id, selected.variant.revision,
+        montageProposal.revision, strategy);
+      if (projectRef.current !== projectId) return;
+      setTasks((current) => current.map((item) => item.id === selected.id ? {
+        ...item, variant: result.variant, reviewStatus: invalidatedReviewStatus(item),
+        montageProposals: [...(item.montageProposals ?? []).filter((saved) => saved.id !== result.proposal.id), result.proposal],
+      } : item));
+      if (strategy !== "abandon") setDrafts((current) => { const next = { ...current }; delete next[selected.id]; return next; });
+      setMontageMessage(strategy === "abandon" ? "已放弃本次混剪提案，当前编辑未改变。" : `提案已写入变体第 ${result.variant.revision} 版，可继续编辑。`);
+      onPersistedChange?.();
+    } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法应用混剪提案。"); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
 
@@ -602,6 +733,62 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
         })}
       </div>}
       {(!presentation || presentation === "edit") && <>
+      <section className="batch-editor-montage" aria-labelledby="batch-montage-title">
+        <div className="batch-editor-montage-heading"><div><h5 id="batch-montage-title">可解释混剪提案</h5>
+          <p>按已保存脚本逐段执行本地视觉检索，旁白与词边界优先，节拍只作辅助。提案采用后写入当前变体编辑序列。</p></div>
+          <button type="button" className="primary-action" disabled={busy || dirty || contentDirty || montageAdjustmentDirty || montageBeatTimes === null || !montageNarration.length || !scriptSegments(selected.script).length}
+            onClick={() => void generateMontageProposal()}>{busy ? "正在处理…" : "生成可解释混剪提案"}</button></div>
+        <label className="batch-editor-montage-beats">音乐节拍（秒，选填）<input value={montageBeatInputs[selected.id] ?? ""}
+          onChange={(event) => setMontageBeatInputs((current) => ({ ...current, [selected.id]: event.target.value }))}
+          placeholder="例如 1.20, 2.40, 3.60" /></label>
+        {montageBeatTimes === null && <p role="status">节拍须填写非负秒数，并用逗号或空格分隔。</p>}
+        {montageTimingEstimated && <p>当前尚无逐段实测配音或已保存字幕时长，首轮提案使用明确标记的文本估时；生成配音后请重新生成，节拍吸附只会用于实测时长。</p>}
+        {(dirty || contentDirty) && <p>先保存或撤销当前脚本与变体草稿，再生成提案。</p>}
+        {montageAdjustmentDirty && <p>先保存或撤销当前提案调整，再重新生成。</p>}
+        {montageProposal && <div className="batch-editor-montage-proposal">
+          <p>提案版本 {montageProposal.revision} · {montageProposal.plannerVersion} · {montageProposal.status === "applied" ? `已写入变体第 ${montageProposal.appliedVariantRevision} 版` : montageProposal.status === "abandoned" ? "已放弃" : "待确认"}</p>
+          {montageProposal.segments.map((segment, index) => {
+            const candidates = [segment.suggestion, ...segment.alternatives.map((item) => item.candidate)].filter((item): item is NonNullable<typeof item> => Boolean(item));
+            const adjustment = montageDraft[segment.id];
+            const suggestionName = assets.find((asset) => asset.id === segment.suggestion?.assetId)?.name ?? segment.suggestion?.assetId;
+            return <article key={segment.id} className={segment.status === "gap" ? "is-gap" : ""}>
+              <header><div><strong>第 {index + 1} 段</strong><p>{segment.text}</p></div><span>{segment.status === "gap"
+                ? segment.suggestion ? "时长缺口" : "缺少可用候选"
+                : `${segment.timing.narrationDurationSeconds.toFixed(3)} 秒`}</span></header>
+              {segment.suggestion && <p>系统原建议：{suggestionName} {segment.suggestion.inPointSeconds.toFixed(3)}–{segment.suggestion.outPointSeconds.toFixed(3)} 秒</p>}
+              {candidates.length > 0 && <div className="batch-editor-montage-controls">
+                <label>第 {index + 1} 段候选片段<select aria-label={`第 ${index + 1} 段候选片段`} value={adjustment?.candidateId ?? ""}
+                  onChange={(event) => changeMontageCandidate(segment.id, event.target.value)}>
+                  {candidates.map((candidate) => <option key={candidate.candidateId} value={candidate.candidateId}>
+                    {assets.find((asset) => asset.id === candidate.assetId)?.name ?? candidate.assetId} · {candidate.inPointSeconds.toFixed(3)}–{candidate.outPointSeconds.toFixed(3)} 秒
+                  </option>)}</select></label>
+                <label>第 {index + 1} 段源入点（秒）<input type="number" min="0" step="0.1" value={adjustment?.inPointSeconds ?? ""}
+                  onChange={(event) => changeMontageTiming(segment.id, "inPointSeconds", Number(event.target.value))} /></label>
+                <label>第 {index + 1} 段画面时长（秒）<input type="number" min="0.001" step="0.1" value={adjustment?.durationSeconds ?? ""}
+                  onChange={(event) => changeMontageTiming(segment.id, "durationSeconds", Number(event.target.value))} /></label>
+              </div>}
+              <details><summary>选择依据与未满足项</summary><ul>{segment.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>
+                {segment.unmet.length > 0 && <ul>{segment.unmet.map((message) => <li key={message}>{message}</li>)}</ul>}</details>
+            </article>;
+          })}
+          <button type="button" className="secondary-action" disabled={busy || !montageAdjustmentDirty || montageProposal.status !== "draft" || Object.keys(montageDraft).length !== montageProposal.segments.length}
+            onClick={() => void saveMontageAdjustments()}>保存提案调整</button>
+          {montageAdjustmentDirty && <p>先保存候选、入点和时长调整，再采用提案。</p>}
+          <fieldset><legend>当前变体已有编辑时如何处理</legend>
+            <label><input type="radio" name={`montage-strategy-${selected.id}`} checked={montageStrategies[selected.id] === "overwrite"}
+              onChange={() => setMontageStrategies((current) => ({ ...current, [selected.id]: "overwrite" }))} />覆盖当前人工编辑</label>
+            <label><input type="radio" name={`montage-strategy-${selected.id}`} checked={montageStrategies[selected.id] === "merge"}
+              onChange={() => setMontageStrategies((current) => ({ ...current, [selected.id]: "merge" }))} />合并到当前编辑末尾</label>
+            <label><input type="radio" name={`montage-strategy-${selected.id}`} checked={montageStrategies[selected.id] === "abandon"}
+              onChange={() => setMontageStrategies((current) => ({ ...current, [selected.id]: "abandon" }))} />放弃本次提案</label>
+          </fieldset>
+          <button type="button" className="primary-action" disabled={busy || montageAdjustmentDirty || !montageStrategies[selected.id] || montageProposal.status !== "draft" ||
+            (montageStrategies[selected.id] !== "abandon" && (dirty || contentDirty)) ||
+            (montageStrategies[selected.id] !== "abandon" && (montageProposal.unmet.length > 0 || montageProposal.segments.some((segment) => segment.unmet.length > 0)))}
+            onClick={() => void applyMontage()}>采用混剪提案</button>
+        </div>}
+        {montageMessage && <p role="status">{montageMessage}</p>}
+      </section>
       <div className="batch-editor-recommendation">
         <h5>按脚本推荐镜头</h5>
         <p>依据素材名称和备注的词语匹配脚本段落；当前不分析画面内容。请在素材页补充准确备注，脚本用句号或换行分段。</p>
