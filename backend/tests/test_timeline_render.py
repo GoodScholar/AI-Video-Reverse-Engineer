@@ -25,13 +25,16 @@ def _run(*command):
     subprocess.run(command, check=True, capture_output=True, text=True)
 
 
-def _video(path: Path, color: str, frequency: int, duration: float = 2.0) -> Path:
-    _run(
+def _video(path: Path, color: str, frequency: int, duration: float = 2.0, *, subject: bool = False) -> Path:
+    command = [
         "ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y",
         "-f", "lavfi", "-i", "color=%s:size=64x48:rate=24:duration=%s" % (color, duration),
         "-f", "lavfi", "-i", "sine=frequency=%s:sample_rate=48000:duration=%s" % (frequency, duration),
-        "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(path),
-    )
+    ]
+    if subject:
+        command.extend(["-vf", "drawbox=x=22:y=20:w=4:h=4:color=red:t=fill"])
+    command.extend(["-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(path)])
+    _run(*command)
     return path
 
 
@@ -54,12 +57,15 @@ def _video_with_short_video_stream(path: Path) -> Path:
     return path
 
 
-def _image(path: Path, color: str) -> Path:
-    _run(
+def _image(path: Path, color: str, *, subject: bool = False) -> Path:
+    command = [
         "ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y",
         "-f", "lavfi", "-i", "color=%s:size=64x48:rate=1" % color,
-        "-frames:v", "1", str(path),
-    )
+    ]
+    if subject:
+        command.extend(["-vf", "drawbox=x=22:y=20:w=4:h=4:color=red:t=fill"])
+    command.extend(["-frames:v", "1", str(path)])
+    _run(*command)
     return path
 
 
@@ -73,9 +79,15 @@ def _clip(asset_id: str, start: float, duration: float, **values):
     return clip
 
 
-def _accepted_center_reframe(width: int = 9, height: int = 16):
+def _accepted_center_reframe(width: int = 9, height: int = 16, *, still_image: bool):
     from app.montage_reframe import pending_reframe
     reframe = pending_reframe(target_width=width, target_height=height, reason="测试中的显式人工构图")
+    reframe.update(sourceWidth=64, sourceHeight=48, samples=[{
+        "timeSeconds": 0 if still_image else .2,
+        "boxes": [{"x": 22 / 64, "y": 20 / 48, "width": 4 / 64, "height": 4 / 48,
+                   "label": "red-subject", "confidence": .99}],
+        "center": {"x": .5, "y": .5}, "confidence": .99,
+    }])
     reframe["override"] = {"mode": "center", "keyframes": []}
     return reframe
 
@@ -223,7 +235,7 @@ def test_wav_applies_trim_speed_volume_and_output_relative_fades(tmp_path):
 
 
 def test_preview_scales_to_at_most_640_pixels_wide_and_keeps_aspect_ratio(tmp_path):
-    image = _image(tmp_path / "green.png", "green")
+    image = _image(tmp_path / "green.png", "green", subject=True)
     output = tmp_path / "preview.mp4"
 
     render_timeline(
@@ -272,7 +284,7 @@ def test_packaging_uses_one_ass_subtitle_pass_and_keeps_preview_export_coordinat
         return real_build(*args, **kwargs)
     monkeypatch.setattr(timeline_render, "_build_command", capture)
     monkeypatch.setattr("app.batch_subtitles.caption_images", lambda *_: pytest.fail("包装不得走 PNG 字幕"))
-    timeline = _timeline(width=720, height=1280, tracks=[_track("video", [_clip("green", 0, .5, reframe=_accepted_center_reframe())])])
+    timeline = _timeline(width=720, height=1280, tracks=[_track("video", [_clip("green", 0, .5, reframe=_accepted_center_reframe(still_image=True))])])
     cues = [{"id": "cue", "start": .1, "end": .3, "text": "唯一烧录"}]
     preview, export = tmp_path / "pack-preview.mp4", tmp_path / "pack-export.mp4"
 
@@ -320,8 +332,8 @@ def test_production_multiline_outline_pixels_stay_inside_the_compiler_bbox(tmp_p
     ffmpeg = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"
     if not Path(ffmpeg).is_file():
         pytest.skip("包装真实描边证据需要含 libass 的 FFmpeg")
-    background = _video(tmp_path / "outline-background.mp4", "0x123456", 440, duration=.5)
-    timeline = _timeline(width=720, height=1280, tracks=[_track("video", [_clip("background", 0, .5, reframe=_accepted_center_reframe())])])
+    background = _video(tmp_path / "outline-background.mp4", "0x123456", 440, duration=.5, subject=True)
+    timeline = _timeline(width=720, height=1280, tracks=[_track("video", [_clip("background", 0, .5, reframe=_accepted_center_reframe(still_image=False))])])
     packaging = default_packaging()
     packaging["elements"] = [{
         "id": "outline-title", "kind": "title", "enabled": True, "start": .1, "end": .3,
@@ -340,8 +352,16 @@ def test_production_multiline_outline_pixels_stay_inside_the_compiler_bbox(tmp_p
         _run(ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-y", "-ss", "0.2", "-i", str(video),
              "-frames:v", "1", str(image))
     with Image.open(frame).convert("RGB") as actual, Image.open(base_frame).convert("RGB") as baseline:
+        subject_pixels = [(x, y) for y in range(baseline.height) for x in range(baseline.width)
+                          if baseline.getpixel((x, y))[0] > baseline.getpixel((x, y))[2] + 35]
+        assert subject_pixels
+        subject_box = [min(x for x, _y in subject_pixels), min(y for _x, y in subject_pixels),
+                       max(x for x, _y in subject_pixels) + 1, max(y for _x, y in subject_pixels) + 1]
+        subject_halo = [max(0, subject_box[0] - 32), max(0, subject_box[1] - 32),
+                        subject_box[2] + 32, subject_box[3] + 32]
         points = [(x, y) for y in range(actual.height) for x in range(actual.width)
-                  if sum(abs(left - right) for left, right in zip(actual.getpixel((x, y)), baseline.getpixel((x, y)))) > 8]
+                  if not (subject_halo[0] <= x < subject_halo[2] and subject_halo[1] <= y < subject_halo[3])
+                  and sum(abs(left - right) for left, right in zip(actual.getpixel((x, y)), baseline.getpixel((x, y)))) > 8]
     assert points  # compare against a real no-ASS render, not a yellow-fill colour threshold
     actual_box = [min(x for x, _y in points), min(y for _x, y in points),
                   max(x for x, _y in points) + 1, max(y for _x, y in points) + 1]
@@ -377,14 +397,16 @@ def test_production_multiline_outline_pixels_stay_inside_the_compiler_bbox(tmp_p
         "production-multiline-outline-fontselect.log",
     ]
     assert all((evidence / name).is_file() for name in expected)
+    assert (predicted_box[2] <= subject_box[0] or subject_box[2] <= predicted_box[0]
+            or predicted_box[3] <= subject_box[1] or subject_box[3] <= predicted_box[1])
     assert predicted_box[0] <= actual_box[0] and predicted_box[1] <= actual_box[1]
     assert predicted_box[2] >= actual_box[2] and predicted_box[3] >= actual_box[3]
 
 
 def test_packaging_rejects_default_missing_glyph_and_cleans_ass_on_renderer_failure(tmp_path, monkeypatch):
     from app.montage_packaging import default_packaging
-    image, output = _image(tmp_path / "green.png", "green"), tmp_path / "bad-packaging.mp4"
-    timeline = _timeline(width=720, height=1280, tracks=[_track("video", [_clip("green", 0, .5, reframe=_accepted_center_reframe())])])
+    image, output = _image(tmp_path / "green.png", "green", subject=True), tmp_path / "bad-packaging.mp4"
+    timeline = _timeline(width=720, height=1280, tracks=[_track("video", [_clip("green", 0, .5, reframe=_accepted_center_reframe(still_image=True))])])
     with pytest.raises(TimelineRenderError, match="缺少"):
         render_timeline(timeline, {"green": image}, output, format="preview", packaging=default_packaging(),
                         packaging_cues=[{"id": "bad", "start": 0, "end": .4, "text": "\U00020000"}])
