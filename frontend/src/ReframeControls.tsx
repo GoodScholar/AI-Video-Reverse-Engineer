@@ -92,12 +92,13 @@ export function ReframeControls({ clipId, assetUrl, mediaKind = "video", sourceS
   };
   const move = (clientX: number, clientY: number) => {
     if (!reframe || disabled) return;
-    const sourceRect = source.current?.getBoundingClientRect();
     const stageRect = stage.current?.getBoundingClientRect();
-    const interactiveRect = sourceRect?.width ? sourceRect : stageRect;
-    if (!interactiveRect?.width) return;
-    const x = clamp((clientX - interactiveRect.left) / interactiveRect.width, cropWidthFraction / 2, 1 - cropWidthFraction / 2);
-    const y = Number.isFinite(clientY) && interactiveRect.height ? clamp((clientY - interactiveRect.top) / interactiveRect.height, cropHeightFraction / 2, 1 - cropHeightFraction / 2) : active.y;
+    const sourceRect = source.current?.getBoundingClientRect();
+    if (!stageRect || !sourceRect?.width) return;
+    const frame = contentRect(stageRect, sourceRect, source.current?.videoWidth || reframe.sourceWidth, source.current?.videoHeight || reframe.sourceHeight);
+    if (!frame.width || !frame.height) return;
+    const x = clamp((clientX - stageRect.left - frame.left) / frame.width, cropWidthFraction / 2, 1 - cropWidthFraction / 2);
+    const y = Number.isFinite(clientY) ? clamp((clientY - stageRect.top - frame.top) / frame.height, cropHeightFraction / 2, 1 - cropHeightFraction / 2) : active.y;
     const keyframes = [...override.keyframes.filter((item) => item.timeSeconds !== active.timeSeconds), { timeSeconds: currentTime, x: Number(x.toFixed(3)), y: Number(y.toFixed(3)) }]
       .sort((left, right) => left.timeSeconds - right.timeSeconds);
     setOverride({ mode: "manual", keyframes });

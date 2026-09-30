@@ -10,6 +10,8 @@ def prepare(tmp_path):
 
 def test_missing_and_unreadable_sources_are_located_without_creating_run(tmp_path):
     client, queue = prepare(tmp_path)
+    path = tmp_path / 'project-files/p1/preproduction/assets/video.mp4'
+    path.write_bytes(b'broken-media')
     response = client.post(BASE + '/preflight', json={'revision': 1, 'format': 'mp4'})
     assert response.status_code == 200
     result = response.json()
@@ -17,7 +19,6 @@ def test_missing_and_unreadable_sources_are_located_without_creating_run(tmp_pat
     assert result['issues'][0]['clipId'] == 'clip1'
     assert result['issues'][0]['assetId'] == 'video'
     assert queue.jobs == []
-    path = tmp_path / 'project-files/p1/preproduction/assets/video.mp4'
     path.unlink()
     assert not client.post(BASE + '/preflight', json={'revision': 1, 'format': 'mp4'}).json()['ready']
     assert client.post(BASE + '/preflight', json={'revision': 0, 'format': 'mp4'}).status_code == 409

@@ -75,6 +75,20 @@ describe("TimelineEditor", () => {
     expect(screen.getByLabelText("播放头（秒）")).toHaveValue(1);
   });
 
+  it("245px 检查器中包装字段保持单列且可用键盘聚焦编辑", async () => {
+    mockedGet.mockResolvedValue(workspace());
+    render(<TimelineEditor projectId="narrow-packaging" />);
+    await userEvent.click(await screen.findByRole("button", { name: "开场.jpg" }));
+    const inspector = document.querySelector(".timeline-inspector") as HTMLElement;
+    inspector.style.width = "245px";
+    expect(inspector).toHaveClass("timeline-inspector");
+    await userEvent.click(screen.getByRole("button", { name: "添加title" }));
+    const title = screen.getByLabelText(/title-\d+ 文字/);
+    title.focus();
+    await userEvent.keyboard("窄列标题");
+    expect(title).toHaveValue("窄列标题");
+  });
+
   it("向项目备份报告内存草稿状态，保存后解除保护", async () => {
     mockedGet.mockResolvedValue(workspace());
     const onDraftChange = vi.fn();

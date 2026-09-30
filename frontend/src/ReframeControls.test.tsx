@@ -32,8 +32,10 @@ describe("ReframeControls", () => {
       onAnalyze={vi.fn()} onCancel={vi.fn()} onChange={onChange} />);
 
     const stage = screen.getByLabelText("clip-a 主体裁剪原片");
+    const video = screen.getByLabelText("clip-a 原片");
     const crop = screen.getByRole("slider", { name: "clip-a 裁剪框" });
-    Object.defineProperty(stage, "getBoundingClientRect", { value: () => ({ left: 0, width: 400 }) });
+    Object.defineProperty(stage, "getBoundingClientRect", { value: () => ({ left: 0, top: 0, width: 400, height: 300 }) });
+    Object.defineProperty(video, "getBoundingClientRect", { value: () => ({ left: 0, top: 0, width: 400, height: 300 }) });
     const event = new Event("pointerdown", { bubbles: true });
     Object.defineProperty(event, "clientX", { value: 260 });
     fireEvent(crop, event);
@@ -77,6 +79,27 @@ describe("ReframeControls", () => {
     const event = new Event("pointerdown", { bubbles: true }); Object.defineProperty(event, "clientX", { value: 250 });
     fireEvent(screen.getByRole("slider", { name: "letterbox 裁剪框" }), event);
     expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ override: expect.objectContaining({ keyframes: [expect.objectContaining({ x: .75 })] }) }));
+  });
+
+  it("800×360 播放器中的 1120×630 原片按实际内容矩形保存横裁位置", () => {
+    const onChange = vi.fn();
+    const horizontal = { ...reframe, sourceWidth: 1120, sourceHeight: 630, targetAspect: { width: 720, height: 1280 } };
+    render(<ReframeControls clipId="crop-axis" assetUrl="/wide.mp4" reframe={horizontal} analysis={undefined} disabled={false}
+      onAnalyze={vi.fn()} onCancel={vi.fn()} onChange={onChange} />);
+    const stage = screen.getByLabelText("crop-axis 主体裁剪原片");
+    const video = screen.getByLabelText("crop-axis 原片") as HTMLVideoElement;
+    Object.defineProperty(stage, "getBoundingClientRect", { value: () => ({ left: 50, top: 40, width: 800, height: 360 }) });
+    Object.defineProperty(video, "getBoundingClientRect", { value: () => ({ left: 50, top: 40, width: 800, height: 360 }) });
+    Object.defineProperty(video, "videoWidth", { value: 1120 }); Object.defineProperty(video, "videoHeight", { value: 630 });
+    fireEvent.loadedMetadata(video);
+    const event = new Event("pointerdown", { bubbles: true });
+    // 画面实际显示为 640×360，左侧留边 80px；全元素坐标会错误保存为 .70。
+    Object.defineProperty(event, "clientX", { value: 50 + 80 + 640 * .75 });
+    Object.defineProperty(event, "clientY", { value: 40 + 180 });
+    fireEvent(screen.getByRole("slider", { name: "crop-axis 裁剪框" }), event);
+    expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({
+      override: expect.objectContaining({ keyframes: [expect.objectContaining({ x: .75, y: .5 })] }),
+    }));
   });
 
   it("竖源转横按服务端二维裁剪高度绘制并允许纵向拖框", () => {
