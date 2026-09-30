@@ -6,6 +6,10 @@ import { SourceSegmentIndexPanel } from "./SourceSegmentIndexPanel";
 import type { PreproductionAsset } from "./preproductionApi";
 
 
+vi.mock("./SegmentRetrievalPanel", () => ({
+  SegmentRetrievalPanel: ({ enabled }: { enabled: boolean }) => <div data-testid="segment-retrieval-seam">{enabled ? "检索可用" : "检索不可用"}</div>,
+}));
+
 const assets: PreproductionAsset[] = [
   { id: "video-a", name: "咖啡冲泡长视频", kind: "video", role: "motion", url: "/video-a.mp4", duration: 10 },
   { id: "video-b", name: "包装展示", kind: "video", role: "reference", url: "/video-b.mp4", duration: 8 },
@@ -69,6 +73,7 @@ it("展示同源多个候选、关键帧和受入点出点约束的预览", asyn
   expect(screen.getByText("00:02.000 → 00:07.000")).toBeVisible();
   expect(screen.getByRole("img", { name: "咖啡冲泡长视频 关键帧 00:04.500" })).toHaveAttribute("src", "/frame-2");
   expect(screen.getByText("候选尚未进入变体；采用后才会成为正式剪辑片段。")).toBeVisible();
+  expect(screen.getByTestId("segment-retrieval-seam")).toHaveTextContent("检索可用");
 
   const preview = screen.getByLabelText("咖啡冲泡长视频 片段预览 00:02.000 至 00:07.000") as HTMLVideoElement;
   expect(preview.getAttribute("src")).toBe("/video-a.mp4#t=2.000,7.000");

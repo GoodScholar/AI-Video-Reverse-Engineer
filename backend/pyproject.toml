@@ -8,6 +8,8 @@ dependencies = [
   "keyring==25.7.0",
   "Pillow==11.3.0",
   "python-multipart==0.0.20",
+  "torch==2.8.0",
+  "transformers==4.57.6",
   "uvicorn==0.34.3",
 ]
 

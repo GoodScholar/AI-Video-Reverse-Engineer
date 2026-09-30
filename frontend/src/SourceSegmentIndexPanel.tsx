@@ -2,12 +2,13 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Film, RefreshCw, Square, WandSparkles } from "lucide-react";
 
 import type { PreproductionAsset } from "./preproductionApi";
+import { SegmentRetrievalPanel } from "./SegmentRetrievalPanel";
+import { formatTime, SegmentPreview } from "./SegmentPreview";
 import {
   cancelSourceSegmentIndex,
   listSourceSegmentIndexes,
   retrySourceSegmentIndex,
   startSourceSegmentIndexes,
-  type SourceSegmentCandidate,
   type SourceSegmentIndex,
   type SourceSegmentStaleReason,
 } from "./sourceSegmentApi";
@@ -28,36 +29,6 @@ const staleMessages: Record<SourceSegmentStaleReason, string> = {
   keyframe_model_changed: "关键帧版本已变化，旧候选不可用于后续选片。",
 };
 
-function formatTime(value: number) {
-  const milliseconds = Math.max(0, Math.round(value * 1000));
-  const minutes = Math.floor(milliseconds / 60_000);
-  const seconds = Math.floor(milliseconds / 1000) % 60;
-  const fraction = milliseconds % 1000;
-  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}.${String(fraction).padStart(3, "0")}`;
-}
-
-function SegmentPreview({ assetName, candidate }: { assetName: string; candidate: SourceSegmentCandidate }) {
-  const start = candidate.preview.startSeconds;
-  const end = candidate.preview.endSeconds;
-  const label = `${assetName} 片段预览 ${formatTime(start)} 至 ${formatTime(end)}`;
-  return <video
-    controls
-    playsInline
-    preload="metadata"
-    src={candidate.preview.url}
-    aria-label={label}
-    onLoadedMetadata={(event) => { event.currentTarget.currentTime = start; }}
-    onTimeUpdate={(event) => {
-      if (event.currentTarget.currentTime < start) {
-        event.currentTarget.currentTime = start;
-      } else if (event.currentTarget.currentTime >= end) {
-        event.currentTarget.pause();
-        event.currentTarget.currentTime = end;
-      }
-    }}
-  />;
-}
-
 function mergeIndexes(current: SourceSegmentIndex[], updates: SourceSegmentIndex[]) {
   const byAsset = new Map(current.map((item) => [item.assetId, item]));
   for (const item of updates) byAsset.set(item.assetId, item);
@@ -74,6 +45,8 @@ export function SourceSegmentIndexPanel({ projectId, assets }: { projectId: stri
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState("");
   const indexesByAsset = useMemo(() => new Map(indexes.map((item) => [item.assetId, item])), [indexes]);
+  const retrievalEnabled = indexes.some((item) => item.status === "completed"
+    && item.validity.status === "current" && item.candidates.length > 0);
 
   const load = useCallback(async () => {
     try {
@@ -163,5 +136,6 @@ export function SourceSegmentIndexPanel({ projectId, assets }: { projectId: stri
         </section>}
       </article>;
     })}</div>
+    {!loading && <SegmentRetrievalPanel projectId={projectId} assets={assets ?? []} enabled={retrievalEnabled} />}
   </section>;
 }

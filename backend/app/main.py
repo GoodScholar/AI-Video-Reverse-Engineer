@@ -349,6 +349,8 @@ def create_app(
     semantic_analysis_queue_factory: Optional[Callable] = None,
     semantic_analysis_runner: Optional[Callable] = None,
     source_segment_runner: Optional[Callable] = None,
+    segment_visual_vectorizer=None,
+    segment_reranker=None,
     analysis_provider_registry=None,
     provider_registry=None,
     clock: Optional[Callable[[], datetime]] = None,
@@ -1175,7 +1177,7 @@ def create_app(
             return True
         return (
             request.method in ("POST", "PUT")
-            and bool(re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|preparation|preproduction|source-segments|timeline|batch-edits|upscale|character-motion|toolkit|backup)(?:/.*)?", path))
+            and bool(re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|preparation|preproduction|source-segments|segment-searches|timeline|batch-edits|upscale|character-motion|toolkit|backup)(?:/.*)?", path))
         ) or (
             request.method == "PUT" and bool(re.fullmatch(r"/api/analysis-providers/[^/]+/configuration", path))
         ) or (
@@ -2501,6 +2503,13 @@ def create_app(
     app.include_router(create_source_segment_router(
         data_dir, ensure_project_exists, compute_jobs,
         runner=source_segment_runner, ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
+        source_lock=project_write_lock,
+    ))
+    from .segment_retrieval import AnalysisProviderSegmentReranker, create_segment_retrieval_router
+    app.include_router(create_segment_retrieval_router(
+        data_dir, ensure_project_exists,
+        vectorizer=segment_visual_vectorizer,
+        reranker=segment_reranker or AnalysisProviderSegmentReranker(analysis_provider_configurations),
         source_lock=project_write_lock,
     ))
     from .product_images_api import create_product_images_router
