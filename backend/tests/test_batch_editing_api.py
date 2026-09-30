@@ -828,3 +828,45 @@ def test_two_source_variant_renders_a_real_vertical_preview(tmp_path):
         other_preview = client.get(other_path + f"/previews/{other_id}/output")
         assert other_preview.status_code == 200
         assert other_preview.content != preview.content
+
+
+def test_batch_reframe_repeat_cancel_retry_and_source_cas(tmp_path):
+    """A newer analysis token owns the clip; cancelled and stale jobs cannot publish."""
+    from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint
+    project_id = "reframe-batch"
+    root = tmp_path / "project-files" / project_id / "preproduction"
+    (root / "assets").mkdir(parents=True)
+    source = root / "assets" / "source.mp4"
+    source.write_bytes(b"source")
+    (root / "state.json").write_text(json.dumps({"schemaVersion": 1, "revision": 1, "brief": {}, "shots": [],
+        "assets": [{"id": "source", "name": "source", "kind": "video", "file": "source.mp4", "duration": 8}]}, ensure_ascii=False), encoding="utf-8")
+    jobs = []
+    class Queue:
+        def submit(self, _kind, pid, handler):
+            jobs.append((pid, handler)); return True
+    def analyzer(path, _start, _end, aspect):
+        return {"schemaVersion": 1, "sourceFingerprint": source_fingerprint(path), "sourceWidth": 64, "sourceHeight": 48,
+                "targetAspect": aspect, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+                "samples": [{"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+                            {"timeSeconds": 2, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9}],
+                "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []}}
+    app = FastAPI()
+    app.include_router(create_batch_editing_router(tmp_path, lambda _: SimpleNamespace(id=project_id), Queue(), reframe_analyzer=analyzer))
+    with TestClient(app) as client:
+        base = f"/api/projects/{project_id}/batch-edits"
+        task = client.post(base, json={"sellingPoint": "x", "script": "x"}).json()["task"]
+        tracks = task["variant"]["tracks"]
+        tracks[0]["clips"] = [{"id": "clip", "assetId": "source", "start": 0, "inPoint": 0, "duration": 2,
+                               "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0}]
+        assert client.put(f"{base}/{task['id']}/variant", json={"revision": 0, "tracks": tracks}).status_code == 200
+        url = f"{base}/{task['id']}/variant/reframes/clip"
+        assert client.post(url + "/analyze", json={"revision": 1}).status_code == 202
+        assert client.post(url + "/analyze", json={"revision": 1}).status_code == 202
+        assert client.post(url + "/cancel", json={"revision": 1}).status_code == 200
+        jobs.pop(0)[1](project_id)
+        assert client.get(base).json()["tasks"][0]["variant"]["reframeAnalysis"]["clip"]["status"] == "cancelled"
+        assert client.post(url + "/analyze", json={"revision": 1}).status_code == 202
+        jobs.pop()[1](project_id)
+        variant = client.get(base).json()["tasks"][0]["variant"]
+        assert variant["revision"] == 2
+        assert variant["tracks"][0]["clips"][0]["reframe"]["status"] == "ready"
