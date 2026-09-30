@@ -269,6 +269,10 @@ def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width
 
             def paired_boxes(left_boxes: list[dict[str, Any]], right_boxes: list[dict[str, Any]]):
                 """Pair only explicit identities (or the sole unambiguous subject)."""
+                def same_label(left: dict[str, Any], right: dict[str, Any]) -> bool:
+                    label = left.get("label")
+                    return isinstance(label, str) and bool(label) and label == right.get("label")
+
                 def unique_by_identity(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
                     identities: dict[str, list[dict[str, Any]]] = {}
                     for item in items:
@@ -277,10 +281,11 @@ def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width
                             identities.setdefault(identity, []).append(item)
                     return {identity: items[0] for identity, items in identities.items() if len(items) == 1}
 
-                if len(left_boxes) == len(right_boxes) == 1:
+                if len(left_boxes) == len(right_boxes) == 1 and same_label(left_boxes[0], right_boxes[0]):
                     return [(left_boxes[0], right_boxes[0])], [], []
                 left_ids, right_ids = unique_by_identity(left_boxes), unique_by_identity(right_boxes)
-                shared = set(left_ids) & set(right_ids)
+                shared = {identity for identity in set(left_ids) & set(right_ids)
+                          if same_label(left_ids[identity], right_ids[identity])}
                 paired_left, paired_right = {id(left_ids[label]) for label in shared}, {id(right_ids[label]) for label in shared}
                 return ([(left_ids[label], right_ids[label]) for label in shared],
                         [box for box in left_boxes if id(box) not in paired_left],

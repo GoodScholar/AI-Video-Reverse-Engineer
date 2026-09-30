@@ -248,6 +248,27 @@ def test_subject_sweep_uses_only_the_event_subsegment_and_the_real_last_frame_ho
     assert any(box[0] < 360 < box[2] for box in middle)
 
 
+def test_subject_sweep_never_pairs_unique_boxes_when_their_labels_change():
+    """Changing the sole detector label leaves both identities occupied, not interpolated."""
+    from app.montage_packaging import _subject_boxes
+
+    tracks = _reframed_track()
+    tracks[0]["clips"][0]["reframe"]["samples"] = [
+        {"timeSeconds": 0, "boxes": [{"x": .28, "y": .42, "width": .1, "height": .18,
+                                          "label": "A", "confidence": .9}],
+         "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 1, "boxes": [{"x": .62, "y": .42, "width": .1, "height": .18,
+                                          "label": "B", "confidence": .9}],
+         "center": {"x": .5, "y": .5}, "confidence": .9},
+    ]
+
+    # Mutating production code back to unconditional one-box pairing must fail:
+    # the short final event would otherwise contain only the interpolated B side.
+    occupied = _subject_boxes(tracks, .9, 1, 720, 1280)
+    assert any(box[0] < 120 < box[2] for box in occupied)  # A remains occupied.
+    assert any(box[0] < 560 < box[2] for box in occupied)  # B remains occupied.
+
+
 def test_subject_sweep_keeps_each_ambiguous_endpoint_and_both_transition_sides_in_a_short_event():
     """A+B→A must not zip-away B, and an overlapping clip is independently occupied."""
     from app.montage_packaging import _subject_boxes

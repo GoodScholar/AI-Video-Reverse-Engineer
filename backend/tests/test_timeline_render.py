@@ -1,5 +1,6 @@
 import json
 import math
+import re
 import shutil
 import subprocess
 import wave
@@ -339,15 +340,36 @@ def test_production_multiline_outline_pixels_stay_inside_the_compiler_bbox(tmp_p
                   max(x for x, _y in points) + 1, max(y for _x, y in points) + 1]
     event = _element_events(packaging, [], 720, 1280)[0]
     predicted_box = [360 - event["width"] / 2, 64, 360 + event["width"] / 2, 64 + event["height"]]
-    (tmp_path / "production-multiline-outline-predicted.json").write_text(json.dumps(predicted_box), encoding="utf-8")
-    (tmp_path / "production-multiline-outline-actual.json").write_text(json.dumps(actual_box), encoding="utf-8")
+    predicted_json = tmp_path / "production-multiline-outline-predicted.json"
+    actual_json = tmp_path / "production-multiline-outline-actual.json"
+    predicted_json.write_text(json.dumps(predicted_box), encoding="utf-8")
+    actual_json.write_text(json.dumps(actual_box), encoding="utf-8")
     fontselect = subprocess.run(
         [ffmpeg, "-hide_banner", "-nostdin", "-v", "verbose", "-i", str(background),
          "-vf", "ass=filename=%s:fontsdir=%s" % (ass_path, private_font_path().parent),
          "-ss", "0.2", "-frames:v", "1", "-f", "null", "-"], check=True, capture_output=True, text=True,
     ).stderr
-    (tmp_path / "production-multiline-outline-fontselect.log").write_text(fontselect, encoding="utf-8")
-    assert "fontselect" in fontselect and "NotoSansCJKsc-Regular" in fontselect
+    fontselect_log = tmp_path / "production-multiline-outline-fontselect.log"
+    fontselect_log.write_text(fontselect, encoding="utf-8")
+    requested_face = "NotoSansCJKsc-Regular"
+    assert re.search(
+        r"fontselect: \(" + re.escape(requested_face) + r", \d+, 0\) -> "
+        + re.escape(requested_face) + r", 0, " + re.escape(requested_face) + r"(?:\r?$)",
+        fontselect,
+        flags=re.MULTILINE,
+    )
+    assert sorted(path.name for path in private_font_path().parent.iterdir()) == [private_font_path().name]
+    evidence = Path("/tmp/aivre-ticket05-evidence/task21-round5")
+    evidence.mkdir(parents=True, exist_ok=True)
+    for artifact in (ass_path, rendered, control, frame, base_frame, predicted_json, actual_json, fontselect_log):
+        shutil.copy2(artifact, evidence / artifact.name)
+    expected = [
+        "production-multiline-outline.ass", "production-multiline-outline.mp4", "outline-control.mp4",
+        "production-multiline-outline.png", "outline-control.png",
+        "production-multiline-outline-predicted.json", "production-multiline-outline-actual.json",
+        "production-multiline-outline-fontselect.log",
+    ]
+    assert all((evidence / name).is_file() for name in expected)
     assert predicted_box[0] <= actual_box[0] and predicted_box[1] <= actual_box[1]
     assert predicted_box[2] >= actual_box[2] and predicted_box[3] >= actual_box[3]
 
