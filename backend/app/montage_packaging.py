@@ -25,6 +25,7 @@ KINDS = {"subtitle", "keyword", "title", "selling-point", "cta"}
 POSITIONS = {"auto", "top", "middle", "bottom"}
 STYLES = {"plain", "emphasis", "banner"}
 _FONT = Path(__file__).with_name("fonts") / "controlled" / "NotoSansCJKsc-Regular.otf"
+_FONT_INFO: tuple[str, dict[int, str], dict[int, str], dict[str, tuple[int, int]], int] | None = None
 
 
 class PackagingError(ValueError):
@@ -33,14 +34,24 @@ class PackagingError(ValueError):
 
 def private_font_path() -> Path:
     """Return the only allowed font after hash and metadata verification."""
-    if not _FONT.is_file() or hashlib.sha256(_FONT.read_bytes()).hexdigest() != FONT_SHA256:
+    actual_hash = hashlib.sha256(_FONT.read_bytes()).hexdigest() if _FONT.is_file() else None
+    if actual_hash != FONT_SHA256:
         raise PackagingError("受控字体不可用或哈希不匹配。")
+    global _FONT_INFO
+    if _FONT_INFO is not None and _FONT_INFO[0] == actual_hash:
+        return _FONT
     try:
         from fontTools.ttLib import TTFont
         face = TTFont(_FONT, lazy=True)
         names = {entry.nameID: entry.toUnicode() for entry in face["name"].names if entry.nameID in (1, 4, 6)}
         if names.get(1) != FONT_FAMILY or names.get(4) != FONT_FAMILY or names.get(6) != FONT_POSTSCRIPT:
             raise PackagingError("受控字体身份无效。")
+        os2 = face["OS/2"]
+        real_dim = os2.usWinAscent + os2.usWinDescent
+        if real_dim <= 0:
+            raise PackagingError("受控字体真实尺寸无效。")
+        _FONT_INFO = (actual_hash, names, face.getBestCmap(), dict(face["hmtx"].metrics), real_dim)
+        face.close()
     except PackagingError:
         raise
     except Exception as error:
@@ -85,8 +96,9 @@ def _validate_text(value: Any) -> str:
 def _glyphs(text: str) -> None:
     """Reject unsupported user glyphs before libass can silently fall back."""
     try:
-        from fontTools.ttLib import TTFont
-        cmap = TTFont(private_font_path(), lazy=True).getBestCmap()
+        private_font_path()
+        assert _FONT_INFO is not None
+        cmap = _FONT_INFO[2]
     except PackagingError:
         raise
     except Exception as error:
@@ -173,22 +185,16 @@ def _ass_time(seconds: float) -> str:
 
 def _advance(text: str, size: float) -> float:
     """libass/FreeType REAL_DIM advance in ASS script pixels."""
-    from fontTools.ttLib import TTFont
-    font = TTFont(private_font_path(), lazy=True)
-    cmap, metrics, os2 = font.getBestCmap(), font["hmtx"].metrics, font["OS/2"]
-    real_dim = os2.usWinAscent + os2.usWinDescent
-    if real_dim <= 0:
-        raise PackagingError("受控字体真实尺寸无效。")
+    private_font_path()
+    assert _FONT_INFO is not None
+    cmap, metrics, real_dim = _FONT_INFO[2], _FONT_INFO[3], _FONT_INFO[4]
     return sum(metrics[cmap[ord(char)]][0] for char in text if char not in "\n\t" and ord(char) in cmap) * size / real_dim
 
 
 def _font_height(size: float) -> float:
     """FT_SIZE_REQUEST_TYPE_REAL_DIM makes Win ascent+descent equal Fontsize."""
-    from fontTools.ttLib import TTFont
-    font = TTFont(private_font_path(), lazy=True)
-    os2 = font["OS/2"]
-    if os2.usWinAscent + os2.usWinDescent <= 0:
-        raise PackagingError("受控字体真实尺寸无效。")
+    private_font_path()
+    assert _FONT_INFO is not None
     return size
 
 
