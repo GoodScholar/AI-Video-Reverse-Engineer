@@ -919,7 +919,7 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
             [selected.id]: subtitleDraft.filter((_, position) => position !== index) }))}>删除第 {index + 1} 条字幕</button>
         </div>)}
         {subtitleDirty && !subtitlesValid && <p role="status">每条字幕需填写不超过 120 字；时间须在当前画面范围内且至少相隔 1 毫秒。</p>}
-        <button type="button" className="primary-action" disabled={busy || dirty || !subtitleDirty || !subtitlesValid} onClick={() => void saveSubtitles()}>保存字幕</button>
+        <button type="button" className="primary-action" disabled={busy || tracksDirty || transitionsDirty || aspectDirty || !subtitleDirty || !subtitlesValid} onClick={() => void saveSubtitles()}>保存字幕</button>
       </div>
       {selectedPackaging && <PackagingControls value={selectedPackaging} cues={subtitleDraft} disabled={busy}
         onChange={(packaging) => setPackagingDrafts((current) => ({ ...current, [selected.id]: packaging }))} />}

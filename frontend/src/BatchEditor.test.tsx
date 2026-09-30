@@ -688,6 +688,9 @@ describe("BatchEditor", () => {
     expect(screen.getByText("预览对应保存版本 1／字幕版本 0（当前编辑已变化）")).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: "采用识别候选" }));
     expect(screen.getByLabelText("第 1 条字幕文字")).toHaveValue("识别候选");
+    await userEvent.click(screen.getByRole("button", { name: "添加title" }));
+    // A local packaging draft must not block persisting the cue it will reference.
+    expect(screen.getByRole("button", { name: "保存字幕" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "生成预览" })).toBeDisabled();
     await userEvent.click(screen.getByRole("button", { name: "保存字幕" }));
     expect(JSON.parse(vi.mocked(fetch).mock.calls[1][1]?.body as string)).toEqual({ revision: 1, timelineRevision: 1, cues: [candidate] });

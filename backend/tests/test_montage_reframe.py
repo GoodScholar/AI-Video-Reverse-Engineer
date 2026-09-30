@@ -54,6 +54,7 @@ def test_replacement_or_source_range_change_resets_server_reframe_to_pending(fie
     assert reframe["status"] == "review_required"
     assert reframe["sourceFingerprint"] == ""
     assert reframe["samples"] == []
+    assert reframe["override"] == {"mode": "auto", "keyframes": []}
     assert "素材或源时间已改变" in reframe["uncertaintyReasons"][0]
 
 

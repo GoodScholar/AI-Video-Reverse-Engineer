@@ -755,6 +755,7 @@ def test_variant_candidate_replacement_reads_back_pending_reframe(tmp_path):
         assert saved.status_code == 200, saved.text
         pending = saved.json()["variant"]["tracks"][0]["clips"][0]["reframe"]
         assert pending["sourceFingerprint"] == "" and pending["samples"] == []
+        assert pending["override"] == {"mode": "auto", "keyframes": []}
         assert client.get(base).json()["tasks"][0]["variant"]["tracks"][0]["clips"][0]["reframe"] == pending
 
 

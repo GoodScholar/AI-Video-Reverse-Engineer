@@ -131,6 +131,7 @@ def test_candidate_replacement_persists_pending_reframe_and_manual_render(tmp_pa
     saved = client.put(BASE, json={"revision": analyzed["revision"], "settings": analyzed["settings"], "tracks": replacement}).json()
     pending = saved["tracks"][0]["clips"][0]["reframe"]
     assert pending["sourceFingerprint"] == "" and pending["samples"] == []
+    assert pending["override"] == {"mode": "auto", "keyframes": []}
     assert client.get(BASE).json()["tracks"][0]["clips"][0]["reframe"] == pending
     pending["override"] = {"mode": "center", "keyframes": []}
     rendered = client.put(BASE, json={"revision": saved["revision"], "settings": saved["settings"], "tracks": saved["tracks"]}).json()

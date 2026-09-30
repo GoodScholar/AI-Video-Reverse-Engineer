@@ -64,6 +64,7 @@ describe("ReframeControls", () => {
     expect(onReplace).toHaveBeenCalledWith("other");
   });
 
+
   it("按真实视频显示矩形拖动，留边不参与源像素坐标", () => {
     const onChange = vi.fn();
     render(<ReframeControls clipId="letterbox" assetUrl="/source.mp4" reframe={reframe} analysis={undefined} disabled={false}
@@ -76,6 +77,30 @@ describe("ReframeControls", () => {
     const event = new Event("pointerdown", { bubbles: true }); Object.defineProperty(event, "clientX", { value: 250 });
     fireEvent(screen.getByRole("slider", { name: "letterbox 裁剪框" }), event);
     expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ override: expect.objectContaining({ keyframes: [expect.objectContaining({ x: .75 })] }) }));
+  });
+
+  it("竖源转横按服务端二维裁剪高度绘制并允许纵向拖框", () => {
+    const onChange = vi.fn();
+    const vertical = { ...reframe, sourceWidth: 630, sourceHeight: 1120, targetAspect: { width: 1280, height: 720 } };
+    render(<ReframeControls clipId="vertical" assetUrl="/vertical.mp4" reframe={vertical} analysis={undefined} disabled={false} onAnalyze={vi.fn()} onCancel={vi.fn()} onChange={onChange} />);
+    const stage = screen.getByLabelText("vertical 主体裁剪原片"); const video = screen.getByLabelText("vertical 原片") as HTMLVideoElement;
+    Object.defineProperty(stage, "getBoundingClientRect", { value: () => ({ left: 0, top: 0, width: 400, height: 300 }) });
+    Object.defineProperty(video, "getBoundingClientRect", { value: () => ({ left: 0, top: 0, width: 400, height: 300 }) });
+    Object.defineProperty(video, "videoWidth", { value: 630 }); Object.defineProperty(video, "videoHeight", { value: 1120 }); fireEvent.loadedMetadata(video);
+    const crop = screen.getByRole("slider", { name: "vertical 裁剪框" });
+    expect(parseFloat((crop as HTMLElement).style.height)).toBeCloseTo(94.9, 0);
+    const event = new Event("pointerdown", { bubbles: true }); Object.defineProperty(event, "clientX", { value: 200 }); Object.defineProperty(event, "clientY", { value: 210 }); fireEvent(crop, event);
+    expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ override: expect.objectContaining({ keyframes: [expect.objectContaining({ x: .5, y: .7 })] }) }));
+  });
+
+  it("播放插值中心并在选择样本时 seek 到绝对源时间", () => {
+    const onChange = vi.fn(); const twoPoints = { ...reframe, samples: [{ timeSeconds: 4, boxes: [], center: { x: .2, y: .3 }, confidence: .9 }, { timeSeconds: 6, boxes: [], center: { x: .8, y: .7 }, confidence: .9 }] };
+    render(<ReframeControls clipId="interpolate" assetUrl="/source.mp4" sourceStart={4} sourceEnd={6} reframe={twoPoints} analysis={undefined} disabled={false} onAnalyze={vi.fn()} onCancel={vi.fn()} onChange={onChange} />);
+    const video = screen.getByLabelText("interpolate 原片") as HTMLVideoElement;
+    Object.defineProperty(video, "currentTime", { value: 5, writable: true }); fireEvent.timeUpdate(video);
+    expect(screen.getByRole("slider", { name: "interpolate 裁剪框" })).toHaveAttribute("aria-valuenow", "0.5");
+    fireEvent.click(screen.getByRole("button", { name: "0:06" }));
+    expect(video.currentTime).toBe(6);
   });
 
   it("播放从非零入点同步源时间，重复新增覆盖同一关键点且不允许删除最后一点", () => {
@@ -150,6 +175,14 @@ describe("PackagingControls", () => {
       safeArea: { left: .5, right: .5, top: .05, bottom: .05 } }} cues={[]} onChange={vi.fn()} disabled={false} />);
     expect(screen.getAllByRole("alert").map((item) => item.textContent).join(" ")).toContain("受控字体引用无效");
     expect(screen.getAllByRole("alert").map((item) => item.textContent).join(" ")).toContain("安全区没有可用空间");
+  });
+
+  it("模板可选择且可一次关闭全部已启用包装", async () => {
+    const onChange = vi.fn(); const value = { ...defaultPackaging(), elements: [{ id: "title", kind: "title" as const, enabled: true, start: 0, end: 2, text: "标题", position: "top" as const, style: "banner" as const }] };
+    render(<PackagingControls value={value} cues={[]} onChange={onChange} disabled={false} />);
+    expect(screen.getByLabelText("包装模板")).toHaveValue("commercial-clean");
+    await userEvent.click(screen.getByRole("button", { name: "关闭已启用包装" }));
+    expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ elements: [expect.objectContaining({ enabled: false })] }));
   });
 
   it("删除后新增同类元素仍生成唯一 id", async () => {
