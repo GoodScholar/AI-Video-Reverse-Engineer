@@ -115,6 +115,7 @@ def source_fingerprint(path: Path) -> str:
 
 def run_local_detector(source: Path, *, start: float, end: float, target_width: int, target_height: int,
                        source_timing: SourceTiming | None = None,
+                       media_kind: str = "video",
                        worker_python: str | None = None, model_path: Path | None = None,
                        worker_path: Path | None = None,
                        cancelled=lambda: False) -> dict[str, Any]:
@@ -125,8 +126,10 @@ def run_local_detector(source: Path, *, start: float, end: float, target_width: 
     runtime = worker_python or os.environ.get("AIVRE_PERSON_WORKER_PYTHON") or str(root / "person_worker" / ".venv" / "bin" / "python")
     if not Path(runtime).is_file() or not model.is_file():
         raise ReframeError("本地主体检测环境或固定模型未就绪；不会自动下载。")
+    if media_kind not in ("video", "image"):
+        raise ReframeError("主体检测媒体类型无效。")
     command = [runtime, str(worker), "--input", str(source), "--model", str(model), "--start", f"{start:.6f}",
-               "--end", f"{end:.6f}", "--target-width", str(target_width), "--target-height", str(target_height)]
+               "--end", f"{end:.6f}", "--media-kind", media_kind, "--target-width", str(target_width), "--target-height", str(target_height)]
     process = None
     try:
         # Spool streams while polling: a large successful JSON result must
@@ -241,7 +244,7 @@ def validate_stored_reframe(value: Any) -> dict[str, Any]:
 
 def normalize_reframe(value: Any, *, source_fingerprint: str, source_width: int, source_height: int,
                       source_timing: SourceTiming | None = None, required_start: float | None = None,
-                      required_end: float | None = None) -> dict[str, Any]:
+                      required_end: float | None = None, still_image: bool = False) -> dict[str, Any]:
     """Validate a persisted worker result against the current decoded source."""
     required_keys = {
         "schemaVersion", "sourceFingerprint", "sourceWidth", "sourceHeight", "targetAspect",
@@ -269,7 +272,9 @@ def normalize_reframe(value: Any, *, source_fingerprint: str, source_width: int,
     if value["status"] == "ready":
         if value["uncertaintyReasons"] or not samples:
             raise ReframeError("完成的主体裁剪必须有连续检测证据。")
-        if not _source_samples_cover(source_timing, samples, required_start, required_end):
+        if still_image and (len(samples) != 1 or samples[0]["timeSeconds"] != 0):
+            return _review_required(value, samples, override, "静态图片自动构图必须有唯一的 0 秒检测样本")
+        if not still_image and not _source_samples_cover(source_timing, samples, required_start, required_end):
             return _review_required(value, samples, override, "需重新分析源时间，自动构图未获可信逐帧时间授权")
     elif not value["uncertaintyReasons"]:
         raise ReframeError("待人工主体裁剪必须说明不确定原因。")
@@ -280,7 +285,7 @@ def normalize_reframe(value: Any, *, source_fingerprint: str, source_width: int,
 def reframe_filter(value: dict[str, Any], *, source_width: int, source_height: int, output_width: int,
                    output_height: int, in_point: float, speed: float, duration: float,
                    source_hash: str | None = None, source_timing: SourceTiming | None = None, crop_name: str = "reframe", commands_path: Path | None = None,
-                   trajectory_fps: float = 30) -> str:
+                   trajectory_fps: float = 30, still_image: bool = False) -> str:
     """Return `sendcmd,crop,scale` for source-time samples before setpts speed.
 
     Output command times are local clip times; each one maps to
@@ -307,7 +312,8 @@ def reframe_filter(value: dict[str, Any], *, source_width: int, source_height: i
                                    source_height=source_height,
                                    source_timing=source_timing,
                                    required_start=in_point if stored["override"]["mode"] == "auto" else None,
-                                   required_end=end if stored["override"]["mode"] == "auto" else None)
+                                   required_end=end if stored["override"]["mode"] == "auto" else None,
+                                   still_image=still_image)
     override = result["override"]
     if result["status"] != "ready" and override["mode"] == "auto":
         raise ReframeError("主体构图待人工确认，不能渲染。")

@@ -41,6 +41,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--target-height", required=True, type=int)
     value.add_argument("--sample-fps", type=float, default=2.0)
     value.add_argument("--timing-json")
+    value.add_argument("--media-kind", choices=("video", "image"), default="video")
     return value
 
 
@@ -115,12 +116,15 @@ def main(argv: list[str] | None = None) -> int:
         source, model = Path(args.input), Path(args.model)
         if not source.is_file() or not model.is_file() or sha256(model) != MODEL_SHA256:
             raise ValueError("输入或固定检测模型不可用。")
-        if (not math.isfinite(args.start) or not math.isfinite(args.end) or args.start < 0 or args.end <= args.start
+        if (not math.isfinite(args.start) or not math.isfinite(args.end) or args.start < 0
+                or (args.media_kind == "video" and args.end <= args.start)
+                or (args.media_kind == "image" and (args.start != 0 or args.end != 0))
                 or args.target_width <= 0 or args.target_height <= 0 or not math.isfinite(args.sample_fps)
                 or not .1 <= args.sample_fps <= 10):
             raise ValueError("主体检测区间或采样率无效。")
-        result = analyze(source, model, args.start, args.end, args.target_width, args.target_height, args.sample_fps,
-                         args.timing_json)
+        result = (analyze_image(source, model, args.target_width, args.target_height)
+                  if args.media_kind == "image" else analyze(source, model, args.start, args.end, args.target_width,
+                                                               args.target_height, args.sample_fps, args.timing_json))
         print(json.dumps(result, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
         return 0
     except Exception as error:
@@ -206,6 +210,56 @@ def analyze(source: Path, model: Path, start: float, end: float, target_width: i
             "frameDurationSeconds": None, "samplingIntervalSeconds": None,
             "modelSha256": MODEL_SHA256, "samples": samples, "uncertaintyReasons": reasons, "status": status,
             "override": {"mode": "auto", "keyframes": []}}
+
+
+def analyze_image(source: Path, model: Path, target_width: int, target_height: int) -> dict:
+    """Run the pinned detector exactly once in IMAGE mode for a real still."""
+    import cv2
+    import mediapipe as mp
+    from mediapipe.tasks import python
+    from mediapipe.tasks.python import vision
+
+    frame = cv2.imread(str(source), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise ValueError("无法打开主体检测图片。")
+    height, width = frame.shape[:2]
+    if width <= 0 or height <= 0:
+        raise ValueError("主体检测图片元数据无效。")
+    options = vision.ObjectDetectorOptions(
+        base_options=python.BaseOptions(model_asset_path=str(model)), running_mode=vision.RunningMode.IMAGE,
+        score_threshold=.35, max_results=10,
+    )
+    with vision.ObjectDetector.create_from_options(options) as detector:
+        image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        detected = detector.detect(image)
+    boxes = []
+    for detection in detected.detections:
+        category = detection.categories[0] if detection.categories else None
+        box = detection.bounding_box
+        if category is None or not category.category_name or box.width <= 0 or box.height <= 0:
+            continue
+        boxes.append({"x": max(0, box.origin_x / width), "y": max(0, box.origin_y / height),
+                      "width": min(1, box.width / width), "height": min(1, box.height / height),
+                      "label": category.category_name, "confidence": float(category.score)})
+    people = [box for box in boxes if box["label"].lower() == "person"]
+    reasons = []
+    if len(people) != 1:
+        reasons.append("未检测到唯一人物主体" if not people else "检测到多个可能主体")
+        center, confidence = {"x": .5, "y": .5}, 0.0
+    else:
+        subject = people[0]
+        crop_width_ratio, crop_height_ratio = crop_window_ratios(width, height, target_width, target_height)
+        if subject["width"] > crop_width_ratio or subject["height"] > crop_height_ratio:
+            reasons.append("主体框大于目标满幅裁剪窗，可能持续被裁切")
+        if any(box["label"].lower() != "person" for box in boxes):
+            reasons.append("检测到可能商品或遮挡物，无法确认满幅裁剪不会遮挡商品")
+        center = {"x": round(subject["x"] + subject["width"] / 2, 6), "y": round(subject["y"] + subject["height"] / 2, 6)}
+        confidence = round(subject["confidence"], 6)
+    samples = [{"timeSeconds": 0, "boxes": boxes, "center": center, "confidence": confidence}] if people else []
+    return {"schemaVersion": 1, "sourceFingerprint": sha256(source), "sourceWidth": width, "sourceHeight": height,
+            "targetAspect": {"width": target_width, "height": target_height}, "detectorVersion": DETECTOR_VERSION,
+            "modelSha256": MODEL_SHA256, "samples": samples, "uncertaintyReasons": reasons,
+            "status": "ready" if not reasons else "review_required", "override": {"mode": "auto", "keyframes": []}}
 
 
 def _review_result(source: Path, width: int, height: int, target_width: int, target_height: int, reason: str) -> dict:

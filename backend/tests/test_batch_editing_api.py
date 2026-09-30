@@ -302,6 +302,35 @@ def _add_export_child(fixture, child_id, *, reframed=True):
     return child
 
 
+def test_batch_export_keeps_non_reframed_sibling_sources_available_for_reframe_safety(tmp_path):
+    """Reframe safety must preflight the whole approved snapshot, not just its reframe clip."""
+    with _reframe_delivery_client(tmp_path) as fixture:
+        _add_export_child(fixture, "child")
+        state = json.loads(fixture.state_path.read_text(encoding="utf-8"))
+        child = next(item for item in state["tasks"] if item["id"] == "child")
+        preproduction_path = fixture.source.parent.parent / "state.json"
+        preproduction = json.loads(preproduction_path.read_text(encoding="utf-8"))
+        sibling = fixture.source.parent / "sibling.mp4"
+        shutil.copyfile(fixture.source, sibling)
+        preproduction["assets"].append({"id": "sibling", "name": "sibling", "kind": "video", "file": "sibling.mp4", "duration": 2})
+        preproduction_path.write_text(json.dumps(preproduction), encoding="utf-8")
+        plain_clip = {"id": "plain", "assetId": "sibling", "start": 0, "inPoint": 0, "duration": 2,
+                      "speed": 1, "volume": 0, "fadeIn": 0, "fadeOut": 0}
+        child["variant"]["tracks"][0]["clips"][0]["start"] = 2
+        child["variant"]["tracks"][0]["clips"].insert(0, plain_clip)
+        preview = child["variant"]["runs"][0]
+        preview["snapshot"]["tracks"][0]["clips"][0]["start"] = 2
+        preview["snapshot"]["tracks"][0]["clips"].insert(0, dict(plain_clip))
+        preview["sources"]["sibling"] = "sibling.mp4"
+        frozen_sibling = fixture.state_path.parent / "runs" / "preview" / "sources" / "sibling.mp4"
+        shutil.copyfile(sibling, frozen_sibling)
+        fixture.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        response = fixture.client.post(f"{fixture.base}/{fixture.task['id']}/exports", json={"taskIds": ["child"]})
+
+        assert response.status_code == 202, response.text
+
+
 class _HookSourceLock:
     def __init__(self):
         self.entries = 0

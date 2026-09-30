@@ -8,6 +8,7 @@ import json
 import hashlib
 import math
 import os
+from copy import deepcopy
 import signal
 import shutil
 import subprocess
@@ -65,7 +66,7 @@ class _Media:
 def _validate_reframe_media(media: _Media) -> None:
     if (media.width is None or media.height is None or media.sample_aspect_ratio not in (None, "1:1", "0:1")
             or not math.isfinite(media.rotation) or abs(media.rotation) > .001):
-        raise TimelineRenderError("主体裁剪不支持旋转或非方形像素的源视频。")
+        raise TimelineRenderError("主体裁剪不支持旋转或非方形像素的源画面。")
 
 
 def render_timeline(
@@ -104,6 +105,12 @@ def render_timeline(
         raise TimelineRenderError("时间线轨道无效。")
 
     clips = _collect_clips(tracks, sources, ffprobe_path, format)
+    packaging_tracks = deepcopy(tracks)
+    still_clip_ids = {clip["id"] for clip in clips if clip["media"].image}
+    for track in packaging_tracks:
+        for clip in track.get("clips", []):
+            if clip.get("id") in still_clip_ids:
+                clip["_stillImage"] = True
     from .timeline import validate_transitions
     try:
         validate_transitions(timeline.get('transitions', []), tracks)
@@ -134,7 +141,7 @@ def render_timeline(
             from .montage_packaging import PackagingError, compile_ass, private_font_path
             try:
                 ass_path = output.parent / ".packaging.ass"
-                ass_path.write_text(compile_ass(packaging, packaging_cues or [], tracks, width, height, private_font_path()), encoding="utf-8")
+                ass_path.write_text(compile_ass(packaging, packaging_cues or [], packaging_tracks, width, height, private_font_path()), encoding="utf-8")
             except (OSError, PackagingError) as error:
                 raise TimelineRenderError(str(error)) from error
         command, expected = _build_command(
@@ -196,6 +203,7 @@ def inspect_timeline_media(state: dict, assets: dict, resolve_source, format: st
                         output_width=state["settings"]["width"], output_height=state["settings"]["height"],
                         in_point=clip["inPoint"], speed=clip["speed"], duration=clip["duration"],
                         source_hash=source_fingerprint(source), source_timing=collected.get("source_timing"), crop_name="preflight",
+                        still_image=media.image,
                     )
                 visible |= track["kind"] == "video" and not track["hidden"] and media.has_video
                 audible |= not track["muted"] and clip["volume"] > 0 and media.has_audio
@@ -604,7 +612,7 @@ def _video_filter(index: int, clip: dict, width: int, height: int, fps: float, l
                 source_timing=clip.get("source_timing"),
                 crop_name="reframe_" + hashlib.sha256(str(clip["id"]).encode()).hexdigest()[:12],
                 commands_path=reframe_commands_file,
-                trajectory_fps=fps,
+                trajectory_fps=fps, still_image=media.image,
             )
         except (OSError, KeyError, ReframeError) as error:
             raise TimelineRenderError(str(error)) from error

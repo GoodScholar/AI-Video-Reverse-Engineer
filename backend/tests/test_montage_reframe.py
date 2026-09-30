@@ -43,6 +43,21 @@ def test_normalize_reframe_preserves_detection_facts_when_manual_override_is_sel
     assert reframe["samples"][1]["center"] == {"x": .7, "y": .5}
 
 
+def test_still_image_auto_reframe_accepts_exactly_one_real_zero_second_sample_without_video_pts():
+    """A still has one detector instant, not a fabricated video timeline."""
+    analysis = _analysis(samples=[
+        {"timeSeconds": 0, "boxes": [{"x": .2, "y": .1, "width": .3, "height": .7,
+                                         "label": "person", "confidence": .9}],
+         "center": {"x": .35, "y": .45}, "confidence": .9},
+    ])
+
+    stored = normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
+                               still_image=True)
+
+    assert stored["status"] == "ready"
+    assert [sample["timeSeconds"] for sample in stored["samples"]] == [0]
+
+
 @pytest.mark.parametrize("field,value", [("assetId", "replacement"), ("inPoint", 1), ("duration", 3), ("speed", 1.25)])
 def test_replacement_or_source_range_change_resets_server_reframe_to_pending(field, value):
     """A stable clip id must never carry detector facts to another source identity."""

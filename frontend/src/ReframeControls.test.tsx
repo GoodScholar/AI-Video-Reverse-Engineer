@@ -127,8 +127,23 @@ describe("ReframeControls", () => {
     const video = screen.getByLabelText("interpolate 原片") as HTMLVideoElement;
     Object.defineProperty(video, "currentTime", { value: 5, writable: true }); fireEvent.timeUpdate(video);
     expect(screen.getByRole("slider", { name: "interpolate 裁剪框" })).toHaveAttribute("aria-valuenow", "0.5");
-    fireEvent.click(screen.getByRole("button", { name: "0:06" }));
+    fireEvent.click(screen.getByRole("button", { name: "源时间 0:06.0 的检测样本" }));
     expect(video.currentTime).toBe(6);
+  });
+
+  it("相隔 0.1 秒的样本显示不同时间且各自有唯一可访问名称", () => {
+    const onChange = vi.fn();
+    const closeSamples = { ...reframe, samples: [
+      { timeSeconds: 0, boxes: [], center: { x: .5, y: .5 }, confidence: .9 },
+      { timeSeconds: .1, boxes: [], center: { x: .5, y: .5 }, confidence: .9 },
+      { timeSeconds: .16, boxes: [], center: { x: .5, y: .5 }, confidence: .9 },
+    ] };
+    render(<ReframeControls clipId="a11y-samples" assetUrl="/source.mp4" reframe={closeSamples} analysis={undefined} disabled={false}
+      onAnalyze={vi.fn()} onCancel={vi.fn()} onChange={onChange} />);
+
+    expect(screen.getByRole("button", { name: "源时间 0:00.0 的检测样本" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "源时间 0:00.1 的检测样本" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "源时间 0:00.16 的检测样本" })).toBeVisible();
   });
 
   it("播放从非零入点同步源时间，重复新增覆盖同一关键点且不允许删除最后一点", () => {
@@ -146,12 +161,28 @@ describe("ReframeControls", () => {
     expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ override: expect.objectContaining({ keyframes: [expect.objectContaining({ timeSeconds: 6 })] }) }));
   });
 
-  it("静态图片使用 img，且不暴露视频主体分析操作", () => {
+  it("静态图片使用 img，并提供同一服务端主体分析入口", () => {
     render(<ReframeControls clipId="still" assetUrl="/source.png" mediaKind="image" reframe={reframe} analysis={undefined} disabled={false}
       onAnalyze={vi.fn()} onCancel={vi.fn()} onChange={vi.fn()} />);
     expect(screen.getByRole("img", { name: "still 原片" })).toHaveAttribute("src", "/source.png");
-    expect(screen.queryByRole("button", { name: "分析主体" })).toBeNull();
+    expect(screen.getByRole("button", { name: "分析主体" })).toBeVisible();
     expect(document.querySelector('video[aria-label="still 原片"]')).toBeNull();
+  });
+
+  it("静态图片按真实图像几何拖框和键盘保存 0 秒人工构图", () => {
+    const onChange = vi.fn();
+    render(<ReframeControls clipId="still-geometry" assetUrl="/source.png" mediaKind="image" reframe={reframe} analysis={undefined} disabled={false}
+      onAnalyze={vi.fn()} onCancel={vi.fn()} onChange={onChange} />);
+    const stage = screen.getByLabelText("still-geometry 主体裁剪原片");
+    const image = screen.getByRole("img", { name: "still-geometry 原片" });
+    Object.defineProperty(stage, "getBoundingClientRect", { value: () => ({ left: 0, top: 0, width: 400, height: 300 }) });
+    Object.defineProperty(image, "getBoundingClientRect", { value: () => ({ left: 100, top: 0, width: 200, height: 300 }) });
+    Object.defineProperty(image, "naturalWidth", { value: 1920 }); Object.defineProperty(image, "naturalHeight", { value: 1080 });
+    fireEvent.load(image);
+    const crop = screen.getByRole("slider", { name: "still-geometry 裁剪框" });
+    fireEvent.pointerDown(crop, { clientX: 250, clientY: 150, pointerId: 1 });
+    fireEvent.keyDown(crop, { key: "ArrowRight" });
+    expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ override: expect.objectContaining({ mode: "manual", keyframes: [expect.objectContaining({ timeSeconds: 0, x: .52 })] }) }));
   });
 });
 

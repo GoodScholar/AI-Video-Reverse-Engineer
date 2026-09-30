@@ -342,6 +342,11 @@ def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width
 
             if not usable:
                 raise PackagingError("主体检测时间覆盖未知，需人工确认。")
+            if clip.get("_stillImage"):
+                if len(usable) != 1 or float(usable[0]["timeSeconds"]) != 0:
+                    raise PackagingError("静态图片主体检测必须有唯一的 0 秒样本，需人工确认。")
+                append_sweep(usable[0], usable[0], 0, 0)
+                continue
             first_time, last_time = float(usable[0]["timeSeconds"]), float(usable[-1]["timeSeconds"])
             if source_start < first_time - 1e-9:
                 raise PackagingError("主体检测时间覆盖未知，需人工确认。")

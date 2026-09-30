@@ -29,7 +29,11 @@ export function defaultPackaging(): Packaging {
 }
 
 function clamp(value: number, minimum = 0, maximum = 1) { return Math.min(maximum, Math.max(minimum, value)); }
-function formatTime(value: number) { return `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, "0")}`; }
+function formatTime(value: number) {
+  const seconds = value % 60;
+  const precision = Number.isInteger(value) ? 1 : Math.min(6, Math.max(1, String(value).split(".")[1]?.length ?? 1));
+  return `${Math.floor(value / 60)}:${seconds.toFixed(precision).padStart(3 + precision, "0")}`;
+}
 function interpolate(points: Array<{ timeSeconds: number; x: number; y: number }>, time: number) {
   if (!points.length) return { x: .5, y: .5 };
   const ordered = [...points].sort((left, right) => left.timeSeconds - right.timeSeconds);
@@ -56,12 +60,13 @@ export function ReframeControls({ clipId, assetUrl, mediaKind = "video", sourceS
 }) {
   const stage = useRef<HTMLDivElement>(null);
   const source = useRef<HTMLVideoElement>(null);
+  const still = useRef<HTMLImageElement>(null);
   const dragging = useRef(false);
   const [selectedTime, setSelectedTime] = useState<number | null>(null);
   const [visibleFrame, setVisibleFrame] = useState({ left: 0, top: 0, width: 0, height: 0 });
   const isVideo = mediaKind === "video";
-  const maximumSourceTime = sourceEnd ?? Math.max(sourceStart, ...(reframe?.samples.map((sample) => sample.timeSeconds) ?? [sourceStart]));
-  const currentTime = Math.min(maximumSourceTime, Math.max(sourceStart, selectedTime ?? reframe?.samples[0]?.timeSeconds ?? sourceStart));
+  const maximumSourceTime = isVideo ? sourceEnd ?? Math.max(sourceStart, ...(reframe?.samples.map((sample) => sample.timeSeconds) ?? [sourceStart])) : 0;
+  const currentTime = isVideo ? Math.min(maximumSourceTime, Math.max(sourceStart, selectedTime ?? reframe?.samples[0]?.timeSeconds ?? sourceStart)) : 0;
   const override = reframe?.override ?? { mode: "auto" as const, keyframes: [] };
   const active = { timeSeconds: currentTime, ...(override.mode === "center" ? { x: .5, y: .5 } : interpolate(override.mode === "manual" || override.mode === "replace" ? override.keyframes : reframe?.samples.map((sample) => ({ timeSeconds: sample.timeSeconds, x: sample.center?.x ?? .5, y: sample.center?.y ?? .5 })) ?? [], currentTime)) };
   const targetRatio = reframe ? reframe.targetAspect.width / reframe.targetAspect.height : .5625;
@@ -72,30 +77,42 @@ export function ReframeControls({ clipId, assetUrl, mediaKind = "video", sourceS
   const setOverride = (next: ReframeOverride) => { if (reframe) onChange({ ...reframe, override: next }); };
   const measureVisibleFrame = () => {
     const stageRect = stage.current?.getBoundingClientRect();
-    const sourceRect = source.current?.getBoundingClientRect();
+    const node = isVideo ? source.current : still.current;
+    const sourceRect = node?.getBoundingClientRect();
     if (!stageRect || !sourceRect || !sourceRect.width || !sourceRect.height) return;
-    setVisibleFrame(contentRect(stageRect, sourceRect, source.current?.videoWidth || reframe?.sourceWidth || 0, source.current?.videoHeight || reframe?.sourceHeight || 0));
+    const width = isVideo ? source.current?.videoWidth : still.current?.naturalWidth;
+    const height = isVideo ? source.current?.videoHeight : still.current?.naturalHeight;
+    setVisibleFrame(contentRect(stageRect, sourceRect, width || reframe?.sourceWidth || 0, height || reframe?.sourceHeight || 0));
   };
   useEffect(() => {
     const node = source.current;
-    if (!node || !isVideo) return;
+    if (!node) return;
     const sync = () => { measureVisibleFrame(); if (node.currentTime < sourceStart) node.currentTime = sourceStart; };
     node.addEventListener("loadedmetadata", sync);
     window.addEventListener("resize", measureVisibleFrame);
     sync();
     return () => { node.removeEventListener("loadedmetadata", sync); window.removeEventListener("resize", measureVisibleFrame); };
   }, [assetUrl, isVideo, sourceStart, reframe?.sourceWidth, reframe?.sourceHeight]);
+  useEffect(() => {
+    if (isVideo || !still.current) return;
+    const node = still.current;
+    node.addEventListener("load", measureVisibleFrame);
+    window.addEventListener("resize", measureVisibleFrame);
+    measureVisibleFrame();
+    return () => { node.removeEventListener("load", measureVisibleFrame); window.removeEventListener("resize", measureVisibleFrame); };
+  }, [assetUrl, isVideo, reframe?.sourceWidth, reframe?.sourceHeight]);
   const setSourceTime = (timeSeconds: number) => {
     const next = Math.min(maximumSourceTime, Math.max(sourceStart, timeSeconds));
     setSelectedTime(next);
-    if (source.current) source.current.currentTime = next;
+    if (source.current && isVideo) source.current.currentTime = next;
   };
   const move = (clientX: number, clientY: number) => {
     if (!reframe || disabled) return;
     const stageRect = stage.current?.getBoundingClientRect();
-    const sourceRect = source.current?.getBoundingClientRect();
+    const node = isVideo ? source.current : still.current;
+    const sourceRect = node?.getBoundingClientRect();
     if (!stageRect || !sourceRect?.width) return;
-    const frame = contentRect(stageRect, sourceRect, source.current?.videoWidth || reframe.sourceWidth, source.current?.videoHeight || reframe.sourceHeight);
+    const frame = contentRect(stageRect, sourceRect, (isVideo ? source.current?.videoWidth : still.current?.naturalWidth) || reframe.sourceWidth, (isVideo ? source.current?.videoHeight : still.current?.naturalHeight) || reframe.sourceHeight);
     if (!frame.width || !frame.height) return;
     const x = clamp((clientX - stageRect.left - frame.left) / frame.width, cropWidthFraction / 2, 1 - cropWidthFraction / 2);
     const y = Number.isFinite(clientY) ? clamp((clientY - stageRect.top - frame.top) / frame.height, cropHeightFraction / 2, 1 - cropHeightFraction / 2) : active.y;
@@ -126,24 +143,23 @@ export function ReframeControls({ clipId, assetUrl, mediaKind = "video", sourceS
 
   return <section className="reframe-controls" aria-label="主体裁剪">
     <header><div><h5>主体裁剪与满幅构图</h5><p>播放原片并拖动明亮裁剪框；框外区域会变暗。人工关键点只保存在草稿中，分析完成不会覆盖它。</p></div>
-      <div className="reframe-actions">{isVideo && (analysis?.status === "queued" || analysis?.status === "running"
+      <div className="reframe-actions">{analysis?.status === "queued" || analysis?.status === "running"
         ? <button type="button" className="secondary-action" disabled={disabled} onClick={onCancel}>取消主体分析</button>
-        : <button type="button" className="secondary-action" disabled={disabled} onClick={onAnalyze}>{analysis?.status === "failed" ? "重新分析主体" : "分析主体"}</button>)}</div></header>
+        : <button type="button" className="secondary-action" disabled={disabled} onClick={onAnalyze}>{analysis?.status === "failed" ? "重新分析主体" : "分析主体"}</button>}</div></header>
     {analysis?.status === "failed" && <p className="reframe-error" role="alert">主体分析失败：{analysis.error ?? "请检查本地模型和原片后重试。"}</p>}
     {analysis && (analysis.status === "queued" || analysis.status === "running") && <p role="status">主体分析{analysis.status === "queued" ? "排队中" : "进行中"}；可以取消，当前人工草稿不会丢失。</p>}
     {reviewReason && <p className="reframe-review" role="status">需人工确认：{reviewReason}</p>}
-    {mediaKind === "image" && assetUrl && <><p role="status">静态图片按原始像素显示；主体分析仅支持视频素材。</p><div className="reframe-stage" aria-label={`${clipId} 静态图片`}><img src={assetUrl} alt={`${clipId} 原片`} /></div></>}
     {!reframe && assetUrl && isVideo && <><p role="status">原片已就绪；完成主体分析后即可拖动裁剪框并保存人工关键点。</p><div ref={stage} className="reframe-stage" aria-label={`${clipId} 主体裁剪原片`}>
       <video ref={source} controls playsInline preload="metadata" src={assetUrl} aria-label={`${clipId} 原片`} onTimeUpdate={selectPlaybackTime} />{overlay(false)}
     </div></>}
-    {reframe && isVideo ? <>
-      <div className="reframe-keyframes" aria-label="源时间关键点">{reframe.samples.map((sample) => <button key={sample.timeSeconds} type="button" className="secondary-action" disabled={disabled}
-        aria-pressed={sample.timeSeconds === currentTime} onClick={() => setSourceTime(sample.timeSeconds)}>{formatTime(sample.timeSeconds)}</button>)}<label>关键点秒<input aria-label="关键点秒" type="number" min="0" step=".01" value={active.timeSeconds} disabled={disabled}
+    {reframe ? <>
+      {isVideo && <div className="reframe-keyframes" aria-label="源时间关键点">{reframe.samples.map((sample) => <button key={sample.timeSeconds} type="button" className="secondary-action" disabled={disabled}
+        aria-label={`源时间 ${formatTime(sample.timeSeconds)} 的检测样本`} aria-pressed={sample.timeSeconds === currentTime} onClick={() => setSourceTime(sample.timeSeconds)}>{formatTime(sample.timeSeconds)}</button>)}<label>关键点秒<input aria-label="关键点秒" type="number" min="0" step=".01" value={active.timeSeconds} disabled={disabled}
           onChange={(event) => { const input = Number(event.target.value); if (!Number.isFinite(input)) return; const timeSeconds = Math.min(maximumSourceTime, Math.max(sourceStart, input)); setSourceTime(timeSeconds); setOverride({ mode: "manual", keyframes: [...override.keyframes.filter((item) => item.timeSeconds !== active.timeSeconds && item.timeSeconds !== timeSeconds), { ...active, timeSeconds }].sort((a, b) => a.timeSeconds - b.timeSeconds) }); }} /></label>
         <button type="button" className="secondary-action" disabled={disabled} onClick={() => setOverride({ mode: "manual", keyframes: [...override.keyframes.filter((item) => item.timeSeconds !== currentTime), { ...active, timeSeconds: currentTime }].sort((a, b) => a.timeSeconds - b.timeSeconds) })}>新增关键点</button>
-        <button type="button" className="secondary-action" disabled={disabled || override.keyframes.length <= 1} onClick={() => setOverride({ ...override, keyframes: override.keyframes.filter((item) => item.timeSeconds !== active.timeSeconds) })}>删除关键点</button></div>
+        <button type="button" className="secondary-action" disabled={disabled || override.keyframes.length <= 1} onClick={() => setOverride({ ...override, keyframes: override.keyframes.filter((item) => item.timeSeconds !== active.timeSeconds) })}>删除关键点</button></div>}
       <div ref={stage} className="reframe-stage" aria-label={`${clipId} 主体裁剪原片`} onPointerMove={(event) => { if (dragging.current) move(event.clientX, event.clientY); }} onPointerUp={() => { dragging.current = false; }} onPointerCancel={() => { dragging.current = false; }}>
-        <video ref={source} controls playsInline preload="metadata" src={assetUrl} aria-label={`${clipId} 原片`} onLoadedMetadata={measureVisibleFrame} onTimeUpdate={selectPlaybackTime} />{overlay(true)}
+        {isVideo ? <video ref={source} controls playsInline preload="metadata" src={assetUrl} aria-label={`${clipId} 原片`} onLoadedMetadata={measureVisibleFrame} onTimeUpdate={selectPlaybackTime} /> : <img ref={still} src={assetUrl} alt={`${clipId} 原片`} onLoad={measureVisibleFrame} />}{overlay(true)}
       </div>
       <div className="reframe-modes" role="group" aria-label="裁剪模式"><button type="button" className="secondary-action" aria-pressed={override.mode === "auto"} disabled={disabled} onClick={() => setOverride({ mode: "auto", keyframes: [] })}>自动</button>
         <button type="button" className="secondary-action" aria-pressed={override.mode === "center"} disabled={disabled} onClick={() => setOverride({ mode: "center", keyframes: [] })}>中心裁剪</button>
@@ -152,7 +168,7 @@ export function ReframeControls({ clipId, assetUrl, mediaKind = "video", sourceS
       {override.mode === "manual" && <div className="reframe-number"><label>当前关键点横向位置<input aria-label="当前关键点横向位置" type="number" min="0" max="1" step=".01" value={active.x.toFixed(2)} disabled={disabled}
         onChange={(event) => { const x = clamp(Number(event.target.value)); if (Number.isFinite(x)) setOverride({ mode: "manual", keyframes: [...override.keyframes.filter((item) => item.timeSeconds !== active.timeSeconds), { ...active, x }].sort((a, b) => a.timeSeconds - b.timeSeconds) }); }} /></label><label>当前关键点纵向位置<input aria-label="当前关键点纵向位置" type="number" min="0" max="1" step=".01" value={active.y.toFixed(2)} disabled={disabled}
         onChange={(event) => { const y = clamp(Number(event.target.value)); if (Number.isFinite(y)) setOverride({ mode: "manual", keyframes: [...override.keyframes.filter((item) => item.timeSeconds !== active.timeSeconds), { ...active, y }].sort((a, b) => a.timeSeconds - b.timeSeconds) }); }} /></label></div>}
-    </> : !assetUrl ? <p>请选择可用视频素材后再执行主体分析。</p> : null}
+    </> : !assetUrl ? <p>请选择可用图片或视频素材后再执行主体分析。</p> : null}
   </section>;
 }
 

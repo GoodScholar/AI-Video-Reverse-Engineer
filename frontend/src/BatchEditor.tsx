@@ -890,7 +890,7 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
             reframe={clip.reframe as Reframe | undefined} analysis={selected.variant.reframeAnalysis?.[clip.id]} disabled={busy}
             onChange={(reframe) => changeClips(track.id, (clips) => clips.map((item) => item.id === clip.id ? { ...item, reframe } : item))}
             onAnalyze={() => void updateReframe(clip.id, "analyze")} onCancel={() => void updateReframe(clip.id, "cancel")}
-            candidates={assets.filter((asset) => asset.kind === "video" && asset.id !== clip.assetId).map((asset) => ({ id: asset.id, name: asset.name }))}
+            candidates={assets.filter((asset) => (asset.kind === "video" || asset.kind === "image") && asset.id !== clip.assetId).map((asset) => ({ id: asset.id, name: asset.name }))}
             onReplace={(assetId) => changeClips(track.id, (clips) => clips.map((item) => item.id === clip.id ? { ...item, assetId, reframe: undefined } : item))} />}
           {track.kind === "video" && transition && <TransitionControls boundary={transition} name={boundaryName} onChange={change => changeTransition(transition, change)} />}
           </Fragment>;

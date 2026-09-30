@@ -95,14 +95,15 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             if clip is None:
                 fail("reframe_clip_missing", "时间线片段不存在。", 404)
             asset = asset_index(project_id).get(clip["assetId"])
-            if asset is None or asset.get("kind") != "video":
-                fail("reframe_source_unavailable", "主体分析仅支持可用视频素材。")
+            if asset is None or asset.get("kind") not in ("video", "image"):
+                fail("reframe_source_unavailable", "主体分析仅支持可用图片或视频素材。")
             source = source_path(project_id, asset)
+            still_image = asset.get("kind") == "image"
             from .montage_reframe import pending_reframe, probe_source_timing, source_fingerprint
             clip.setdefault("reframe", pending_reframe(target_width=state["settings"]["width"], target_height=state["settings"]["height"], reason="已提交本地主体分析"))
             identity = {"assetId": clip["assetId"], "inPoint": clip["inPoint"], "duration": clip["duration"],
                         "speed": clip["speed"], "sourceFingerprint": source_fingerprint(source)}
-            source_timing = probe_source_timing(source, ffprobe_path)
+            source_timing = None if still_image else probe_source_timing(source, ffprobe_path)
             try:
                 from .timeline_render import _probe_media
                 trusted_media = _probe_media(source, ffprobe_path)
@@ -126,15 +127,16 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 if not all(type(value) is int and value > 0 for value in trusted_size):
                     raise ValueError("无法获取可信源尺寸，不能完成主体分析。")
                 raw = reframe_analyzer(source, identity) if reframe_analyzer else run_local_detector(
-                    source, start=identity["inPoint"], end=identity["inPoint"] + identity["duration"] * identity["speed"],
+                    source, start=0 if still_image else identity["inPoint"], end=0 if still_image else identity["inPoint"] + identity["duration"] * identity["speed"],
                     target_width=state["settings"]["width"], target_height=state["settings"]["height"],
-                    source_timing=source_timing,
+                    source_timing=source_timing, media_kind="image" if still_image else "video",
                     cancelled=lambda: (state_for(project_id).get("reframeAnalysis", {}).get(clip_id, {}).get("id") != run_id
                                        or state_for(project_id).get("reframeAnalysis", {}).get(clip_id, {}).get("status") == "cancelled"))
                 result = normalize_reframe(raw, source_fingerprint=identity["sourceFingerprint"],
                                            source_width=trusted_size[0], source_height=trusted_size[1], source_timing=source_timing,
-                                           required_start=identity["inPoint"],
-                                           required_end=identity["inPoint"] + identity["duration"] * identity["speed"])
+                                           required_start=None if still_image else identity["inPoint"],
+                                           required_end=None if still_image else identity["inPoint"] + identity["duration"] * identity["speed"],
+                                           still_image=still_image)
                 error = None
             except Exception as failure:
                 result, error = None, str(failure)[:300] or "本地主体分析失败。"

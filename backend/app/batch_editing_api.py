@@ -616,9 +616,10 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             for clip_id in clip_ids:
                 clip = clip_for(task, clip_id, proposal_id)
                 asset = assets_for(project_id).get(clip["assetId"])
-                if asset is None or asset.get("kind") != "video":
-                    raise ValueError("主体裁剪仅支持可用视频素材。")
+                if asset is None or asset.get("kind") not in ("video", "image"):
+                    raise ValueError("主体裁剪仅支持可用图片或视频素材。")
                 source = project_assets.file(project_id, asset)
+                still_image = asset.get("kind") == "image"
                 from .montage_reframe import pending_reframe, probe_source_timing, source_fingerprint
                 clip.setdefault("reframe", pending_reframe(target_width=variant["settings"]["width"],
                                                             target_height=variant["settings"]["height"],
@@ -626,7 +627,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 identity = {"assetId": clip["assetId"], "inPoint": clip["inPoint"], "duration": clip["duration"],
                             "speed": clip["speed"], "sourceFingerprint": source_fingerprint(source)}
                 if identity["sourceFingerprint"] not in source_probes:
-                    timing = probe_source_timing(source, ffprobe_path)
+                    timing = None if still_image else probe_source_timing(source, ffprobe_path)
                     try:
                         from .timeline_render import _probe_media
                         media = _probe_media(source, ffprobe_path)
@@ -637,7 +638,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 analysis[clip_id] = {"id": run_id, "status": "queued", "error": None, "proposalId": proposal_id,
                                      "identity": identity}
                 jobs.append((clip_id, identity, source, dict(clip["reframe"]["targetAspect"]),
-                             source_probes[identity["sourceFingerprint"]]))
+                             source_probes[identity["sourceFingerprint"]], still_image))
             save(project_id, state)
 
         def process(_pid):
@@ -654,7 +655,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     if record is not None and record.get("id") == run_id and record.get("status") == "queued":
                         record["status"] = "running"
                 save(project_id, state)
-            for clip_id, identity, source, aspect, (source_timing, trusted_size) in jobs:
+            for clip_id, identity, source, aspect, (source_timing, trusted_size), still_image in jobs:
                 try:
                     with lock:
                         record = task_for(state_for(project_id), task_id)["variant"].get("reframeAnalysis", {}).get(clip_id)
@@ -665,14 +666,14 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                         raise ValueError("分析期间素材已变化，请重新主体分析。")
                     if not all(type(value) is int and value > 0 for value in trusted_size):
                         raise ValueError("无法获取可信源尺寸，不能完成主体分析。")
-                    raw = reframe_analyzer(source, identity["inPoint"], identity["inPoint"] + identity["duration"] * identity["speed"], aspect) if reframe_analyzer else run_local_detector(
-                        source, start=identity["inPoint"], end=identity["inPoint"] + identity["duration"] * identity["speed"],
+                    raw = reframe_analyzer(source, 0 if still_image else identity["inPoint"], 0 if still_image else identity["inPoint"] + identity["duration"] * identity["speed"], aspect) if reframe_analyzer else run_local_detector(
+                        source, start=0 if still_image else identity["inPoint"], end=0 if still_image else identity["inPoint"] + identity["duration"] * identity["speed"],
                         target_width=aspect["width"], target_height=aspect["height"], source_timing=source_timing,
-                        cancelled=lambda cid=clip_id: cancelled(cid))
+                        media_kind="image" if still_image else "video", cancelled=lambda cid=clip_id: cancelled(cid))
                     completed[clip_id] = normalize_reframe(raw, source_fingerprint=identity["sourceFingerprint"],
                         source_width=trusted_size[0], source_height=trusted_size[1],
                         source_timing=source_timing,
-                        required_start=identity["inPoint"], required_end=identity["inPoint"] + identity["duration"] * identity["speed"])
+                        required_start=None if still_image else identity["inPoint"], required_end=None if still_image else identity["inPoint"] + identity["duration"] * identity["speed"], still_image=still_image)
                 except Exception as error:
                     failures[clip_id] = str(error)[:300] or "本地主体分析失败。"
             with source_lock or nullcontext(), lock:
@@ -680,7 +681,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 task = task_for(state, task_id)
                 changed = False
                 renderable_changed = False
-                for clip_id, identity, _source, _aspect, _probe in jobs:
+                for clip_id, identity, _source, _aspect, _probe, _still_image in jobs:
                     record = task["variant"].get("reframeAnalysis", {}).get(clip_id)
                     if record is None or record.get("id") != run_id or record.get("identity") != identity or record.get("status") == "cancelled":
                         continue
@@ -829,10 +830,11 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             state = {"revision": run.get("revision", task["variant"]["revision"]), **snapshot}
             referenced_assets = {clip["assetId"] for track in snapshot["tracks"] for clip in track["clips"]
                                if clip.get("id") in clip_ids}
+            snapshot_assets = {clip["assetId"] for track in snapshot["tracks"] for clip in track["clips"]}
             frozen_facts = {asset_id: stable_source_fact(frozen_sources[asset_id]) for asset_id in referenced_assets}
-            current_paths = {asset_id: project_assets.file(project_id, assets[asset_id]) for asset_id in referenced_assets}
+            current_paths = {asset_id: project_assets.file(project_id, assets[asset_id]) for asset_id in snapshot_assets}
             current_facts = {asset_id: {**stable_source_fact(path), "assetFile": assets[asset_id].get("file")}
-                             for asset_id, path in current_paths.items()}
+                             for asset_id, path in current_paths.items() if asset_id in referenced_assets}
             frozen_issues = inspect_timeline_media(
                 state, assets, lambda asset: frozen_sources[asset["id"]], "mp4", ffprobe_path,
                 media_cache=media_cache, timing_cache=frozen_timing_cache)
