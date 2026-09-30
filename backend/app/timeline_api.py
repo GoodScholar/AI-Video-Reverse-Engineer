@@ -200,13 +200,12 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             from .montage_reframe import pending_reframe
             previous_reframe = clip.get("reframe", {})
             previous_fingerprint = previous_reframe.get("sourceFingerprint")
-            if previous_fingerprint != proof["fingerprint"]:
-                pending = pending_reframe(target_width=current_aspect["width"], target_height=current_aspect["height"], reason="已提交本地主体分析")
-                override = previous_reframe.get("override")
-                if (not previous_fingerprint and isinstance(override, dict)
-                        and override.get("mode") != "auto"):
-                    pending["override"] = deepcopy(override)
-                clip["reframe"] = pending
+            pending = pending_reframe(target_width=current_aspect["width"], target_height=current_aspect["height"], reason="已提交本地主体分析")
+            override = previous_reframe.get("override")
+            if ((not previous_fingerprint or previous_fingerprint == proof["fingerprint"])
+                    and isinstance(override, dict) and override.get("mode") != "auto"):
+                pending["override"] = deepcopy(override)
+            clip["reframe"] = pending
             identity = {**request["clip"], "sourceFingerprint": proof["fingerprint"], "targetAspect": current_aspect}
             source = current_source
             source_timing, trusted_size = proof["timing"], proof["size"]

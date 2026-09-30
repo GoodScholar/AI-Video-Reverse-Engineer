@@ -567,7 +567,7 @@ def test_download_rejects_a_run_identity_changed_during_its_probe(tmp_path, monk
     from app import montage_reframe
 
     with _reframe_delivery_client(tmp_path) as fixture:
-        entered, release = threading.Event(), threading.Event()
+        entered, release, read_done = threading.Event(), threading.Event(), threading.Event()
         original = montage_reframe.probe_source_timing
         monkeypatch.setattr(montage_reframe, "probe_source_timing", lambda path, probe:
                             entered.set() or (release.wait(5) and original(path, probe)))
@@ -592,7 +592,7 @@ def test_submit_rejects_a_preview_identity_changed_during_its_probe(tmp_path, mo
 
     with _reframe_delivery_client(tmp_path) as fixture:
         _add_export_child(fixture, "child")
-        entered, release = threading.Event(), threading.Event()
+        entered, release, read_done = threading.Event(), threading.Event(), threading.Event()
         original = montage_reframe.probe_source_timing
 
         def blocked_probe(path, probe):
@@ -1720,7 +1720,7 @@ def test_montage_proposal_apply_pts_proof_does_not_block_get(tmp_path, monkeypat
         state = json.loads(state_path.read_text(encoding="utf-8"))
         state["tasks"][0]["variant"]["reframeAnalysis"] = {}
         state_path.write_text(json.dumps(state), encoding="utf-8")
-        entered, release = threading.Event(), threading.Event()
+        entered, release, read_done = threading.Event(), threading.Event(), threading.Event()
         original = montage_reframe.probe_source_timing
         def blocked(path, probe):
             entered.set(); assert release.wait(5); return original(path, probe)
@@ -1730,8 +1730,10 @@ def test_montage_proposal_apply_pts_proof_does_not_block_get(tmp_path, monkeypat
             f"{base}/{task['id']}/montage-proposals/{proposal['id']}/apply",
             json={"revision": 0, "proposalRevision": 0, "strategy": "overwrite"}, headers=INTENT)))
         thread.start(); assert entered.wait(5)
-        assert client.get(base).status_code == 200
-        release.set(); thread.join(5)
+        reader = threading.Thread(target=lambda: (result.setdefault("read", client.get(base)), read_done.set()))
+        reader.start(); assert read_done.wait(1)
+        assert result["read"].status_code == 200
+        release.set(); thread.join(5); reader.join(5)
         assert result["response"].status_code == 200
         assert len(queue.jobs) == 1
 

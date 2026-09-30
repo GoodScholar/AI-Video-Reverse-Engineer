@@ -733,14 +733,21 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                         raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "主体分析状态已更新，请刷新后重试。"})
                 previous_reframe = clip.get("reframe", {})
                 previous_fingerprint = previous_reframe.get("sourceFingerprint")
-                if reuse_existing and previous_fingerprint == source_fact["fingerprint"] and previous_fingerprint:
+                reusable = (reuse_existing and previous_fingerprint == source_fact["fingerprint"]
+                            and previous_fingerprint
+                            and previous_reframe.get("targetAspect") == aspect
+                            and (previous_reframe.get("sourceWidth"), previous_reframe.get("sourceHeight"))
+                            == tuple(source_fact["size"]))
+                if reusable:
                     # A full lock-free proof confirms that these saved facts
                     # (including a deliberate manual decision) still bind the source.
                     continue
                 pending = pending_reframe(target_width=aspect["width"], target_height=aspect["height"],
-                                          reason="已提交本地主体分析")
+                                          reason=("候选或源区间已改变，需重新主体分析"
+                                                  if proposal_id is not None else "已提交本地主体分析"))
                 override = previous_reframe.get("override")
-                if (not previous_fingerprint and isinstance(override, dict)
+                if ((not previous_fingerprint or previous_fingerprint == source_fact["fingerprint"])
+                        and isinstance(override, dict)
                         and override.get("mode") != "auto"):
                     pending["override"] = deepcopy(override)
                 clip["reframe"] = pending
@@ -923,7 +930,14 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             progressed = {clip_id for clip_id, record in current_analysis.items()
                           if record != expected_analysis.get(clip_id)}
             for clip_id in progressed:
-                staged_analysis[clip_id] = deepcopy(current_analysis[clip_id])
+                current_record = current_analysis[clip_id]
+                staged_record = staged_analysis.get(clip_id, {})
+                if (staged_record.get("adopted") is True
+                        and staged_record.get("id") == current_record.get("id")
+                        and staged_record.get("identity") == current_record.get("identity")):
+                    staged_analysis[clip_id] = {**deepcopy(current_record), "adopted": True}
+                else:
+                    staged_analysis[clip_id] = deepcopy(current_record)
             for clip_id in progressed:
                 current_clip = next((clip for track in current_task["variant"]["tracks"]
                                      for clip in track.get("clips", []) if clip.get("id") == clip_id), None)
@@ -1993,7 +2007,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                               staged_state=staged_state, expected_state=expected_state, reuse_existing=True)
         else:
             commit_staged_batch_state(project_id, expected_state, staged_state)
-        return response
+        with lock:
+            return {"proposal": deepcopy(montage_proposal_for(task_for(state_for(project_id), task_id), proposal_id))}
 
     @router.post("/{task_id}/montage-proposals/{proposal_id}/apply")
     def apply_montage_proposal(project_id: str, task_id: str, proposal_id: str, body: dict[str, Any]):
@@ -2173,7 +2188,9 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                               reuse_existing=True)
         else:
             commit_staged_batch_state(project_id, expected_state, staged_state)
-        return response
+        with lock:
+            task = task_for(state_for(project_id), task_id)
+            return {"proposal": deepcopy(montage_proposal_for(task, proposal_id)), "variant": public_task(project_id, task)["variant"]}
 
     def process_voiceover(project_id, task_id, job_id):
         directory = store.path(project_id, "voiceovers", job_id, task_id)

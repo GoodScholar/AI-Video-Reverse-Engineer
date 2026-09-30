@@ -379,7 +379,7 @@ def test_timeline_reframe_probe_media_proof_does_not_block_get(tmp_path, monkeyp
 
     client, queue = setup(tmp_path)
     assert client.put(BASE, json=_workspace()).status_code == 200
-    entered, release = threading.Event(), threading.Event()
+    entered, release, read_done = threading.Event(), threading.Event(), threading.Event()
     original = timeline_render._probe_media
     def blocked(path, probe):
         entered.set(); assert release.wait(5); return original(path, probe)
@@ -388,8 +388,10 @@ def test_timeline_reframe_probe_media_proof_does_not_block_get(tmp_path, monkeyp
     thread = threading.Thread(target=lambda: result.setdefault("response", client.post(
         BASE + "/reframes/clip1/analyze", json={"revision": 1})))
     thread.start(); assert entered.wait(5)
-    assert client.get(BASE).status_code == 200
-    release.set(); thread.join(5)
+    reader = threading.Thread(target=lambda: (result.setdefault("read", client.get(BASE)), read_done.set()))
+    reader.start(); assert read_done.wait(1)
+    assert result["read"].status_code == 200
+    release.set(); thread.join(5); reader.join(5)
     assert result["response"].status_code == 202
     assert queue.jobs
 
