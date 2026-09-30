@@ -647,8 +647,11 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         fingerprint = source_fingerprint(path)
         after = source_identity(path)
         if before != after:
-            raise OSError("素材在校验期间变化")
+            raise SourceProofConflict("素材在校验期间变化")
         return {**before, "fingerprint": fingerprint}
+
+    class SourceProofConflict(OSError):
+        """A source changed after a proof started; clients can retry from a fresh snapshot."""
 
     def safety_run_identity(task: dict, run: dict) -> dict[str, Any]:
         return {
@@ -686,7 +689,9 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     for asset_id, fact in frozen_facts.items())
                     or any(source_identity(current_paths[asset_id]) != {key: fact[key] for key in fact if key not in ("fingerprint", "assetFile")}
                            for asset_id, fact in current_facts.items())):
-                raise OSError("素材在校验期间变化")
+                raise SourceProofConflict("素材在校验期间变化")
+        except SourceProofConflict as error:
+            raise BatchProductionError("batch_export_reframe_conflict", "主体构图验证期间素材已变化，请刷新后重试。") from error
         except (KeyError, OSError, ValueError, RenderInputError) as error:
             raise BatchProductionError("batch_export_reframe_review_required",
                                        "主体构图关联素材不可验证，请重新主体分析并预览审核。") from error
@@ -722,6 +727,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
 
     def prepare_approved_source_snapshot(project_id: str, run_id: str, preview: dict, assets: dict) -> dict:
         """Copy an approved export input outside locks and retain a stat-CAS proof for every source."""
+        destination = store.path(project_id, "exports", run_id)
+        completed = False
         try:
             approved_directory = store.path(project_id, "runs", preview["id"])
             frozen_sources = render_inputs.resolve(approved_directory, preview["sources"])
@@ -730,17 +737,23 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             frozen = {asset_id: stable_source_fact(path) for asset_id, path in frozen_sources.items()}
             current = {asset_id: {**stable_source_fact(path), "assetFile": assets[asset_id].get("file")}
                        for asset_id, path in current_paths.items()}
-            sources = snapshot_approved_sources(project_id, store.path(project_id, "exports", run_id), preview, assets)
+            sources = snapshot_approved_sources(project_id, destination, preview, assets)
             if (any(source_identity(frozen_sources[asset_id]) != {key: fact[key] for key in fact if key != "fingerprint"}
                     for asset_id, fact in frozen.items())
                     or any(source_identity(current_paths[asset_id]) != {key: fact[key] for key in fact if key not in ("fingerprint", "assetFile")}
                            for asset_id, fact in current.items())):
-                raise OSError("素材在快照期间变化")
+                raise SourceProofConflict("素材在快照期间变化")
+            completed = True
             return {"sources": sources, "frozen": frozen, "current": current}
+        except SourceProofConflict as error:
+            raise BatchProductionError("batch_export_reframe_conflict", "导出准备期间素材已变化，请刷新后重试。") from error
         except HTTPException:
             raise BatchProductionError("batch_asset_unavailable", "原素材缺失或变化，请重新预览审核。") from None
         except (KeyError, OSError, ValueError, RenderInputError) as error:
             raise BatchProductionError("batch_asset_unavailable", "原素材缺失或变化，请重新预览审核。") from error
+        finally:
+            if not completed:
+                shutil.rmtree(destination, ignore_errors=True)
 
     def consume_source_snapshot(project_id: str, preview: dict, proof: dict, assets: dict) -> None:
         """Stat-check the lock-free approved-source copy without rereading media bytes."""
@@ -758,7 +771,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 }:
                     raise OSError("项目素材已变化")
         except (KeyError, OSError, ValueError, RenderInputError) as error:
-            raise BatchProductionError("batch_asset_unavailable", "原素材在导出准备期间变化，请重新预览审核。") from error
+            raise BatchProductionError("batch_export_reframe_conflict", "导出准备期间素材已变化，请刷新后重试。") from error
 
     def find_run(variant: dict[str, Any], run_id: str):
         run = next((item for item in variant["runs"] if item["id"] == run_id), None)
@@ -1868,16 +1881,30 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 media_cache=media_cache, frozen_timing_cache=frozen_timing_cache,
                 current_timing_cache=current_timing_cache,
             )
+
+        def cleanup_prepared_sources(run_ids=None):
+            targets = set(run_ids) if run_ids is not None else {run_id for _child_id, run_id in planned_snapshots}
+            for planned_run_id in targets:
+                shutil.rmtree(store.path(project_id, "exports", planned_run_id), ignore_errors=True)
+
         source_snapshots = {}
-        for (child_id, run_id), (_child, preview) in planned_snapshots.items():
-            source_snapshots[(child_id, run_id)] = production_call(
-                prepare_approved_source_snapshot, project_id, run_id, preview, assets)
+        try:
+            for (child_id, run_id), (_child, preview) in planned_snapshots.items():
+                source_snapshots[(child_id, run_id)] = production_call(
+                    prepare_approved_source_snapshot, project_id, run_id, preview, assets)
+        except BaseException:
+            cleanup_prepared_sources()
+            raise
         reserved_ids = iter(planned_ids)
 
         with source_lock or nullcontext(), lock:
-            state = state_for(project_id)
-            parent = task_for(state, task_id)
-            children = [task_for(state, child_id) for child_id in body["taskIds"]]
+            try:
+                state = state_for(project_id)
+                parent = task_for(state, task_id)
+                children = [task_for(state, child_id) for child_id in body["taskIds"]]
+            except BaseException:
+                cleanup_prepared_sources()
+                raise
 
             # Report proof staleness as a retryable CAS conflict before the
             # production lifecycle can collapse it into a generic approval error.
@@ -1892,6 +1919,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     current_run = next((item for item in child["variant"].get("exports", [])
                                         if item["id"] == run_id), None)
                 if current_run is None or proof["identity"] != safety_run_identity(child, current_run):
+                    cleanup_prepared_sources()
                     raise HTTPException(409, detail={"code": "batch_export_reframe_conflict",
                                                      "message": "主体构图验证期间版本已变化，请刷新后重试。"})
 
@@ -1908,7 +1936,11 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 except StopIteration:
                     raise BatchProductionError("batch_export_reframe_conflict", "导出准备已变化，请刷新后重试。") from None
 
-            assets = assets_for(project_id)
+            try:
+                assets = assets_for(project_id)
+            except BaseException:
+                cleanup_prepared_sources()
+                raise
             try:
                 prepared = production_call(
                     export_approved_versions, parent, children, assets=assets,
@@ -1918,24 +1950,29 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     id_factory=actual_id,
                 )
             except BaseException:
-                for _child_id, planned_run_id in source_snapshots:
-                    shutil.rmtree(store.path(project_id, "exports", planned_run_id), ignore_errors=True)
+                cleanup_prepared_sources()
                 raise
             used_snapshot_ids = {run["id"] for _child, run, created in prepared if created}
-            for _child_id, planned_run_id in source_snapshots:
-                if planned_run_id not in used_snapshot_ids:
-                    shutil.rmtree(store.path(project_id, "exports", planned_run_id), ignore_errors=True)
+            cleanup_prepared_sources({planned_run_id for _child_id, planned_run_id in source_snapshots
+                                      if planned_run_id not in used_snapshot_ids})
             results = []
-            for child, run, created in prepared:
-                if not created:
-                    results.append({"taskId": child["id"], "runId": run["id"], "status": run["status"]})
-                    continue
-                save(project_id, state)
-                if run["status"] == "queued" and not compute_queue.submit("batch-export:" + run["id"], project_id,
-                                                                          lambda pid, cid=child["id"], rid=run["id"]: process_export(pid, cid, rid)):
-                    run.update(status=LOCAL_RUN_POLICY.fail(run["status"]), error="本地处理队列不可用。")
+            persisted_snapshot_ids = set()
+            try:
+                for child, run, created in prepared:
+                    if not created:
+                        results.append({"taskId": child["id"], "runId": run["id"], "status": run["status"]})
+                        continue
                     save(project_id, state)
-                results.append({"taskId": child["id"], "runId": run["id"], "status": run["status"], "error": run["error"]})
+                    persisted_snapshot_ids.add(run["id"])
+                    if run["status"] == "queued" and not compute_queue.submit("batch-export:" + run["id"], project_id,
+                                                                              lambda pid, cid=child["id"], rid=run["id"]: process_export(pid, cid, rid)):
+                        run.update(status=LOCAL_RUN_POLICY.fail(run["status"]), error="本地处理队列不可用。")
+                        save(project_id, state)
+                    results.append({"taskId": child["id"], "runId": run["id"], "status": run["status"], "error": run["error"]})
+            except BaseException:
+                cleanup_prepared_sources({planned_run_id for _child_id, planned_run_id in source_snapshots
+                                          if planned_run_id not in persisted_snapshot_ids})
+                raise
             return {"results": results}
 
     @router.post("/{task_id}/exports/{run_id}/cancel")

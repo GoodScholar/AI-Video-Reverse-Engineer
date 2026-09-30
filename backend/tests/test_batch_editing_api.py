@@ -1,5 +1,6 @@
 """User-visible batch editing paths through the project API."""
 import json
+import os
 import shutil
 import subprocess
 import threading
@@ -1047,6 +1048,63 @@ def test_completed_export_download_rechecks_real_reframe_sources_but_keeps_cente
         (outputs / "preview.mp4").write_bytes(b"preview")
         assert client.get(f"{base}/{task['id']}/exports/delivery/output").content == b"delivery"
 
+        # Download uses the same lock-free proof boundary: unrelated reads and
+        # cancellation must remain available while its real PTS probe waits.
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        active = delivery("active", deepcopy(snapshot))
+        active["status"] = "queued"
+        state["tasks"][0]["variant"]["exports"].append(active)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        original_probe = montage_reframe.probe_source_timing
+        download_entered, download_release, download_read = threading.Event(), threading.Event(), threading.Event()
+
+        def delayed_download_probe(path, probe):
+            download_entered.set()
+            assert download_release.wait(5), "测试未释放下载探测"
+            return original_probe(path, probe)
+
+        monkeypatch.setattr(montage_reframe, "probe_source_timing", delayed_download_probe)
+        download_result = {}
+        downloading = threading.Thread(target=lambda: download_result.setdefault(
+            "response", client.get(f"{base}/{task['id']}/exports/delivery/output")
+        ))
+        downloading.start()
+        assert download_entered.wait(2)
+        reading = threading.Thread(target=lambda: (client.get(base), download_read.set()))
+        reading.start()
+        try:
+            assert download_read.wait(.5), "下载探测期间普通读取不应等待交付锁"
+            assert client.post(f"{base}/{task['id']}/exports/active/cancel").status_code == 200
+        finally:
+            download_release.set()
+        downloading.join(5)
+        reading.join(5)
+        assert download_result["response"].content == b"delivery"
+
+        # Replacing the path with identical bytes during a proof is still a
+        # CAS race, not a media-quality failure, and must be retryable.
+        race_entered, race_release = threading.Event(), threading.Event()
+
+        def delayed_race_probe(path, probe):
+            race_entered.set()
+            assert race_release.wait(5), "测试未释放竞态探测"
+            return original_probe(path, probe)
+
+        monkeypatch.setattr(montage_reframe, "probe_source_timing", delayed_race_probe)
+        race_result = {}
+        racing = threading.Thread(target=lambda: race_result.setdefault(
+            "response", client.get(f"{base}/{task['id']}/exports/delivery/output")
+        ))
+        racing.start()
+        assert race_entered.wait(2)
+        replacement = source.with_name("source-replacement.mp4")
+        replacement.write_bytes(source.read_bytes())
+        os.replace(replacement, source)
+        race_release.set()
+        racing.join(5)
+        assert race_result["response"].status_code == 409
+        assert race_result["response"].json()["detail"]["code"] == "batch_export_reframe_conflict"
+
         # A delivery proof may take a long time to inspect real frame PTS, but
         # that work must not monopolize the shared project lock.  Submit uses
         # the same proof path and two variants sharing this source must reuse it.
@@ -1061,7 +1119,6 @@ def test_completed_export_download_rechecks_real_reframe_sources_but_keeps_cente
         state["tasks"].extend(children)
         state_path.write_text(json.dumps(state), encoding="utf-8")
         entered, release, read_done = threading.Event(), threading.Event(), threading.Event()
-        original_probe = montage_reframe.probe_source_timing
         probes = []
 
         def delayed_probe(path, probe):
@@ -1093,7 +1150,12 @@ def test_completed_export_download_rechecks_real_reframe_sources_but_keeps_cente
         assert len(probes) == 2, "冻结副本与当前源各验证一次，但同请求同源变体不得重复探测"
 
         # The second lock must consume only the proof for the exact version it
-        # inspected; a concurrent variant edit becomes a retryable conflict.
+        # inspected; a concurrent variant edit becomes a retryable conflict and
+        # must not leave the lock-free source copy behind.
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        next(item for item in state["tasks"] if item["id"] == children[0]["id"])["variant"]["exports"] = []
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        exports_before = {item.name for item in (state_path.parent / "exports").iterdir()}
         entered.clear()
         release.clear()
         stale_result = {}
@@ -1109,6 +1171,7 @@ def test_completed_export_download_rechecks_real_reframe_sources_but_keeps_cente
         stale.join(5)
         assert stale_result["response"].status_code == 409
         assert stale_result["response"].json()["detail"]["code"] == "batch_export_reframe_conflict"
+        assert {item.name for item in (state_path.parent / "exports").iterdir()} == exports_before
 
         monkeypatch.setattr(montage_reframe, "probe_source_timing", lambda path, probe:
                             montage_reframe.SourceTiming((), (), False, "新 probe 发现 VFR") if path == source else original_probe(path, probe))
