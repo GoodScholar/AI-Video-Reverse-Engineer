@@ -24,3 +24,20 @@ def test_worker_keeps_early_cfr_frame_pts_and_rejects_repeated_frames():
 
     assert module.cfr_frame_time(23, 24, 10) == 23 / 24
     assert module.cfr_frame_time(23, 24, 23) is None
+
+
+def test_worker_selects_real_pts_intersections_not_index_divided_by_fps():
+    worker = Path(__file__).parents[1] / "person_worker" / "run_reframe.py"
+    spec = importlib.util.spec_from_file_location("reframe_worker_pts_selection", worker)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    selected = module.select_sample_indices([
+        {"elapsedSeconds": 0.0, "durationSeconds": 1 / 24},
+        {"elapsedSeconds": .5, "durationSeconds": 1 / 24},
+        {"elapsedSeconds": 1.0, "durationSeconds": 1 / 24},
+        {"elapsedSeconds": 1.5, "durationSeconds": 1 / 24},
+        {"elapsedSeconds": 1.958333, "durationSeconds": 1 / 24},
+    ], 0.1, 1.99, 2.0)
+
+    assert selected == [1, 2, 3, 4]

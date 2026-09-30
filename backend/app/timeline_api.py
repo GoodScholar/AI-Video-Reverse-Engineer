@@ -98,10 +98,17 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             if asset is None or asset.get("kind") != "video":
                 fail("reframe_source_unavailable", "主体分析仅支持可用视频素材。")
             source = source_path(project_id, asset)
-            from .montage_reframe import pending_reframe, source_fingerprint
+            from .montage_reframe import pending_reframe, probe_source_timing, source_fingerprint
             clip.setdefault("reframe", pending_reframe(target_width=state["settings"]["width"], target_height=state["settings"]["height"], reason="已提交本地主体分析"))
             identity = {"assetId": clip["assetId"], "inPoint": clip["inPoint"], "duration": clip["duration"],
                         "speed": clip["speed"], "sourceFingerprint": source_fingerprint(source)}
+            source_timing = probe_source_timing(source, ffprobe_path)
+            try:
+                from .timeline_render import _probe_media
+                trusted_media = _probe_media(source, ffprobe_path)
+                trusted_size = (trusted_media.width, trusted_media.height)
+            except Exception:
+                trusted_size = (None, None)
             state.setdefault("reframeAnalysis", {})[clip_id] = {"id": run_id, "status": "queued", "error": None, "identity": identity}
             save(project_id, state)
         def process(_pid):
@@ -117,10 +124,13 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 raw = reframe_analyzer(source, identity) if reframe_analyzer else run_local_detector(
                     source, start=identity["inPoint"], end=identity["inPoint"] + identity["duration"] * identity["speed"],
                     target_width=state["settings"]["width"], target_height=state["settings"]["height"],
+                    source_timing=source_timing,
                     cancelled=lambda: (state_for(project_id).get("reframeAnalysis", {}).get(clip_id, {}).get("id") != run_id
                                        or state_for(project_id).get("reframeAnalysis", {}).get(clip_id, {}).get("status") == "cancelled"))
-                result = normalize_reframe(raw, source_fingerprint=identity["sourceFingerprint"], source_width=raw["sourceWidth"],
-                                           source_height=raw["sourceHeight"], required_start=identity["inPoint"],
+                result = normalize_reframe(raw, source_fingerprint=identity["sourceFingerprint"],
+                                           source_width=trusted_size[0] or raw["sourceWidth"],
+                                           source_height=trusted_size[1] or raw["sourceHeight"], source_timing=source_timing,
+                                           required_start=identity["inPoint"],
                                            required_end=identity["inPoint"] + identity["duration"] * identity["speed"])
                 error = None
             except Exception as failure:
@@ -336,6 +346,11 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 fail("timeline_invalid", str(error), 422)
             if body["revision"] != state["revision"]:
                 fail("timeline_conflict", "时间线已更新，请刷新后重试。")
+            try:
+                from .montage_reframe import ReframeError, retain_server_reframe_facts
+                tracks = retain_server_reframe_facts(state["tracks"], tracks)
+            except ReframeError as error:
+                fail("timeline_invalid", str(error), 422)
             state["settings"] = settings
             state["tracks"] = tracks
             state["transitions"] = validate_transitions(transition_input, tracks)

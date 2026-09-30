@@ -29,6 +29,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--target-width", required=True, type=int)
     value.add_argument("--target-height", required=True, type=int)
     value.add_argument("--sample-fps", type=float, default=2.0)
+    value.add_argument("--timing-json")
     return value
 
 
@@ -53,6 +54,44 @@ def cfr_frame_time(frame_index: int, fps: float, previous_index: int) -> float |
     return frame_index / fps
 
 
+def select_sample_indices(frames: list[dict], start: float, end: float, sample_fps: float) -> list[int]:
+    """Keep first/last intersecting real frames and an at-most-2Hz interior."""
+    intersecting = [index for index, frame in enumerate(frames)
+                    if frame["elapsedSeconds"] < end and frame["elapsedSeconds"] + frame["durationSeconds"] > start]
+    if not intersecting:
+        return []
+    selected = [intersecting[0]]
+    next_target = start + 1 / sample_fps
+    for index in intersecting[1:-1]:
+        if frames[index]["elapsedSeconds"] >= next_target - .001:
+            selected.append(index)
+            next_target = frames[index]["elapsedSeconds"] + 1 / sample_fps
+    if intersecting[-1] != selected[-1]:
+        selected.append(intersecting[-1])
+    return selected
+
+
+def load_timing(path: str | None) -> tuple[list[dict], str | None]:
+    if not path:
+        return [], "服务端未提供可信逐帧时间"
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        frames = payload.get("frames")
+        if not payload.get("cfr") or not isinstance(frames, list):
+            return [], str(payload.get("reason") or "源视频时间不可信")
+        valid = []
+        previous = -1.0
+        for frame in frames:
+            point, duration = float(frame["elapsedSeconds"]), float(frame["durationSeconds"])
+            if not math.isfinite(point) or not math.isfinite(duration) or point < 0 or point <= previous or duration <= 0:
+                return [], "服务端逐帧时间无效"
+            valid.append({"elapsedSeconds": point, "durationSeconds": duration})
+            previous = point
+        return valid, None if valid else "服务端逐帧时间无效"
+    except (OSError, ValueError, TypeError, KeyError):
+        return [], "服务端逐帧时间无效"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
@@ -63,7 +102,8 @@ def main(argv: list[str] | None = None) -> int:
                 or args.target_width <= 0 or args.target_height <= 0 or not math.isfinite(args.sample_fps)
                 or not .1 <= args.sample_fps <= 10):
             raise ValueError("主体检测区间或采样率无效。")
-        result = analyze(source, model, args.start, args.end, args.target_width, args.target_height, args.sample_fps)
+        result = analyze(source, model, args.start, args.end, args.target_width, args.target_height, args.sample_fps,
+                         args.timing_json)
         print(json.dumps(result, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
         return 0
     except Exception as error:
@@ -72,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def analyze(source: Path, model: Path, start: float, end: float, target_width: int, target_height: int,
-            sample_fps: float) -> dict:
+            sample_fps: float, timing_json: str | None = None) -> dict:
     import cv2
     import mediapipe as mp
     from mediapipe.tasks import python
@@ -82,38 +122,36 @@ def analyze(source: Path, model: Path, start: float, end: float, target_width: i
     if not capture.isOpened():
         raise ValueError("无法打开主体检测视频。")
     width, height = round(capture.get(cv2.CAP_PROP_FRAME_WIDTH)), round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = float(capture.get(cv2.CAP_PROP_FPS))
-    if width <= 0 or height <= 0 or not math.isfinite(fps) or fps <= 0:
+    if width <= 0 or height <= 0:
         capture.release()
         raise ValueError("主体检测视频元数据无效。")
+    frames, timing_reason = load_timing(timing_json)
+    if timing_reason:
+        capture.release()
+        return _review_result(source, width, height, target_width, target_height, timing_reason)
     options = vision.ObjectDetectorOptions(
         base_options=python.BaseOptions(model_asset_path=str(model)), running_mode=vision.RunningMode.VIDEO,
         score_threshold=.35, max_results=10,
     )
-    samples, reasons, last_timestamp, last_frame_index = [], [], -1, -1
+    samples, reasons, last_timestamp = [], [], -1
     crop_width_ratio, crop_height_ratio = crop_window_ratios(width, height, target_width, target_height)
-    expected = max(2, round((end - start) * sample_fps) + 1)
-    # The requested end is exclusive for FFmpeg/timeline ranges; sampling it
-    # exactly can seek one frame beyond a valid stream.
-    last_time = max(start, end - min(1 / fps, (end - start) / 2))
-    times = [start + (last_time - start) * index / (expected - 1) for index in range(expected)]
+    selected_indices = select_sample_indices(frames, start, end, min(sample_fps, 2.0))
+    if not selected_indices or len(selected_indices) > 640:
+        capture.release()
+        return _review_result(source, width, height, target_width, target_height, "源视频时间区间无法可靠采样")
     try:
         with vision.ObjectDetector.create_from_options(options) as detector:
-            for time_seconds in times:
-                capture.set(cv2.CAP_PROP_POS_MSEC, time_seconds * 1000)
+            for frame_index in selected_indices:
+                capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
                 ok, frame = capture.read()
                 if not ok:
                     reasons.append("部分源时间无法解码")
                     continue
-                # OpenCV seek can land on an earlier CFR frame.  Keep that
-                # frame's actual index/PTS; never relabel it as the requested
-                # time merely to satisfy coverage validation.
-                frame_index = round(capture.get(cv2.CAP_PROP_POS_FRAMES)) - 1
-                actual_time = cfr_frame_time(frame_index, fps, last_frame_index)
-                if actual_time is None:
-                    reasons.append("源视频帧时间无法可靠确定")
+                decoded_index = round(capture.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+                if decoded_index != frame_index:
+                    reasons.append("OpenCV 未读取到服务端确认的帧索引")
                     continue
-                last_frame_index = frame_index
+                actual_time = frames[frame_index]["elapsedSeconds"]
                 timestamp = max(last_timestamp + 1, round(actual_time * 1000))
                 last_timestamp = timestamp
                 image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
@@ -143,13 +181,20 @@ def analyze(source: Path, model: Path, start: float, end: float, target_width: i
     finally:
         capture.release()
     reasons = list(dict.fromkeys(reasons))
-    if len(samples) != len(times):
+    if len(samples) != len(selected_indices):
         reasons.append("检测结果不连续，需人工确认构图")
     status = "ready" if not reasons else "review_required"
     return {"schemaVersion": 1, "sourceFingerprint": sha256(source), "sourceWidth": width, "sourceHeight": height,
             "targetAspect": {"width": target_width, "height": target_height}, "detectorVersion": DETECTOR_VERSION,
-            "frameDurationSeconds": round(1 / fps, 9), "samplingIntervalSeconds": round(1 / sample_fps, 9),
+            "frameDurationSeconds": None, "samplingIntervalSeconds": None,
             "modelSha256": MODEL_SHA256, "samples": samples, "uncertaintyReasons": reasons, "status": status,
+            "override": {"mode": "auto", "keyframes": []}}
+
+
+def _review_result(source: Path, width: int, height: int, target_width: int, target_height: int, reason: str) -> dict:
+    return {"schemaVersion": 1, "sourceFingerprint": sha256(source), "sourceWidth": width, "sourceHeight": height,
+            "targetAspect": {"width": target_width, "height": target_height}, "detectorVersion": DETECTOR_VERSION,
+            "modelSha256": MODEL_SHA256, "samples": [], "uncertaintyReasons": [reason], "status": "review_required",
             "override": {"mode": "auto", "keyframes": []}}
 
 

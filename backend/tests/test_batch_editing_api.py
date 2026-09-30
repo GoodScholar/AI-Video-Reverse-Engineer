@@ -924,7 +924,10 @@ def test_batch_reframe_repeat_cancel_retry_and_source_cas(tmp_path):
         jobs.pop()[1](project_id)
         variant = client.get(base).json()["tasks"][0]["variant"]
         assert variant["revision"] == 2
-        assert variant["tracks"][0]["clips"][0]["reframe"]["status"] == "ready"
+        assert variant["tracks"][0]["clips"][0]["reframe"]["status"] == "review_required"
+        forged = variant["tracks"]
+        forged[0]["clips"][0]["reframe"]["status"] = "ready"
+        assert client.put(f"{base}/{task['id']}/variant", json={"revision": 2, "tracks": forged}).status_code == 422
         assert client.post(url + "/analyze", json={"revision": 2}).status_code == 202
         source.unlink()
         jobs.pop()[1](project_id)
@@ -958,7 +961,7 @@ def test_montage_candidate_replacement_keeps_pending_reframe_and_queues_analysis
         handler(pid)
         task = client.get(base).json()["tasks"][0]
         selected = task["montageProposals"][0]["segments"][0]["selectedClip"]
-        assert selected["reframe"]["status"] == "ready"
+        assert selected["reframe"]["status"] == "review_required"
         assert task["variant"]["reframeAnalysis"][selected["id"]]["status"] == "completed"
 
 
@@ -984,7 +987,7 @@ def test_two_clip_proposal_adoption_publishes_one_aggregate_reframe_revision(tmp
         assert variant["revision"] == 2
         clips = variant["tracks"][0]["clips"]
         assert len(clips) == 2
-        assert [clip["reframe"]["status"] for clip in clips] == ["ready", "ready"]
+        assert [clip["reframe"]["status"] for clip in clips] == ["review_required", "review_required"]
         assert [variant["reframeAnalysis"][clip["id"]]["status"] for clip in clips] == ["completed", "completed"]
 
 
@@ -1011,7 +1014,7 @@ def test_pending_proposal_apply_publishes_to_variant_without_overwriting_later_m
         variant = client.get(base).json()["tasks"][0]["variant"]
         stored = variant["tracks"][0]["clips"][0]["reframe"]
         assert variant["revision"] == 3
-        assert stored["status"] == "ready"
+        assert stored["status"] == "review_required"
         assert stored["override"] == {"mode": "manual", "keyframes": [{"timeSeconds": 1.0, "x": .2, "y": .7}]}
         assert len(stored["samples"]) == 2
 
@@ -1098,7 +1101,6 @@ def test_proposal_same_asset_bytes_change_or_speed_change_never_reuses_manual_re
         handler(pid)
         tracks = client.get(base).json()["tasks"][0]["variant"]["tracks"]
         clip = tracks[0]["clips"][0]
-        valid_reframe = clip["reframe"]
         clip["reframe"]["override"] = {"mode": "manual", "keyframes": [{"timeSeconds": 1, "x": .2, "y": .7}]}
         clip["speed"] = 2
         assert client.put(f"{base}/{task['id']}/variant", json={"revision": 2, "tracks": tracks}, headers=INTENT).status_code == 200
@@ -1119,7 +1121,9 @@ def test_proposal_same_asset_bytes_change_or_speed_change_never_reuses_manual_re
         tracks = applied.json()["variant"]["tracks"]
         clip = tracks[0]["clips"][0]
         clip["speed"] = 1
-        clip["reframe"] = {**valid_reframe, "override": {"mode": "manual", "keyframes": [{"timeSeconds": 1, "x": .2, "y": .7}]}}
+        # A client may only change the current pending record's human override;
+        # replaying `valid_reframe` facts would now correctly be rejected.
+        clip["reframe"]["override"] = {"mode": "manual", "keyframes": [{"timeSeconds": 1, "x": .2, "y": .7}]}
         assert client.put(f"{base}/{task['id']}/variant", json={"revision": 4, "tracks": tracks}, headers=INTENT).status_code == 200
         from app import batch_editing_api
         frozen_search = batch_editing_api.load_planning_search(
@@ -1191,5 +1195,5 @@ def test_adopted_multi_clip_job_increments_once_when_first_result_succeeds_and_l
         variant = client.get(base).json()["tasks"][0]["variant"]
         clips = variant["tracks"][0]["clips"]
         assert variant["revision"] == 2
-        assert clips[0]["reframe"]["status"] == "ready"
+        assert clips[0]["reframe"]["status"] == "review_required"
         assert clips[1]["reframe"]["status"] == "review_required"

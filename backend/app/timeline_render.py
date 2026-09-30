@@ -148,6 +148,7 @@ def inspect_timeline_media(state: dict, assets: dict, resolve_source, format: st
     from .timeline import validate_workspace
     issues = []
     media_cache = {}
+    timing_cache = {}
     audible = False
     visible = False
     for track in state["tracks"]:
@@ -159,7 +160,7 @@ def inspect_timeline_media(state: dict, assets: dict, resolve_source, format: st
                 single_track = {**track, "clips": [clip]}
                 validate_workspace({"revision": state["revision"], "settings": state["settings"], "tracks": [single_track]}, assets)
                 source = resolve_source(asset)
-                collected = _collect_clips([single_track], {clip["assetId"]: source}, ffprobe_path, format, media_cache)[0]
+                collected = _collect_clips([single_track], {clip["assetId"]: source}, ffprobe_path, format, media_cache, timing_cache)[0]
                 media = collected["media"]
                 if clip.get("reframe") is not None:
                     from .montage_reframe import ReframeError, reframe_filter, source_fingerprint, validate_stored_reframe
@@ -174,7 +175,7 @@ def inspect_timeline_media(state: dict, assets: dict, resolve_source, format: st
                         reframe, source_width=media.width or 0, source_height=media.height or 0,
                         output_width=state["settings"]["width"], output_height=state["settings"]["height"],
                         in_point=clip["inPoint"], speed=clip["speed"], duration=clip["duration"],
-                        source_hash=source_fingerprint(source), crop_name="preflight",
+                        source_hash=source_fingerprint(source), source_timing=collected.get("source_timing"), crop_name="preflight",
                     )
                 visible |= track["kind"] == "video" and not track["hidden"] and media.has_video
                 audible |= not track["muted"] and clip["volume"] > 0 and media.has_audio
@@ -197,9 +198,12 @@ def inspect_timeline_media(state: dict, assets: dict, resolve_source, format: st
     return issues
 
 
-def _collect_clips(tracks: list, sources: Dict[str, Path], ffprobe_path: str, format: str, media_cache=None) -> List[dict]:
+def _collect_clips(tracks: list, sources: Dict[str, Path], ffprobe_path: str, format: str, media_cache=None,
+                   timing_cache=None) -> List[dict]:
     if media_cache is None:
         media_cache = {}
+    if timing_cache is None:
+        timing_cache = {}
     result = []
     for track_index, track in enumerate(tracks):
         if not isinstance(track, dict):
@@ -231,6 +235,11 @@ def _collect_clips(tracks: list, sources: Dict[str, Path], ffprobe_path: str, fo
             media = media_cache[cache_key]
             if isinstance(media, Exception):
                 raise media
+            source_timing = None
+            if clip.get("reframe") is not None and media.has_video and not media.image:
+                from .montage_reframe import probe_source_timing, source_fingerprint
+                fingerprint = source_fingerprint(source)
+                source_timing = timing_cache.setdefault(fingerprint, probe_source_timing(source, ffprobe_path))
             start = _nonnegative_number(clip.get("start"), "片段起点")
             in_point = _nonnegative_number(clip.get("inPoint"), "片段入点")
             clip_duration = _positive_number(clip.get("duration"), "片段时长")
@@ -269,6 +278,7 @@ def _collect_clips(tracks: list, sources: Dict[str, Path], ffprobe_path: str, fo
                 "clip_index": clip_index,
                 "end": start + clip_duration,
                 "reframe": clip.get("reframe"),
+                "source_timing": source_timing,
             })
     return result
 
@@ -562,6 +572,7 @@ def _video_filter(index: int, clip: dict, width: int, height: int, fps: float, l
                 reframe, source_width=media.width, source_height=media.height,
                 output_width=width, output_height=height, in_point=clip["in_point"],
                 speed=clip["speed"], duration=clip["duration"], source_hash=source_fingerprint(clip["source"]),
+                source_timing=clip.get("source_timing"),
                 crop_name="reframe_" + hashlib.sha256(str(clip["id"]).encode()).hexdigest()[:12],
                 commands_path=reframe_commands_file,
                 trajectory_fps=fps,

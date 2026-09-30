@@ -268,12 +268,11 @@ def test_reframe_moves_a_full_bleed_crop_in_source_time_without_black_padding(tm
     analysis = {
         "schemaVersion": 1, "sourceFingerprint": source_fingerprint(source), "sourceWidth": 128, "sourceHeight": 48,
         "targetAspect": {"width": 1, "height": 2}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
-        "samples": [
-            {"timeSeconds": 0, "boxes": [{"x": .1, "y": .1, "width": .1, "height": .8, "label": "person", "confidence": .9}],
-             "center": {"x": .2, "y": .5}, "confidence": .9},
-            {"timeSeconds": 3, "boxes": [{"x": .7, "y": .1, "width": .1, "height": .8, "label": "person", "confidence": .9}],
-             "center": {"x": .8, "y": .5}, "confidence": .9},
-        ], "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []},
+            "samples": [
+                {"timeSeconds": point, "boxes": [{"x": .1, "y": .1, "width": .1, "height": .8, "label": "person", "confidence": .9}],
+                 "center": {"x": .2 + .6 * point / 2.958333, "y": .5}, "confidence": .9}
+                for point in (0, .5, 1, 1.5, 2, 2.5, 2.958333)
+            ], "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []},
     }
     output = tmp_path / "reframe.mp4"
     render_timeline(_timeline(width=24, height=48, tracks=[_track("video", [

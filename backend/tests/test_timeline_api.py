@@ -94,7 +94,10 @@ def test_timeline_reframe_analyze_cancel_and_retry_are_durable(tmp_path):
     queue.run()
     completed = client.get(BASE).json()
     assert completed["reframeAnalysis"]["clip1"]["status"] == "completed"
-    assert completed["tracks"][0]["clips"][0]["reframe"]["status"] == "ready"
+    assert completed["tracks"][0]["clips"][0]["reframe"]["status"] == "review_required"
+    forged = completed["tracks"]
+    forged[0]["clips"][0]["reframe"]["status"] = "ready"
+    assert client.put(BASE, json={"revision": completed["revision"], "settings": completed["settings"], "tracks": forged}).status_code == 422
 
 
 def test_timeline_reframe_invalidates_when_source_changes_while_queued(tmp_path):

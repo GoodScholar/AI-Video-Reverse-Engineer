@@ -4,8 +4,10 @@ from __future__ import annotations
 import pytest
 import sys
 import time
+from types import SimpleNamespace
 
-from app.montage_reframe import MODEL_SHA256, ReframeError, normalize_reframe, pending_reframe, reframe_filter, run_local_detector
+from app import montage_reframe
+from app.montage_reframe import MODEL_SHA256, ReframeError, SourceTiming, normalize_reframe, pending_reframe, probe_source_timing, reframe_filter, run_local_detector
 
 
 def _analysis(*, override=None, samples=None, status="ready"):
@@ -64,12 +66,11 @@ def test_normalize_reframe_accepts_a_real_half_open_final_frame_only_when_sampli
     stored = normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
                                required_start=0, required_end=2)
 
-    assert stored["samples"][-1]["timeSeconds"] == 1.966667
+    assert stored["status"] == "review_required"
     analysis["samples"][1]["timeSeconds"] = .1
     analysis["samples"][-1]["timeSeconds"] = .9
-    with pytest.raises(ReframeError, match="未覆盖"):
-        normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
-                          required_start=0, required_end=2)
+    assert normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
+                             required_start=0, required_end=2)["status"] == "review_required"
 
 
 def test_normalize_reframe_rejects_worker_timing_holes_and_long_tail_but_accepts_real_frame_tolerance():
@@ -79,18 +80,16 @@ def test_normalize_reframe_rejects_worker_timing_holes_and_long_tail_but_accepts
         {"timeSeconds": 19.958333, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
     ])
     analysis.update(frameDurationSeconds=1 / 24, samplingIntervalSeconds=.5)
-    with pytest.raises(ReframeError, match="时间空洞"):
-        normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
-                          required_start=0, required_end=20)
+    assert normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
+                             required_start=0, required_end=20)["status"] == "review_required"
 
     analysis["samples"] = [
         {"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
         {"timeSeconds": .5, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
         {"timeSeconds": 1.958333, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
     ]
-    with pytest.raises(ReframeError, match="时间空洞"):
-        normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
-                          required_start=0, required_end=2)
+    assert normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
+                             required_start=0, required_end=2)["status"] == "review_required"
 
     analysis["samples"] = [
         {"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
@@ -101,13 +100,13 @@ def test_normalize_reframe_rejects_worker_timing_holes_and_long_tail_but_accepts
     ]
     normalized = normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
                                    required_start=0, required_end=2)
-    assert normalized["samples"][-1]["timeSeconds"] == 1.958333
+    assert normalized["status"] == "review_required"
 
 
 def test_reframe_filter_maps_output_time_to_source_time_and_crops_before_scaling():
     """Applying crop after speed conversion would track the wrong source instant."""
     graph = reframe_filter(
-        _analysis(), source_width=1920, source_height=1080, output_width=720, output_height=1280,
+        _analysis(override={"mode": "manual", "keyframes": [{"timeSeconds": 2, "x": .2, "y": .5}, {"timeSeconds": 4, "x": .8, "y": .5}]}), source_width=1920, source_height=1080, output_width=720, output_height=1280,
         in_point=2, speed=2, duration=1,
     )
 
@@ -161,3 +160,34 @@ def test_local_detector_spools_large_child_output_and_reaps_cancelled_child(tmp_
         run_local_detector(source, start=0, end=1, target_width=9, target_height=16,
                            worker_python=sys.executable, worker_path=sleeper, model_path=model, cancelled=lambda: True)
     assert time.monotonic() - started < 6
+
+
+def test_normalize_reframe_requires_server_pts_evidence_for_auto_ready():
+    """客户端声明的宽松 cadence 不能让 [0,10] 冒充 [0,20)。"""
+    analysis = _analysis(samples=[
+        {"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 10, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+    ])
+    analysis.update(frameDurationSeconds=1, samplingIntervalSeconds=2)
+    timing = SourceTiming((0.0, 10.0, 19.958333), (.041667, .041667, .041667), True, None)
+
+    stored = normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
+                               source_timing=timing, required_start=0, required_end=20)
+
+    assert stored["status"] == "review_required"
+    assert any("需重新分析源时间" in reason for reason in stored["uncertaintyReasons"])
+
+
+def test_probe_rejects_vfr_from_pts_even_when_nominal_rates_would_agree(monkeypatch, tmp_path):
+    """avg/r 元数据并未参与授权；逐帧 PTS 不均必须转人工。"""
+    payload = {"streams": [{"start_time": "2", "duration": "1"}], "frames": [
+        {"best_effort_timestamp_time": "2.000", "pkt_duration_time": ".04"},
+        {"best_effort_timestamp_time": "2.040", "pkt_duration_time": ".04"},
+        {"best_effort_timestamp_time": "2.100", "pkt_duration_time": ".04"},
+    ]}
+    monkeypatch.setattr(montage_reframe.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=__import__("json").dumps(payload)))
+
+    timing = probe_source_timing(tmp_path / "nominal-cfr.mp4", "ffprobe")
+
+    assert not timing.cfr
+    assert "可变帧率" in timing.reason

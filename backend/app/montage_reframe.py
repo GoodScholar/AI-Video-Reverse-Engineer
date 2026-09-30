@@ -17,6 +17,8 @@ import subprocess
 import tempfile
 import sys
 import time
+from dataclasses import dataclass
+from statistics import median
 from typing import Any
 
 
@@ -24,6 +26,62 @@ DETECTOR_VERSION = "mediapipe-object-detector-0.10.21"
 SCHEMA_VERSION = 1
 MODEL_SHA256 = "2e04c53bfeac0ac2a30c057c7e2a777594ce39baaac35a92f74fb1e8c4fc4e0b"
 _OVERRIDE_MODES = frozenset(("auto", "center", "manual", "replace"))
+
+
+@dataclass(frozen=True)
+class SourceTiming:
+    """Server-probed decoded-display timing, expressed from the first frame."""
+    elapsed: tuple[float, ...]
+    durations: tuple[float, ...]
+    cfr: bool
+    reason: str | None
+
+    def worker_payload(self) -> dict[str, Any]:
+        return {"cfr": self.cfr, "reason": self.reason,
+                "frames": [{"elapsedSeconds": point, "durationSeconds": duration}
+                           for point, duration in zip(self.elapsed, self.durations)]}
+
+
+def probe_source_timing(source: Path, ffprobe_path: str) -> SourceTiming:
+    """Probe real display PTS; fps metadata is deliberately not timing evidence."""
+    command = [ffprobe_path, "-v", "error", "-select_streams", "v:0", "-show_frames", "-show_streams",
+               "-show_entries", "frame=best_effort_timestamp_time,pkt_duration_time:stream=start_time,duration",
+               "-of", "json", str(source)]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+    except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired, OSError):
+        return SourceTiming((), (), False, "无法可靠探测源视频逐帧时间")
+    if result.returncode:
+        return SourceTiming((), (), False, "无法可靠探测源视频逐帧时间")
+    try:
+        payload = json.loads(result.stdout)
+        frames = payload.get("frames") or []
+        stream = (payload.get("streams") or [{}])[0]
+        pts = [_finite_float(frame.get("best_effort_timestamp_time")) for frame in frames]
+    except (ValueError, TypeError, AttributeError):
+        return SourceTiming((), (), False, "源视频缺少逐帧显示时间")
+    if len(pts) < 2 or any(point is None for point in pts):
+        return SourceTiming((), (), False, "源视频缺少逐帧显示时间")
+    absolute = tuple(pts)  # type: ignore[arg-type]
+    if any(right <= left for left, right in zip(absolute, absolute[1:])):
+        return SourceTiming((), (), False, "源视频逐帧时间重复或倒序")
+    intervals = [right - left for left, right in zip(absolute, absolute[1:])]
+    interval = median(intervals)
+    tolerance = max(.001, interval * .03)
+    if interval <= 0 or any(abs(item - interval) > tolerance for item in intervals):
+        return SourceTiming((), (), False, "源视频为可变帧率或帧间隔不可信")
+    last_duration = _finite_float(frames[-1].get("pkt_duration_time")) if isinstance(frames[-1], dict) else None
+    if last_duration is None or last_duration <= 0:
+        start = _finite_float(stream.get("start_time")) if isinstance(stream, dict) else None
+        duration = _finite_float(stream.get("duration")) if isinstance(stream, dict) else None
+        candidate = start + duration - absolute[-1] if start is not None and duration is not None else None
+        if candidate is None or candidate <= 0 or abs(candidate - interval) > tolerance:
+            return SourceTiming((), (), False, "源视频末帧时长无法可靠确定")
+        last_duration = candidate
+    if abs(last_duration - interval) > tolerance:
+        return SourceTiming((), (), False, "源视频末帧时长与逐帧时间不一致")
+    return SourceTiming(tuple(point - absolute[0] for point in absolute),
+                        tuple(intervals + [last_duration]), True, None)
 
 
 class ReframeError(ValueError):
@@ -54,6 +112,7 @@ def source_fingerprint(path: Path) -> str:
 
 
 def run_local_detector(source: Path, *, start: float, end: float, target_width: int, target_height: int,
+                       source_timing: SourceTiming | None = None,
                        worker_python: str | None = None, model_path: Path | None = None,
                        worker_path: Path | None = None,
                        cancelled=lambda: False) -> dict[str, Any]:
@@ -70,7 +129,11 @@ def run_local_detector(source: Path, *, start: float, end: float, target_width: 
     try:
         # Spool streams while polling: a large successful JSON result must
         # never fill an OS pipe before the parent drains it.
-        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stdout, tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr:
+        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stdout, tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr, tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json") as timing_file:
+            if source_timing is not None:
+                json.dump(source_timing.worker_payload(), timing_file, separators=(",", ":"))
+                timing_file.flush()
+                command.extend(("--timing-json", timing_file.name))
             process = subprocess.Popen(command, stdout=stdout, stderr=stderr, text=True, start_new_session=True)
             deadline = time.monotonic() + 300
             while process.poll() is None:
@@ -104,6 +167,26 @@ def pending_reframe(*, target_width: int, target_height: int, reason: str) -> di
         "samples": [], "uncertaintyReasons": [reason], "status": "review_required",
         "override": {"mode": "auto", "keyframes": []},
     }
+
+
+def retain_server_reframe_facts(existing_tracks: list, submitted_tracks: list) -> list:
+    """PUT may express a human override, never detector facts or auto approval."""
+    existing = {clip.get("id"): clip for track in existing_tracks for clip in track.get("clips", [])}
+    for track in submitted_tracks:
+        for clip in track.get("clips", []):
+            submitted = clip.get("reframe")
+            stored = existing.get(clip.get("id"), {}).get("reframe")
+            if submitted is None:
+                if isinstance(stored, dict):
+                    clip["reframe"] = stored
+                continue
+            if not isinstance(stored, dict):
+                raise ReframeError("主体检测事实只能由服务端分析写入。")
+            if {key: value for key, value in submitted.items() if key != "override"} != {
+                    key: value for key, value in stored.items() if key != "override"}:
+                raise ReframeError("主体检测事实或状态不能由客户端修改。")
+            clip["reframe"] = {**stored, "override": submitted["override"]}
+    return submitted_tracks
 
 
 def validate_stored_reframe(value: Any) -> dict[str, Any]:
@@ -141,7 +224,8 @@ def validate_stored_reframe(value: Any) -> dict[str, Any]:
 
 
 def normalize_reframe(value: Any, *, source_fingerprint: str, source_width: int, source_height: int,
-                      required_start: float | None = None, required_end: float | None = None) -> dict[str, Any]:
+                      source_timing: SourceTiming | None = None, required_start: float | None = None,
+                      required_end: float | None = None) -> dict[str, Any]:
     """Validate a persisted worker result against the current decoded source."""
     required_keys = {
         "schemaVersion", "sourceFingerprint", "sourceWidth", "sourceHeight", "targetAspect",
@@ -169,31 +253,8 @@ def normalize_reframe(value: Any, *, source_fingerprint: str, source_width: int,
     if value["status"] == "ready":
         if value["uncertaintyReasons"] or not samples:
             raise ReframeError("完成的主体裁剪必须有连续检测证据。")
-        # Analysis uses a half-open [start, end) source interval.  The final
-        # decoded frame therefore precedes end; its measured sampling cadence
-        # proves coverage without inventing a timestamp at the exclusive end.
-        frame_duration = value.get("frameDurationSeconds")
-        sample_interval = value.get("samplingIntervalSeconds")
-        if frame_duration is not None or sample_interval is not None:
-            if (not _finite_number(frame_duration) or not _finite_number(sample_interval)
-                    or not 0 < frame_duration <= 1 or not 0 < sample_interval <= 2):
-                raise ReframeError("主体检测时间元数据无效。")
-            gaps = [right["timeSeconds"] - left["timeSeconds"] for left, right in zip(samples, samples[1:])]
-            if any(gap > sample_interval + frame_duration + .001 for gap in gaps):
-                raise ReframeError("主体检测采样存在时间空洞，需人工确认构图。")
-            end_tolerance = frame_duration + .001
-        else:
-            # Compatibility for records created before the pinned worker
-            # emitted timing evidence. New worker output always takes the
-            # strict branch above.
-            end_tolerance = max((right["timeSeconds"] - left["timeSeconds"]
-                                 for left, right in zip(samples, samples[1:])), default=0.0) + .001
-        if required_start is not None and required_end is not None and (
-            samples[0]["timeSeconds"] > required_start + .001
-            or samples[-1]["timeSeconds"] > required_end + .001
-            or samples[-1]["timeSeconds"] < required_end - end_tolerance
-        ):
-            raise ReframeError("主体裁剪结果未覆盖当前素材区间。")
+        if not _source_samples_cover(source_timing, samples, required_start, required_end):
+            return _review_required(value, samples, override, "需重新分析源时间，自动构图未获可信逐帧时间授权")
     elif not value["uncertaintyReasons"]:
         raise ReframeError("待人工主体裁剪必须说明不确定原因。")
     return {**value, "targetAspect": {"width": aspect["width"], "height": aspect["height"]},
@@ -202,7 +263,7 @@ def normalize_reframe(value: Any, *, source_fingerprint: str, source_width: int,
 
 def reframe_filter(value: dict[str, Any], *, source_width: int, source_height: int, output_width: int,
                    output_height: int, in_point: float, speed: float, duration: float,
-                   source_hash: str | None = None, crop_name: str = "reframe", commands_path: Path | None = None,
+                   source_hash: str | None = None, source_timing: SourceTiming | None = None, crop_name: str = "reframe", commands_path: Path | None = None,
                    trajectory_fps: float = 30) -> str:
     """Return `sendcmd,crop,scale` for source-time samples before setpts speed.
 
@@ -228,6 +289,7 @@ def reframe_filter(value: dict[str, Any], *, source_width: int, source_height: i
     else:
         result = normalize_reframe(stored, source_fingerprint=source_hash, source_width=source_width,
                                    source_height=source_height,
+                                   source_timing=source_timing,
                                    required_start=in_point if stored["override"]["mode"] == "auto" else None,
                                    required_end=end if stored["override"]["mode"] == "auto" else None)
     override = result["override"]
@@ -269,8 +331,51 @@ def crop_geometry(source_width: int, source_height: int, output_width: int, outp
     return width, height
 
 
+def _finite_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _review_required(value: dict[str, Any], samples: list[dict[str, Any]], override: dict[str, Any], reason: str) -> dict[str, Any]:
+    reasons = list(value["uncertaintyReasons"])
+    if reason not in reasons:
+        reasons.append(reason)
+    return {**value, "samples": samples, "uncertaintyReasons": reasons,
+            "status": "review_required", "override": override}
+
+
+def _source_samples_cover(timing: SourceTiming | None, samples: list[dict[str, Any]],
+                          start: float | None, end: float | None) -> bool:
+    """Authorize auto framing only from the server's real PTS table."""
+    if timing is None or not timing.cfr or len(timing.elapsed) != len(timing.durations) or not timing.elapsed:
+        return False
+    if any(duration <= 0 or not math.isfinite(duration) for duration in timing.durations):
+        return False
+    if any(not any(abs(sample["timeSeconds"] - pts) <= .001 for pts in timing.elapsed) for sample in samples):
+        return False
+    if start is None or end is None:
+        return True
+    if not (_finite_number(start) and _finite_number(end) and 0 <= start < end):
+        return False
+    intersecting = [index for index, (pts, duration) in enumerate(zip(timing.elapsed, timing.durations))
+                    if pts < end and pts + duration > start]
+    if not intersecting:
+        return False
+    first, last = intersecting[0], intersecting[-1]
+    if abs(samples[0]["timeSeconds"] - timing.elapsed[first]) > .001 or abs(samples[-1]["timeSeconds"] - timing.elapsed[last]) > .001:
+        return False
+    frame_duration = max(timing.durations)
+    if any(right["timeSeconds"] - left["timeSeconds"] > .5 + frame_duration + .001
+           for left, right in zip(samples, samples[1:])):
+        return False
+    return timing.elapsed[first] + timing.durations[first] > start and timing.elapsed[last] < end
+
+
 def _samples(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, list) or len(value) > 600:
+    if not isinstance(value, list) or len(value) > 640:
         raise ReframeError("主体检测采样无效。")
     normalized = []
     previous = -1.0
