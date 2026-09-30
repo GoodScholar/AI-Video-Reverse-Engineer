@@ -113,6 +113,29 @@ def test_generation_rejects_unconfirmed_and_stale_requests(workspace):
         assert not jobs
 
 
+def test_voiceover_preserves_transition_overlap_without_shifting_speech(workspace):
+    api, jobs = client_for(workspace)
+    with api:
+        task = arranged(api)
+        base = f"/api/projects/p1/batch-edits/{task['id']}"
+        tracks = task['variant']['tracks']
+        tracks[0]['clips'][0]['duration'] = 3.3
+        transition = dict(id='t1', leftClipId='clip0', rightClipId='clip1', template='dissolve',
+                          enabled=True, duration=.3, overlap=.3, audioCrossfade=True, reason='场景变化')
+        response = api.put(base+'/variant', json={'revision': 1, 'tracks': tracks, 'transitions': [transition]})
+        assert response.status_code == 200, response.text
+        task = api.get('/api/projects/p1/batch-edits').json()['tasks'][0]
+        response = api.post(base+'/voiceovers', json=request_for(task))
+        assert response.status_code == 202, response.text
+        pid, handler = jobs.pop(); handler(pid)
+        current = api.get('/api/projects/p1/batch-edits').json()['tasks'][0]
+        assert current['voiceover']['status'] == 'completed', current
+        assert current['variant']['transitions'] == [transition]
+        clips = current['variant']['tracks'][0]['clips']
+        assert [(c['start'], c['duration']) for c in clips] == [(0, 1.8), (1.5, 2.5)]
+        assert current['variant']['subtitles']['cues'][1]['start'] == 1.5
+
+
 def test_generation_rejects_selected_voice_when_its_model_is_unavailable(workspace):
     class UnavailableProjectVoice(VoiceService):
         def catalog(self, project_id):

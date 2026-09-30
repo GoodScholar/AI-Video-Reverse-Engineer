@@ -114,6 +114,33 @@ def test_run_uses_saved_snapshot_and_publishes_only_completed_output(tmp_path):
     assert client.get(BASE + "/runs/" + run_id + "/output").content == b"rendered"
 
 
+def test_transition_boundary_is_persisted_and_frozen_into_the_render_run(tmp_path):
+    received = []
+    def renderer(timeline, sources, output, **kwargs):
+        received.append(timeline)
+        output.write_bytes(b"rendered")
+    client, queue = setup(tmp_path, renderer)
+    value = _workspace(tracks=[{
+        "id": "v1", "name": "视频", "kind": "video", "muted": False, "hidden": False,
+        "clips": [
+            {"id": "one", "assetId": "video", "start": 0, "inPoint": 0, "duration": 2, "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0},
+            {"id": "two", "assetId": "video", "start": 1.6, "inPoint": 2, "duration": 2, "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0},
+        ],
+    }])
+    value["transitions"] = [{
+        "id": "boundary", "leftClipId": "one", "rightClipId": "two", "template": "dissolve",
+        "enabled": True, "duration": .4, "overlap": .4, "audioCrossfade": True, "reason": "场景变化",
+    }]
+
+    saved = client.put(BASE, json=value)
+    assert saved.status_code == 200
+    assert saved.json()["transitions"] == value["transitions"]
+    assert client.post(BASE + "/runs", json={"revision": 1, "format": "preview"}).status_code == 202
+    queue.run()
+
+    assert received[0]["transitions"] == value["transitions"]
+
+
 def test_cancelled_or_failed_run_never_publishes_partial_output(tmp_path):
     def broken(timeline, sources, output, **kwargs):
         output.write_bytes(b"partial")

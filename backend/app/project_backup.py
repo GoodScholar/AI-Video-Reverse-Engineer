@@ -140,7 +140,8 @@ def validate_core(data_root, project):
                 if not prep_store.path(pid, 'artifacts', shot['id'], node['id'], artifact['name']).is_file():
                     fail("备份缺少镜头步骤产物。")
     timeline = TimelineStore(data_root).load(pid)
-    validate_workspace({k: timeline[k] for k in ('revision', 'settings', 'tracks')}, assets)
+    validate_workspace({'revision': timeline['revision'], 'settings': timeline['settings'],
+                        'tracks': timeline['tracks'], 'transitions': timeline.get('transitions', [])}, assets)
     validate_timeline_history(TimelineStore(data_root), pid, timeline, assets)
     if project.referenceMedia:
         from .reference_media_storage import resolve_reference_media_path
@@ -163,7 +164,7 @@ def validate_timeline_history(store, project_id, timeline, assets):
         if run.get('error') is not None and not isinstance(run['error'], str):
             fail('备份中的渲染错误信息无效。')
         snapshot = run.get('snapshot')
-        if not isinstance(snapshot, dict) or set(snapshot) != {'settings', 'tracks'}:
+        if not isinstance(snapshot, dict) or set(snapshot) not in ({'settings', 'tracks'}, {'settings', 'tracks', 'transitions'}):
             fail('备份中的渲染快照无效。')
         _, tracks = validate_workspace({'revision': run['revision'], **snapshot}, assets)
         used = {clip['assetId'] for track in tracks for clip in track['clips']}

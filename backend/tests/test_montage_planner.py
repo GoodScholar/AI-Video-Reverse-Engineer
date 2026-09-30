@@ -1,8 +1,8 @@
 from app.montage_planner import MontagePlanningError, plan_montage
 
 
-def candidate(candidate_id, asset_id, start, end, relevance, quality=0.8):
-    return {
+def candidate(candidate_id, asset_id, start, end, relevance, quality=0.8, **values):
+    result = {
         "candidateId": candidate_id,
         "assetId": asset_id,
         "inPointSeconds": start,
@@ -12,6 +12,8 @@ def candidate(candidate_id, asset_id, start, end, relevance, quality=0.8):
         "duplicateRisk": {"level": "low", "reason": "不同源区间"},
         "evidence": {"kind": "keyframe_visual_vector", "basis": "关键帧视觉证据"},
     }
+    result.update(values)
+    return result
 
 
 def segment(segment_id, text, duration, candidates, boundaries=(), source="provided"):
@@ -46,11 +48,12 @@ def test_plan_covers_every_script_segment_and_keeps_semantics_ahead_of_beats():
         beat_times=[2.18, 4.4],
     )
 
-    assert proposal["plannerVersion"] == "montage-planner-v1"
+    assert proposal["plannerVersion"] == "montage-planner-v2"
     assert [item["status"] for item in proposal["segments"]] == ["planned", "planned"]
     assert [item["suggestion"]["candidateId"] for item in proposal["segments"]] == ["lid", "commute"]
     assert [clip["start"] for clip in proposal["clips"]] == [0.0, 2.4]
     assert [clip["duration"] for clip in proposal["clips"]] == [2.4, 2.0]
+    assert proposal["transitions"][0]["template"] == "cut"
     assert proposal["segments"][0]["timing"]["beatSnap"] is None
     assert "节拍 2.180 秒早于旁白结束，因此未吸附" in proposal["segments"][0]["reasons"]
     assert proposal["inputSnapshot"]["contentRevision"] == 2
@@ -113,6 +116,63 @@ def test_optional_beat_tail_never_turns_a_narration_complete_candidate_into_a_ga
     assert proposal["clips"][0]["duration"] == 2.0
     assert proposal["unmet"] == []
     assert "候选覆盖完整旁白但不足以延伸到节拍 2.100 秒，因此未吸附" in proposal["segments"][0]["reasons"]
+
+
+def test_planner_keeps_ordinary_narrative_boundary_as_hard_cut():
+    proposal = plan_montage(
+        task_id="task-a", variant_id="variant-a", content_revision=0, variant_revision=0,
+        segments=[
+            segment("one", "先展示操作", 2, [candidate("one", "asset-a", 0, 3, .9, sceneId="same")]),
+            segment("two", "再展示结果", 2, [candidate("two", "asset-a", 4, 7, .9, sceneId="same")]),
+        ], beat_times=[], selling_point="省时",
+    )
+
+    assert proposal["transitions"] == [{
+        "id": proposal["transitions"][0]["id"], "leftClipId": proposal["clips"][0]["id"],
+        "rightClipId": proposal["clips"][1]["id"], "template": "cut", "enabled": True,
+        "duration": 0.0, "overlap": 0.0, "audioCrossfade": False,
+        "reason": "普通叙事边界保持硬切，避免无依据堆叠效果",
+    }]
+
+
+def test_planner_uses_evidence_for_scene_beat_and_selling_point_transitions():
+    common = dict(task_id="task-a", variant_id="variant-a", content_revision=0, variant_revision=0)
+    scene = plan_montage(**common, segments=[
+        segment("one", "开场", 2, [candidate("one", "asset-a", 0, 4, .9, sceneId="wide")]),
+        segment("two", "细节", 2, [candidate("two", "asset-b", 0, 4, .9, sceneId="macro")]),
+    ], beat_times=[], selling_point="省时")
+    beat = plan_montage(**common, segments=[
+        segment("one", "开场", 2, [candidate("one", "asset-a", 0, 4, .9, sceneId="same")]),
+        segment("two", "细节", 2, [candidate("two", "asset-b", 0, 4, .9, sceneId="same")]),
+    ], beat_times=[2], selling_point="省时")
+    emphasis = plan_montage(**common, segments=[
+        segment("one", "开场", 2, [candidate("one", "asset-a", 0, 4, .9, sceneId="same")]),
+        segment("two", "突出省时", 2, [candidate("two", "asset-b", 0, 4, .9, sceneId="same")]),
+    ], beat_times=[], selling_point="省时")
+
+    assert scene["transitions"][0]["template"] == "dissolve"
+    assert beat["transitions"][0]["template"] == "push"
+    assert emphasis["transitions"][0]["template"] == "flash-white"
+    assert all(item["transitions"][0]["enabled"] for item in (scene, beat, emphasis))
+    assert scene["clips"][0]["duration"] == 2.35
+    assert scene["clips"][1]["start"] == 2.0
+    assert scene["transitions"][0]["audioCrossfade"] is True
+
+
+def test_transition_falls_back_for_short_neighbor_and_unmeasured_or_earlier_beats():
+    common = dict(task_id="t", variant_id="v", content_revision=0, variant_revision=0)
+    for duration, source, beats, scenes in [
+        (.1, "provided", [], ("a", "b")),
+        (2, "estimated_text", [2], (None, None)),
+        (2, "subtitle_cue", [2], (None, None)),
+        (2, "provided", [1.95], (None, None)),
+    ]:
+        proposal = plan_montage(**common, segments=[
+            segment("one", "开场", duration, [candidate("one", "a", 0, 4, .9, sceneId=scenes[0])], source=source),
+            segment("two", "后续", duration, [candidate("two", "b", 0, 4, .9, sceneId=scenes[1])], source=source),
+        ], beat_times=beats)
+        assert proposal["transitions"][0]["template"] == "cut"
+        assert proposal["clips"][1]["start"] == duration
 
 
 def test_estimated_narration_is_traceable_and_does_not_claim_word_or_beat_timing():

@@ -16,7 +16,8 @@ def plan_voiceover(task, assets):
     clips = sorted(visuals[0]['clips'], key=lambda clip: clip['start'])
     if len(clips) != len(texts):
         raise ValueError('每段脚本需要对应一个画面片段，请先按脚本推荐并保存镜头。')
-    validate_workspace({'revision': task['variant']['revision'], 'settings': task['variant']['settings'], 'tracks': task['variant']['tracks']}, assets)
+    validate_workspace({'revision': task['variant']['revision'], 'settings': task['variant']['settings'],
+                        'tracks': task['variant']['tracks'], 'transitions': task['variant'].get('transitions', [])}, assets)
     return {'texts': texts, 'videoTrackId': visuals[0]['id'], 'clips': deepcopy(clips)}
 
 
@@ -59,8 +60,15 @@ def arrange_voiceover(task, plan, audio_assets, assets):
                                 'fadeOut': min(clip['fadeOut'], duration)})
             track['clips'] = trimmed
     tracks.append({'id':'voiceover','name':'AI 配音','kind':'audio','muted':False,'hidden':False,'clips':voice_clips})
+    by_id = {clip['id']: clip for clip in video['clips']}
+    for transition in task['variant'].get('transitions', []):
+        if transition['enabled'] and transition['overlap']:
+            left = by_id.get(transition['leftClipId'])
+            if left is not None:
+                left['duration'] += transition['overlap']
     try:
-        validate_workspace({'revision':task['variant']['revision'],'settings':task['variant']['settings'],'tracks':tracks},
+        validate_workspace({'revision':task['variant']['revision'],'settings':task['variant']['settings'],'tracks':tracks,
+                            'transitions': task['variant'].get('transitions', [])},
                            {**assets, **{a['id']:a for a in audio_assets}})
     except ValueError as error:
         raise ValueError(f'画面无法覆盖实际配音时长，请补充更长素材或手动调整镜头速度后重试：{error}') from None

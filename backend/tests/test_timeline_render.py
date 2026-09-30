@@ -9,6 +9,7 @@ import pytest
 from PIL import Image
 
 from app.batch_subtitles import write_srt
+from app import timeline_render
 from app.timeline_render import TimelineRenderError, _output_size, render_timeline
 
 
@@ -70,14 +71,23 @@ def _clip(asset_id: str, start: float, duration: float, **values):
     return clip
 
 
-def _timeline(width=64, height=48, fps=24, tracks=()):
-    return {"settings": {"width": width, "height": height, "fps": fps}, "tracks": list(tracks)}
+def _timeline(width=64, height=48, fps=24, tracks=(), transitions=()):
+    return {"settings": {"width": width, "height": height, "fps": fps}, "tracks": list(tracks),
+            "transitions": list(transitions)}
 
 
 def _track(kind: str, clips, **values):
     track = {"id": kind + "-track", "name": kind, "kind": kind, "muted": False, "hidden": False, "clips": clips}
     track.update(values)
     return track
+
+
+def _transition(template, duration=.3, *, audio=True):
+    return {
+        "id": "boundary", "leftClipId": "red-clip", "rightClipId": "blue-clip",
+        "template": template, "enabled": True, "duration": duration, "overlap": duration,
+        "audioCrossfade": audio, "reason": "测试边界",
+    }
 
 
 def _probe(path: Path):
@@ -91,7 +101,7 @@ def _probe(path: Path):
 def _rgb_at(path: Path, second: float):
     result = subprocess.run(
         ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-ss", str(second), "-i", str(path),
-         "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
+         "-frames:v", "1", "-vf", "scale=64:48", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
         check=True, capture_output=True,
     )
     data = result.stdout
@@ -278,3 +288,207 @@ def test_cancelled_render_does_not_publish_output(tmp_path):
         )
 
     assert not output.exists()
+
+
+@pytest.mark.parametrize(("template", "ffmpeg_template"), [
+    ("dissolve", "fade"), ("push", "slideleft"), ("wipe", "wipeleft"),
+    ("flash-white", "fadewhite"), ("pixelize", "pixelize"),
+])
+@pytest.mark.parametrize("duration", [.15, .4])
+def test_actual_ffmpeg_renders_every_supported_visual_transition(template, ffmpeg_template, duration, tmp_path, monkeypatch):
+    red = _video(tmp_path / "red.mp4", "red", 440, duration=1.5)
+    blue = _video(tmp_path / "blue.mp4", "blue", 880, duration=1.5)
+    output = tmp_path / f"{template}-{duration}.mp4"
+
+    commands = []
+    real_run = timeline_render._run_ffmpeg
+    def capture(command, cancelled, cwd=None):
+        commands.append(command)
+        return real_run(command, cancelled, cwd)
+    monkeypatch.setattr(timeline_render, "_run_ffmpeg", capture)
+
+    media = render_timeline(
+        _timeline(
+            tracks=[_track("video", [_clip("red", 0, 1.2), _clip("blue", 1.2 - duration, 1.2)])],
+            transitions=[_transition(template, duration)],
+        ),
+        {"red": red, "blue": blue}, output, format="mp4",
+    )
+
+    assert media["duration"] == pytest.approx(2.4 - duration, abs=.12)
+    assert output.is_file()
+    filter_graph = commands[0][commands[0].index("-filter_complex") + 1]
+    assert f"xfade=transition={ffmpeg_template}:duration={duration:g}:offset=" in filter_graph
+
+
+def test_transition_audio_crossfade_blends_both_adjacent_clip_streams(tmp_path, monkeypatch):
+    red = _video(tmp_path / "red.mp4", "red", 440, duration=1.5)
+    blue = _video(tmp_path / "blue.mp4", "blue", 880, duration=1.5)
+    output = tmp_path / "crossfade.mp4"
+    commands = []
+    real_run = timeline_render._run_ffmpeg
+    def capture(command, cancelled, cwd=None):
+        commands.append(command)
+        return real_run(command, cancelled, cwd)
+    monkeypatch.setattr(timeline_render, "_run_ffmpeg", capture)
+    render_timeline(
+        _timeline(
+            tracks=[_track("video", [_clip("red", 0, 1.2), _clip("blue", .8, 1.2)])],
+            transitions=[_transition("dissolve", .4)],
+        ),
+        {"red": red, "blue": blue}, output, format="mp4",
+    )
+    wav = tmp_path / "crossfade.wav"
+    _run("ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-i", str(output), "-map", "0:a:0", str(wav))
+
+    assert _tone_amplitude(wav, 440, .95, .1) > 100
+    assert _tone_amplitude(wav, 880, .95, .1) > 100
+    assert _tone_amplitude(wav, 440, .82, .06) > _tone_amplitude(wav, 440, 1.1, .06) * 2
+    assert _tone_amplitude(wav, 880, 1.1, .06) > _tone_amplitude(wav, 880, .82, .06) * 2
+    red_level, _, blue_level = _rgb_at(output, 1.0)
+    assert 70 < red_level < 190 and 70 < blue_level < 190
+    filter_graph = commands[0][commands[0].index("-filter_complex") + 1]
+    assert "acrossfade=d=0.4" in filter_graph
+
+
+def test_disabling_audio_crossfade_uses_a_hard_audio_cut_at_the_same_boundary(tmp_path, monkeypatch):
+    red = _video(tmp_path / "red.mp4", "red", 440, duration=1.5)
+    blue = _video(tmp_path / "blue.mp4", "blue", 880, duration=1.5)
+    output = tmp_path / "hard-audio-cut.mp4"
+    commands = []
+    real_run = timeline_render._run_ffmpeg
+    def capture(command, cancelled, cwd=None):
+        commands.append(command)
+        return real_run(command, cancelled, cwd)
+    monkeypatch.setattr(timeline_render, "_run_ffmpeg", capture)
+
+    render_timeline(
+        _timeline(
+            tracks=[_track("video", [_clip("red", 0, 1.2), _clip("blue", .8, 1.2)])],
+            transitions=[_transition("dissolve", .4, audio=False)],
+        ),
+        {"red": red, "blue": blue}, output, format="mp4",
+    )
+
+    filter_graph = commands[0][commands[0].index("-filter_complex") + 1]
+    assert "acrossfade=" not in filter_graph
+    assert "concat=n=2:v=0:a=1" in filter_graph
+
+
+def test_visual_transition_uses_silence_when_adjacent_images_have_no_audio(tmp_path):
+    red = _image(tmp_path / "red.png", "red")
+    blue = _image(tmp_path / "blue.png", "blue")
+    output = tmp_path / "silent-transition.mp4"
+
+    render_timeline(
+        _timeline(
+            tracks=[_track("video", [_clip("red", 0, .8), _clip("blue", .6, .8)])],
+            transitions=[_transition("wipe", .2)],
+        ),
+        {"red": red, "blue": blue}, output, format="mp4",
+    )
+
+    assert {stream["codec_type"] for stream in _probe(output)["streams"]} == {"video", "audio"}
+
+
+def test_preview_and_export_use_the_same_transition_boundary_timing(tmp_path):
+    red = _video(tmp_path / "red.mp4", "red", 440, duration=1.5)
+    blue = _video(tmp_path / "blue.mp4", "blue", 880, duration=1.5)
+    timeline = _timeline(
+        width=1280, height=720,
+        tracks=[_track("video", [_clip("red", 0, 1.2), _clip("blue", .9, 1.2)])],
+        transitions=[_transition("dissolve", .3)],
+    )
+    preview = tmp_path / "preview-transition.mp4"
+    export = tmp_path / "export-transition.mp4"
+
+    preview_media = render_timeline(timeline, {"red": red, "blue": blue}, preview, format="preview")
+    export_media = render_timeline(timeline, {"red": red, "blue": blue}, export, format="mp4")
+
+    assert preview_media["duration"] == pytest.approx(export_media["duration"], abs=.01)
+    assert _rgb_at(preview, 1.05) == pytest.approx(_rgb_at(export, 1.05), abs=3)
+    for video in (preview, export):
+        wav = video.with_suffix('.wav')
+        _run("ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-i", str(video), "-map", "0:a:0", str(wav))
+    for frequency in (440, 880):
+        assert _tone_amplitude(preview.with_suffix('.wav'), frequency, 1, .1) == pytest.approx(
+            _tone_amplitude(export.with_suffix('.wav'), frequency, 1, .1), rel=.05)
+
+
+def test_cancelled_transition_render_never_publishes_a_partial_output(tmp_path):
+    red = _video(tmp_path / "red.mp4", "red", 440, duration=1.5)
+    blue = _video(tmp_path / "blue.mp4", "blue", 880, duration=1.5)
+    output = tmp_path / "cancelled-transition.mp4"
+    checks = 0
+    def cancelled():
+        nonlocal checks
+        checks += 1
+        return checks >= 3
+
+    with pytest.raises(TimelineRenderError, match="取消"):
+        render_timeline(
+            _timeline(
+                tracks=[_track("video", [_clip("red", 0, 1.2), _clip("blue", .8, 1.2)])],
+                transitions=[_transition("dissolve", .4)],
+            ),
+            {"red": red, "blue": blue}, output, format="mp4", cancelled=cancelled,
+        )
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".cancelled-transition.*.mp4"))
+
+
+@pytest.mark.parametrize(("template", "right_speed"), [("cut", 1), ("speed-change", 1.25)])
+def test_actual_ffmpeg_renders_hard_cut_and_controlled_speed_change(template, right_speed, tmp_path, monkeypatch):
+    red = _video(tmp_path / "red.mp4", "red", 440, duration=1.5)
+    blue = _video(tmp_path / "blue.mp4", "blue", 880, duration=1.5)
+    output = tmp_path / f"{template}.mp4"
+    transition = _transition(template, 0, audio=False)
+    commands = []
+    real_run = timeline_render._run_ffmpeg
+    def capture(command, cancelled, cwd=None):
+        commands.append(command)
+        return real_run(command, cancelled, cwd)
+    monkeypatch.setattr(timeline_render, "_run_ffmpeg", capture)
+
+    render_timeline(
+        _timeline(
+            tracks=[_track("video", [_clip("red", 0, 1), _clip("blue", 1, 1, speed=right_speed)])],
+            transitions=[transition],
+        ),
+        {"red": red, "blue": blue}, output, format="mp4",
+    )
+
+    filter_graph = commands[0][commands[0].index("-filter_complex") + 1]
+    assert "xfade=" not in filter_graph
+    if template == "speed-change":
+        assert "setpts=(PTS-STARTPTS)/1.25" in filter_graph
+
+
+def test_render_rejects_transition_longer_than_an_adjacent_short_clip(tmp_path):
+    red = _video(tmp_path / "red.mp4", "red", 440, duration=1)
+    blue = _video(tmp_path / "blue.mp4", "blue", 880, duration=1)
+
+    with pytest.raises(TimelineRenderError, match="短于相邻片段"):
+        render_timeline(
+            _timeline(
+                tracks=[_track("video", [_clip("red", 0, .2), _clip("blue", 0, .4)])],
+                transitions=[_transition("dissolve", .2)],
+            ),
+            {"red": red, "blue": blue}, tmp_path / "bad-transition.mp4", format="mp4",
+        )
+
+
+def test_transition_normalizes_different_input_dimensions_and_frame_rates(tmp_path):
+    red = _video(tmp_path / "red.mp4", "red", 440)
+    blue = tmp_path / "blue.mp4"
+    _run("ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
+         "color=blue:size=120x80:rate=30:duration=2", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(blue))
+    output = tmp_path / "normalized.mp4"
+    render_timeline(_timeline(fps=25, tracks=[_track("video", [_clip("red", 0, 1.2), _clip("blue", .8, 1.2)])],
+                              transitions=[_transition("dissolve", .4)]),
+                    {"red": red, "blue": blue}, output, format="mp4")
+    video = next(stream for stream in _probe(output)["streams"] if stream["codec_type"] == "video")
+    assert (video["width"], video["height"], video["r_frame_rate"]) == (64, 48, "25/1")
+    red_level, _, blue_level = _rgb_at(output, 1)
+    assert 70 < red_level < 190 and 70 < blue_level < 190

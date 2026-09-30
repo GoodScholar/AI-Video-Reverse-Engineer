@@ -36,6 +36,38 @@ describe("TimelineEditor", () => {
   afterEach(() => vi.useRealTimers());
   beforeEach(() => { sessionStorage.clear(); localStorage.clear(); mockedGet.mockReset(); mockedSave.mockReset(); mockedCancel.mockReset(); });
 
+  it("转场随草稿保存和撤销，并在删除关联片段时清理", async () => {
+    const value = workspace();
+    value.tracks[0].clips.push({ ...value.tracks[0].clips[0], id: "clip-2", start: 3.6 });
+    value.transitions = [{ id: "t1", leftClipId: "clip-1", rightClipId: "clip-2", template: "dissolve", enabled: true, duration: .4, overlap: .4, audioCrossfade: true, reason: "场景切换" }];
+    mockedGet.mockResolvedValue(value);
+    mockedSave.mockImplementation(async (_id, draft) => ({ ...value, ...draft, revision: 3 }));
+    render(<TimelineEditor projectId="transition-draft" />);
+    const duration = await screen.findByLabelText("开场.jpg → 开场.jpg 持续时间（秒）");
+    fireEvent.change(duration, { target: { value: ".3" } });
+    await userEvent.click(screen.getByRole("button", { name: "撤销" }));
+    expect(duration).toHaveValue(.4);
+    await userEvent.click(screen.getByRole("button", { name: "重做" }));
+    await userEvent.click(screen.getByRole("button", { name: "保存时间线" }));
+    expect(mockedSave.mock.calls[0][1].transitions?.[0].overlap).toBe(.3);
+    expect(mockedSave.mock.calls[0][1].tracks[0].clips[1].start).toBe(3.6);
+    await userEvent.click(screen.getAllByRole("button", { name: "开场.jpg" })[0]);
+    await userEvent.keyboard("{Delete}");
+    await userEvent.click(screen.getByRole("button", { name: "保存时间线" }));
+    expect(mockedSave.mock.calls[1][1].transitions).toEqual([]);
+  });
+
+  it("同版本重试失败时不回显旧成功预览", async () => {
+    const value = workspace();
+    value.runs[0].revision = value.revision;
+    value.runs.push({ id: "failed", revision: value.revision, format: "preview", status: "failed", error: "转场失败" });
+    mockedGet.mockResolvedValue(value);
+    const view = render(<TimelineEditor projectId="failed-transition" />);
+    await screen.findByText("转场失败");
+    expect(view.container.querySelector("video")).toBeNull();
+    expect(screen.getByRole("button", { name: "重新提交" })).toBeEnabled();
+  });
+
   it("从候选引用定位已保存时间线片段", async () => {
     mockedGet.mockResolvedValue(workspace());
     render(<TimelineEditor projectId="focus-from-candidate" focusClip={{ trackId: "video-1", clipId: "clip-1" }} />);

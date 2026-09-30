@@ -36,6 +36,25 @@ def video_tracks():
     ]
 
 
+def video_transition():
+    return [{
+        "id": "boundary", "leftClipId": "clip-a", "rightClipId": "clip-b",
+        "template": "dissolve", "enabled": True, "duration": 0.4, "overlap": 0.4,
+        "audioCrossfade": True, "reason": "场景变化并贴合卖点强调",
+    }]
+
+
+def transitioning_tracks():
+    tracks = video_tracks()
+    tracks[0]["clips"] = [
+        {"id": "clip-a", "assetId": "shot", "start": 0, "inPoint": 0, "duration": 2,
+         "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0},
+        {"id": "clip-b", "assetId": "shot-b", "start": 1.6, "inPoint": 0, "duration": 2,
+         "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0},
+    ]
+    return tracks
+
+
 def completed_preview(task, preview_id="preview"):
     content_revision, variant_revision, subtitle_revision = production.current_version(task)
     return {
@@ -170,6 +189,44 @@ def test_commands_share_one_frozen_edit_snapshot_for_preview_review_and_export()
     }
     assert delivery["snapshot"] is not preview["snapshot"]
     assert delivery["previewRunId"] == "preview"
+
+
+def test_transition_change_advances_variant_and_freezes_the_same_preview_and_export_input():
+    task = create_batch("省时", "操作演示", id_factory=ids("task", "variant"))
+    assets = {
+        "shot": {"id": "shot", "name": "镜头一", "kind": "video", "duration": 4},
+        "shot-b": {"id": "shot-b", "name": "镜头二", "kind": "video", "duration": 4},
+    }
+
+    save_variant(
+        task, expected_revision=0, tracks=transitioning_tracks(), transitions=video_transition(),
+        settings={"width": 720, "height": 1280, "fps": 30}, aspect_mode="9:16", assets=assets,
+    )
+    preview = submit_preview(
+        task, expected_revision=1, assets=assets,
+        snapshot_sources=lambda *_: {"shot": "shot.mp4", "shot-b": "shot-b.mp4"},
+        id_factory=ids("preview"),
+    )
+    preview.update(status="completed", output="preview.mp4")
+    review_current_version(task, run_id="preview", decision="approved", reason="确认",
+                           preview_available=lambda _: True, id_factory=ids("review"))
+    delivery, _ = export_approved_version(
+        task, assets=assets, snapshot_sources=lambda *_: {"shot": "shot.mp4", "shot-b": "shot-b.mp4"},
+        id_factory=ids("delivery"),
+    )
+
+    assert preview["snapshot"]["transitions"] == video_transition()
+    assert delivery["snapshot"] == preview["snapshot"]
+
+    disabled = [{**video_transition()[0], "enabled": False}]
+    cut_tracks = transitioning_tracks()
+    cut_tracks[0]["clips"][1]["start"] = 2
+    save_variant(
+        task, expected_revision=1, tracks=cut_tracks, transitions=disabled,
+        settings=task["variant"]["settings"], aspect_mode="9:16", assets=assets,
+    )
+    assert production.inspect_variant(task).preview.status == "stale"
+    assert production.review_status(task) == "stale"
 
 
 def test_review_and_export_reject_a_preview_after_the_edit_version_changes():

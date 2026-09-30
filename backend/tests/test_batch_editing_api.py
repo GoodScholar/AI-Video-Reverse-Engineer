@@ -322,6 +322,8 @@ def test_montage_proposal_is_traceable_and_applies_through_variant_revision_rule
         assert [item["suggestion"]["candidateId"] for item in proposal["segments"]] == ["segment-lid", "segment-commute"]
         assert proposal["inputSnapshot"]["segments"][0]["searchId"] == searches[0]["id"]
         assert proposal["revision"] == 0
+        assert proposal["transitions"][0]["template"] == "dissolve"
+        assert proposal["segments"][0]["suggestion"]["sceneId"] == "lid:segment-lid"
         reopened = client.get(base).json()["tasks"][0]["montageProposals"][0]
         assert reopened["id"] == proposal["id"]
 
@@ -341,6 +343,7 @@ def test_montage_proposal_is_traceable_and_applies_through_variant_revision_rule
         assert applied.status_code == 200, applied.text
         assert applied.json()["variant"]["revision"] == 1
         assert [clip["assetId"] for clip in applied.json()["variant"]["tracks"][0]["clips"]] == ["lid", "commute"]
+        assert applied.json()["variant"]["transitions"] == proposal["transitions"]
         conflict = client.post(f"{base}/{task['id']}/montage-proposals/{proposal['id']}/apply", json={
             "revision": 0, "proposalRevision": 1, "strategy": "overwrite",
         }, headers=INTENT)
@@ -357,6 +360,33 @@ def test_montage_proposal_is_traceable_and_applies_through_variant_revision_rule
         merged_clips = merged.json()["variant"]["tracks"][0]["clips"]
         assert len(merged_clips) == 4
         assert len({clip["id"] for clip in merged_clips}) == 4
+
+
+def test_editing_proposal_does_not_convert_old_transition_handle_into_narration_time(tmp_path):
+    with TestClient(create_app(tmp_path, segment_visual_vectorizer=MontageVectorizer())) as client:
+        project_id = client.post("/api/projects", json={"name": "转场人工调整"}).json()["id"]
+        install_montage_indexes(tmp_path, project_id)
+        searches = [client.post(f"/api/projects/{project_id}/segment-searches",
+                               json={"query": query, "limit": 2}, headers=INTENT).json()
+                    for query in ("展示杯盖", "展示通勤")]
+        base = f"/api/projects/{project_id}/batch-edits"
+        task = client.post(base, json={"sellingPoint": "方便", "script": "展示杯盖。展示通勤。"}, headers=INTENT).json()["task"]
+        proposal = client.post(f"{base}/{task['id']}/montage-proposals", json={
+            "revision": 0, "searchIds": [item["id"] for item in searches],
+            "narration": [{"durationSeconds": 2, "wordBoundariesSeconds": []}] * 2,
+            "beatTimes": [],
+        }, headers=INTENT).json()["proposal"]
+        assert proposal["clips"][0]["duration"] == 2.35
+        edited = client.put(f"{base}/{task['id']}/montage-proposals/{proposal['id']}", json={
+            "revision": 0, "segments": [{"segmentId": item["id"], "candidateId": item["selectedCandidateId"],
+                "inPointSeconds": item["selectedClip"]["inPoint"], "durationSeconds": item["selectedClip"]["duration"]}
+                for item in proposal["segments"]],
+        }, headers=INTENT)
+        assert edited.status_code == 200, edited.text
+        current = edited.json()["proposal"]
+        assert [(clip["start"], clip["duration"]) for clip in current["clips"]] == [(0, 2), (2, 2)]
+        assert current["transitions"][0]["template"] == "cut"
+        assert current["segments"][0]["suggestionClip"]["duration"] == 2.35
 
 
 def test_montage_proposal_replacement_preserves_suggestion_and_stale_source_blocks_apply(tmp_path):

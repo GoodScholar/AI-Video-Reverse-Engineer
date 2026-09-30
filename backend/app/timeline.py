@@ -16,6 +16,11 @@ DEFAULT_SETTINGS = {"width": 1280, "height": 720, "fps": 30}
 MAX_DURATION = 300.0
 MAX_TRACKS = 8
 MAX_CLIPS = 80
+MAX_TRANSITIONS = MAX_CLIPS - 1
+TRANSITION_TEMPLATES = {
+    "cut", "dissolve", "push", "wipe", "flash-white", "pixelize", "speed-change",
+}
+EFFECT_TRANSITIONS = {"dissolve", "push", "wipe", "flash-white", "pixelize"}
 
 
 class TimelineStore:
@@ -36,6 +41,7 @@ class TimelineStore:
         except (OSError, ValueError, json.JSONDecodeError) as error:
             raise OSError("时间线状态无法读取") from error
         validate_state(state)
+        state.setdefault("transitions", [])
         return state
 
     def save(self, project_id: str, state: Dict[str, Any]) -> None:
@@ -57,7 +63,7 @@ class TimelineStore:
 
 
 def default_workspace() -> Dict[str, Any]:
-    return {"schemaVersion": 1, "revision": 0, "settings": dict(DEFAULT_SETTINGS), "tracks": [], "runs": []}
+    return {"schemaVersion": 1, "revision": 0, "settings": dict(DEFAULT_SETTINGS), "tracks": [], "transitions": [], "runs": []}
 
 
 def validate_state(state: Any) -> None:
@@ -65,12 +71,16 @@ def validate_state(state: Any) -> None:
         raise ValueError("时间线状态无效")
     if not isinstance(state.get("revision"), int) or isinstance(state["revision"], bool) or state["revision"] < 0:
         raise ValueError("时间线版本无效")
-    if not isinstance(state.get("settings"), dict) or not isinstance(state.get("tracks"), list) or not isinstance(state.get("runs"), list):
+    if (not isinstance(state.get("settings"), dict) or not isinstance(state.get("tracks"), list)
+            or not isinstance(state.get("transitions", []), list) or not isinstance(state.get("runs"), list)):
         raise ValueError("时间线状态无效")
 
 
 def validate_workspace(value: Any, assets: Dict[str, Dict[str, Any]]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    _keys(value, ("revision", "settings", "tracks"))
+    if not isinstance(value, dict) or set(value) not in (
+        {"revision", "settings", "tracks"}, {"revision", "settings", "tracks", "transitions"},
+    ):
+        raise ValueError("请求字段无效")
     revision = value["revision"]
     if not _integer(revision) or revision < 0:
         raise ValueError("版本无效")
@@ -107,14 +117,95 @@ def validate_workspace(value: Any, assets: Dict[str, Dict[str, Any]]) -> Tuple[D
                 raise ValueError("片段标识符不能重复")
             seen_clips.add(clip["id"])
             clips.append(clip)
-        if kind == "video":
-            previous_end = -1.0
-            for clip in sorted(clips, key=lambda item: item["start"]):
-                if clip["start"] < previous_end - 1e-8:
-                    raise ValueError("同一视频轨道的片段不能重叠")
-                previous_end = clip["start"] + clip["duration"]
         tracks.append({"id": track_id, "name": name, "kind": kind, "muted": raw_track["muted"], "hidden": raw_track["hidden"], "clips": clips})
+    transitions = validate_transitions(value.get("transitions", []), tracks)
+    effective = {(item["leftClipId"], item["rightClipId"]): item for item in transitions
+                 if item["enabled"] and item["template"] in EFFECT_TRANSITIONS}
+    for track in tracks:
+        if track["kind"] != "video":
+            continue
+        ordered = sorted(track["clips"], key=lambda item: item["start"])
+        for left, right in zip(ordered, ordered[1:]):
+            overlap = left["start"] + left["duration"] - right["start"]
+            if overlap > 1e-8 and (left["id"], right["id"]) not in effective:
+                raise ValueError("同一视频轨道的片段只能通过启用的转场重叠")
     return settings, tracks
+
+
+def validate_transitions(value: Any, tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(value, list) or len(value) > MAX_TRANSITIONS:
+        raise ValueError("转场数量无效")
+    clip_locations = {}
+    adjacent = set()
+    for track in tracks:
+        if track.get("kind") != "video" or track.get("hidden"):
+            continue
+        ordered = sorted(track.get("clips", []), key=lambda item: item["start"])
+        for clip in ordered:
+            clip_locations[clip["id"]] = (track, clip)
+        adjacent.update((left["id"], right["id"]) for left, right in zip(ordered, ordered[1:]))
+
+    result = []
+    seen_ids = set()
+    seen_boundaries = set()
+    for raw in value:
+        _keys(raw, (
+            "id", "leftClipId", "rightClipId", "template", "enabled", "duration", "overlap",
+            "audioCrossfade", "reason",
+        ))
+        transition_id = _identifier(raw["id"], "转场标识符")
+        left_id = _identifier(raw["leftClipId"], "左片段标识符")
+        right_id = _identifier(raw["rightClipId"], "右片段标识符")
+        boundary = (left_id, right_id)
+        if transition_id in seen_ids or boundary in seen_boundaries:
+            raise ValueError("转场标识符和片段边界不能重复")
+        if boundary not in adjacent or left_id not in clip_locations or right_id not in clip_locations:
+            raise ValueError("转场只能连接同一可见视频轨道的相邻片段")
+        template = raw["template"]
+        if not isinstance(template, str) or template not in TRANSITION_TEMPLATES:
+            raise ValueError("转场模板不受支持")
+        if not isinstance(raw["enabled"], bool) or not isinstance(raw["audioCrossfade"], bool):
+            raise ValueError("转场开关无效")
+        duration = _number(raw["duration"], "转场持续时间")
+        overlap = _number(raw["overlap"], "转场重叠量")
+        reason = raw["reason"]
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
+            raise ValueError("转场建议依据无效")
+        left = clip_locations[left_id][1]
+        right = clip_locations[right_id][1]
+        if template in ("cut", "speed-change"):
+            if duration != 0 or overlap != 0 or raw["audioCrossfade"]:
+                raise ValueError("硬切和速度变化不能设置重叠或音频交叉淡化")
+            if template == "speed-change" and left["speed"] == 1 and right["speed"] == 1:
+                raise ValueError("受控速度变化需要至少一个相邻片段调整速度")
+        else:
+            if duration < .05 or duration > 2 or abs(duration - overlap) > 1e-8:
+                raise ValueError("转场持续时间必须为 0.05 到 2 秒并与重叠量一致")
+            if overlap >= min(left["duration"], right["duration"]) - 1e-8:
+                raise ValueError("转场持续时间必须短于相邻片段")
+        effective_overlap = overlap if raw["enabled"] and template in EFFECT_TRANSITIONS else 0.0
+        expected_start = left["start"] + left["duration"] - effective_overlap
+        if abs(right["start"] - expected_start) > 1e-6:
+            if not raw["enabled"]:
+                raise ValueError("禁用转场后相邻片段必须按硬切连续排列")
+            raise ValueError("相邻片段位置与转场重叠量不一致")
+        normalized = {
+            "id": transition_id, "leftClipId": left_id, "rightClipId": right_id,
+            "template": template, "enabled": raw["enabled"], "duration": duration,
+            "overlap": overlap, "audioCrossfade": raw["audioCrossfade"], "reason": reason.strip(),
+        }
+        result.append(normalized)
+        seen_ids.add(transition_id)
+        seen_boundaries.add(boundary)
+    coverage = {}
+    for item in result:
+        if item['enabled'] and item['template'] in EFFECT_TRANSITIONS:
+            for clip_id in (item['leftClipId'], item['rightClipId']):
+                coverage[clip_id] = coverage.get(clip_id, 0) + item['overlap']
+    if any(overlap >= clip_locations[clip_id][1]['duration'] - 1e-8
+           for clip_id, overlap in coverage.items()):
+        raise ValueError('同一片段的前后转场不能相互重叠，需缩短转场持续时间')
+    return result
 
 
 def has_visible_video(tracks: Iterable[Dict[str, Any]]) -> bool:

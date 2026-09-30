@@ -19,6 +19,13 @@ from typing import Callable, Dict, List, Optional, Tuple
 _RENDER_TIMEOUT_SECONDS = 600.0
 _PROBE_TIMEOUT_SECONDS = 30.0
 _THREADS = "2"
+_XFADE_TEMPLATES = {
+    "dissolve": "fade",
+    "push": "slideleft",
+    "wipe": "wipeleft",
+    "flash-white": "fadewhite",
+    "pixelize": "pixelize",
+}
 
 
 class TimelineRenderError(RuntimeError):
@@ -81,6 +88,12 @@ def render_timeline(
         raise TimelineRenderError("时间线轨道无效。")
 
     clips = _collect_clips(tracks, sources, ffprobe_path, format)
+    from .timeline import validate_transitions
+    try:
+        validate_transitions(timeline.get('transitions', []), tracks)
+    except (ValueError, TypeError, KeyError) as error:
+        raise TimelineRenderError(str(error)) from error
+    transitions = _collect_transitions(timeline.get("transitions", []), clips)
     duration = max((clip["end"] for clip in clips), default=0.0)
     if duration <= 0:
         raise TimelineRenderError("时间线没有可渲染的片段。")
@@ -91,7 +104,7 @@ def render_timeline(
         from .batch_subtitles import caption_images
         captions = caption_images(Path(subtitles_path), render_width, render_height)
     command, expected = _build_command(
-        clips, duration, render_width, render_height, fps, format, ffmpeg_path, captions
+        clips, transitions, duration, render_width, render_height, fps, format, ffmpeg_path, captions
     )
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -140,7 +153,8 @@ def inspect_timeline_media(state: dict, assets: dict, resolve_source, format: st
                 issues.append({**location, "level": "error", "message": str(error)})
     if not any(item["level"] == "error" for item in issues):
         try:
-            validate_workspace({key: state[key] for key in ("revision", "settings", "tracks")}, assets)
+            validate_workspace({"revision": state["revision"], "settings": state["settings"],
+                                "tracks": state["tracks"], "transitions": state.get("transitions", [])}, assets)
         except ValueError as error:
             issues.append({"level": "error", "message": str(error), "label": "时间线"})
     if format == "wav" and not audible:
@@ -205,6 +219,7 @@ def _collect_clips(tracks: list, sources: Dict[str, Path], ffprobe_path: str, fo
             if not muted and media.has_audio:
                 _validate_source_range(media.audio_duration, in_point, needed_source_duration, "音频流")
             result.append({
+                "id": clip.get("id"),
                 "source": source,
                 "media": media,
                 "kind": kind,
@@ -219,10 +234,17 @@ def _collect_clips(tracks: list, sources: Dict[str, Path], ffprobe_path: str, fo
                 "fade_in": fade_in,
                 "fade_out": fade_out,
                 "track_index": track_index,
+                "track_id": track.get("id"),
                 "clip_index": clip_index,
                 "end": start + clip_duration,
             })
     return result
+
+
+def _collect_transitions(value: object, clips: List[dict]) -> List[dict]:
+    # Schema, adjacency and overlap are checked by validate_transitions above.
+    by_id = {clip.get("id"): clip for clip in clips if isinstance(clip.get("id"), str)}
+    return [{**item, "left": by_id[item["leftClipId"]], "right": by_id[item["rightClipId"]]} for item in value]
 
 
 def _probe_media(source: Path, ffprobe_path: str) -> _Media:
@@ -300,6 +322,7 @@ def _validate_source_range(
 
 def _build_command(
     clips: List[dict],
+    transitions: List[dict],
     duration: float,
     width: int,
     height: int,
@@ -317,26 +340,117 @@ def _build_command(
     audio_labels = []
     input_index = 0
     captions = captions or []
+    active = [item for item in transitions if item["enabled"] and item["template"] in _XFADE_TEMPLATES]
+    active_by_left = {item["left"]["id"]: item for item in active}
+    active_right_ids = {item["right"]["id"] for item in active}
+    transitioned_video_ids = {item[side]["id"] for item in active for side in ("left", "right")}
+    audio_active = [item for item in active if not item["left"]["muted"]]
+    audio_by_left = {item["left"]["id"]: item for item in audio_active}
+    audio_right_ids = {item["right"]["id"] for item in audio_active}
+    transitioned_audio_ids = {item[side]["id"] for item in audio_active for side in ("left", "right")}
 
     if format != "wav":
         filters.append("color=c=black:s=%dx%d:r=%s:d=%s[base0]" % (width, height, _number(fps), _number(duration)))
+        video_labels = {}
+        visual_units = []
         for clip in clips:
             if clip["kind"] != "video" or clip["hidden"]:
                 continue
             command.extend(_input_arguments(clip, fps))
-            label = "v%d" % len(visual_labels)
-            filters.append(_video_filter(input_index, clip, width, height, fps, label))
-            visual_labels.append(label)
+            label = "v%d" % len(video_labels)
+            filters.append(_video_filter(
+                input_index, clip, width, height, fps, label,
+                local=clip["id"] in transitioned_video_ids,
+            ))
+            video_labels[clip["id"]] = label
             input_index += 1
 
+        consumed = set()
+        for clip in clips:
+            if clip["id"] in consumed or clip["kind"] != "video" or clip["hidden"]:
+                continue
+            if clip["id"] in transitioned_video_ids and clip["id"] not in active_right_ids:
+                current = video_labels[clip["id"]]
+                cumulative = clip["duration"]
+                cursor = clip
+                step = 0
+                consumed.add(cursor["id"])
+                while cursor["id"] in active_by_left:
+                    transition = active_by_left[cursor["id"]]
+                    following = transition["right"]
+                    output_label = "vx%d_%d" % (len(visual_units), step)
+                    filters.append("[%s][%s]xfade=transition=%s:duration=%s:offset=%s[%s]" % (
+                        current, video_labels[following["id"]], _XFADE_TEMPLATES[transition["template"]],
+                        _number(transition["duration"]), _number(cumulative - transition["overlap"]), output_label,
+                    ))
+                    current = output_label
+                    cumulative += following["duration"] - transition["overlap"]
+                    cursor = following
+                    consumed.add(cursor["id"])
+                    step += 1
+                positioned = "vchain%d" % len(visual_units)
+                filters.append("[%s]setpts=PTS-STARTPTS+%s/TB[%s]" % (
+                    current, _number(clip["start"]), positioned))
+                visual_units.append((clip["track_index"], clip["clip_index"], positioned))
+            elif clip["id"] not in transitioned_video_ids:
+                visual_units.append((clip["track_index"], clip["clip_index"], video_labels[clip["id"]]))
+                consumed.add(clip["id"])
+        visual_labels = [item[2] for item in sorted(visual_units)]
+
+    audio_source_labels = {}
     for clip in clips:
-        if clip["muted"] or not clip["media"].has_audio:
+        if clip["muted"]:
             continue
-        command.extend(_input_arguments(clip, fps))
-        label = "a%d" % len(audio_labels)
-        filters.append(_audio_filter(input_index, clip, label))
-        audio_labels.append(label)
-        input_index += 1
+        in_chain = clip["id"] in transitioned_audio_ids
+        label = "as%d" % len(audio_source_labels)
+        if clip["media"].has_audio:
+            command.extend(_input_arguments(clip, fps))
+            filters.append(_audio_filter(input_index, clip, label, local=in_chain))
+            input_index += 1
+        elif in_chain:
+            filters.append("anullsrc=r=48000:cl=stereo:d=%s[%s]" % (_number(clip["duration"]), label))
+        else:
+            continue
+        audio_source_labels[clip["id"]] = label
+
+    consumed_audio = set()
+    for clip in clips:
+        if clip["muted"] or clip["id"] in consumed_audio or clip["id"] not in audio_source_labels:
+            continue
+        if clip["id"] in transitioned_audio_ids and clip["id"] not in audio_right_ids:
+            current = audio_source_labels[clip["id"]]
+            cursor = clip
+            cumulative = clip["duration"]
+            step = 0
+            consumed_audio.add(cursor["id"])
+            while cursor["id"] in audio_by_left:
+                transition = audio_by_left[cursor["id"]]
+                following = transition["right"]
+                output_label = "ax%d_%d" % (len(audio_labels), step)
+                if transition["audioCrossfade"]:
+                    filters.append("[%s][%s]acrossfade=d=%s:c1=tri:c2=tri[%s]" % (
+                        current, audio_source_labels[following["id"]], _number(transition["duration"]), output_label,
+                    ))
+                else:
+                    trimmed = output_label + "trim"
+                    filters.append("[%s]atrim=duration=%s,asetpts=PTS-STARTPTS[%s]" % (
+                        current, _number(cumulative - transition["overlap"]), trimmed,
+                    ))
+                    filters.append("[%s][%s]concat=n=2:v=0:a=1[%s]" % (
+                        trimmed, audio_source_labels[following["id"]], output_label,
+                    ))
+                current = output_label
+                cumulative += following["duration"] - transition["overlap"]
+                cursor = following
+                consumed_audio.add(cursor["id"])
+                step += 1
+            positioned = "achain%d" % len(audio_labels)
+            filters.append("[%s]adelay=%s:all=1[%s]" % (
+                current, _milliseconds(clip["start"]), positioned))
+            audio_labels.append(positioned)
+        elif clip["id"] not in transitioned_audio_ids:
+            audio_labels.append(audio_source_labels[clip["id"]])
+            consumed_audio.add(clip["id"])
 
     if format != "wav":
         current = "base0"
@@ -385,18 +499,20 @@ def _input_arguments(clip: dict, fps: float) -> List[str]:
     return ["-ss", _number(clip["in_point"]), "-t", _number(clip["source_duration"]), "-i", str(clip["source"])]
 
 
-def _video_filter(index: int, clip: dict, width: int, height: int, fps: float, label: str) -> str:
+def _video_filter(index: int, clip: dict, width: int, height: int, fps: float, label: str,
+                  *, local: bool = False) -> str:
+    position = "PTS-STARTPTS" if local else "PTS-STARTPTS+%s/TB" % _number(clip["start"])
     return (
         "[%d:v]setpts=PTS-STARTPTS,setpts=(PTS-STARTPTS)/%s,trim=duration=%s,"
         "scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black,"
-        "setsar=1,fps=%s,setpts=PTS-STARTPTS+%s/TB[%s]"
+        "setsar=1,fps=%s,format=yuv420p,settb=AVTB,setpts=%s[%s]"
     ) % (
         index, _number(clip["speed"]), _number(clip["duration"]),
-        width, height, width, height, _number(fps), _number(clip["start"]), label,
+        width, height, width, height, _number(fps), position, label,
     )
 
 
-def _audio_filter(index: int, clip: dict, label: str) -> str:
+def _audio_filter(index: int, clip: dict, label: str, *, local: bool = False) -> str:
     speed_filters = ",".join("atempo=%s" % _number(part) for part in _tempo_parts(clip["speed"]))
     fade_parts = []
     if clip["fade_in"]:
@@ -413,7 +529,7 @@ def _audio_filter(index: int, clip: dict, label: str) -> str:
         "volume=%s" % _number(clip["volume"]),
         *fade_parts,
         "aformat=sample_rates=48000:channel_layouts=stereo",
-        "adelay=%s:all=1" % _milliseconds(clip["start"]),
+        *([] if local else ["adelay=%s:all=1" % _milliseconds(clip["start"])]),
     ])
     return "[%d:a]%s[%s]" % (index, transform, label)
 

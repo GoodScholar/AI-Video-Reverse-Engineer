@@ -7,10 +7,13 @@ export type TimelineRunStatus = "queued" | "running" | "completed" | "failed" | 
 
 export type TimelineClip = { id: string; assetId: string; start: number; inPoint: number; duration: number; speed: number; volume: number; fadeIn: number; fadeOut: number };
 export type TimelineTrack = { id: string; name: string; kind: TimelineTrackKind; muted: boolean; hidden: boolean; clips: TimelineClip[] };
+export type TimelineTransitionTemplate = "cut" | "dissolve" | "push" | "wipe" | "flash-white" | "pixelize" | "speed-change";
+export type TimelineTransition = { id: string; leftClipId: string; rightClipId: string; template: TimelineTransitionTemplate;
+  enabled: boolean; duration: number; overlap: number; audioCrossfade: boolean; reason: string };
 export type TimelineAsset = { id: string; name: string; kind: TimelineAssetKind; url: string; duration?: number; width?: number; height?: number };
 export type TimelineRun = { id: string; revision: number; format: TimelineFormat; status: TimelineRunStatus; error: string | null; url?: string };
-export type TimelineWorkspace = { revision: number; settings: { width: number; height: number; fps: 24 | 25 | 30 }; tracks: TimelineTrack[]; assets: TimelineAsset[]; runs: TimelineRun[] };
-export type TimelineSave = Pick<TimelineWorkspace, "revision" | "settings" | "tracks">;
+export type TimelineWorkspace = { revision: number; settings: { width: number; height: number; fps: 24 | 25 | 30 }; tracks: TimelineTrack[]; transitions?: TimelineTransition[]; assets: TimelineAsset[]; runs: TimelineRun[] };
+export type TimelineSave = Pick<TimelineWorkspace, "revision" | "settings" | "tracks" | "transitions">;
 
 const connectionError = "无法连接本地服务，请确认应用服务正在运行后重试。";
 const jsonHeaders = { "Content-Type": "application/json", "x-aivre-intent": "semantic-analysis" };
@@ -30,8 +33,9 @@ export function getTimeline(projectId: string): Promise<TimelineWorkspace> {
 }
 
 export function saveTimeline(projectId: string, workspace: TimelineSave): Promise<TimelineWorkspace> {
-  const { revision, settings, tracks } = workspace;
-  return request(timelineBase(projectId), { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ revision, settings, tracks }) }, "无法保存剪辑时间线，请刷新后重试。");
+  const { revision, settings, tracks, transitions } = workspace;
+  return request(timelineBase(projectId), { method: "PUT", headers: jsonHeaders,
+    body: JSON.stringify({ revision, settings, tracks, ...(transitions ? { transitions } : {}) }) }, "无法保存剪辑时间线，请刷新后重试。");
 }
 
 export function startTimelineRun(projectId: string, revision: number, format: TimelineFormat): Promise<TimelineWorkspace> {

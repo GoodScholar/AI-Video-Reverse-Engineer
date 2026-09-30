@@ -75,7 +75,7 @@ def _complete_local_run(run: dict[str, Any], result: dict[str, Any]) -> None:
     run.update(status=completion.status, error=None, **completion.result)
 
 
-def _validate_timeline_shape(revision: int, settings: Any, tracks: Any) -> None:
+def _validate_timeline_shape(revision: int, settings: Any, tracks: Any, transitions: Any = None) -> None:
     if not isinstance(tracks, list):
         raise ValueError("短视频变体轨道无效")
     assets = {}
@@ -86,7 +86,8 @@ def _validate_timeline_shape(revision: int, settings: Any, tracks: Any) -> None:
             if isinstance(clip, dict) and isinstance(clip.get("assetId"), str):
                 assets[clip["assetId"]] = {"kind": "video", "duration": 1_000_000_000}
     try:
-        validate_workspace({"revision": revision, "settings": settings, "tracks": tracks}, assets)
+        validate_workspace({"revision": revision, "settings": settings, "tracks": tracks,
+                            "transitions": [] if transitions is None else transitions}, assets)
     except (TypeError, KeyError, ValueError) as error:
         raise ValueError("短视频变体时间线无效") from error
 
@@ -203,7 +204,7 @@ def _validate_state(value: Any) -> None:
             raise ValueError("短视频变体比例无效")
         if not isinstance(runs, list):
             raise ValueError("短视频变体无效")
-        _validate_timeline_shape(variant["revision"], settings, tracks)
+        _validate_timeline_shape(variant["revision"], settings, tracks, variant.get("transitions", []))
         subtitles = variant.get("subtitles")
         if subtitles is not None:
             if (not isinstance(subtitles, dict) or type(subtitles.get("revision")) is not int or subtitles["revision"] < 0
@@ -219,7 +220,7 @@ def _validate_state(value: Any) -> None:
                         or not isinstance(recognition.get("snapshot"), dict) or not isinstance(recognition.get("sources"), dict)
                         or (recognition.get("error") is not None and not isinstance(recognition["error"], str))):
                     raise ValueError("字幕识别记录无效")
-                _validate_timeline_shape(recognition["timelineRevision"], recognition["snapshot"].get("settings"), recognition["snapshot"].get("tracks"))
+                _validate_timeline_shape(recognition["timelineRevision"], recognition["snapshot"].get("settings"), recognition["snapshot"].get("tracks"), recognition["snapshot"].get("transitions", []))
                 _validate_cues(recognition.get("cues"), recognition["snapshot"]["tracks"])
                 if any(not _valid_id(asset_id) or not _valid_id(filename) for asset_id, filename in recognition["sources"].items()):
                     raise ValueError("字幕识别来源无效")
@@ -235,7 +236,7 @@ def _validate_state(value: Any) -> None:
                 raise ValueError("短视频推荐无效")
             first_video = next((track["id"] for track in tracks if track["kind"] == "video"), None)
             proposal_tracks = [{**track, "clips": proposal["clips"]} if track["id"] == first_video else track for track in tracks]
-            _validate_timeline_shape(proposal["baseRevision"], settings, proposal_tracks)
+            _validate_timeline_shape(proposal["baseRevision"], settings, proposal_tracks, proposal.get("transitions", []))
             for clip, match in zip(proposal["clips"], proposal["matches"]):
                 if (not isinstance(match, dict) or match.get("clipId") != clip["id"] or match.get("assetId") != clip["assetId"]
                         or any(not isinstance(match.get(key), str) or not match[key].strip() for key in ("scriptSegment", "assetName"))
@@ -249,7 +250,7 @@ def _validate_state(value: Any) -> None:
                 raise ValueError("变体预览记录无效")
             if run.get("status") not in ("queued", "running", "completed", "failed", "cancelled") or not isinstance(run.get("snapshot"), dict) or not isinstance(run.get("sources"), dict):
                 raise ValueError("变体预览记录无效")
-            _validate_timeline_shape(run["revision"], run["snapshot"].get("settings"), run["snapshot"].get("tracks"))
+            _validate_timeline_shape(run["revision"], run["snapshot"].get("settings"), run["snapshot"].get("tracks"), run["snapshot"].get("transitions", []))
             if any(not _valid_id(asset_id) or not _valid_id(filename) for asset_id, filename in run["sources"].items()):
                 raise ValueError("变体预览来源无效")
             if run.get("error") is not None and not isinstance(run["error"], str):
@@ -282,7 +283,7 @@ def _validate_state(value: Any) -> None:
                            or not isinstance(asset.get("kind"), str) for asset in delivery["assets"])
                     or (delivery.get("error") is not None and not isinstance(delivery["error"], str))):
                 raise ValueError("成片记录无效")
-            _validate_timeline_shape(delivery["variantRevision"], delivery["snapshot"].get("settings"), delivery["snapshot"].get("tracks"))
+            _validate_timeline_shape(delivery["variantRevision"], delivery["snapshot"].get("settings"), delivery["snapshot"].get("tracks"), delivery["snapshot"].get("transitions", []))
             _validate_cues(delivery.get("subtitles"), delivery["snapshot"]["tracks"])
             if any(not _valid_id(asset_id) or not _valid_id(filename) for asset_id, filename in delivery["sources"].items()):
                 raise ValueError("成片素材快照无效")
@@ -782,6 +783,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             run_id = uuid4().hex
             directory = store.path(project_id, "recognitions", run_id)
             snapshot = {"settings": variant["settings"], "tracks": variant["tracks"]}
+            if variant.get("transitions"):
+                snapshot["transitions"] = variant["transitions"]
             sources = snapshot_sources(project_id, directory, variant["tracks"], assets_for(project_id))
             run = {"id": run_id, "status": LOCAL_RUN_POLICY.initial_status, "error": None, "timelineRevision": variant["revision"],
                    "subtitleRevision": subtitles["revision"], "language": body["language"], "cues": [],
@@ -831,7 +834,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
     @router.put("/{task_id}/variant")
     def save_variant(project_id: str, task_id: str, body: dict[str, Any]):
         project_for(project_id)
-        if not isinstance(body, dict) or not {"revision", "tracks"} <= set(body) or set(body) - {"revision", "tracks", "settings", "aspectMode"}:
+        if not isinstance(body, dict) or not {"revision", "tracks"} <= set(body) or set(body) - {"revision", "tracks", "transitions", "settings", "aspectMode"}:
             raise HTTPException(422, detail={"code": "batch_variant_invalid", "message": "变体内容无效。"})
         with source_lock or nullcontext(), lock:
             state = state_for(project_id)
@@ -842,6 +845,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 settings=body.get("settings", variant["settings"]),
                 aspect_mode=body.get("aspectMode", variant.get("aspectMode")), assets=assets_for(project_id),
                 validate_subtitles=_validate_cues, aspect_was_explicit="aspectMode" in body,
+                transitions=body.get("transitions", variant.get("transitions", [])),
             )
             save(project_id, state)
             return {"variant": public_task(project_id, task)["variant"]}
@@ -946,6 +950,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     segments=segment_inputs, beat_times=body["beatTimes"], shared_usage=shared_usage,
                     variant_ordinal=variant_ordinal,
                     proposal_generation=len(task.get("montageProposals", [])),
+                    selling_point=task["sellingPoint"],
                 )
             except MontagePlanningError as error:
                 raise HTTPException(422, detail={"code": error.code, "message": error.message}) from None
@@ -973,6 +978,19 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 raise HTTPException(409, detail={"code": "montage_proposal_closed", "message": "混剪提案已采用或放弃，请重新生成。"})
             by_segment = {item["id"]: item for item in proposal["segments"]}
             input_by_segment = {item["id"]: item for item in proposal["inputSnapshot"]["segments"]}
+            old_handles = {item["leftClipId"]: item["overlap"] for item in proposal.get("transitions", [])
+                           if item["enabled"]}
+            # UI durations include the old overlap tail. Strip it when unchanged;
+            # explicitly changed durations remain the user's requested duration.
+            for item in proposal["segments"]:
+                clip = item.get("selectedClip")
+                if clip and clip["id"] in old_handles:
+                    adjustment = next((value for value in body["segments"] if isinstance(value, dict)
+                                       and value.get("segmentId") == item["id"]), None)
+                    if adjustment is None:
+                        clip["duration"] = round(clip["duration"] - old_handles[clip["id"]], 6)
+                    elif adjustment.get("durationSeconds") == clip["duration"]:
+                        adjustment["durationSeconds"] = round(clip["duration"] - old_handles[clip["id"]], 6)
             seen = set()
             for adjustment in body["segments"]:
                 if (not isinstance(adjustment, dict) or set(adjustment) != {"segmentId", "candidateId", "inPointSeconds", "durationSeconds"}
@@ -1053,6 +1071,13 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                                        if not reason.startswith("镜头结束")]
                     item["reasons"].append("人工时长调整改变了节奏位置，已取消原节拍吸附")
             proposal["clips"] = [item["selectedClip"] for item in proposal["segments"] if item.get("selectedClip")]
+            proposal["transitions"] = [{
+                "id": f"transition-{hashlib.sha256((proposal['id'] + ':' + left['id'] + ':' + right['id']).encode()).hexdigest()[:20]}",
+                "leftClipId": left["id"], "rightClipId": right["id"], "template": "cut", "enabled": True,
+                "duration": 0.0, "overlap": 0.0, "audioCrossfade": False,
+                "reason": "片段候选或时长已人工调整，重新确认效果前安全回退为硬切",
+            } for left, right in zip(proposal["clips"], proposal["clips"][1:])
+                if abs(left["start"] + left["duration"] - right["start"]) < 1e-6]
             proposal["unmet"] = [{"segmentId": item["id"], "message": message}
                                  for item in proposal["segments"] for message in item.get("unmet", [])]
             proposal.update(revision=proposal["revision"] + 1, status="draft")
@@ -1098,21 +1123,43 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             if video_track is None:
                 raise HTTPException(422, detail={"code": "batch_variant_invalid", "message": "变体缺少画面轨道。"})
             proposed_clips = deepcopy(proposal["clips"])
+            proposed_transitions = deepcopy(proposal.get("transitions", []))
+            saved_transitions = deepcopy(task["variant"].get("transitions", []))
             adjusted_subtitles = None
             if body["strategy"] == "merge" and video_track["clips"]:
                 offset = max(clip["start"] + clip["duration"] for clip in video_track["clips"])
+                previous_last_id = max(video_track["clips"], key=lambda clip: clip["start"] + clip["duration"])["id"]
                 used_clip_ids = {clip["id"] for track in tracks for clip in track.get("clips", [])}
                 remapped = []
+                clip_id_map = {}
                 for index, clip in enumerate(proposed_clips, start=1):
+                    original_id = clip["id"]
                     clip_id = clip["id"]
                     if clip_id in used_clip_ids:
                         clip_id = f"{clip_id}-{proposal['id'][-8:]}-{index}"
                     remapped.append({**clip, "id": clip_id, "start": round(clip["start"] + offset, 6)})
+                    clip_id_map[original_id] = clip_id
                     used_clip_ids.add(clip_id)
                 proposed_clips = remapped
+                proposed_transitions = [{
+                    **item,
+                    "id": f"{item['id']}-{proposal['id'][-8:]}",
+                    "leftClipId": clip_id_map[item["leftClipId"]],
+                    "rightClipId": clip_id_map[item["rightClipId"]],
+                } for item in proposed_transitions]
+                connector = {
+                    "id": f"transition-{hashlib.sha256((proposal['id'] + ':merge').encode()).hexdigest()[:20]}",
+                    "leftClipId": previous_last_id, "rightClipId": proposed_clips[0]["id"],
+                    "template": "cut", "enabled": True, "duration": 0.0, "overlap": 0.0,
+                    "audioCrossfade": False, "reason": "合并到既有编辑末尾时保持可预测的硬切边界",
+                }
                 video_track["clips"].extend(proposed_clips)
+                target_transitions = [*saved_transitions, connector, *proposed_transitions]
             else:
+                replaced_ids = {clip["id"] for clip in video_track["clips"]}
                 video_track["clips"] = proposed_clips
+                target_transitions = [item for item in saved_transitions
+                                      if item["leftClipId"] not in replaced_ids and item["rightClipId"] not in replaced_ids] + proposed_transitions
                 voice_track = next((track for track in tracks if track.get("id") == "voiceover"
                                     and track.get("kind") == "audio"), None)
                 subtitle_timing = proposed_clips
@@ -1143,6 +1190,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 save_batch_variant, task, expected_revision=body["revision"], tracks=tracks,
                 settings=task["variant"]["settings"], aspect_mode=task["variant"].get("aspectMode"),
                 assets=assets_for(project_id), validate_subtitles=_validate_cues, aspect_was_explicit=False,
+                transitions=target_transitions,
             )
             if adjusted_subtitles is not None:
                 task["variant"]["subtitles"]["cues"] = adjusted_subtitles
@@ -1327,8 +1375,11 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     if variant["revision"] == child["variant"]["revision"] and not any(
                         run["status"] in ("queued", "running") for run in variant["runs"]
                     ):
+                        snapshot = {"settings": variant["settings"], "tracks": variant["tracks"]}
+                        if variant.get("transitions"):
+                            snapshot["transitions"] = variant["transitions"]
                         failed = {"id": uuid4().hex, "revision": variant["revision"], "status": "failed", "error": message,
-                                  "snapshot": {"settings": variant["settings"], "tracks": variant["tracks"]}, "sources": {}}
+                                  "snapshot": snapshot, "sources": {}}
                         variant["runs"].append(failed)
                         save(project_id, state)
                 results.append({"taskId": child["id"], "status": "failed", "error": message})

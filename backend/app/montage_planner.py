@@ -9,7 +9,7 @@ from copy import deepcopy
 from typing import Any
 
 
-PLANNER_VERSION = "montage-planner-v1"
+PLANNER_VERSION = "montage-planner-v2"
 BEAT_SNAP_TOLERANCE_SECONDS = 0.12
 
 
@@ -222,6 +222,7 @@ def plan_montage(
     shared_usage: dict[str, int] | None = None,
     variant_ordinal: int = 0,
     proposal_generation: int = 0,
+    selling_point: str = "",
 ) -> dict[str, Any]:
     """Create a frozen proposal without mutating a saved edit sequence."""
     if not segments:
@@ -248,6 +249,7 @@ def plan_montage(
         "sharedUsage": dict(sorted(usage.items())),
         "variantOrdinal": variant_ordinal,
         "proposalGeneration": proposal_generation,
+        "sellingPoint": selling_point.strip(),
     }
     digest = hashlib.sha256(json.dumps(input_snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     proposal_id = f"montage-proposal-{digest[:24]}"
@@ -337,6 +339,12 @@ def plan_montage(
             "quality": deepcopy(chosen["quality"]),
             "evidence": deepcopy(chosen.get("evidence")),
         }
+        if isinstance(chosen.get("sceneId"), str) and chosen["sceneId"]:
+            suggestion["sceneId"] = chosen["sceneId"]
+        elif chosen.get("algorithmVersion") == "pyscenedetect-adaptive-v1":
+            # The existing source index emits one candidate per detected scene,
+            # not arbitrary time slices. Preserve that provenance in the proposal.
+            suggestion["sceneId"] = f"{chosen['assetId']}:{chosen['candidateId']}"
         planned_segments.append({
             "id": segment["id"], "text": segment["text"], "status": "gap" if segment_unmet else "planned",
             "suggestion": suggestion, "suggestionClip": deepcopy(selected_clip), "selectedClip": selected_clip,
@@ -353,6 +361,64 @@ def plan_montage(
         previous_candidate = chosen
         timeline_start = _round(timeline_start + requested_duration)
 
+    transitions = []
+    for left_segment, right_segment in zip(planned_segments, planned_segments[1:]):
+        left_clip = left_segment.get("selectedClip")
+        right_clip = right_segment.get("selectedClip")
+        left_candidate = left_segment.get("suggestion")
+        right_candidate = right_segment.get("suggestion")
+        if not left_clip or not right_clip or not left_candidate or not right_candidate:
+            continue
+        boundary_time = float(right_clip["start"])
+        emphasis = bool(selling_point.strip() and selling_point.strip() in right_segment["text"])
+        on_beat = left_segment["timing"].get("beatSnap") == boundary_time
+        scene_change = (
+            left_candidate.get("sceneId") is not None
+            and right_candidate.get("sceneId") is not None
+            and left_candidate["sceneId"] != right_candidate["sceneId"]
+        )
+        if emphasis:
+            template, duration = "flash-white", .25
+            reason = f"进入卖点“{selling_point.strip()}”的强调段，建议短闪白并保留音频连续性"
+        elif on_beat:
+            template, duration = "push", .3
+            reason = f"镜头边界 {boundary_time:.3f} 秒贴合音乐节拍，建议受控推拉"
+        elif scene_change:
+            template, duration = "dissolve", .35
+            reason = "相邻候选具有明确场景变化证据，建议短叠化缓冲视觉跳变"
+        else:
+            template, duration = "cut", 0.0
+            reason = "普通叙事边界保持硬切，避免无依据堆叠效果"
+        available_handle = float(left_candidate["outPointSeconds"]) - (
+            float(left_clip["inPoint"]) + float(left_clip["duration"])
+        )
+        source_end = float(left_clip["inPoint"]) + float(left_clip["duration"]) + duration
+        overlaps_source = any(
+            other["id"] != left_clip["id"] and other["assetId"] == left_clip["assetId"]
+            and float(left_clip["inPoint"]) < other["inPoint"] + other["duration"]
+            and source_end > other["inPoint"]
+            for other in clips
+        )
+        if duration and (available_handle + 1e-8 < duration or duration >= right_clip["duration"]
+                         or overlaps_source or abs(left_clip["start"] + left_clip["duration"] - boundary_time) > 1e-6):
+            template, duration = "cut", 0.0
+            reason = "源素材 handle、相邻时长或非重复来源条件不足，安全回退为硬切"
+        if abs(left_clip["start"] + left_clip["duration"] - boundary_time) > 1e-6:
+            continue
+        if duration:
+            left_clip["duration"] = _round(float(left_clip["duration"]) + duration)
+            suggestion_clip = left_segment.get("suggestionClip")
+            if suggestion_clip is not None:
+                suggestion_clip["duration"] = left_clip["duration"]
+        transition_id = "transition-" + hashlib.sha256(
+            f"{proposal_id}:{left_clip['id']}:{right_clip['id']}".encode()
+        ).hexdigest()[:20]
+        transitions.append({
+            "id": transition_id, "leftClipId": left_clip["id"], "rightClipId": right_clip["id"],
+            "template": template, "enabled": True, "duration": duration, "overlap": duration,
+            "audioCrossfade": bool(duration), "reason": reason,
+        })
+
     return {
         "schemaVersion": 1,
         "id": proposal_id,
@@ -361,6 +427,7 @@ def plan_montage(
         "inputSnapshot": input_snapshot,
         "segments": planned_segments,
         "clips": clips,
+        "transitions": transitions,
         "unmet": unmet,
     }
 

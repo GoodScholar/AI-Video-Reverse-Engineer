@@ -1,6 +1,6 @@
 import { readApiError } from "./referenceMediaApi";
 import type { AigcBeat, AigcBrief } from "./aigcContentApi";
-import type { TimelineAsset, TimelineClip, TimelineTrack } from "./timelineApi";
+import type { TimelineAsset, TimelineClip, TimelineTrack, TimelineTransition } from "./timelineApi";
 import type { AspectMode } from "./videoAspect";
 
 export type BatchRun = { id: string; revision: number; contentRevision?: number; subtitleRevision?: number; status: "queued" | "running" | "completed" | "failed" | "cancelled"; error: string | null;
@@ -10,12 +10,12 @@ export type BatchReview = { id: string; runId: string; decision: "approved" | "r
 export type BatchExportRun = { id: string; status: "queued" | "running" | "completed" | "failed" | "cancelled"; error: string | null;
   contentRevision: number; variantRevision: number; subtitleRevision: number; previewRunId: string; review: BatchReview;
   sellingPoint: string; script: string; assets: Array<{ id: string; name: string; kind: string }>;
-  snapshot: { settings: { width: number; height: number; fps: number }; tracks: TimelineTrack[] }; subtitles: BatchCue[]; url?: string };
+  snapshot: { settings: { width: number; height: number; fps: number }; tracks: TimelineTrack[]; transitions?: TimelineTransition[] }; subtitles: BatchCue[]; url?: string };
 export type BatchCue = { id: string; start: number; end: number; text: string };
 export type BatchRecognition = { id: string; status: "queued" | "running" | "completed" | "failed"; error: string | null;
   timelineRevision: number; subtitleRevision: number; language: "auto" | "zh" | "en" | "ja" | "ko"; cues: BatchCue[] };
 export type BatchSubtitles = { revision: number; cues: BatchCue[]; recognitions: BatchRecognition[] };
-export type BatchVariant = { id: string; revision: number; settings: { width: number; height: number; fps: number }; tracks: TimelineTrack[]; runs: BatchRun[];
+export type BatchVariant = { id: string; revision: number; settings: { width: number; height: number; fps: number }; tracks: TimelineTrack[]; transitions?: TimelineTransition[]; runs: BatchRun[];
   subtitles?: BatchSubtitles; exports?: BatchExportRun[]; aspectMode?: AspectMode; resolvedAspect?: string; aspectReason?: string };
 export type BatchProposal = { baseRevision: number; method: "asset-metadata-keywords"; assetIds: string[]; clips: TimelineClip[]; matches: Array<{
   clipId: string; scriptSegment: string; assetId: string; assetName: string; matchedTerms: string[]; matchedSellingPointTerms: string[];
@@ -28,7 +28,7 @@ export type MontageProposalSegment = { id: string; text: string; status: "planne
   reasons: string[]; unmet: string[]; timing: { narrationDurationSeconds: number; wordBoundarySeconds: number; beatSnap: number | null } };
 export type MontageProposal = { id: string; revision: number; status: "draft" | "abandoned" | "applied"; plannerVersion: string;
   baseRevision: number; appliedVariantRevision: number | null; appliedClipIds?: string[];
-  appliedSelections?: Array<{ segmentId: string; candidateId: string; clipId: string; assetId?: string; inPoint?: number; duration?: number }>; segments: MontageProposalSegment[]; clips: TimelineClip[];
+  appliedSelections?: Array<{ segmentId: string; candidateId: string; clipId: string; assetId?: string; inPoint?: number; duration?: number }>; segments: MontageProposalSegment[]; clips: TimelineClip[]; transitions?: TimelineTransition[];
   unmet: Array<{ segmentId: string; message: string }>; inputSnapshot: { contentRevision: number; variantRevision: number } };
 export type BatchTask = { voiceover?: {id:string;voiceId:string;status:"queued"|"running"|"completed"|"failed";error:string|null;
   contentRevision:number;variantRevision:number;model:string;modelRevision:string;assetIds:string[]}; id: string; sellingPoint: string; script: string; contentRevision?: number;
@@ -59,9 +59,9 @@ export function createBatchTask(projectId: string, sellingPoint: string, script:
   return request(base(projectId), { method: "POST", headers, body: JSON.stringify({ sellingPoint, script }) }, "无法创建批量任务。");
 }
 
-export function saveBatchVariant(projectId: string, taskId: string, revision: number, tracks: TimelineTrack[], settings?: BatchVariant["settings"], aspectMode?: AspectMode): Promise<{ variant: BatchVariant }> {
+export function saveBatchVariant(projectId: string, taskId: string, revision: number, tracks: TimelineTrack[], transitions: TimelineTransition[] = [], settings?: BatchVariant["settings"], aspectMode?: AspectMode): Promise<{ variant: BatchVariant }> {
   return request(`${base(projectId)}/${encodeURIComponent(taskId)}/variant`,
-    { method: "PUT", headers, body: JSON.stringify({ revision, tracks, ...(settings ? { settings } : {}), ...(aspectMode ? { aspectMode } : {}) }) }, "无法保存短视频变体。");
+    { method: "PUT", headers, body: JSON.stringify({ revision, tracks, transitions, ...(settings ? { settings } : {}), ...(aspectMode ? { aspectMode } : {}) }) }, "无法保存短视频变体。");
 }
 
 export function saveBatchContent(projectId: string, taskId: string, revision: number, sellingPoint: string, script: string): Promise<{ task: BatchTask }> {

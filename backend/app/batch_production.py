@@ -8,7 +8,7 @@ from typing import Any, Callable, Literal
 from uuid import uuid4
 
 from .durable_runs import LOCAL_RUN_POLICY, RunConflict, freeze_run_input
-from .timeline import validate_workspace
+from .timeline import validate_transitions, validate_workspace
 from .video_aspect import PRODUCT_PRESETS, ratio_label, resolve_product_aspect, valid_aspect_mode
 
 
@@ -67,11 +67,14 @@ def _voice_is_current(task: dict[str, Any]) -> bool:
 def frozen_edit_snapshot(task: dict[str, Any]) -> dict[str, Any]:
     variant = task["variant"]
     content_revision, variant_revision, subtitle_revision = current_version(task)
+    snapshot = {"settings": deepcopy(variant["settings"]), "tracks": deepcopy(variant["tracks"])}
+    if variant.get("transitions"):
+        snapshot["transitions"] = deepcopy(variant["transitions"])
     return {
         "contentRevision": content_revision,
         "variantRevision": variant_revision,
         "subtitleRevision": subtitle_revision,
-        "snapshot": {"settings": deepcopy(variant["settings"]), "tracks": deepcopy(variant["tracks"])},
+        "snapshot": snapshot,
         "subtitleCues": deepcopy(variant.get("subtitles", {}).get("cues", [])),
     }
 
@@ -191,6 +194,7 @@ def create_batch(selling_point: str, script: str, aspect: dict[str, Any] | None 
                 {"id": "video", "name": "画面", "kind": "video", "muted": False, "hidden": False, "clips": []},
                 {"id": "audio", "name": "声音", "kind": "audio", "muted": False, "hidden": False, "clips": []},
             ],
+            "transitions": [],
             "subtitles": {"revision": 0, "cues": [], "recognitions": []},
             "runs": [], "exports": [],
         },
@@ -461,13 +465,17 @@ def complete_voiceover(task: dict[str, Any], *, job_id: str, expected_version: t
 def save_variant(task: dict[str, Any], *, expected_revision: int, tracks: list[dict[str, Any]],
                  settings: dict[str, Any], aspect_mode: str | None, assets: dict[str, dict[str, Any]],
                  validate_subtitles: Callable[[list, list], Any] | None = None,
-                 aspect_was_explicit: bool = True) -> dict[str, Any]:
+                 aspect_was_explicit: bool = True,
+                 transitions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     variant = task["variant"]
     if type(expected_revision) is not int or expected_revision != variant["revision"]:
         raise BatchProductionError("batch_variant_conflict", "变体已更新，请刷新后重试。")
     try:
+        transition_input = variant.get("transitions", []) if transitions is None else transitions
         settings, tracks = validate_workspace(
-            {"revision": variant["revision"], "settings": settings, "tracks": tracks}, assets)
+            {"revision": variant["revision"], "settings": settings, "tracks": tracks,
+             "transitions": transition_input}, assets)
+        transitions = validate_transitions(transition_input, tracks)
         if settings["fps"] != 30:
             raise ValueError("批量成片使用 30 帧/秒")
         mode = aspect_mode
@@ -492,7 +500,7 @@ def save_variant(task: dict[str, Any], *, expected_revision: int, tracks: list[d
             validate_subtitles(subtitles_for(variant)["cues"], tracks)
     except (KeyError, TypeError, ValueError) as error:
         raise BatchProductionError("batch_variant_invalid", str(error), 422) from None
-    variant.update(tracks=tracks, settings=settings, aspectMode=mode, resolvedAspect=resolved)
+    variant.update(tracks=tracks, transitions=transitions, settings=settings, aspectMode=mode, resolvedAspect=resolved)
     variant["aspectReason"] = (resolution["reason"] if resolution else
                                ("单条作品覆盖批次视频比例。" if aspect_was_explicit else
                                 variant.get("aspectReason", "沿用作品已保存的输出尺寸。")))
@@ -516,7 +524,8 @@ def submit_preview(task: dict[str, Any], *, expected_revision: int, assets: dict
         raise BatchProductionError("batch_preview_active", "此变体已有预览任务。")
     try:
         settings, tracks = validate_workspace(
-            {"revision": variant["revision"], "settings": variant["settings"], "tracks": variant["tracks"]}, assets)
+            {"revision": variant["revision"], "settings": variant["settings"], "tracks": variant["tracks"],
+             "transitions": variant.get("transitions", [])}, assets)
     except (KeyError, TypeError, ValueError) as error:
         raise BatchProductionError("batch_variant_invalid", str(error), 422) from None
     if not any(track["kind"] == "video" and not track["hidden"] and track["clips"] for track in tracks):
@@ -524,6 +533,8 @@ def submit_preview(task: dict[str, Any], *, expected_revision: int, assets: dict
     run_id = id_factory()
     frozen = frozen_edit_snapshot(task)
     frozen["snapshot"] = {"settings": settings, "tracks": tracks}
+    if variant.get("transitions"):
+        frozen["snapshot"]["transitions"] = validate_transitions(variant["transitions"], tracks)
     run = {
         "id": run_id, "revision": frozen["variantRevision"],
         "contentRevision": frozen["contentRevision"], "subtitleRevision": frozen["subtitleRevision"],

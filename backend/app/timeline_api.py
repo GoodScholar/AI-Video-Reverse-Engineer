@@ -22,7 +22,7 @@ from .preproduction import PreproductionStore
 from .project_assets import ProjectAssets
 from .reference_video import validate_storage_id
 from .render_inputs import RenderInputError, RenderInputPreparation
-from .timeline import TimelineStore, has_audible_audio, has_visible_video, validate_workspace
+from .timeline import TimelineStore, has_audible_audio, has_visible_video, validate_transitions, validate_workspace
 
 
 ACTIVE_STATUSES = LOCAL_RUN_POLICY.active_statuses
@@ -80,7 +80,9 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
         return public
 
     def response(project_id, state):
-        return {"revision": state["revision"], "settings": state["settings"], "tracks": state["tracks"], "assets": public_assets(project_id), "runs": [public_run(project_id, run) for run in state["runs"]]}
+        return {"revision": state["revision"], "settings": state["settings"], "tracks": state["tracks"],
+                "transitions": state.get("transitions", []), "assets": public_assets(project_id),
+                "runs": [public_run(project_id, run) for run in state["runs"]]}
 
     def find_run(state, run_id):
         try:
@@ -215,21 +217,27 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 fail("timeline_invalid", str(error), 422)
             for asset_id in {clip["assetId"] for track in tracks for clip in track["clips"]}:
                 source_path(project_id, assets[asset_id])
-            return {"revision": body["revision"], "settings": settings, "tracks": tracks}
+            checked = {"revision": body["revision"], "settings": settings, "tracks": tracks}
+            if "transitions" in body:
+                checked["transitions"] = validate_transitions(body["transitions"], tracks)
+            return checked
 
     @router.put("")
     def save_workspace(project_id: str, body: Dict[str, Any]):
         project_for(project_id)
         with source_lock or nullcontext(), lock:
             state = state_for(project_id)
+            transition_input = body.get("transitions", state.get("transitions", [])) if isinstance(body, dict) else []
             try:
-                settings, tracks = validate_workspace(body, asset_index(project_id))
+                value = {**body, "transitions": transition_input}
+                settings, tracks = validate_workspace(value, asset_index(project_id))
             except ValueError as error:
                 fail("timeline_invalid", str(error), 422)
             if body["revision"] != state["revision"]:
                 fail("timeline_conflict", "时间线已更新，请刷新后重试。")
             state["settings"] = settings
             state["tracks"] = tracks
+            state["transitions"] = validate_transitions(transition_input, tracks)
             state["revision"] += 1
             save(project_id, state)
             return response(project_id, state)
@@ -271,7 +279,9 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 start = round(start + duration, 6)
             track = {"id": track_id, "name": "镜头结果 · 方案 {}".format(preparation["revision"]), "kind": "video", "muted": False, "hidden": False, "clips": clips}
             try:
-                _, tracks = validate_workspace({"revision": state["revision"], "settings": state["settings"], "tracks": state["tracks"] + [track]}, assets)
+                _, tracks = validate_workspace({"revision": state["revision"], "settings": state["settings"],
+                                                "tracks": state["tracks"] + [track],
+                                                "transitions": state.get("transitions", [])}, assets)
             except ValueError as error:
                 fail("shot_result_invalid", str(error))
             state["tracks"] = tracks
@@ -330,7 +340,9 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 fail("timeline_run_active", "当前项目已有渲染任务正在执行。")
             assets = asset_index(project_id)
             try:
-                settings, tracks = validate_workspace({"revision": state["revision"], "settings": state["settings"], "tracks": state["tracks"]}, assets)
+                settings, tracks = validate_workspace({"revision": state["revision"], "settings": state["settings"],
+                                                       "tracks": state["tracks"],
+                                                       "transitions": state.get("transitions", [])}, assets)
             except ValueError as error:
                 fail("timeline_invalid", str(error), 422)
             if body["format"] == "wav":
@@ -341,7 +353,9 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             run_id = uuid4().hex
             sources = snapshot_sources(project_id, run_id, tracks, assets)
             run = {"id": run_id, "revision": state["revision"], "format": body["format"], "status": LOCAL_RUN_POLICY.initial_status, "error": None,
-                   "snapshot": {"settings": settings, "tracks": tracks}, "sources": sources}
+                   "snapshot": {"settings": settings, "tracks": tracks,
+                                "transitions": validate_transitions(state.get("transitions", []), tracks)},
+                   "sources": sources}
             state["runs"].append(run)
             save(project_id, state)
             queue_run(project_id, run_id)
