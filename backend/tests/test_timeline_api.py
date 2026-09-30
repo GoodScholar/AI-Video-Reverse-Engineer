@@ -139,6 +139,30 @@ def test_timeline_reframe_source_deleted_while_queued_becomes_retryable_failure(
     assert "素材" in record["error"]
 
 
+def test_timeline_reframe_restart_recovers_queued_analysis_as_retryable(tmp_path):
+    client, queue = setup(tmp_path)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    # The detector need not execute: recovery must not leave the durable
+    # queued record permanently active after a new router is constructed.
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    restarted, _queue = setup(tmp_path)
+    record = restarted.get(BASE).json()["reframeAnalysis"]["clip1"]
+    assert record["status"] == "failed"
+    assert "重启" in record["error"]
+    assert queue.jobs
+
+
+def test_timeline_reframe_rejects_stale_revision_before_it_can_enqueue(tmp_path):
+    client, queue = setup(tmp_path)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    assert client.put(BASE, json=_workspace(revision=1)).status_code == 200
+
+    stale = client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1})
+
+    assert stale.status_code == 409
+    assert queue.jobs == []
+
+
 def test_rejects_overlapping_video_clips_and_wrong_asset_track_kind(tmp_path):
     client, _ = setup(tmp_path)
     overlapping = _workspace(tracks=[{
