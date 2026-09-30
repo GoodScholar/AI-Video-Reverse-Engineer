@@ -1622,6 +1622,93 @@ def test_batch_reframe_proves_source_outside_lock_and_aborts_stale_submission(tm
         assert queue.jobs == []
 
 
+def test_montage_proposal_create_proof_allows_get_then_rejects_concurrent_save(tmp_path, monkeypatch):
+    """The public create endpoint must not hold its project lock while proving clips."""
+    from app import montage_reframe
+
+    app, queue = _proposal_reframe_app(tmp_path)
+    with TestClient(app) as client:
+        _project_id, base, task, proposal = _create_montage_proposal(client, tmp_path)
+        queue.jobs.clear()
+        entered, release, read_done = threading.Event(), threading.Event(), threading.Event()
+        original = montage_reframe.source_fingerprint
+        monkeypatch.setattr(montage_reframe, "source_fingerprint", lambda path: (
+            entered.set(), release.wait(5), original(path))[2])
+        body = {"revision": 0, "searchIds": [segment["searchId"] for segment in proposal["inputSnapshot"]["segments"]],
+                "narration": [{"durationSeconds": 2, "wordBoundariesSeconds": []}], "beatTimes": []}
+        result = {}
+        thread = threading.Thread(target=lambda: result.setdefault("response", client.post(
+            f"{base}/{task['id']}/montage-proposals", json=body, headers=INTENT)))
+        thread.start()
+        assert entered.wait(5)
+        reader = threading.Thread(target=lambda: (result.setdefault("read", client.get(base)), read_done.set()))
+        reader.start()
+        assert read_done.wait(1)
+        current = result["read"].json()["tasks"][0]["variant"]
+        assert client.put(f"{base}/{task['id']}/variant", json={"revision": current["revision"], "tracks": current["tracks"]}, headers=INTENT).status_code == 200
+        release.set(); thread.join(5); reader.join(5)
+        assert result["response"].status_code == 409
+        assert queue.jobs == [] or all("batch-reframe:" not in job[0] for job in queue.jobs)
+
+
+def test_montage_proposal_update_proof_preserves_concurrent_cancel(tmp_path, monkeypatch):
+    from app import montage_reframe
+
+    app, _queue = _proposal_reframe_app(tmp_path)
+    with TestClient(app) as client:
+        _project_id, base, task, proposal = _create_montage_proposal(client, tmp_path)
+        entered, release = threading.Event(), threading.Event()
+        original = montage_reframe.source_fingerprint
+        def blocked(path):
+            entered.set(); assert release.wait(5); return original(path)
+        monkeypatch.setattr(montage_reframe, "source_fingerprint", blocked)
+        body = {"revision": 0, "segments": [{"segmentId": proposal["segments"][0]["id"],
+                 "candidateId": proposal["segments"][0]["selectedCandidateId"],
+                 "inPointSeconds": proposal["segments"][0]["selectedClip"]["inPoint"],
+                 "durationSeconds": proposal["segments"][0]["selectedClip"]["duration"]}]}
+        result = {}
+        thread = threading.Thread(target=lambda: result.setdefault("response", client.put(
+            f"{base}/{task['id']}/montage-proposals/{proposal['id']}", json=body, headers=INTENT)))
+        thread.start(); assert entered.wait(5)
+        assert client.get(base).status_code == 200
+        clip_id = proposal["clips"][0]["id"]
+        assert client.post(f"{base}/{task['id']}/variant/reframes/{clip_id}/cancel", json={"revision": 0}, headers=INTENT).status_code == 200
+        release.set(); thread.join(5)
+        assert result["response"].status_code == 409
+        assert client.get(base).json()["tasks"][0]["variant"]["reframeAnalysis"][clip_id]["status"] == "cancelled"
+
+
+def test_montage_proposal_apply_proof_allows_get_then_leaves_variant_unchanged_on_save(tmp_path, monkeypatch):
+    from app import montage_reframe
+
+    app, queue = _proposal_reframe_app(tmp_path)
+    with TestClient(app) as client:
+        project_id, base, task, proposal = _create_montage_proposal(client, tmp_path)
+        queue.jobs.clear()
+        state_path = tmp_path / "project-files" / project_id / "batch-edits" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["tasks"][0]["variant"]["reframeAnalysis"] = {}
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        entered, release = threading.Event(), threading.Event()
+        original = montage_reframe.source_fingerprint
+        def blocked(path):
+            entered.set(); assert release.wait(5); return original(path)
+        monkeypatch.setattr(montage_reframe, "source_fingerprint", blocked)
+        result = {}
+        thread = threading.Thread(target=lambda: result.setdefault("response", client.post(
+            f"{base}/{task['id']}/montage-proposals/{proposal['id']}/apply",
+            json={"revision": 0, "proposalRevision": 0, "strategy": "overwrite"}, headers=INTENT)))
+        thread.start(); assert entered.wait(5)
+        current = client.get(base).json()["tasks"][0]["variant"]
+        assert client.put(f"{base}/{task['id']}/variant", json={"revision": current["revision"], "tracks": current["tracks"]}, headers=INTENT).status_code == 200
+        release.set(); thread.join(5)
+        assert result["response"].status_code == 409
+        stored = client.get(base).json()["tasks"][0]
+        assert stored["montageProposals"][0]["status"] == "draft"
+        assert stored["variant"]["tracks"] == current["tracks"]
+        assert queue.jobs == []
+
+
 def test_batch_reframe_proof_deduplicates_shared_source_and_keeps_multi_clip_submit_atomic(tmp_path, monkeypatch):
     """Two adopted clips sharing one file receive one proof and one all-or-nothing queue job."""
     from app import montage_reframe, timeline_render
@@ -2282,3 +2369,22 @@ def test_adopted_multi_clip_job_increments_once_when_first_result_succeeds_and_l
         assert variant["revision"] == 2
         assert clips[0]["reframe"]["status"] == "review_required"
         assert clips[1]["reframe"]["status"] == "review_required"
+
+
+def test_batch_reframe_worker_rejects_asset_identity_change_with_same_file(tmp_path):
+    app, queue = _proposal_reframe_app(tmp_path)
+    with TestClient(app) as client:
+        project_id, base, task, proposal = _create_montage_proposal(client, tmp_path)
+        applied = client.post(f"{base}/{task['id']}/montage-proposals/{proposal['id']}/apply", json={
+            "revision": 0, "proposalRevision": 0, "strategy": "overwrite",
+        }, headers=INTENT)
+        assert applied.status_code == 200, applied.text
+        preproduction_path = tmp_path / "project-files" / project_id / "preproduction" / "state.json"
+        preproduction = json.loads(preproduction_path.read_text(encoding="utf-8"))
+        preproduction["assets"][0]["sourceReferenceId"] = "replacement-reference"
+        preproduction_path.write_text(json.dumps(preproduction), encoding="utf-8")
+        _kind, pid, handler = queue.jobs[0]
+        handler(pid)
+
+        variant = client.get(base).json()["tasks"][0]["variant"]
+        assert variant["reframeAnalysis"][proposal["clips"][0]["id"]]["status"] == "failed"

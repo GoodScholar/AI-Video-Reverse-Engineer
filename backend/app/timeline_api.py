@@ -253,6 +253,7 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                     if ({key: clip.get(key) for key in ("assetId", "inPoint", "duration", "speed")} !=
                             {key: identity[key] for key in ("assetId", "inPoint", "duration", "speed")}
                             or current_source_fact is None
+                            or current_asset is None or reframe_asset_identity(current_asset) != request["asset"]
                             or current_source_identity != proof["identity"]
                             or current_source_identity != current_source_fact["identity"]
                             or current_source_fact["identity"] != proof["identity"]

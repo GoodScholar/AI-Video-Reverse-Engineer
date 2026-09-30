@@ -252,6 +252,19 @@ def test_timeline_reframe_source_deleted_while_queued_becomes_retryable_failure(
     assert "素材" in record["error"]
 
 
+def test_timeline_reframe_worker_rejects_asset_identity_change_with_same_file(tmp_path):
+    client, queue = setup(tmp_path)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    asset_path = tmp_path / "project-files" / PROJECT_ID / "preproduction" / "state.json"
+    assets = json.loads(asset_path.read_text(encoding="utf-8"))
+    assets["assets"][0]["sourceReferenceId"] = "replacement-reference"
+    asset_path.write_text(json.dumps(assets), encoding="utf-8")
+    queue.run()
+
+    assert client.get(BASE).json()["reframeAnalysis"]["clip1"]["status"] == "failed"
+
+
 def test_timeline_reframe_never_accepts_worker_dimensions_when_the_source_probe_has_none(tmp_path, monkeypatch):
     """Only ffprobe dimensions may authorize detector facts for a timeline clip."""
     from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint

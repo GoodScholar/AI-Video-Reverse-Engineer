@@ -628,6 +628,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             if expected_state is not None and not batch_state_cas_equal(persisted, expected_state):
                 raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "变体已更新，请刷新后重试。"})
             state = deepcopy(staged_state) if staged_state is not None else persisted
+            if expected_state is not None:
+                merge_analysis_progress(persisted, state, expected_state)
             task = task_for(state, task_id)
             variant = task["variant"]
             if expected_revision is not None and variant["revision"] != expected_revision:
@@ -677,6 +679,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             if expected_state is not None and not batch_state_cas_equal(persisted, expected_state):
                 raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "变体已更新，请刷新后重试。"})
             state = deepcopy(staged_state) if staged_state is not None else persisted
+            if expected_state is not None:
+                merge_analysis_progress(persisted, state, expected_state)
             task = task_for(state, task_id)
             variant = task["variant"]
             if variant["revision"] != request["variantRevision"]:
@@ -715,17 +719,30 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
 
             from .montage_reframe import pending_reframe
             analysis = variant.setdefault("reframeAnalysis", {})
+            progressed = analysis_progressed_for(persisted, expected_state, task_id) if expected_state is not None else set()
             jobs = []
             for item, clip, source, source_fact, aspect in confirmed:
-                clip.setdefault("reframe", pending_reframe(target_width=aspect["width"], target_height=aspect["height"],
-                                                            reason="已提交本地主体分析"))
                 identity = {**item["identity"], "sourceFingerprint": source_fact["fingerprint"], "targetAspect": aspect}
+                existing = analysis.get(item["id"])
+                if item["id"] in progressed:
+                    if existing is None or existing.get("status") == "cancelled":
+                        raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "主体分析状态已更新，请刷新后重试。"})
+                    if existing.get("identity") == identity:
+                        continue
+                    if existing.get("status") in ("queued", "running"):
+                        raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "主体分析状态已更新，请刷新后重试。"})
+                if clip.get("reframe", {}).get("sourceFingerprint") != source_fact["fingerprint"]:
+                    clip["reframe"] = pending_reframe(target_width=aspect["width"], target_height=aspect["height"],
+                                                       reason="已提交本地主体分析")
                 analysis[item["id"]] = {"id": run_id, "status": "queued", "error": None, "proposalId": proposal_id,
                                         "identity": identity}
                 jobs.append((item["id"], identity, source, dict(aspect),
                              (None if item["stillImage"] else source_fact["timing"], source_fact["size"]), item["stillImage"],
-                             source_fact["identity"]))
+                             source_fact["identity"], item["asset"]))
             save(project_id, state)
+
+        if not jobs:
+            return
 
         def process(_pid):
             completed, failures = {}, {}
@@ -741,7 +758,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     if record is not None and record.get("id") == run_id and record.get("status") == "queued":
                         record["status"] = "running"
                 save(project_id, state)
-            for clip_id, identity, source, aspect, (source_timing, trusted_size), still_image, _proof_identity in jobs:
+            for clip_id, identity, source, aspect, (source_timing, trusted_size), still_image, _proof_identity, _proof_asset in jobs:
                 try:
                     with lock:
                         record = task_for(state_for(project_id), task_id)["variant"].get("reframeAnalysis", {}).get(clip_id)
@@ -763,7 +780,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 except Exception as error:
                     failures[clip_id] = str(error)[:300] or "本地主体分析失败。"
             current_source_facts = {}
-            for clip_id, _identity, source, _aspect, _probe, _still_image, _proof_identity in jobs:
+            for clip_id, _identity, source, _aspect, _probe, _still_image, _proof_identity, _proof_asset in jobs:
                 if str(source) in current_source_facts:
                     continue
                 try:
@@ -775,7 +792,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 task = task_for(state, task_id)
                 changed = False
                 renderable_changed = False
-                for clip_id, identity, _source, _aspect, _probe, _still_image, proof_identity in jobs:
+                for clip_id, identity, _source, _aspect, _probe, _still_image, proof_identity, proof_asset in jobs:
                     record = task["variant"].get("reframeAnalysis", {}).get(clip_id)
                     if record is None or record.get("id") != run_id or record.get("identity") != identity or record.get("status") == "cancelled":
                         continue
@@ -793,6 +810,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                         current_source_identity = None
                     if (current != {key: identity[key] for key in current}
                             or current_source_fact is None
+                            or current_asset is None or reframe_asset_identity(current_asset) != proof_asset
                             or current_source_identity != proof_identity
                             or current_source_identity != {key: current_source_fact[key] for key in proof_identity}
                             or current_source_fact["fingerprint"] != identity["sourceFingerprint"]):
@@ -862,8 +880,10 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
     def commit_staged_batch_state(project_id: str, expected_state: dict, staged_state: dict) -> None:
         """Persist a lock-free proposal staging result only if its base is still current."""
         with source_lock or nullcontext(), lock:
-            if not batch_state_cas_equal(state_for(project_id), expected_state):
+            persisted = state_for(project_id)
+            if not batch_state_cas_equal(persisted, expected_state):
                 raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "变体已更新，请刷新后重试。"})
+            merge_analysis_progress(persisted, staged_state, expected_state)
             save(project_id, staged_state)
 
     def batch_state_cas_equal(current: dict, expected: dict) -> bool:
@@ -874,6 +894,48 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 task.get("variant", {}).pop("reframeAnalysis", None)
             return state
         return comparable(current) == comparable(expected)
+
+    def merge_analysis_progress(current: dict, staged: dict, expected: dict) -> None:
+        """Keep concurrent cancel/worker facts authoritative while committing staged edits."""
+        expected_tasks = {task.get("id"): task for task in expected.get("tasks", [])}
+        current_tasks = {task.get("id"): task for task in current.get("tasks", [])}
+        for task in staged.get("tasks", []):
+            task_id = task.get("id")
+            current_task, expected_task = current_tasks.get(task_id), expected_tasks.get(task_id)
+            if current_task is None or expected_task is None:
+                continue
+            current_analysis = current_task.get("variant", {}).get("reframeAnalysis", {})
+            expected_analysis = expected_task.get("variant", {}).get("reframeAnalysis", {})
+            staged_analysis = task.get("variant", {}).setdefault("reframeAnalysis", {})
+            progressed = {clip_id for clip_id, record in current_analysis.items()
+                          if record != expected_analysis.get(clip_id)}
+            for clip_id in progressed:
+                staged_analysis[clip_id] = deepcopy(current_analysis[clip_id])
+            for clip_id in progressed:
+                current_clip = next((clip for track in current_task["variant"]["tracks"]
+                                     for clip in track.get("clips", []) if clip.get("id") == clip_id), None)
+                if current_clip is None:
+                    current_clip = next((segment.get("selectedClip") for proposal in current_task.get("montageProposals", [])
+                                         for segment in proposal.get("segments", [])
+                                         if (segment.get("selectedClip") or {}).get("id") == clip_id), None)
+                if current_clip is not None:
+                    staged_clip = next((clip for track in task["variant"]["tracks"]
+                                        for clip in track.get("clips", []) if clip.get("id") == clip_id), None)
+                    if staged_clip is None:
+                        staged_clip = next((segment.get("selectedClip") for proposal in task.get("montageProposals", [])
+                                            for segment in proposal.get("segments", [])
+                                            if (segment.get("selectedClip") or {}).get("id") == clip_id), None)
+                    if staged_clip is None:
+                        continue
+                    if "reframe" in current_clip:
+                        staged_clip["reframe"] = deepcopy(current_clip["reframe"])
+
+    def analysis_progressed_for(current: dict, expected: dict, task_id: str) -> set[str]:
+        current_task = next((task for task in current.get("tasks", []) if task.get("id") == task_id), {})
+        expected_task = next((task for task in expected.get("tasks", []) if task.get("id") == task_id), {})
+        current_analysis = current_task.get("variant", {}).get("reframeAnalysis", {})
+        expected_analysis = expected_task.get("variant", {}).get("reframeAnalysis", {})
+        return {clip_id for clip_id, record in current_analysis.items() if record != expected_analysis.get(clip_id)}
 
     def regular_file(path: Path):
         descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
