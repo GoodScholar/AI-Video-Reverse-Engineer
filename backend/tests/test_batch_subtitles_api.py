@@ -138,6 +138,75 @@ def test_rerecognition_repairs_an_ambiguous_legacy_cue_with_a_namespaced_result(
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None, reason="需要本地 FFmpeg")
+def test_late_rerecognition_needs_explicit_cas_adoption_after_a_manual_subtitle_edit(tmp_path, monkeypatch):
+    project_id = "late-legacy-cues"
+    root = tmp_path / "project-files" / project_id / "preproduction"
+    (root / "assets").mkdir(parents=True)
+    video = root / "assets" / "shot.mp4"
+    subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "lavfi",
+                    "-i", "color=c=black:s=128x96:r=24:d=2", "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+                    "-shortest", "-c:v", "libx264", "-c:a", "aac", str(video)], check=True)
+    (root / "state.json").write_text(json.dumps({"schemaVersion": 1, "revision": 0, "brief": {}, "shots": [],
+        "assets": [{"id": "shot", "name": "演示", "kind": "video", "file": "shot.mp4", "duration": 2}]}), encoding="utf-8")
+    whisper = tmp_path / "fake-whisper"
+    whisper.write_text("#!/bin/sh\nfor arg in \"$@\"; do last=\"$arg\"; done\nprintf '1\\n00:00:00,300 --> 00:00:02,000\\n识别候选\\n' > \"${last}.srt\"\nprintf '{}' > \"${last}.json\"\n", encoding="utf-8")
+    whisper.chmod(0o755)
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"model")
+    monkeypatch.setenv("WHISPER_BINARY", str(whisper))
+    monkeypatch.setenv("WHISPER_MODEL", str(model))
+    jobs = []
+
+    class Queue:
+        def submit(self, _kind, pid, handler):
+            jobs.append((pid, handler))
+            return True
+
+    app = FastAPI()
+    app.include_router(create_batch_editing_router(tmp_path, lambda _: object(), Queue()))
+    with TestClient(app) as client:
+        base = f"/api/projects/{project_id}/batch-edits"
+        task = client.post(base, json={"sellingPoint": "省时", "script": "演示"}).json()["task"]
+        tracks = task["variant"]["tracks"]
+        tracks[0]["clips"] = [{"id": "clip", "assetId": "shot", "start": 0, "inPoint": 0, "duration": 2,
+                               "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0}]
+        assert client.put(f"{base}/{task['id']}/variant", json={"revision": 0, "tracks": tracks}).status_code == 200
+        state_path = tmp_path / "project-files" / project_id / "batch-edits" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        stored = state["tasks"][0]
+        cue = {"id": "line-1", "start": 0, "end": 1, "text": "旧字幕"}
+        stored["variant"]["subtitles"].update(cues=[cue], recognitions=[
+            {"id": run_id, "status": "completed", "error": None, "language": "zh", "timelineRevision": 1,
+             "subtitleRevision": 0, "cues": [cue], "snapshot": {"settings": stored["variant"]["settings"], "tracks": tracks},
+             "sources": {"shot": "shot.mp4"}}
+            for run_id in ("recognition-one", "recognition-two")
+        ])
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        subtitles_path = f"{base}/{task['id']}/subtitles"
+        submitted = client.post(f"{subtitles_path}/recognitions", json={"language": "zh"})
+        assert submitted.status_code == 202, submitted.text
+        manual = [{"id": "line-1", "start": 0.5, "end": 1.4, "text": "人工新正文"}]
+        assert client.put(subtitles_path, json={"revision": 0, "timelineRevision": 1, "cues": manual}).status_code == 200
+        pid, handler = jobs.pop()
+        handler(pid)
+        after_late = client.get(base).json()["tasks"][0]["variant"]["subtitles"]
+        run = after_late["recognitions"][-1]
+
+        assert after_late["cues"] == manual and after_late["revision"] == 1
+        assert run["adoptionRequired"] is True and run["cues"][0]["text"] == "识别候选"
+        assert "migrationRequired" in after_late
+        conflict = client.post(f"{subtitles_path}/recognitions/{run['id']}/apply", json={"revision": 0, "timelineRevision": 1})
+        assert conflict.status_code == 409
+        adopted = client.post(f"{subtitles_path}/recognitions/{run['id']}/apply", json={"revision": 1, "timelineRevision": 1})
+        assert adopted.status_code == 200, adopted.text
+        assert adopted.json()["subtitles"]["cues"] == run["cues"]
+        assert "migrationRequired" not in adopted.json()["subtitles"]
+        handler(pid)
+        repeated = client.get(base).json()["tasks"][0]["variant"]["subtitles"]
+        assert repeated["cues"] == run["cues"] and repeated["revision"] == 2
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None, reason="需要本地 FFmpeg")
 def test_recognition_keeps_existing_edit_as_candidate_then_burns_confirmed_subtitle(tmp_path, monkeypatch):
     project_id = "p1"
     root = tmp_path / "project-files" / project_id / "preproduction"

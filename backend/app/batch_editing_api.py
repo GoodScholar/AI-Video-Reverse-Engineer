@@ -320,6 +320,16 @@ def _validate_state(value: Any) -> None:
                         or not isinstance(recognition.get("snapshot"), dict) or not isinstance(recognition.get("sources"), dict)
                         or (recognition.get("error") is not None and not isinstance(recognition["error"], str))):
                     raise ValueError("字幕识别记录无效")
+                if ("cueIds" in recognition and (not isinstance(recognition["cueIds"], list)
+                                                 or len(set(recognition["cueIds"])) != len(recognition["cueIds"])
+                                                 or any(not _valid_id(cue_id) for cue_id in recognition["cueIds"]))):
+                    raise ValueError("字幕识别输入无效")
+                if ("adoptionRequired" in recognition and recognition["adoptionRequired"] is not True
+                        and recognition["adoptionRequired"] is not False):
+                    raise ValueError("字幕识别采用状态无效")
+                if "adoptionConflict" in recognition and (not isinstance(recognition["adoptionConflict"], str)
+                                                            or not recognition["adoptionConflict"]):
+                    raise ValueError("字幕识别采用状态无效")
                 _validate_timeline_shape(recognition["timelineRevision"], recognition["snapshot"].get("settings"), recognition["snapshot"].get("tracks"), recognition["snapshot"].get("transitions", []))
                 _validate_cues(recognition.get("cues"), recognition["snapshot"]["tracks"])
                 if "legacyCueAmbiguity" in recognition and recognition["legacyCueAmbiguity"] is not True:
@@ -986,6 +996,12 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             raise HTTPException(404, detail={"code": "batch_recognition_missing", "message": "字幕识别任务不存在。"})
         return run
 
+    def recognition_input_is_current(task: dict, run: dict) -> bool:
+        subtitles = _subtitles(task["variant"])
+        return (run["timelineRevision"] == task["variant"]["revision"]
+                and run["subtitleRevision"] == subtitles["revision"]
+                and run.get("cueIds", []) == [cue["id"] for cue in subtitles["cues"]])
+
     def recognition_cancelled(project_id: str, task_id: str, run_id: str) -> bool:
         with lock:
             try:
@@ -1035,10 +1051,15 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     # durable cue identity to this recognition attempt so a
                     # later retry cannot inherit an old style override.
                     persisted = [{**cue, "id": f"{run_id}-{cue['id']}"} for cue in cues]
-                    _complete_local_run(run, {"cues": persisted})
                     task = task_for(state, task_id)
-                    if (task["variant"]["subtitles"].get("migrationRequired") is not None
-                            and not has_ambiguous_packaging_dependency(task)):
+                    auto_adopt = (task["variant"]["subtitles"].get("migrationRequired") is not None
+                                  and recognition_input_is_current(task, run)
+                                  and not has_ambiguous_packaging_dependency(task))
+                    result = {"cues": persisted, "adoptionRequired": not auto_adopt}
+                    if not auto_adopt:
+                        result["adoptionConflict"] = "字幕在识别期间已修改，请确认候选后采用。"
+                    _complete_local_run(run, result)
+                    if auto_adopt:
                         subtitles = task["variant"]["subtitles"]
                         subtitles["cues"] = deepcopy(persisted)
                         subtitles["revision"] += 1
@@ -1320,7 +1341,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 snapshot["transitions"] = variant["transitions"]
             sources = snapshot_sources(project_id, directory, variant["tracks"], assets_for(project_id))
             run = {"id": run_id, "status": LOCAL_RUN_POLICY.initial_status, "error": None, "timelineRevision": variant["revision"],
-                   "subtitleRevision": subtitles["revision"], "language": body["language"], "cues": [],
+                   "subtitleRevision": subtitles["revision"], "cueIds": [cue["id"] for cue in subtitles["cues"]],
+                   "language": body["language"], "cues": [],
                    "snapshot": snapshot, "sources": sources}
             subtitles["recognitions"].append(run)
             save(project_id, state)
@@ -1342,6 +1364,27 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             if not LOCAL_RUN_POLICY.active(run["status"]):
                 raise HTTPException(409, detail={"code": "batch_recognition_not_active", "message": "字幕识别未在运行。"})
             run.update(status=LOCAL_RUN_POLICY.cancel(run["status"]), error="字幕识别已取消。")
+            save(project_id, state)
+            return {"subtitles": public_task(project_id, task)["variant"]["subtitles"]}
+
+    @router.post("/{task_id}/subtitles/recognitions/{run_id}/apply")
+    def apply_recognition(project_id: str, task_id: str, run_id: str, body: dict[str, Any]):
+        project_for(project_id)
+        if (not isinstance(body, dict) or set(body) != {"revision", "timelineRevision"}
+                or type(body["revision"]) is not int or type(body["timelineRevision"]) is not int):
+            raise HTTPException(422, detail={"code": "batch_recognition_invalid", "message": "字幕采用请求无效。"})
+        with lock:
+            state = state_for(project_id)
+            task = task_for(state, task_id)
+            run = recognition_for(task["variant"], run_id)
+            if run.get("status") != "completed" or run.get("adoptionRequired") is not True:
+                raise HTTPException(409, detail={"code": "batch_recognition_adoption_unavailable", "message": "此识别候选无需或不能采用。"})
+            production_call(
+                save_batch_subtitles, task, expected_revision=body["revision"],
+                timeline_revision=body["timelineRevision"], cues=deepcopy(run["cues"]), validate_cues=_validate_cues,
+            )
+            run["adoptionRequired"] = False
+            run.pop("adoptionConflict", None)
             save(project_id, state)
             return {"subtitles": public_task(project_id, task)["variant"]["subtitles"]}
 
