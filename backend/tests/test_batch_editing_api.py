@@ -1534,6 +1534,11 @@ def test_batch_image_reframe_rejects_invalid_manual_keyframes_and_stale_output_a
         record = client.get(base).json()["tasks"][0]["variant"]["reframeAnalysis"]["clip"]
         assert record["status"] == "failed"
         assert "输出比例" in record["error"]
+        assert client.post(reframe_path + "/analyze", json={"revision": 2}).status_code == 202
+        jobs.pop()[1](project_id)
+        retried = client.get(base).json()["tasks"][0]["variant"]
+        assert retried["reframeAnalysis"]["clip"]["status"] == "completed"
+        assert retried["tracks"][0]["clips"][0]["reframe"]["targetAspect"] == {"width": 1280, "height": 720}
 
 
 def test_batch_reframe_never_accepts_worker_dimensions_when_the_source_probe_has_none(tmp_path, monkeypatch):

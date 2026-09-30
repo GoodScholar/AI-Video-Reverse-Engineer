@@ -219,7 +219,6 @@ export function mergeServerReframeFacts(draftTracks: TimelineTrack[], serverTrac
     const server = serverById.get(clip.id);
     if (!server?.reframe || !sameReframeIdentity(clip, server)) return clip;
     const override = clip.reframe?.override;
-    const pendingReplacement = !server.reframe.sourceFingerprint && server.reframe.status === "review_required";
-    return { ...clip, reframe: { ...server.reframe, ...(!pendingReplacement && override && override.mode !== "auto" ? { override } : {}) } };
+    return { ...clip, reframe: { ...server.reframe, ...(override && override.mode !== "auto" ? { override } : {}) } };
   }) }));
 }

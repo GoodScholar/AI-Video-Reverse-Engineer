@@ -638,7 +638,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     source_probes[identity["sourceFingerprint"]] = (timing, size)
                 analysis[clip_id] = {"id": run_id, "status": "queued", "error": None, "proposalId": proposal_id,
                                      "identity": identity}
-                jobs.append((clip_id, identity, source, dict(clip["reframe"]["targetAspect"]),
+                jobs.append((clip_id, identity, source, dict(identity["targetAspect"]),
                              source_probes[identity["sourceFingerprint"]], still_image))
             save(project_id, state)
 

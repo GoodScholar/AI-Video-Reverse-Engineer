@@ -80,7 +80,7 @@ def test_backup_rejects_invalid_current_timeline_packaging_without_a_render_hist
         assert client.post(f'/api/projects/{pid}/backup', json={}).status_code == 422
 
 
-def test_backup_rejects_a_forged_ready_static_image_reframe(tmp_path):
+def test_backup_rejects_a_ready_static_image_reframe_whose_center_crops_out_the_person(tmp_path):
     from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256
     from app.timeline import TimelineStore
 
@@ -97,9 +97,9 @@ def test_backup_rejects_a_forged_ready_static_image_reframe(tmp_path):
             "clips": [{"id": "still", "assetId": asset_id, "start": 0, "inPoint": 0, "duration": 1, "speed": 1,
                        "volume": 1, "fadeIn": 0, "fadeOut": 0, "reframe": {
                            "schemaVersion": 1, "sourceFingerprint": "a" * 64, "sourceWidth": 64, "sourceHeight": 48,
-                           "targetAspect": {"width": 1280, "height": 720}, "detectorVersion": DETECTOR_VERSION,
-                           "modelSha256": MODEL_SHA256, "samples": [{"timeSeconds": 0, "boxes": [],
-                           "center": {"x": .5, "y": .5}, "confidence": .9}], "uncertaintyReasons": [], "status": "ready",
+                           "targetAspect": {"width": 9, "height": 16}, "detectorVersion": DETECTOR_VERSION,
+                           "modelSha256": MODEL_SHA256, "samples": [{"timeSeconds": 0, "boxes": [{"x": .02, "y": .1, "width": .15, "height": .7,
+                           "label": "person", "confidence": .9}], "center": {"x": .9, "y": .5}, "confidence": .9}], "uncertaintyReasons": [], "status": "ready",
                            "override": {"mode": "auto", "keyframes": []},
                        }}]}]
         TimelineStore(tmp_path).save(pid, timeline)

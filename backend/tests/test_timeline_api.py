@@ -166,6 +166,11 @@ def test_timeline_image_reframe_analysis_cas_rejects_an_old_output_aspect(tmp_pa
     record = client.get(BASE).json()["reframeAnalysis"]["clip1"]
     assert record["status"] == "failed"
     assert "输出比例" in record["error"]
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 2}).status_code == 202
+    queue.run()
+    retried = client.get(BASE).json()
+    assert retried["reframeAnalysis"]["clip1"]["status"] == "completed"
+    assert retried["tracks"][0]["clips"][0]["reframe"]["targetAspect"] == {"width": 720, "height": 1280}
 
 
 def test_candidate_replacement_persists_pending_reframe_and_manual_render(tmp_path):

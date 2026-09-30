@@ -195,6 +195,16 @@ it("服务端迟到的检测事实合并进草稿但不覆盖人工关键点", (
   expect(result[0].clips[0].reframe?.override).toEqual(manual.override);
 });
 
+it("同源服务端仍在 pending 时保留未保存的人工关键点", () => {
+  const manual = { ...reframe, override: { mode: "manual" as const, keyframes: [{ timeSeconds: 0, x: .72, y: .5 }] } };
+  const pending = { ...reframe, sourceFingerprint: "", sourceWidth: 0, sourceHeight: 0, samples: [],
+    uncertaintyReasons: ["已提交本地主体分析"], status: "review_required" as const,
+    override: { mode: "auto" as const, keyframes: [] } };
+  const result = mergeServerReframeFacts([{ id: "video", name: "画面", kind: "video", muted: false, hidden: false, clips: [{ id: "clip-a", assetId: "a", start: 0, inPoint: 0, duration: 2, speed: 1, volume: 1, fadeIn: 0, fadeOut: 0, reframe: manual }] }],
+    [{ id: "video", name: "画面", kind: "video", muted: false, hidden: false, clips: [{ id: "clip-a", assetId: "a", start: 0, inPoint: 0, duration: 2, speed: 1, volume: 1, fadeIn: 0, fadeOut: 0, reframe: pending }] }]);
+  expect(result[0].clips[0].reframe?.override).toEqual(manual.override);
+});
+
 it("来源素材或源时间变化时拒绝迟到的服务端检测事实", () => {
   const local = { ...reframe, override: { mode: "manual" as const, keyframes: [{ timeSeconds: 0, x: .72, y: .5 }] } };
   const server = { ...reframe, samples: [{ timeSeconds: 0, boxes: [{ x: .4, y: .1, width: .3, height: .7 }] }] };

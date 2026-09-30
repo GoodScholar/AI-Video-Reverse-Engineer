@@ -236,8 +236,9 @@ def validate_stored_reframe(value: Any, *, still_image: bool = False) -> dict[st
     if value["status"] == "ready" and (not samples or not value["sourceFingerprint"]
                                          or not value["sourceWidth"] or not value["sourceHeight"]):
         raise ReframeError("完成的主体裁剪必须有源身份和检测证据。")
-    if value["status"] == "ready" and still_image and not _valid_still_image_auto_facts(samples):
-        raise ReframeError("静态图片自动构图必须有唯一可信 person 检测框。")
+    if value["status"] == "ready" and still_image and not _valid_still_image_auto_facts(
+            samples, value["sourceWidth"], value["sourceHeight"], aspect):
+        raise ReframeError("静态图片自动构图必须有唯一可信 person 检测框且裁窗包含主体。")
     if value["status"] == "review_required" and not value["uncertaintyReasons"]:
         raise ReframeError("待人工主体裁剪必须说明不确定原因。")
     if still_image:
@@ -276,8 +277,8 @@ def normalize_reframe(value: Any, *, source_fingerprint: str, source_width: int,
     if value["status"] == "ready":
         if value["uncertaintyReasons"] or not samples:
             raise ReframeError("完成的主体裁剪必须有连续检测证据。")
-        if still_image and not _valid_still_image_auto_facts(samples):
-            return _review_required(value, samples, override, "静态图片自动构图必须有唯一可信 person 检测框")
+        if still_image and not _valid_still_image_auto_facts(samples, source_width, source_height, aspect):
+            return _review_required(value, samples, override, "静态图片自动构图必须有唯一可信 person 检测框且裁窗包含主体")
         if not still_image and not _source_samples_cover(source_timing, samples, required_start, required_end):
             return _review_required(value, samples, override, "需重新分析源时间，自动构图未获可信逐帧时间授权")
     elif not value["uncertaintyReasons"]:
@@ -382,12 +383,23 @@ def _review_required(value: dict[str, Any], samples: list[dict[str, Any]], overr
             "status": "review_required", "override": override}
 
 
-def _valid_still_image_auto_facts(samples: list[dict[str, Any]]) -> bool:
+def _valid_still_image_auto_facts(samples: list[dict[str, Any]], source_width: int, source_height: int,
+                                  target_aspect: dict[str, int]) -> bool:
     """An IMAGE detector result is exactly one real, usable person observation."""
     if len(samples) != 1 or samples[0]["timeSeconds"] != 0 or samples[0]["confidence"] <= 0:
         return False
     boxes = samples[0]["boxes"]
-    return len(boxes) == 1 and boxes[0]["label"] == "person" and boxes[0]["confidence"] > 0
+    if len(boxes) != 1 or boxes[0]["label"] != "person" or boxes[0]["confidence"] <= 0:
+        return False
+    crop_width, crop_height = crop_geometry(source_width, source_height, target_aspect["width"], target_aspect["height"])
+    crop_x, crop_y = _crop_position((samples[0]["center"]["x"], samples[0]["center"]["y"]),
+                                    source_width, source_height, crop_width, crop_height)
+    box = boxes[0]
+    left, top = box["x"] * source_width, box["y"] * source_height
+    right, bottom = (box["x"] + box["width"]) * source_width, (box["y"] + box["height"]) * source_height
+    # This uses the identical even-sized crop and clamped position that FFmpeg
+    # receives, so a ready fact cannot point outside the actual render window.
+    return crop_x <= left and right <= crop_x + crop_width and crop_y <= top and bottom <= crop_y + crop_height
 
 
 def _validate_still_image_override(override: dict[str, Any]) -> None:

@@ -58,6 +58,23 @@ def test_still_image_auto_reframe_accepts_exactly_one_real_zero_second_sample_wi
     assert [sample["timeSeconds"] for sample in stored["samples"]] == [0]
 
 
+def test_still_image_auto_reframe_requires_the_declared_crop_to_contain_its_person():
+    """A valid box cannot authorize auto crop when its declared center cuts it away."""
+    analysis = _analysis(samples=[{
+        "timeSeconds": 0, "boxes": [{"x": .02, "y": .1, "width": .15, "height": .7,
+                                         "label": "person", "confidence": .9}],
+        "center": {"x": .9, "y": .5}, "confidence": .9,
+    }])
+
+    normalized = normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
+                                   still_image=True)
+
+    assert normalized["status"] == "review_required"
+    assert "裁窗" in normalized["uncertaintyReasons"][-1]
+    with pytest.raises(ReframeError, match="裁窗"):
+        validate_stored_reframe(analysis, still_image=True)
+
+
 @pytest.mark.parametrize("boxes", [
     [],
     [{"x": .2, "y": .1, "width": .3, "height": .7, "label": "product", "confidence": .9}],
