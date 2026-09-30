@@ -4,6 +4,8 @@ import os
 import shutil
 import subprocess
 import threading
+from contextlib import contextmanager
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -153,6 +155,350 @@ class DeferredComputeQueue:
 
     def shutdown(self):
         pass
+
+
+@contextmanager
+def _reframe_delivery_client(tmp_path, *, source_lock=None):
+    """One approved reframed delivery, ready for focused delivery-gate races."""
+    from copy import deepcopy
+    from app.montage_reframe import normalize_reframe, probe_source_timing
+
+    project_id = "reframe-delivery"
+    root = tmp_path / "project-files" / project_id / "preproduction"
+    (root / "assets").mkdir(parents=True)
+    source = root / "assets" / "source.mp4"
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
+        "color=red:size=64x48:rate=30:duration=2", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+    ], check=True, capture_output=True, text=True)
+    (root / "state.json").write_text(json.dumps({"schemaVersion": 1, "revision": 1, "brief": {}, "shots": [],
+        "assets": [{"id": "source", "name": "source", "kind": "video", "file": "source.mp4", "duration": 2}]}), encoding="utf-8")
+    timing = probe_source_timing(source, "ffprobe")
+    raw = {"schemaVersion": 1, "sourceFingerprint": source_fingerprint(source), "sourceWidth": 64, "sourceHeight": 48,
+           "targetAspect": {"width": 720, "height": 1280}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+           "samples": [{"timeSeconds": point, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9}
+                       for point in timing.elapsed], "uncertaintyReasons": [], "status": "ready",
+           "override": {"mode": "auto", "keyframes": []}}
+    ready = normalize_reframe(raw, source_fingerprint=source_fingerprint(source), source_width=64, source_height=48,
+                              source_timing=timing, required_start=0, required_end=2)
+    app = FastAPI()
+    app.include_router(create_batch_editing_router(tmp_path, lambda value: SimpleNamespace(id=value) if value == project_id else None,
+                                                  DeferredComputeQueue(), source_lock=source_lock))
+    with TestClient(app) as client:
+        base = f"/api/projects/{project_id}/batch-edits"
+        task = client.post(base, json={"sellingPoint": "x", "script": "x"}).json()["task"]
+        state_path = tmp_path / "project-files" / project_id / "batch-edits" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        stored = state["tasks"][0]
+        clip = {"id": "clip", "assetId": "source", "start": 0, "inPoint": 0, "duration": 2,
+                "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0, "reframe": ready}
+        stored["variant"].update(revision=1, tracks=[{**stored["variant"]["tracks"][0], "clips": [clip]}, stored["variant"]["tracks"][1]])
+        snapshot = {"settings": deepcopy(stored["variant"]["settings"]), "tracks": deepcopy(stored["variant"]["tracks"])}
+        preview = {"id": "preview", "revision": 1, "contentRevision": 0, "subtitleRevision": 0, "subtitleCues": [],
+                   "status": "completed", "error": None, "output": "preview.mp4", "snapshot": deepcopy(snapshot), "sources": {"source": "source.mp4"}}
+        review = {"id": "review", "runId": "preview", "decision": "approved", "reason": "确认",
+                  "contentRevision": 0, "variantRevision": 1, "subtitleRevision": 0}
+        delivery = {"id": "delivery", "status": "completed", "error": None, "output": "delivery.mp4",
+                    "contentRevision": 0, "variantRevision": 1, "subtitleRevision": 0, "previewRunId": "preview",
+                    "review": deepcopy(review), "sellingPoint": "x", "script": "x", "snapshot": deepcopy(snapshot),
+                    "subtitles": [], "assets": [{"id": "source", "name": "source", "kind": "video"}], "sources": {"source": "source.mp4"}}
+        stored["variant"]["runs"] = [preview]
+        stored["reviews"] = [review]
+        stored["variant"]["exports"] = [delivery]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        for directory in ("runs/preview", "exports/delivery"):
+            destination = state_path.parent / directory / "sources"
+            destination.mkdir(parents=True)
+            shutil.copyfile(source, destination / "source.mp4")
+        (state_path.parent / "outputs").mkdir()
+        (state_path.parent / "outputs" / "preview.mp4").write_bytes(b"preview")
+        (state_path.parent / "deliverables").mkdir()
+        (state_path.parent / "deliverables" / "delivery.mp4").write_bytes(b"delivery")
+        yield SimpleNamespace(client=client, base=base, task=task, source=source, state_path=state_path, snapshot=snapshot)
+
+
+def _add_export_child(fixture, child_id, *, reframed=True):
+    from copy import deepcopy
+    state = json.loads(fixture.state_path.read_text(encoding="utf-8"))
+    child = deepcopy(state["tasks"][0])
+    child.update(id=child_id, batchId=fixture.task["id"], generationId="generation",
+                 generation={"status": "ready", "error": None})
+    child["variant"]["exports"] = []
+    if not reframed:
+        for track in child["variant"]["tracks"]:
+            for clip in track["clips"]:
+                clip.pop("reframe", None)
+        for run in child["variant"]["runs"]:
+            for track in run["snapshot"]["tracks"]:
+                for clip in track["clips"]:
+                    clip.pop("reframe", None)
+    state["tasks"].append(child)
+    fixture.state_path.write_text(json.dumps(state), encoding="utf-8")
+    return child
+
+
+class _HookSourceLock:
+    def __init__(self):
+        self.entries = 0
+        self.hook = None
+
+    def __enter__(self):
+        self.entries += 1
+        if self.hook is not None:
+            self.hook(self.entries)
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+def test_submit_cleans_every_prepared_source_directory_when_later_copy_fails(tmp_path, monkeypatch):
+    from app.render_inputs import RenderInputError, RenderInputPreparation
+
+    with _reframe_delivery_client(tmp_path) as fixture:
+        _add_export_child(fixture, "first", reframed=False)
+        _add_export_child(fixture, "second", reframed=False)
+        exports = fixture.state_path.parent / "exports"
+        before = {item.name for item in exports.iterdir()}
+        original = RenderInputPreparation.freeze_approved
+        calls = 0
+
+        def fail_after_copy(self, *args, **kwargs):
+            nonlocal calls
+            result = original(self, *args, **kwargs)
+            calls += 1
+            if calls == 2:
+                raise RenderInputError("第二个预复制失败")
+            return result
+
+        monkeypatch.setattr(RenderInputPreparation, "freeze_approved", fail_after_copy)
+        response = fixture.client.post(f"{fixture.base}/{fixture.task['id']}/exports", json={"taskIds": ["first", "second"]})
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "batch_asset_unavailable"
+        assert {item.name for item in exports.iterdir()} == before
+
+
+def test_submit_terminal_source_cas_conflict_returns_409_without_failed_run_or_orphan(tmp_path):
+    lock = _HookSourceLock()
+    with _reframe_delivery_client(tmp_path, source_lock=lock) as fixture:
+        _add_export_child(fixture, "child", reframed=False)
+        exports = fixture.state_path.parent / "exports"
+        before = {item.name for item in exports.iterdir()}
+        lock.entries = 0
+
+        def replace_after_precopy(entry):
+            if entry == 2:
+                replacement = fixture.source.with_name("terminal-replacement.mp4")
+                replacement.write_bytes(fixture.source.read_bytes())
+                os.replace(replacement, fixture.source)
+
+        lock.hook = replace_after_precopy
+        response = fixture.client.post(f"{fixture.base}/{fixture.task['id']}/exports", json={"taskIds": ["child"]})
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "batch_export_reframe_conflict"
+        state = json.loads(fixture.state_path.read_text(encoding="utf-8"))
+        child = next(item for item in state["tasks"] if item["id"] == "child")
+        assert child["variant"]["exports"] == []
+        assert {item.name for item in exports.iterdir()} == before
+
+
+def test_submit_cleans_a_copy_when_its_source_changes_after_copying(tmp_path, monkeypatch):
+    from app.render_inputs import RenderInputPreparation
+
+    with _reframe_delivery_client(tmp_path) as fixture:
+        _add_export_child(fixture, "child", reframed=False)
+        exports = fixture.state_path.parent / "exports"
+        before = {item.name for item in exports.iterdir()}
+        original = RenderInputPreparation.freeze_approved
+
+        def copy_then_replace(self, *args, **kwargs):
+            result = original(self, *args, **kwargs)
+            replacement = fixture.source.with_name("copy-race-replacement.mp4")
+            replacement.write_bytes(fixture.source.read_bytes())
+            os.replace(replacement, fixture.source)
+            return result
+
+        monkeypatch.setattr(RenderInputPreparation, "freeze_approved", copy_then_replace)
+        response = fixture.client.post(f"{fixture.base}/{fixture.task['id']}/exports", json={"taskIds": ["child"]})
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "batch_export_reframe_conflict"
+        assert {item.name for item in exports.iterdir()} == before
+
+
+def test_submit_keeps_the_prepared_directory_after_a_successful_commit(tmp_path):
+    with _reframe_delivery_client(tmp_path) as fixture:
+        _add_export_child(fixture, "child", reframed=False)
+
+        response = fixture.client.post(f"{fixture.base}/{fixture.task['id']}/exports", json={"taskIds": ["child"]})
+
+        assert response.status_code == 202
+        run_id = response.json()["results"][0]["runId"]
+        prepared = fixture.state_path.parent / "exports" / run_id
+        assert (prepared / "sources" / "source.mp4").is_file()
+        state = json.loads(fixture.state_path.read_text(encoding="utf-8"))
+        child = next(item for item in state["tasks"] if item["id"] == "child")
+        assert child["variant"]["exports"][0]["id"] == run_id
+
+
+def test_download_probe_does_not_block_get_or_cancelling_another_export(tmp_path, monkeypatch):
+    from app import montage_reframe
+
+    with _reframe_delivery_client(tmp_path) as fixture:
+        state = json.loads(fixture.state_path.read_text(encoding="utf-8"))
+        active = deepcopy(state["tasks"][0]["variant"]["exports"][0])
+        active.update(id="active", status="queued", error=None)
+        state["tasks"][0]["variant"]["exports"].append(active)
+        fixture.state_path.write_text(json.dumps(state), encoding="utf-8")
+        entered, release, read_done = threading.Event(), threading.Event(), threading.Event()
+        original = montage_reframe.probe_source_timing
+
+        def blocked_probe(path, probe):
+            entered.set()
+            assert release.wait(5), "测试未释放下载探测"
+            return original(path, probe)
+
+        monkeypatch.setattr(montage_reframe, "probe_source_timing", blocked_probe)
+        result = {}
+        downloading = threading.Thread(target=lambda: result.setdefault(
+            "response", fixture.client.get(f"{fixture.base}/{fixture.task['id']}/exports/delivery/output")
+        ))
+        downloading.start()
+        assert entered.wait(2)
+        reader = threading.Thread(target=lambda: (fixture.client.get(fixture.base), read_done.set()))
+        reader.start()
+        try:
+            assert read_done.wait(.5)
+            assert fixture.client.post(f"{fixture.base}/{fixture.task['id']}/exports/active/cancel").status_code == 200
+        finally:
+            release.set()
+        downloading.join(5)
+        reader.join(5)
+        assert result["response"].content == b"delivery"
+
+
+def test_download_rejects_a_run_identity_changed_during_its_probe(tmp_path, monkeypatch):
+    from app import montage_reframe
+
+    with _reframe_delivery_client(tmp_path) as fixture:
+        entered, release = threading.Event(), threading.Event()
+        original = montage_reframe.probe_source_timing
+        monkeypatch.setattr(montage_reframe, "probe_source_timing", lambda path, probe:
+                            entered.set() or (release.wait(5) and original(path, probe)))
+        result = {}
+        thread = threading.Thread(target=lambda: result.setdefault(
+            "response", fixture.client.get(f"{fixture.base}/{fixture.task['id']}/exports/delivery/output")
+        ))
+        thread.start()
+        assert entered.wait(2)
+        state = json.loads(fixture.state_path.read_text(encoding="utf-8"))
+        state["tasks"][0]["variant"]["exports"][0]["review"]["reason"] = "证明期间修改"
+        fixture.state_path.write_text(json.dumps(state), encoding="utf-8")
+        release.set()
+        thread.join(5)
+
+        assert result["response"].status_code == 409
+        assert result["response"].json()["detail"]["code"] == "batch_export_reframe_conflict"
+
+
+def test_submit_rejects_a_preview_identity_changed_during_its_probe(tmp_path, monkeypatch):
+    from app import montage_reframe
+
+    with _reframe_delivery_client(tmp_path) as fixture:
+        _add_export_child(fixture, "child")
+        entered, release = threading.Event(), threading.Event()
+        original = montage_reframe.probe_source_timing
+
+        def blocked_probe(path, probe):
+            entered.set()
+            assert release.wait(5), "测试未释放提交探测"
+            return original(path, probe)
+
+        monkeypatch.setattr(montage_reframe, "probe_source_timing", blocked_probe)
+        result = {}
+        thread = threading.Thread(target=lambda: result.setdefault(
+            "response", fixture.client.post(f"{fixture.base}/{fixture.task['id']}/exports", json={"taskIds": ["child"]})
+        ))
+        thread.start()
+        assert entered.wait(2)
+        state = json.loads(fixture.state_path.read_text(encoding="utf-8"))
+        preview = next(item for item in next(task for task in state["tasks"] if task["id"] == "child")["variant"]["runs"]
+                       if item["id"] == "preview")
+        preview["snapshot"]["tracks"][0]["clips"][0]["start"] = .1
+        fixture.state_path.write_text(json.dumps(state), encoding="utf-8")
+        release.set()
+        thread.join(5)
+
+        assert result["response"].status_code == 409
+        assert result["response"].json()["detail"]["code"] == "batch_export_reframe_conflict"
+
+
+def test_submit_probe_does_not_block_get_or_cancelling_another_export(tmp_path, monkeypatch):
+    from app import montage_reframe
+
+    with _reframe_delivery_client(tmp_path) as fixture:
+        _add_export_child(fixture, "child")
+        state = json.loads(fixture.state_path.read_text(encoding="utf-8"))
+        active = deepcopy(state["tasks"][0]["variant"]["exports"][0])
+        active.update(id="active", status="queued", error=None)
+        state["tasks"][0]["variant"]["exports"].append(active)
+        fixture.state_path.write_text(json.dumps(state), encoding="utf-8")
+        entered, release, read_done = threading.Event(), threading.Event(), threading.Event()
+        original = montage_reframe.probe_source_timing
+
+        def blocked_probe(path, probe):
+            entered.set()
+            assert release.wait(5), "测试未释放提交探测"
+            return original(path, probe)
+
+        monkeypatch.setattr(montage_reframe, "probe_source_timing", blocked_probe)
+        result = {}
+        submitting = threading.Thread(target=lambda: result.setdefault(
+            "response", fixture.client.post(f"{fixture.base}/{fixture.task['id']}/exports", json={"taskIds": ["child"]})
+        ))
+        submitting.start()
+        assert entered.wait(2)
+        reader = threading.Thread(target=lambda: (fixture.client.get(fixture.base), read_done.set()))
+        reader.start()
+        try:
+            assert read_done.wait(.5)
+            assert fixture.client.post(f"{fixture.base}/{fixture.task['id']}/exports/active/cancel").status_code == 200
+        finally:
+            release.set()
+        submitting.join(5)
+        reader.join(5)
+        assert result["response"].status_code == 202
+
+
+def test_download_treats_same_hash_source_replacement_during_probe_as_conflict(tmp_path, monkeypatch):
+    from app import montage_reframe
+
+    with _reframe_delivery_client(tmp_path) as fixture:
+        entered, release = threading.Event(), threading.Event()
+        original = montage_reframe.probe_source_timing
+
+        def blocked_probe(path, probe):
+            entered.set()
+            assert release.wait(5), "测试未释放源竞态探测"
+            return original(path, probe)
+
+        monkeypatch.setattr(montage_reframe, "probe_source_timing", blocked_probe)
+        result = {}
+        thread = threading.Thread(target=lambda: result.setdefault(
+            "response", fixture.client.get(f"{fixture.base}/{fixture.task['id']}/exports/delivery/output")
+        ))
+        thread.start()
+        assert entered.wait(2)
+        replacement = fixture.source.with_name("same-hash-replacement.mp4")
+        replacement.write_bytes(fixture.source.read_bytes())
+        os.replace(replacement, fixture.source)
+        release.set()
+        thread.join(5)
+
+        assert result["response"].status_code == 409
+        assert result["response"].json()["detail"]["code"] == "batch_export_reframe_conflict"
 
 
 def _proposal_reframe_app(root):
