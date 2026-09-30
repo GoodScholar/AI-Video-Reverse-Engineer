@@ -471,6 +471,24 @@ def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width
 
         if not usable:
             raise PackagingError("主体检测时间覆盖未知，需人工确认。")
+        override = reframe.get("override")
+        explicit_risk = (reframe.get("status") == "review_required" and isinstance(override, dict)
+                         and override.get("mode") in ("center", "manual", "replace"))
+        if explicit_risk:
+            # A manual decision makes the crop renderable, but it does not
+            # turn a partially completed detector run into continuous facts.
+            # Reserve only observations that really occurred in this event;
+            # do not interpolate, extend holds, or demand auto PTS coverage.
+            if clip.get("_stillImage"):
+                for sample in usable:
+                    if float(sample["timeSeconds"]) == 0:
+                        append_sweep(sample, sample, 0, 0)
+            else:
+                for sample in usable:
+                    sample_time = float(sample["timeSeconds"])
+                    if source_start <= sample_time < source_end:
+                        append_sweep(sample, sample, sample_time, sample_time)
+            continue
         if clip.get("_stillImage"):
             if len(usable) != 1 or float(usable[0]["timeSeconds"]) != 0:
                 raise PackagingError("静态图片主体检测必须有唯一的 0 秒样本，需人工确认。")
@@ -549,8 +567,13 @@ def _element_events(packaging: dict[str, Any], cues: list[dict[str, Any]], width
         line_widths = [_advance(line, size) for line in item["text"].split("\n")]
         # ASS uses the selected face's Win ascender/descender per line; the
         # compiler has no unbounded animation, so this is its maximum frame.
-        item.update(size=size, outline=outline, width=max(line_widths, default=0) + outline * 2,
-                    height=_font_height(size) * len(line_widths) + outline * 2)
+        # libass paints on pixels while advance metrics are fractional.  Round
+        # outward so collision checks and the compiler's reported bounds never
+        # understate an edge pixel occupied by the outline.
+        # Centre-aligned boxes expand by half their width on both sides, so a
+        # conservative whole-pixel bound must also be even.
+        item.update(size=size, outline=outline, width=math.ceil((max(line_widths, default=0) + outline * 2) / 2) * 2,
+                    height=math.ceil(_font_height(size) * len(line_widths) + outline * 2))
     return events
 
 

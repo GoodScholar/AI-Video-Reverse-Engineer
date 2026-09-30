@@ -1,4 +1,5 @@
 import subprocess
+import pytest
 from test_timeline_api import setup, BASE, _workspace
 
 
@@ -61,6 +62,38 @@ def test_enabled_packaging_blocks_an_unanalysed_visible_clip_but_not_a_nonoverla
     draft['packaging']['elements'][0]['end'] = 2.5
     assert client.put(BASE, json=draft).status_code == 200
     assert client.post(BASE + '/preflight', json={'revision': 2, 'format': 'mp4'}).json()['ready']
+
+
+@pytest.mark.parametrize('mode', ['center', 'manual', 'replace'])
+def test_preflight_allows_explicit_risk_with_only_observed_partial_subject_samples(tmp_path, mode):
+    from app.montage_packaging import default_packaging
+    from app.montage_reframe import pending_reframe
+
+    client, _ = setup(tmp_path)
+    draft = _workspace()
+    draft['packaging'] = default_packaging()
+    draft['packaging']['elements'] = [{
+        'id': 'title', 'kind': 'title', 'enabled': True, 'start': .2, 'end': .8,
+        'text': '人工构图', 'position': 'auto', 'style': 'plain',
+    }]
+    assert client.put(BASE, json=draft).status_code == 200
+    reframe = pending_reframe(target_width=1280, target_height=720, reason='历史分析中断')
+    reframe.update(sourceWidth=64, sourceHeight=48, samples=[{
+        'timeSeconds': .5, 'boxes': [{'x': .35, 'y': .2, 'width': .3, 'height': .6,
+                                      'label': 'person', 'confidence': .9}],
+        'center': {'x': .5, 'y': .5}, 'confidence': .9,
+    }])
+    reframe['override'] = {'mode': mode, 'keyframes': [] if mode == 'center' else [
+        {'timeSeconds': 0, 'x': .5, 'y': .5},
+    ]}
+    # This is a persisted historical worker record: the public PUT correctly
+    # refuses clients trying to invent detector facts.
+    from app.timeline import TimelineStore
+    store = TimelineStore(tmp_path)
+    state = store.load('p1')
+    state['tracks'][0]['clips'][0]['reframe'] = reframe
+    store.save('p1', state)
+    assert client.post(BASE + '/preflight', json={'revision': 1, 'format': 'mp4'}).json()['ready']
 
 
 def test_audio_probe_is_cached_and_muted_wav_is_blocked(tmp_path, monkeypatch):

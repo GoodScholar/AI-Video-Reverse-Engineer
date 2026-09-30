@@ -152,6 +152,35 @@ def test_explicit_reframe_risk_decision_allows_packaging_without_inventing_subje
     assert _subject_boxes([track], .2, .8, 720, 1280) == []
 
 
+@pytest.mark.parametrize("mode", ["center", "manual", "replace"])
+def test_explicit_reframe_risk_decision_keeps_partial_real_boxes_without_pts_coverage(mode):
+    """An explicit decision may avoid observed boxes, but cannot invent a missing interval."""
+    from app.montage_packaging import _subject_boxes, compile_ass, private_font_path, validate_final_events
+
+    track = _reframed_track()[0]
+    reframe = track["clips"][0]["reframe"]
+    reframe.update(status="review_required", uncertaintyReasons=["历史分析中断"], samples=reframe["samples"][:1])
+    reframe["samples"][0]["timeSeconds"] = .5
+    reframe["override"] = {"mode": mode, "keyframes": ([] if mode == "center" else [{"timeSeconds": 0, "x": .5, "y": .5}])}
+    packaging = _packaging([_element("title", start=.2, end=.8, position="auto", text="人工决定")])
+
+    # Ordinary compilation and batch preflight/export see the same event.
+    assert _subject_boxes([track], .2, .8, 720, 1280)
+    assert "Dialogue:" in compile_ass(packaging, [], [track], 720, 1280, private_font_path())
+    cues = [{"id": "cue", "start": .2, "end": .8, "text": "人工决定"}]
+    assert validate_final_events(_packaging([]), cues, [track], batch=True)["elements"] == []
+
+
+def test_auto_review_with_partial_samples_still_requires_pts_coverage():
+    from app.montage_packaging import PackagingError, _subject_boxes
+
+    track = _reframed_track()[0]
+    reframe = track["clips"][0]["reframe"]
+    reframe.update(status="review_required", uncertaintyReasons=["历史分析中断"], samples=reframe["samples"][:1])
+    with pytest.raises(PackagingError, match="主体信息缺失需人工构图"):
+        _subject_boxes([track], .2, .8, 720, 1280)
+
+
 def test_auto_layout_avoids_a_moving_reframe_subject_inside_safe_area():
     from app.montage_packaging import compile_ass, private_font_path
 
