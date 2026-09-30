@@ -72,6 +72,38 @@ def test_normalize_reframe_accepts_a_real_half_open_final_frame_only_when_sampli
                           required_start=0, required_end=2)
 
 
+def test_normalize_reframe_rejects_worker_timing_holes_and_long_tail_but_accepts_real_frame_tolerance():
+    analysis = _analysis(samples=[
+        {"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 10, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 19.958333, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+    ])
+    analysis.update(frameDurationSeconds=1 / 24, samplingIntervalSeconds=.5)
+    with pytest.raises(ReframeError, match="时间空洞"):
+        normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
+                          required_start=0, required_end=20)
+
+    analysis["samples"] = [
+        {"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": .5, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 1.958333, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+    ]
+    with pytest.raises(ReframeError, match="时间空洞"):
+        normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
+                          required_start=0, required_end=2)
+
+    analysis["samples"] = [
+        {"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": .5, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 1.0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 1.5, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 1.958333, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+    ]
+    normalized = normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
+                                   required_start=0, required_end=2)
+    assert normalized["samples"][-1]["timeSeconds"] == 1.958333
+
+
 def test_reframe_filter_maps_output_time_to_source_time_and_crops_before_scaling():
     """Applying crop after speed conversion would track the wrong source instant."""
     graph = reframe_filter(

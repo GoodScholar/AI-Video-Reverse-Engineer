@@ -14,3 +14,13 @@ def test_worker_checks_height_against_the_real_full_bleed_crop_window():
     assert retained_width == 1
     assert retained_height < .4
     assert .8 > retained_height  # A tall subject must become review_required, not be treated as fitting.
+
+
+def test_worker_keeps_early_cfr_frame_pts_and_rejects_repeated_frames():
+    worker = Path(__file__).parents[1] / "person_worker" / "run_reframe.py"
+    spec = importlib.util.spec_from_file_location("reframe_worker_pts", worker)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module.cfr_frame_time(23, 24, 10) == 23 / 24
+    assert module.cfr_frame_time(23, 24, 23) is None

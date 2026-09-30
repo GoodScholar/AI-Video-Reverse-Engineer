@@ -46,6 +46,13 @@ def crop_window_ratios(source_width: int, source_height: int, target_width: int,
     return min(1.0, target_ratio / source_ratio), min(1.0, source_ratio / target_ratio)
 
 
+def cfr_frame_time(frame_index: int, fps: float, previous_index: int) -> float | None:
+    """Return the decoded CFR frame PTS, rejecting repeated/unknown frames."""
+    if frame_index < 0 or frame_index <= previous_index or not math.isfinite(fps) or fps <= 0:
+        return None
+    return frame_index / fps
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
@@ -83,7 +90,7 @@ def analyze(source: Path, model: Path, start: float, end: float, target_width: i
         base_options=python.BaseOptions(model_asset_path=str(model)), running_mode=vision.RunningMode.VIDEO,
         score_threshold=.35, max_results=10,
     )
-    samples, reasons, last_timestamp = [], [], -1
+    samples, reasons, last_timestamp, last_frame_index = [], [], -1, -1
     crop_width_ratio, crop_height_ratio = crop_window_ratios(width, height, target_width, target_height)
     expected = max(2, round((end - start) * sample_fps) + 1)
     # The requested end is exclusive for FFmpeg/timeline ranges; sampling it
@@ -98,7 +105,15 @@ def analyze(source: Path, model: Path, start: float, end: float, target_width: i
                 if not ok:
                     reasons.append("部分源时间无法解码")
                     continue
-                actual_time = max(time_seconds, capture.get(cv2.CAP_PROP_POS_MSEC) / 1000 - 1 / fps)
+                # OpenCV seek can land on an earlier CFR frame.  Keep that
+                # frame's actual index/PTS; never relabel it as the requested
+                # time merely to satisfy coverage validation.
+                frame_index = round(capture.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+                actual_time = cfr_frame_time(frame_index, fps, last_frame_index)
+                if actual_time is None:
+                    reasons.append("源视频帧时间无法可靠确定")
+                    continue
+                last_frame_index = frame_index
                 timestamp = max(last_timestamp + 1, round(actual_time * 1000))
                 last_timestamp = timestamp
                 image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
@@ -133,6 +148,7 @@ def analyze(source: Path, model: Path, start: float, end: float, target_width: i
     status = "ready" if not reasons else "review_required"
     return {"schemaVersion": 1, "sourceFingerprint": sha256(source), "sourceWidth": width, "sourceHeight": height,
             "targetAspect": {"width": target_width, "height": target_height}, "detectorVersion": DETECTOR_VERSION,
+            "frameDurationSeconds": round(1 / fps, 9), "samplingIntervalSeconds": round(1 / sample_fps, 9),
             "modelSha256": MODEL_SHA256, "samples": samples, "uncertaintyReasons": reasons, "status": status,
             "override": {"mode": "auto", "keyframes": []}}
 

@@ -1028,6 +1028,7 @@ def test_reapplying_identical_source_preserves_manual_reframe_but_changed_range_
         handler(pid)
         tracks = client.get(base).json()["tasks"][0]["variant"]["tracks"]
         clip = tracks[0]["clips"][0]
+        valid_reframe = clip["reframe"]
         clip["reframe"]["override"] = {
             "mode": "manual", "keyframes": [{"timeSeconds": clip["inPoint"], "x": .25, "y": .65}],
         }
@@ -1086,7 +1087,7 @@ def test_reapplying_identical_source_preserves_manual_reframe_but_changed_range_
         assert stored["reframe"]["override"]["mode"] == "auto"
 
 
-def test_proposal_same_asset_bytes_change_or_speed_change_never_reuses_manual_reframe(tmp_path):
+def test_proposal_same_asset_bytes_change_or_speed_change_never_reuses_manual_reframe(tmp_path, monkeypatch):
     app, queue = _proposal_reframe_app(tmp_path)
     with TestClient(app) as client:
         project_id, base, task, first = _create_montage_proposal(client, tmp_path)
@@ -1097,6 +1098,7 @@ def test_proposal_same_asset_bytes_change_or_speed_change_never_reuses_manual_re
         handler(pid)
         tracks = client.get(base).json()["tasks"][0]["variant"]["tracks"]
         clip = tracks[0]["clips"][0]
+        valid_reframe = clip["reframe"]
         clip["reframe"]["override"] = {"mode": "manual", "keyframes": [{"timeSeconds": 1, "x": .2, "y": .7}]}
         clip["speed"] = 2
         assert client.put(f"{base}/{task['id']}/variant", json={"revision": 2, "tracks": tracks}, headers=INTENT).status_code == 200
@@ -1110,14 +1112,30 @@ def test_proposal_same_asset_bytes_change_or_speed_change_never_reuses_manual_re
         assert applied.status_code == 200, applied.text
         assert applied.json()["variant"]["tracks"][0]["clips"][0]["reframe"]["override"]["mode"] == "auto"
 
+        byte_proposal = client.post(f"{base}/{task['id']}/montage-proposals", json={
+            "revision": 4, "searchIds": [first["inputSnapshot"]["segments"][0]["searchId"]],
+            "narration": [{"durationSeconds": 2, "wordBoundariesSeconds": []}], "beatTimes": [],
+        }, headers=INTENT).json()["proposal"]
+        tracks = applied.json()["variant"]["tracks"]
+        clip = tracks[0]["clips"][0]
+        clip["speed"] = 1
+        clip["reframe"] = {**valid_reframe, "override": {"mode": "manual", "keyframes": [{"timeSeconds": 1, "x": .2, "y": .7}]}}
+        assert client.put(f"{base}/{task['id']}/variant", json={"revision": 4, "tracks": tracks}, headers=INTENT).status_code == 200
+        from app import batch_editing_api
+        frozen_search = batch_editing_api.load_planning_search(
+            tmp_path, project_id, first["inputSnapshot"]["segments"][0]["searchId"],
+        )
         source = tmp_path / "project-files" / project_id / "preproduction" / "assets" / "lid.mp4"
         source.write_bytes(b"replacement-bytes")
-        changed = client.put(f"{base}/{task['id']}/montage-proposals/{speed_changed['id']}", json={
-            "revision": 1,
-            "segments": [{"segmentId": speed_changed["segments"][0]["id"], "candidateId": "segment-lid",
-                          "inPointSeconds": 1, "durationSeconds": 2}],
+        # Keep proposal provenance readable solely to reach the independent
+        # render identity gate under test; production normally blocks earlier
+        # on this stale search too.
+        monkeypatch.setattr(batch_editing_api, "load_planning_search", lambda *_args, **_kwargs: frozen_search)
+        changed = client.post(f"{base}/{task['id']}/montage-proposals/{byte_proposal['id']}/apply", json={
+            "revision": 5, "proposalRevision": 0, "strategy": "overwrite",
         }, headers=INTENT)
-        assert changed.status_code == 409  # applied proposal cannot be changed; source change must not be silently reused
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["variant"]["tracks"][0]["clips"][0]["reframe"]["override"]["mode"] == "auto"
 
 
 def test_reapplying_empty_hash_manual_pending_does_not_inherit_it(tmp_path):
@@ -1139,3 +1157,39 @@ def test_reapplying_empty_hash_manual_pending_does_not_inherit_it(tmp_path):
         }, headers=INTENT)
         assert again.status_code == 200, again.text
         assert again.json()["variant"]["tracks"][0]["clips"][0]["reframe"]["override"]["mode"] == "auto"
+
+
+@pytest.mark.parametrize("field,value", [("assetId", "commute"), ("inPoint", 1.5), ("speed", 2)])
+def test_adopted_proposal_job_never_overwrites_variant_identity_edited_after_apply(tmp_path, field, value):
+    app, queue = _proposal_reframe_app(tmp_path)
+    with TestClient(app) as client:
+        _project_id, base, task, proposal = _create_montage_proposal(client, tmp_path)
+        assert client.post(f"{base}/{task['id']}/montage-proposals/{proposal['id']}/apply", json={
+            "revision": 0, "proposalRevision": 0, "strategy": "overwrite",
+        }, headers=INTENT).status_code == 200
+        tracks = client.get(base).json()["tasks"][0]["variant"]["tracks"]
+        tracks[0]["clips"][0][field] = value
+        assert client.put(f"{base}/{task['id']}/variant", json={"revision": 1, "tracks": tracks}, headers=INTENT).status_code == 200
+        _kind, pid, handler = queue.jobs[0]
+        handler(pid)
+        variant = client.get(base).json()["tasks"][0]["variant"]
+        assert variant["revision"] == 2
+        assert variant["tracks"][0]["clips"][0]["reframe"]["status"] == "review_required"
+        assert variant["reframeAnalysis"][proposal["clips"][0]["id"]]["status"] == "failed"
+
+
+def test_adopted_multi_clip_job_increments_once_when_first_result_succeeds_and_last_source_is_lost(tmp_path):
+    app, queue = _proposal_reframe_app(tmp_path)
+    with TestClient(app) as client:
+        project_id, base, task, proposal = _create_montage_proposal(client, tmp_path, script="展示杯盖防泼溅。展示通勤携带效果。")
+        assert client.post(f"{base}/{task['id']}/montage-proposals/{proposal['id']}/apply", json={
+            "revision": 0, "proposalRevision": 0, "strategy": "overwrite",
+        }, headers=INTENT).status_code == 200
+        (tmp_path / "project-files" / project_id / "preproduction" / "assets" / "commute.mp4").unlink()
+        _kind, pid, handler = queue.jobs[0]
+        handler(pid)
+        variant = client.get(base).json()["tasks"][0]["variant"]
+        clips = variant["tracks"][0]["clips"]
+        assert variant["revision"] == 2
+        assert clips[0]["reframe"]["status"] == "ready"
+        assert clips[1]["reframe"]["status"] == "review_required"

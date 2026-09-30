@@ -286,6 +286,31 @@ def test_reframe_moves_a_full_bleed_crop_in_source_time_without_black_padding(tm
     assert min(first) >= 0 and min(last) >= 0
 
 
+@pytest.mark.parametrize("sar,rotation", [("2:1", 0), ("1:1", 90)])
+def test_reframe_preflight_rejects_the_same_sar_or_rotation_sources_as_render(tmp_path, monkeypatch, sar, rotation):
+    import app.timeline_render as module
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    reframe = {
+        "schemaVersion": 1, "sourceFingerprint": "", "sourceWidth": 0, "sourceHeight": 0,
+        "targetAspect": {"width": 1, "height": 1}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+        "samples": [], "uncertaintyReasons": ["等待人工"], "status": "review_required",
+        "override": {"mode": "center", "keyframes": []},
+    }
+    state = _timeline(width=64, height=64, tracks=[_track("video", [_clip("source", 0, 1, reframe=reframe)])])
+    state["revision"] = 0
+    media = module._Media(1, 1, None, True, False, False, 64, 48, 24, sar, rotation)
+    collected = {**state["tracks"][0]["clips"][0], "media": media}
+    monkeypatch.setattr(module, "_collect_clips", lambda *_args, **_kwargs: [collected])
+
+    issues = module.inspect_timeline_media(state, {"source": {"id": "source", "kind": "video", "duration": 1}},
+                                           lambda _asset: source, "mp4", "ffprobe")
+
+    assert any("旋转或非方形像素" in issue["message"] for issue in issues)
+    with pytest.raises(TimelineRenderError, match="旋转或非方形像素"):
+        module._video_filter(0, collected, 64, 64, 24, "out")
+
+
 def test_rejects_video_clip_past_the_end_of_its_video_stream_even_if_audio_is_longer(tmp_path):
     source = _video_with_short_video_stream(tmp_path / "uneven.mp4")
 

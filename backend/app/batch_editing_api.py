@@ -545,12 +545,24 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                             adopted = next((item for track in task["variant"]["tracks"] for item in track.get("clips", [])
                                             if item.get("id") == clip_id), None)
                         if adopted is not None:
-                            adopted_override = adopted.get("reframe", {}).get("override")
-                            adopted["reframe"] = {**completed[clip_id], **(
-                                {"override": deepcopy(adopted_override)}
-                                if isinstance(adopted_override, dict) and adopted_override.get("mode") != "auto" else {})}
+                            adopted_identity = {key: adopted.get(key) for key in ("assetId", "inPoint", "duration", "speed")}
+                            try:
+                                adopted_asset = assets_for(project_id).get(adopted_identity["assetId"])
+                                adopted_hash = source_fingerprint(project_assets.file(project_id, adopted_asset)) if adopted_asset else None
+                            except (OSError, ValueError, KeyError):
+                                adopted_hash = None
+                            if adopted_identity == {key: identity[key] for key in adopted_identity} and adopted_hash == identity["sourceFingerprint"]:
+                                adopted_override = adopted.get("reframe", {}).get("override")
+                                adopted["reframe"] = {**completed[clip_id], **(
+                                    {"override": deepcopy(adopted_override)}
+                                    if isinstance(adopted_override, dict) and adopted_override.get("mode") != "auto" else {})}
+                                renderable_changed = True
+                            else:
+                                record.update(status="failed", error="采用后变体片段或素材已变化，请重新主体分析。")
+                                changed = True
+                                continue
                         record.update(status="completed", error=None)
-                        renderable_changed = proposal_id is None or adopted is not None
+                        renderable_changed = renderable_changed or proposal_id is None
                     else:
                         record.update(status="failed", error=failures.get(clip_id, "本地主体分析失败。"))
                     changed = True

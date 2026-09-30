@@ -108,10 +108,12 @@ def pending_reframe(*, target_width: int, target_height: int, reason: str) -> di
 
 def validate_stored_reframe(value: Any) -> dict[str, Any]:
     """Validate persisted shape without trusting it as render authorization."""
-    if not isinstance(value, dict) or set(value) != {
+    required_keys = {
         "schemaVersion", "sourceFingerprint", "sourceWidth", "sourceHeight", "targetAspect",
         "detectorVersion", "modelSha256", "samples", "uncertaintyReasons", "status", "override",
-    }:
+    }
+    optional_timing = {"frameDurationSeconds", "samplingIntervalSeconds"}
+    if not isinstance(value, dict) or not required_keys <= set(value) or set(value) - required_keys - optional_timing:
         raise ReframeError("主体裁剪数据结构无效。")
     if value["schemaVersion"] != SCHEMA_VERSION or value["status"] not in ("ready", "review_required"):
         raise ReframeError("主体裁剪状态无效。")
@@ -141,10 +143,12 @@ def validate_stored_reframe(value: Any) -> dict[str, Any]:
 def normalize_reframe(value: Any, *, source_fingerprint: str, source_width: int, source_height: int,
                       required_start: float | None = None, required_end: float | None = None) -> dict[str, Any]:
     """Validate a persisted worker result against the current decoded source."""
-    if not isinstance(value, dict) or set(value) != {
+    required_keys = {
         "schemaVersion", "sourceFingerprint", "sourceWidth", "sourceHeight", "targetAspect",
         "detectorVersion", "modelSha256", "samples", "uncertaintyReasons", "status", "override",
-    }:
+    }
+    optional_timing = {"frameDurationSeconds", "samplingIntervalSeconds"}
+    if not isinstance(value, dict) or not required_keys <= set(value) or set(value) - required_keys - optional_timing:
         raise ReframeError("主体裁剪数据结构无效。")
     if value["schemaVersion"] != SCHEMA_VERSION or value["sourceFingerprint"] != source_fingerprint:
         raise ReframeError("主体裁剪结果与当前素材不匹配。")
@@ -168,12 +172,26 @@ def normalize_reframe(value: Any, *, source_fingerprint: str, source_width: int,
         # Analysis uses a half-open [start, end) source interval.  The final
         # decoded frame therefore precedes end; its measured sampling cadence
         # proves coverage without inventing a timestamp at the exclusive end.
-        sample_step = max((right["timeSeconds"] - left["timeSeconds"]
-                           for left, right in zip(samples, samples[1:])), default=0.0)
+        frame_duration = value.get("frameDurationSeconds")
+        sample_interval = value.get("samplingIntervalSeconds")
+        if frame_duration is not None or sample_interval is not None:
+            if (not _finite_number(frame_duration) or not _finite_number(sample_interval)
+                    or not 0 < frame_duration <= 1 or not 0 < sample_interval <= 2):
+                raise ReframeError("主体检测时间元数据无效。")
+            gaps = [right["timeSeconds"] - left["timeSeconds"] for left, right in zip(samples, samples[1:])]
+            if any(gap > sample_interval + frame_duration + .001 for gap in gaps):
+                raise ReframeError("主体检测采样存在时间空洞，需人工确认构图。")
+            end_tolerance = frame_duration + .001
+        else:
+            # Compatibility for records created before the pinned worker
+            # emitted timing evidence. New worker output always takes the
+            # strict branch above.
+            end_tolerance = max((right["timeSeconds"] - left["timeSeconds"]
+                                 for left, right in zip(samples, samples[1:])), default=0.0) + .001
         if required_start is not None and required_end is not None and (
             samples[0]["timeSeconds"] > required_start + .001
             or samples[-1]["timeSeconds"] > required_end + .001
-            or samples[-1]["timeSeconds"] < required_end - sample_step - .001
+            or samples[-1]["timeSeconds"] < required_end - end_tolerance
         ):
             raise ReframeError("主体裁剪结果未覆盖当前素材区间。")
     elif not value["uncertaintyReasons"]:

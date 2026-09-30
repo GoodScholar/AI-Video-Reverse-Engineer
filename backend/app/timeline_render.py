@@ -62,6 +62,12 @@ class _Media:
         self.rotation = rotation
 
 
+def _validate_reframe_media(media: _Media) -> None:
+    if (media.width is None or media.height is None or media.sample_aspect_ratio not in (None, "1:1", "0:1")
+            or not math.isfinite(media.rotation) or abs(media.rotation) > .001):
+        raise TimelineRenderError("主体裁剪不支持旋转或非方形像素的源视频。")
+
+
 def render_timeline(
     timeline: dict,
     sources: Dict[str, Path],
@@ -158,6 +164,7 @@ def inspect_timeline_media(state: dict, assets: dict, resolve_source, format: st
                 if clip.get("reframe") is not None:
                     from .montage_reframe import ReframeError, reframe_filter, source_fingerprint, validate_stored_reframe
                     reframe = validate_stored_reframe(clip["reframe"])
+                    _validate_reframe_media(media)
                     if reframe["status"] == "review_required" and reframe["override"]["mode"] == "auto":
                         raise ReframeError("主体构图待人工确认，不能渲染。")
                     # Call the same crop builder as rendering.  It checks
@@ -545,9 +552,7 @@ def _video_filter(index: int, clip: dict, width: int, height: int, fps: float, l
     reframe = clip.get("reframe")
     if reframe is not None:
         media = clip["media"]
-        if (media.width is None or media.height is None or media.sample_aspect_ratio not in (None, "1:1", "0:1")
-                or not math.isfinite(media.rotation) or abs(media.rotation) > .001):
-            raise TimelineRenderError("主体裁剪不支持旋转或非方形像素的源视频。")
+        _validate_reframe_media(media)
         try:
             from .montage_reframe import ReframeError, reframe_filter, source_fingerprint
             aspect = reframe["targetAspect"]
