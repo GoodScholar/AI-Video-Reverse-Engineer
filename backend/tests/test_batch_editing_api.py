@@ -1559,6 +1559,168 @@ def test_batch_reframe_repeat_cancel_retry_and_source_cas(tmp_path):
         assert "素材" in deleted["error"]
 
 
+def test_batch_reframe_proves_source_outside_lock_and_aborts_stale_submission(tmp_path, monkeypatch):
+    """A slow batch source proof neither blocks the variant lock nor queues stale work."""
+    from app import montage_reframe
+
+    project_id = "reframe-lock-free-batch"
+    root = tmp_path / "project-files" / project_id / "preproduction"
+    (root / "assets").mkdir(parents=True)
+    source = root / "assets" / "source.mp4"
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
+        "color=red:size=64x48:rate=24:duration=4", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+    ], check=True, capture_output=True, text=True)
+    (root / "state.json").write_text(json.dumps({"schemaVersion": 1, "revision": 1, "brief": {}, "shots": [],
+        "assets": [{"id": "source", "name": "source", "kind": "video", "file": "source.mp4", "duration": 8}]}, ensure_ascii=False), encoding="utf-8")
+    queue = DeferredComputeQueue()
+    app = FastAPI()
+    app.include_router(create_batch_editing_router(tmp_path, lambda _: SimpleNamespace(id=project_id), queue))
+    with TestClient(app) as client:
+        base = f"/api/projects/{project_id}/batch-edits"
+        task = client.post(base, json={"sellingPoint": "x", "script": "x"}).json()["task"]
+        tracks = task["variant"]["tracks"]
+        tracks[0]["clips"] = [{"id": "clip", "assetId": "source", "start": 0, "inPoint": 0, "duration": 2,
+                               "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0}]
+        variant_path = f"{base}/{task['id']}/variant"
+        assert client.put(variant_path, json={"revision": 0, "tracks": tracks}).status_code == 200
+        entered, release, read_done = threading.Event(), threading.Event(), threading.Event()
+        original = montage_reframe.source_fingerprint
+
+        def blocked_fingerprint(path):
+            entered.set()
+            assert release.wait(5), "测试未释放批量主体分析来源证明"
+            return original(path)
+
+        monkeypatch.setattr(montage_reframe, "source_fingerprint", blocked_fingerprint)
+        result = {}
+        submitted = threading.Thread(target=lambda: result.setdefault(
+            "response", client.post(variant_path + "/reframes/clip/analyze", json={"revision": 1}),
+        ))
+        submitted.start()
+        assert entered.wait(5)
+        reader = threading.Thread(target=lambda: (result.setdefault("read", client.get(base)), read_done.set()))
+        reader.start()
+        try:
+            assert read_done.wait(1), "慢来源证明不应占用批量变体锁"
+            current = result["read"].json()["tasks"][0]["variant"]
+            assert client.post(variant_path + "/reframes/clip/cancel", json={"revision": 1}).status_code == 409
+            changed = client.put(variant_path, json={
+                "revision": current["revision"], "tracks": current["tracks"],
+                "settings": {"width": 1280, "height": 720, "fps": 30}, "aspectMode": "16:9",
+            })
+            assert changed.status_code == 200, changed.text
+        finally:
+            release.set()
+            submitted.join(5)
+            reader.join(5)
+
+        assert result["response"].status_code == 409
+        assert result["response"].json()["detail"]["code"] == "batch_variant_conflict"
+        variant = client.get(base).json()["tasks"][0]["variant"]
+        assert variant.get("reframeAnalysis", {}) == {}
+        assert queue.jobs == []
+
+
+def test_batch_reframe_proof_deduplicates_shared_source_and_keeps_multi_clip_submit_atomic(tmp_path, monkeypatch):
+    """Two adopted clips sharing one file receive one proof and one all-or-nothing queue job."""
+    from app import montage_reframe, timeline_render
+
+    app, queue = _proposal_reframe_app(tmp_path)
+    with TestClient(app) as client:
+        project_id = client.post("/api/projects", json={"name": "同源证明回归"}).json()["id"]
+        install_montage_indexes(tmp_path, project_id)
+        assets = tmp_path / "project-files" / project_id / "preproduction" / "assets"
+        (assets / "commute.mp4").unlink()
+        os.link(assets / "lid.mp4", assets / "commute.mp4")
+        source_state_path = tmp_path / "project-files" / project_id / "source-segments" / "commute" / "state.json"
+        source_state = json.loads(source_state_path.read_text(encoding="utf-8"))
+        fingerprint = montage_reframe.source_fingerprint(assets / "lid.mp4")
+        source_state["sourceFingerprint"] = fingerprint
+        for candidate in source_state["candidates"]:
+            candidate["sourceFingerprint"] = fingerprint
+        source_state_path.write_text(json.dumps(source_state), encoding="utf-8")
+        base = f"/api/projects/{project_id}/batch-edits"
+        searches = [client.post(f"/api/projects/{project_id}/segment-searches", json={"query": query, "limit": 2}, headers=INTENT).json()
+                    for query in ("展示杯盖防泼溅", "展示通勤携带效果")]
+        task = client.post(base, json={"sellingPoint": "防泼溅", "script": "展示杯盖防泼溅。展示通勤携带效果。"}, headers=INTENT).json()["task"]
+        proposal_response = client.post(f"{base}/{task['id']}/montage-proposals", json={
+            "revision": 0, "searchIds": [item["id"] for item in searches],
+            "narration": [{"durationSeconds": 2, "wordBoundariesSeconds": []}] * 2, "beatTimes": [],
+        }, headers=INTENT)
+        assert proposal_response.status_code == 201, proposal_response.text
+        proposal = proposal_response.json()["proposal"]
+        assert len(proposal["clips"]) == 2
+        queue.jobs.clear()
+        state_path = tmp_path / "project-files" / project_id / "batch-edits" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["tasks"][0]["variant"]["reframeAnalysis"] = {}
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        calls = {"hash": 0, "media": 0, "timing": 0}
+        original_hash = montage_reframe.source_fingerprint
+        original_media = timeline_render._probe_media
+        original_timing = montage_reframe.probe_source_timing
+
+        def counted_hash(path):
+            calls["hash"] += 1
+            return original_hash(path)
+
+        def counted_media(path, probe):
+            calls["media"] += 1
+            return original_media(path, probe)
+
+        def counted_timing(path, probe):
+            calls["timing"] += 1
+            return original_timing(path, probe)
+
+        monkeypatch.setattr(montage_reframe, "source_fingerprint", counted_hash)
+        monkeypatch.setattr(timeline_render, "_probe_media", counted_media)
+        monkeypatch.setattr(montage_reframe, "probe_source_timing", counted_timing)
+        applied = client.post(f"{base}/{task['id']}/montage-proposals/{proposal['id']}/apply", json={
+            "revision": 0, "proposalRevision": 0, "strategy": "overwrite",
+        }, headers=INTENT)
+
+        assert applied.status_code == 200, applied.text
+        assert calls == {"hash": 1, "media": 1, "timing": 1}
+        variant = client.get(base).json()["tasks"][0]["variant"]
+        assert set(variant["reframeAnalysis"]) == {clip["id"] for clip in proposal["clips"]}
+        assert {record["status"] for record in variant["reframeAnalysis"].values()} == {"queued"}
+        assert len(queue.jobs) == 1
+
+
+def test_batch_reframe_multi_clip_proof_failure_never_queues_a_subset(tmp_path, monkeypatch):
+    """A failed proof in an adopted two-clip request leaves no partial analysis records."""
+    from app import montage_reframe
+
+    app, queue = _proposal_reframe_app(tmp_path)
+    with TestClient(app) as client:
+        project_id, base, task, proposal = _create_montage_proposal(
+            client, tmp_path, script="展示杯盖防泼溅。展示通勤携带效果。",
+        )
+        queue.jobs.clear()
+        state_path = tmp_path / "project-files" / project_id / "batch-edits" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["tasks"][0]["variant"]["reframeAnalysis"] = {}
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        original = montage_reframe.source_fingerprint
+
+        def fail_second_source(path):
+            if path.name == "commute.mp4":
+                raise OSError("模拟第二段来源消失")
+            return original(path)
+
+        monkeypatch.setattr(montage_reframe, "source_fingerprint", fail_second_source)
+        applied = client.post(f"{base}/{task['id']}/montage-proposals/{proposal['id']}/apply", json={
+            "revision": 0, "proposalRevision": 0, "strategy": "overwrite",
+        }, headers=INTENT)
+
+        assert applied.status_code == 409
+        assert applied.json()["detail"]["code"] == "reframe_source_unavailable"
+        variant = client.get(base).json()["tasks"][0]["variant"]
+        assert variant.get("reframeAnalysis", {}) == {}
+        assert queue.jobs == []
+
+
 def test_batch_image_reframe_rejects_invalid_manual_keyframes_and_stale_output_aspect(tmp_path):
     project_id = "reframe-image-batch"
     root = tmp_path / "project-files" / project_id / "preproduction"

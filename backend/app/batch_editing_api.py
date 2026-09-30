@@ -628,36 +628,88 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             variant = task["variant"]
             if expected_revision is not None and variant["revision"] != expected_revision:
                 raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "变体已更新，请刷新后重试。"})
-            analysis = variant.setdefault("reframeAnalysis", {})
-            jobs = []
-            source_probes = {}
+            assets = assets_for(project_id)
+            proposal = montage_proposal_for(task, proposal_id) if proposal_id is not None else None
+            request = {"variantRevision": variant["revision"],
+                       "proposal": None if proposal is None else {
+                           key: proposal.get(key) for key in ("id", "revision", "status")
+                       }, "clips": []}
             for clip_id in clip_ids:
                 clip = clip_for(task, clip_id, proposal_id)
-                asset = assets_for(project_id).get(clip["assetId"])
+                asset = assets.get(clip["assetId"])
                 if asset is None or asset.get("kind") not in ("video", "image"):
                     raise ValueError("主体裁剪仅支持可用图片或视频素材。")
                 source = project_assets.file(project_id, asset)
-                still_image = asset.get("kind") == "image"
-                from .montage_reframe import pending_reframe, probe_source_timing, source_fingerprint
-                clip.setdefault("reframe", pending_reframe(target_width=variant["settings"]["width"],
-                                                            target_height=variant["settings"]["height"],
+                request["clips"].append({
+                    "id": clip_id,
+                    "identity": {key: clip[key] for key in ("assetId", "inPoint", "duration", "speed")},
+                    "asset": reframe_asset_identity(asset), "source": source_identity(source),
+                    "targetAspect": {"width": variant["settings"]["width"], "height": variant["settings"]["height"]},
+                    "stillImage": asset.get("kind") == "image",
+                })
+
+        source_requests = {}
+        for item in request["clips"]:
+            source_key = source_stat_identity(item["source"])
+            item["sourceKey"] = source_key
+            source_request = source_requests.setdefault(source_key, {
+                "path": Path(item["source"]["path"]), "needsTiming": False,
+            })
+            source_request["needsTiming"] = source_request["needsTiming"] or not item["stillImage"]
+        try:
+            source_proofs = {
+                path: prove_reframe_source(source_request["path"], needs_timing=source_request["needsTiming"])
+                for path, source_request in source_requests.items()
+            }
+        except SourceProofConflict:
+            raise HTTPException(409, detail={"code": "reframe_source_unavailable", "message": "主体分析素材在校验期间变化或不可用，请刷新后重试。"}) from None
+
+        with source_lock or nullcontext(), lock:
+            state = state_for(project_id)
+            task = task_for(state, task_id)
+            variant = task["variant"]
+            if variant["revision"] != request["variantRevision"]:
+                raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "变体已更新，请刷新后重试。"})
+            current_proposal = montage_proposal_for(task, proposal_id) if proposal_id is not None else None
+            current_proposal_identity = None if current_proposal is None else {
+                key: current_proposal.get(key) for key in ("id", "revision", "status")
+            }
+            if current_proposal_identity != request["proposal"]:
+                raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "混剪提案已更新，请刷新后重试。"})
+            assets = assets_for(project_id)
+            confirmed = []
+            for item in request["clips"]:
+                try:
+                    clip = clip_for(task, item["id"], proposal_id)
+                except ValueError:
+                    raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "变体片段已更新，请刷新后重试。"}) from None
+                asset = assets.get(item["identity"]["assetId"])
+                if asset is None or reframe_asset_identity(asset) != item["asset"]:
+                    raise HTTPException(409, detail={"code": "reframe_source_unavailable", "message": "主体分析素材引用已变化，请刷新后重试。"})
+                source = project_assets.file(project_id, asset)
+                source_fact = source_proofs[item["sourceKey"]]
+                current_source_identity = source_identity(source)
+                if (current_source_identity != item["source"]
+                        or source_stat_identity(current_source_identity) != source_stat_identity(source_fact["identity"])):
+                    raise HTTPException(409, detail={"code": "reframe_source_unavailable", "message": "主体分析素材已变化，请刷新后重试。"})
+                if {key: clip.get(key) for key in item["identity"]} != item["identity"]:
+                    raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "变体片段已更新，请刷新后重试。"})
+                aspect = {"width": variant["settings"]["width"], "height": variant["settings"]["height"]}
+                if aspect != item["targetAspect"]:
+                    raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "变体输出比例已更新，请刷新后重试。"})
+                confirmed.append((item, clip, source, source_fact, aspect))
+
+            from .montage_reframe import pending_reframe
+            analysis = variant.setdefault("reframeAnalysis", {})
+            jobs = []
+            for item, clip, source, source_fact, aspect in confirmed:
+                clip.setdefault("reframe", pending_reframe(target_width=aspect["width"], target_height=aspect["height"],
                                                             reason="已提交本地主体分析"))
-                identity = {"assetId": clip["assetId"], "inPoint": clip["inPoint"], "duration": clip["duration"],
-                            "speed": clip["speed"], "sourceFingerprint": source_fingerprint(source),
-                            "targetAspect": {"width": variant["settings"]["width"], "height": variant["settings"]["height"]}}
-                if identity["sourceFingerprint"] not in source_probes:
-                    timing = None if still_image else probe_source_timing(source, ffprobe_path)
-                    try:
-                        from .timeline_render import _probe_media
-                        media = _probe_media(source, ffprobe_path)
-                        size = (media.width, media.height)
-                    except Exception:
-                        size = (None, None)
-                    source_probes[identity["sourceFingerprint"]] = (timing, size)
-                analysis[clip_id] = {"id": run_id, "status": "queued", "error": None, "proposalId": proposal_id,
-                                     "identity": identity}
-                jobs.append((clip_id, identity, source, dict(identity["targetAspect"]),
-                             source_probes[identity["sourceFingerprint"]], still_image))
+                identity = {**item["identity"], "sourceFingerprint": source_fact["fingerprint"], "targetAspect": aspect}
+                analysis[item["id"]] = {"id": run_id, "status": "queued", "error": None, "proposalId": proposal_id,
+                                        "identity": identity}
+                jobs.append((item["id"], identity, source, dict(aspect),
+                             (None if item["stillImage"] else source_fact["timing"], source_fact["size"]), item["stillImage"]))
             save(project_id, state)
 
         def process(_pid):
@@ -695,6 +747,14 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                         required_start=None if still_image else identity["inPoint"], required_end=None if still_image else identity["inPoint"] + identity["duration"] * identity["speed"], still_image=still_image)
                 except Exception as error:
                     failures[clip_id] = str(error)[:300] or "本地主体分析失败。"
+            current_source_facts = {}
+            for clip_id, _identity, source, _aspect, _probe, _still_image in jobs:
+                if str(source) in current_source_facts:
+                    continue
+                try:
+                    current_source_facts[str(source)] = stable_source_fact(source)
+                except (SourceProofConflict, OSError, ValueError):
+                    current_source_facts[str(source)] = None
             with source_lock or nullcontext(), lock:
                 state = state_for(project_id)
                 task = task_for(state, task_id)
@@ -709,12 +769,10 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     except ValueError:
                         continue
                     current = {key: clip.get(key) for key in ("assetId", "inPoint", "duration", "speed")}
-                    from .montage_reframe import source_fingerprint
-                    try:
-                        current_fingerprint = source_fingerprint(_source)
-                    except OSError:
-                        current_fingerprint = None
-                    if current != {key: identity[key] for key in current} or current_fingerprint != identity["sourceFingerprint"]:
+                    current_source_fact = current_source_facts.get(str(_source))
+                    if (current != {key: identity[key] for key in current}
+                            or current_source_fact is None
+                            or current_source_fact["fingerprint"] != identity["sourceFingerprint"]):
                         record.update(status="failed", error="分析期间素材已变化，请重新主体分析。")
                         changed = True
                         continue
@@ -740,7 +798,11 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                             adopted_identity = {key: adopted.get(key) for key in ("assetId", "inPoint", "duration", "speed")}
                             try:
                                 adopted_asset = assets_for(project_id).get(adopted_identity["assetId"])
-                                adopted_hash = source_fingerprint(project_assets.file(project_id, adopted_asset)) if adopted_asset else None
+                                adopted_source = project_assets.file(project_id, adopted_asset) if adopted_asset else None
+                                adopted_fact = current_source_facts.get(str(adopted_source)) if adopted_source else None
+                                adopted_hash = (adopted_fact["fingerprint"] if adopted_fact is not None
+                                                and source_identity(adopted_source) == {key: adopted_fact[key] for key in adopted_fact if key != "fingerprint"}
+                                                else None)
                             except (OSError, ValueError, KeyError):
                                 adopted_hash = None
                             if adopted_identity == {key: identity[key] for key in adopted_identity} and adopted_hash == identity["sourceFingerprint"]:
@@ -815,6 +877,9 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         return {"path": str(path), "dev": item.st_dev, "ino": item.st_ino, "size": item.st_size,
                 "mtimeNs": item.st_mtime_ns, "ctimeNs": item.st_ctime_ns}
 
+    def source_stat_identity(fact: dict[str, Any]) -> tuple:
+        return tuple(fact[key] for key in ("dev", "ino", "size", "mtimeNs", "ctimeNs"))
+
     def stable_source_fact(path: Path) -> dict[str, Any]:
         """Bind a full content hash to an unchanged real file, outside project locks."""
         from .montage_reframe import source_fingerprint
@@ -830,6 +895,32 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
 
     class SourceProofConflict(OSError):
         """A source changed after a proof started; clients can retry from a fresh snapshot."""
+
+    def reframe_asset_identity(asset: dict[str, Any]) -> dict[str, Any]:
+        return {key: asset.get(key) for key in ("id", "kind", "file", "sourceReferenceId")}
+
+    def prove_reframe_source(path: Path, *, needs_timing: bool) -> dict[str, Any]:
+        """Bind analysis hash, dimensions and video timing outside project/source locks."""
+        from .montage_reframe import probe_source_timing, source_fingerprint
+
+        before = source_identity(path)
+        try:
+            fingerprint = source_fingerprint(path)
+            try:
+                from .timeline_render import _probe_media
+                media = _probe_media(path, ffprobe_path)
+                size = (media.width, media.height)
+            except Exception:
+                # Keep the established worker failure for an unprobeable
+                # source rather than accepting dimensions from detector output.
+                size = (None, None)
+            timing = probe_source_timing(path, ffprobe_path) if needs_timing else None
+            after = source_identity(path)
+        except (OSError, ValueError) as error:
+            raise SourceProofConflict("主体分析素材在校验期间不可读取") from error
+        if before != after:
+            raise SourceProofConflict("主体分析素材在校验期间变化")
+        return {"identity": before, "fingerprint": fingerprint, "timing": timing, "size": size}
 
     def safety_run_identity(task: dict, run: dict) -> dict[str, Any]:
         return {

@@ -85,6 +85,58 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 "runs": [public_run(project_id, run) for run in state["runs"]],
                 "reframeAnalysis": state.get("reframeAnalysis", {}), "packaging": state.get("packaging")}
 
+    class ReframeSourceProofConflict(OSError):
+        """A lock-free reframe source proof is no longer current."""
+
+    def reframe_source_identity(source: Path) -> dict[str, Any]:
+        source = Path(source)
+        _regular_file(source)
+        item = os.stat(source)
+        if not stat.S_ISREG(item.st_mode):
+            raise OSError("不是普通文件")
+        return {"path": str(source), "dev": item.st_dev, "ino": item.st_ino, "size": item.st_size,
+                "mtimeNs": item.st_mtime_ns, "ctimeNs": item.st_ctime_ns}
+
+    def prove_reframe_source(source: Path, *, still_image: bool) -> dict[str, Any]:
+        """Read costly source facts outside timeline/source locks, bound to one stat identity."""
+        from .montage_reframe import probe_source_timing, source_fingerprint
+
+        before = reframe_source_identity(source)
+        try:
+            fingerprint = source_fingerprint(source)
+            try:
+                from .timeline_render import _probe_media
+                media = _probe_media(source, ffprobe_path)
+                size = (media.width, media.height)
+            except Exception:
+                # Keep the established worker failure for an unprobeable
+                # source rather than trusting dimensions supplied by a worker.
+                size = (None, None)
+            timing = None if still_image else probe_source_timing(source, ffprobe_path)
+            after = reframe_source_identity(source)
+        except (OSError, ValueError) as error:
+            raise ReframeSourceProofConflict("素材在校验期间不可读取") from error
+        if before != after:
+            raise ReframeSourceProofConflict("素材在校验期间变化")
+        return {"identity": before, "fingerprint": fingerprint, "timing": timing, "size": size}
+
+    def reframe_fingerprint_fact(source: Path) -> dict[str, Any]:
+        """Recheck content outside locks before a worker publishes its result."""
+        from .montage_reframe import source_fingerprint
+
+        before = reframe_source_identity(source)
+        try:
+            fingerprint = source_fingerprint(source)
+            after = reframe_source_identity(source)
+        except (OSError, ValueError) as error:
+            raise ReframeSourceProofConflict("素材在校验期间不可读取") from error
+        if before != after:
+            raise ReframeSourceProofConflict("素材在校验期间变化")
+        return {"identity": before, "fingerprint": fingerprint}
+
+    def reframe_asset_identity(asset: dict[str, Any]) -> dict[str, Any]:
+        return {key: asset.get(key) for key in ("id", "kind", "file", "sourceReferenceId")}
+
     def schedule_reframe(project_id, clip_id, *, expected_revision=None):
         run_id = uuid4().hex
         with source_lock or nullcontext(), lock:
@@ -99,18 +151,46 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 fail("reframe_source_unavailable", "主体分析仅支持可用图片或视频素材。")
             source = source_path(project_id, asset)
             still_image = asset.get("kind") == "image"
-            from .montage_reframe import pending_reframe, probe_source_timing, source_fingerprint
-            clip.setdefault("reframe", pending_reframe(target_width=state["settings"]["width"], target_height=state["settings"]["height"], reason="已提交本地主体分析"))
-            identity = {"assetId": clip["assetId"], "inPoint": clip["inPoint"], "duration": clip["duration"],
-                        "speed": clip["speed"], "sourceFingerprint": source_fingerprint(source),
-                        "targetAspect": {"width": state["settings"]["width"], "height": state["settings"]["height"]}}
-            source_timing = None if still_image else probe_source_timing(source, ffprobe_path)
+            request = {"revision": state["revision"], "clip": {
+                key: clip[key] for key in ("assetId", "inPoint", "duration", "speed")
+            }, "asset": reframe_asset_identity(asset), "source": reframe_source_identity(source),
+                       "targetAspect": {"width": state["settings"]["width"], "height": state["settings"]["height"]},
+                       "stillImage": still_image}
+
+        try:
+            proof = prove_reframe_source(source, still_image=request["stillImage"])
+        except ReframeSourceProofConflict:
+            fail("reframe_source_unavailable", "主体分析素材在校验期间变化或不可用，请刷新后重试。")
+
+        with source_lock or nullcontext(), lock:
+            state = state_for(project_id)
+            if state["revision"] != request["revision"]:
+                fail("timeline_conflict", "时间线已更新，请刷新后重试。")
+            clip = next((item for track in state["tracks"] for item in track["clips"] if item["id"] == clip_id), None)
+            if clip is None:
+                fail("reframe_clip_missing", "时间线片段不存在。", 404)
+            asset = asset_index(project_id).get(request["clip"]["assetId"])
+            if asset is None or reframe_asset_identity(asset) != request["asset"]:
+                fail("reframe_source_unavailable", "主体分析素材已变化，请刷新后重试。")
+            current_source = source_path(project_id, asset)
             try:
-                from .timeline_render import _probe_media
-                trusted_media = _probe_media(source, ffprobe_path)
-                trusted_size = (trusted_media.width, trusted_media.height)
-            except Exception:
-                trusted_size = (None, None)
+                current_source_identity = reframe_source_identity(current_source)
+            except OSError:
+                fail("reframe_source_unavailable", "主体分析素材不可用。")
+            if (current_source_identity != request["source"]
+                    or current_source_identity != proof["identity"]):
+                fail("reframe_source_unavailable", "主体分析素材已变化，请刷新后重试。")
+            current_clip = {key: clip.get(key) for key in request["clip"]}
+            if current_clip != request["clip"]:
+                fail("timeline_conflict", "时间线片段已更新，请刷新后重试。")
+            current_aspect = {"width": state["settings"]["width"], "height": state["settings"]["height"]}
+            if current_aspect != request["targetAspect"]:
+                fail("timeline_conflict", "时间线输出比例已更新，请刷新后重试。")
+            from .montage_reframe import pending_reframe
+            clip.setdefault("reframe", pending_reframe(target_width=current_aspect["width"], target_height=current_aspect["height"], reason="已提交本地主体分析"))
+            identity = {**request["clip"], "sourceFingerprint": proof["fingerprint"], "targetAspect": current_aspect}
+            source = current_source
+            source_timing, trusted_size = proof["timing"], proof["size"]
             state.setdefault("reframeAnalysis", {})[clip_id] = {"id": run_id, "status": "queued", "error": None, "identity": identity}
             save(project_id, state)
         def process(_pid):
@@ -122,7 +202,7 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 record["status"] = "running"
                 save(project_id, state)
             try:
-                from .montage_reframe import normalize_reframe, run_local_detector, source_fingerprint
+                from .montage_reframe import normalize_reframe, run_local_detector
                 if not source.is_file():
                     raise ValueError("分析期间素材已变化，请重新主体分析。")
                 if not all(type(value) is int and value > 0 for value in trusted_size):
@@ -141,6 +221,10 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 error = None
             except Exception as failure:
                 result, error = None, str(failure)[:300] or "本地主体分析失败。"
+            try:
+                current_source_fact = reframe_fingerprint_fact(source) if result is not None else None
+            except ReframeSourceProofConflict:
+                current_source_fact = None
             with source_lock or nullcontext(), lock:
                 state = state_for(project_id)
                 record = state.get("reframeAnalysis", {}).get(clip_id)
@@ -150,13 +234,11 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 if result is None:
                     record.update(status="failed", error=error)
                 else:
-                    try:
-                        current_fingerprint = source_fingerprint(source)
-                    except OSError:
-                        current_fingerprint = None
                     if ({key: clip.get(key) for key in ("assetId", "inPoint", "duration", "speed")} !=
                             {key: identity[key] for key in ("assetId", "inPoint", "duration", "speed")}
-                            or current_fingerprint != identity["sourceFingerprint"]):
+                            or current_source_fact is None
+                            or current_source_fact["identity"] != proof["identity"]
+                            or current_source_fact["fingerprint"] != identity["sourceFingerprint"]):
                         record.update(status="failed", error="分析期间素材或片段已变化，请重新主体分析。")
                     elif {"width": state["settings"]["width"], "height": state["settings"]["height"]} != identity["targetAspect"]:
                         record.update(status="failed", error="分析期间输出比例已变化，请重新主体分析。")

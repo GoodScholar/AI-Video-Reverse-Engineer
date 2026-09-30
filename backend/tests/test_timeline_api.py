@@ -1,5 +1,6 @@
 import json
 import subprocess
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -294,6 +295,124 @@ def test_timeline_reframe_rejects_stale_revision_before_it_can_enqueue(tmp_path)
     stale = client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1})
 
     assert stale.status_code == 409
+    assert queue.jobs == []
+
+
+def test_timeline_reframe_proves_source_outside_lock_and_aborts_stale_submission(tmp_path, monkeypatch):
+    """A slow source proof must not block workspace edits or leave a stale queued record."""
+    from app import montage_reframe
+
+    client, queue = setup(tmp_path)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    entered, release, read_done = threading.Event(), threading.Event(), threading.Event()
+    original = montage_reframe.source_fingerprint
+
+    def blocked_fingerprint(path):
+        entered.set()
+        assert release.wait(5), "测试未释放主体分析来源证明"
+        return original(path)
+
+    monkeypatch.setattr(montage_reframe, "source_fingerprint", blocked_fingerprint)
+    result = {}
+    submitted = threading.Thread(target=lambda: result.setdefault(
+        "response", client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}),
+    ))
+    submitted.start()
+    assert entered.wait(5)
+    reader = threading.Thread(target=lambda: (result.setdefault("read", client.get(BASE)), read_done.set()))
+    reader.start()
+    try:
+        assert read_done.wait(1), "慢来源证明不应占用时间线锁"
+        current = result["read"].json()
+        # There is no record until the proof CAS succeeds, so cancel stays a
+        # quick, truthful conflict instead of waiting behind the hash.
+        assert client.post(BASE + "/reframes/clip1/cancel", json={"revision": 1}).status_code == 409
+        changed = client.put(BASE, json={
+            "revision": current["revision"],
+            "settings": {"width": 720, "height": 1280, "fps": 30},
+            "tracks": current["tracks"],
+        })
+        assert changed.status_code == 200, changed.text
+    finally:
+        release.set()
+        submitted.join(5)
+        reader.join(5)
+
+    assert result["response"].status_code == 409
+    assert result["response"].json()["detail"]["code"] == "timeline_conflict"
+    current = client.get(BASE).json()
+    assert current["reframeAnalysis"] == {}
+    assert queue.jobs == []
+
+
+def test_timeline_reframe_source_replaced_during_proof_never_creates_a_job(tmp_path, monkeypatch):
+    from app import montage_reframe
+
+    client, queue = setup(tmp_path)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    source = tmp_path / "project-files" / PROJECT_ID / "preproduction" / "assets" / "video.mp4"
+    entered, release = threading.Event(), threading.Event()
+    original = montage_reframe.source_fingerprint
+
+    def blocked_fingerprint(path):
+        entered.set()
+        assert release.wait(5), "测试未释放替换来源证明"
+        return original(path)
+
+    monkeypatch.setattr(montage_reframe, "source_fingerprint", blocked_fingerprint)
+    result = {}
+    submitted = threading.Thread(target=lambda: result.setdefault(
+        "response", client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}),
+    ))
+    submitted.start()
+    assert entered.wait(5)
+    try:
+        source.write_bytes(b"replaced while proving")
+    finally:
+        release.set()
+        submitted.join(5)
+
+    assert result["response"].status_code == 409
+    assert result["response"].json()["detail"]["code"] == "reframe_source_unavailable"
+    assert client.get(BASE).json()["reframeAnalysis"] == {}
+    assert queue.jobs == []
+
+
+def test_timeline_reframe_proof_rejects_clip_identity_change_without_revision(tmp_path, monkeypatch):
+    """The second lock compares the clip, not only its public revision token."""
+    from app import montage_reframe
+
+    client, queue = setup(tmp_path)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    entered, release = threading.Event(), threading.Event()
+    original = montage_reframe.source_fingerprint
+
+    def blocked_fingerprint(path):
+        entered.set()
+        assert release.wait(5), "测试未释放片段身份证明"
+        return original(path)
+
+    monkeypatch.setattr(montage_reframe, "source_fingerprint", blocked_fingerprint)
+    result = {}
+    submitted = threading.Thread(target=lambda: result.setdefault(
+        "response", client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}),
+    ))
+    submitted.start()
+    assert entered.wait(5)
+    try:
+        state_path = tmp_path / "project-files" / PROJECT_ID / "timeline" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["tracks"][0]["clips"][0]["inPoint"] = 1
+        # This white-box race intentionally keeps revision=1: the proof CAS
+        # must still reject a changed clip identity before it creates state.
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+    finally:
+        release.set()
+        submitted.join(5)
+
+    assert result["response"].status_code == 409
+    assert result["response"].json()["detail"]["code"] == "timeline_conflict"
+    assert client.get(BASE).json()["reframeAnalysis"] == {}
     assert queue.jobs == []
 
 
