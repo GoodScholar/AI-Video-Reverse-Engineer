@@ -1,6 +1,7 @@
 import { readApiError } from "./referenceMediaApi";
 import type { AigcBeat, AigcBrief } from "./aigcContentApi";
 import type { TimelineAsset, TimelineClip, TimelineTrack, TimelineTransition } from "./timelineApi";
+import type { Packaging, ReframeAnalysis } from "./ReframeControls";
 import type { AspectMode } from "./videoAspect";
 
 export type BatchRun = { id: string; revision: number; contentRevision?: number; subtitleRevision?: number; status: "queued" | "running" | "completed" | "failed" | "cancelled"; error: string | null;
@@ -16,7 +17,7 @@ export type BatchRecognition = { id: string; status: "queued" | "running" | "com
   timelineRevision: number; subtitleRevision: number; language: "auto" | "zh" | "en" | "ja" | "ko"; cues: BatchCue[] };
 export type BatchSubtitles = { revision: number; cues: BatchCue[]; recognitions: BatchRecognition[] };
 export type BatchVariant = { id: string; revision: number; settings: { width: number; height: number; fps: number }; tracks: TimelineTrack[]; transitions?: TimelineTransition[]; runs: BatchRun[];
-  subtitles?: BatchSubtitles; exports?: BatchExportRun[]; aspectMode?: AspectMode; resolvedAspect?: string; aspectReason?: string };
+  subtitles?: BatchSubtitles; exports?: BatchExportRun[]; aspectMode?: AspectMode; resolvedAspect?: string; aspectReason?: string; packaging?: Packaging | null; reframeAnalysis?: Record<string, ReframeAnalysis> };
 export type BatchProposal = { baseRevision: number; method: "asset-metadata-keywords"; assetIds: string[]; clips: TimelineClip[]; matches: Array<{
   clipId: string; scriptSegment: string; assetId: string; assetName: string; matchedTerms: string[]; matchedSellingPointTerms: string[];
 }> };
@@ -59,9 +60,16 @@ export function createBatchTask(projectId: string, sellingPoint: string, script:
   return request(base(projectId), { method: "POST", headers, body: JSON.stringify({ sellingPoint, script }) }, "无法创建批量任务。");
 }
 
-export function saveBatchVariant(projectId: string, taskId: string, revision: number, tracks: TimelineTrack[], transitions: TimelineTransition[] = [], settings?: BatchVariant["settings"], aspectMode?: AspectMode): Promise<{ variant: BatchVariant }> {
+export function saveBatchVariant(projectId: string, taskId: string, revision: number, tracks: TimelineTrack[], transitions: TimelineTransition[] = [], settings?: BatchVariant["settings"], aspectMode?: AspectMode, packaging?: Packaging | null): Promise<{ variant: BatchVariant }> {
   return request(`${base(projectId)}/${encodeURIComponent(taskId)}/variant`,
-    { method: "PUT", headers, body: JSON.stringify({ revision, tracks, transitions, ...(settings ? { settings } : {}), ...(aspectMode ? { aspectMode } : {}) }) }, "无法保存短视频变体。");
+    { method: "PUT", headers, body: JSON.stringify({ revision, tracks, transitions, ...(settings ? { settings } : {}), ...(aspectMode ? { aspectMode } : {}), ...(packaging !== undefined ? { packaging } : {}) }) }, "无法保存短视频变体。");
+}
+
+export function analyzeBatchReframe(projectId: string, taskId: string, clipId: string, revision: number): Promise<{ variant: BatchVariant }> {
+  return request(`${base(projectId)}/${encodeURIComponent(taskId)}/variant/reframes/${encodeURIComponent(clipId)}/analyze`, { method: "POST", headers, body: JSON.stringify({ revision }) }, "无法提交主体分析，请重试。");
+}
+export function cancelBatchReframe(projectId: string, taskId: string, clipId: string, revision: number): Promise<{ variant: BatchVariant }> {
+  return request(`${base(projectId)}/${encodeURIComponent(taskId)}/variant/reframes/${encodeURIComponent(clipId)}/cancel`, { method: "POST", headers, body: JSON.stringify({ revision }) }, "无法取消主体分析，请重试。");
 }
 
 export function saveBatchContent(projectId: string, taskId: string, revision: number, sellingPoint: string, script: string): Promise<{ task: BatchTask }> {

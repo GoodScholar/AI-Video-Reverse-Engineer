@@ -3,6 +3,8 @@
 Adapted files: `dashboard/src/components/ui/StepIndicator.jsx` and visibility observer from `dashboard/src/components/GalleryCard.jsx`.
 Source: https://github.com/Warabellum/openshorts/tree/dc22ac715710260d59b02b61a2ce877dda8d9d95
 
+Also adapted: original-video playback, draggable crop window and exterior dimming interaction in `ReframeControls.tsx`, from `dashboard/src/components/ReframeEditor.jsx` at `89f030934388d5167b3b0ede164ef893dad09ae9`.
+
 MIT License
 
 Copyright (c) 2024 OpenShorts

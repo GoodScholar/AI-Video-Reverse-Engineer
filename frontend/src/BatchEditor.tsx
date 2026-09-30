@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useRef, useState } from "react";
-import { applyMontageProposal, cancelBatchExport, cancelBatchPreview, createBatchTask, createBulkVariants, createMontageProposal, getBatchWorkspace, recognizeBatchSubtitles, recommendBatchVariant, reviewBatchVariant, saveBatchContent, saveBatchSubtitles, saveBatchVariant, startBatchPreview, startGenerationPreviews, submitBatchExports, updateMontageProposal, type BatchAsset, type BatchCue, type BatchReview, type BatchTask, type BatchVariant, type MontageProposal } from "./batchEditingApi";
+import { analyzeBatchReframe, applyMontageProposal, cancelBatchExport, cancelBatchPreview, cancelBatchReframe, createBatchTask, createBulkVariants, createMontageProposal, getBatchWorkspace, recognizeBatchSubtitles, recommendBatchVariant, reviewBatchVariant, saveBatchContent, saveBatchSubtitles, saveBatchVariant, startBatchPreview, startGenerationPreviews, submitBatchExports, updateMontageProposal, type BatchAsset, type BatchCue, type BatchReview, type BatchTask, type BatchVariant, type MontageProposal } from "./batchEditingApi";
 import type { TimelineAsset, TimelineClip, TimelineTrack, TimelineTransition } from "./timelineApi";
 import { TransitionControls } from "./TransitionControls";
 import { changeBoundary, reconcileBoundaries, transitionLabels } from "./timelineTransitions";
@@ -9,6 +9,7 @@ import "./batch.css";
 import { VoiceSelector } from "./VoiceSelector";
 import { ratioLabel, resolveProductAspect, type AspectMode } from "./videoAspect";
 import { searchSegments } from "./segmentRetrievalApi";
+import { defaultPackaging, mergeServerReframeFacts, PackagingControls, ReframeControls, type Packaging, type Reframe } from "./ReframeControls";
 
 function clipName(clip: TimelineClip, assets: TimelineAsset[]) { return assets.find((asset) => asset.id === clip.assetId)?.name ?? "缺失素材"; }
 function isCurrentPreview(task: BatchTask, run: BatchVariant["runs"][number] | undefined): boolean {
@@ -76,6 +77,7 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
   const [reviewReasons, setReviewReasons] = useState<Record<string, string>>({});
   const [selectedExportIds, setSelectedExportIds] = useState<string[]>([]);
   const [subtitleDrafts, setSubtitleDrafts] = useState<Record<string, BatchCue[]>>({});
+  const [packagingDrafts, setPackagingDrafts] = useState<Record<string, Packaging>>({});
   const [recommendationSelections, setRecommendationSelections] = useState<Record<string, string[]>>({});
   const [montageAdjustments, setMontageAdjustments] = useState<Record<string, Record<string, MontageAdjustment>>>({});
   const [montageStrategies, setMontageStrategies] = useState<Record<string, "overwrite" | "merge" | "abandon">>({});
@@ -109,7 +111,7 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
 
   useEffect(() => {
     let active = true;
-    setTasks([]); setAssets([]); setSelectedId(null); setDrafts({}); setTransitionDrafts({}); setAspectDrafts({}); setContentDrafts({}); setReviewReasons({}); setSelectedExportIds([]); setSubtitleDrafts({}); setRecommendationSelections({}); setMontageAdjustments({}); setMontageStrategies({}); setMontageBeatInputs({}); setMontageMessage(""); setBulkCount(5); setBulkInputs({}); setReviewFilter("all"); setLoading(true); setBusy(false); setError("");
+    setTasks([]); setAssets([]); setSelectedId(null); setDrafts({}); setTransitionDrafts({}); setAspectDrafts({}); setContentDrafts({}); setReviewReasons({}); setSelectedExportIds([]); setSubtitleDrafts({}); setPackagingDrafts({}); setRecommendationSelections({}); setMontageAdjustments({}); setMontageStrategies({}); setMontageBeatInputs({}); setMontageMessage(""); setBulkCount(5); setBulkInputs({}); setReviewFilter("all"); setLoading(true); setBusy(false); setError("");
     void getBatchWorkspace(projectId).then((result) => { if (active) { setTasks(result.tasks); setAssets(result.assets); if(presentation) setSelectedId(focusTaskId ?? [...result.tasks].reverse().find(task => !task.batchId)?.id ?? null); } })
       .catch((reason) => { if (active) setError(reason instanceof Error ? reason.message : "无法读取批量任务。"); })
       .finally(() => { if (active) setLoading(false); });
@@ -163,10 +165,12 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
   const transitionsDirty = Boolean(selected && JSON.stringify(draftTransitions) !== JSON.stringify(selected.variant.transitions ?? []));
   const aspectDirty = Boolean(selected && selectedAspect && (selectedAspect.aspectMode !== (selected.variant.aspectMode ?? "9:16") ||
     JSON.stringify(selectedAspect.settings) !== JSON.stringify(selected.variant.settings)));
-  const dirty = tracksDirty || transitionsDirty || aspectDirty;
   const subtitles = selected?.variant.subtitles ?? { revision: 0, cues: [], recognitions: [] };
   const subtitleDraft = selected ? subtitleDrafts[selected.id] ?? subtitles.cues : [];
   const subtitleDirty = JSON.stringify(subtitleDraft) !== JSON.stringify(subtitles.cues);
+  const selectedPackaging = selected ? packagingDrafts[selected.id] ?? selected.variant.packaging ?? defaultPackaging() : null;
+  const packagingDirty = Boolean(selected && packagingDrafts[selected.id] && JSON.stringify(packagingDrafts[selected.id]) !== JSON.stringify(selected.variant.packaging ?? null));
+  const dirty = tracksDirty || transitionsDirty || aspectDirty || packagingDirty;
   const subtitleDuration = Math.max(0, ...(draftTracks ?? []).filter((track) => track.kind === "video" && !track.hidden)
     .flatMap((track) => track.clips.map((clip) => clip.start + clip.duration)));
   const subtitlesValid = subtitleDraft.every((cue) => cue.text.trim() && cue.text.length <= 120 && Number.isFinite(cue.start) && Number.isFinite(cue.end) &&
@@ -177,13 +181,14 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
     (aspectDrafts[task.id] && (aspectDrafts[task.id].aspectMode !== (task.variant.aspectMode ?? "9:16") ||
       JSON.stringify(aspectDrafts[task.id].settings) !== JSON.stringify(task.variant.settings))) ||
     (subtitleDrafts[task.id] && JSON.stringify(subtitleDrafts[task.id]) !== JSON.stringify(task.variant.subtitles?.cues ?? [])) ||
+    (packagingDrafts[task.id] && JSON.stringify(packagingDrafts[task.id]) !== JSON.stringify(task.variant.packaging ?? null)) ||
     (montageAdjustments[task.id] && JSON.stringify(montageAdjustments[task.id]) !== JSON.stringify(savedMontageAdjustments(task.montageProposals?.[task.montageProposals.length - 1]))));
   useEffect(() => { onDraftChange?.(anyDirty || aigcDirty || voicePending); }, [anyDirty, aigcDirty, voicePending, onDraftChange]);
   const latestRun = selected?.variant.runs[selected.variant.runs.length - 1];
   const latestExport = selected?.variant.exports?.[selected.variant.exports.length - 1];
   const latestCompleted = latestRun?.status === "completed" ? latestRun : undefined;
   const currentPreview = selected && isCurrentPreview(selected, latestRun) ? latestRun : null;
-  const reviewReady = Boolean(currentPreview && selected && !hasPendingVoice(selected) && !dirty && !contentDirty && !subtitleDirty && (reviewReasons[selected?.id ?? ""] ?? "").trim());
+  const reviewReady = Boolean(currentPreview && selected && !hasPendingVoice(selected) && !dirty && !contentDirty && !subtitleDirty && !packagingDirty && (reviewReasons[selected?.id ?? ""] ?? "").trim());
   const latestRecognition = subtitles.recognitions[subtitles.recognitions.length - 1];
   const selectedAssets = selected ? recommendationSelections[selected.id] ?? selected.proposal?.assetIds ?? [] : [];
   const selectedChildren = selected && !selected.batchId ? tasks.filter((task) => task.batchId === selected.id) : [];
@@ -550,7 +555,8 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
     if (!selected || !draftTracks || !selectedAspect) return;
     setBusy(true); setError("");
     try {
-      const result = await saveBatchVariant(projectId, selected.id, selected.variant.revision, draftTracks, draftTransitions, selectedAspect.settings, selectedAspect.aspectMode);
+      const result = await saveBatchVariant(projectId, selected.id, selected.variant.revision, draftTracks, draftTransitions, selectedAspect.settings, selectedAspect.aspectMode,
+        packagingDrafts[selected.id]);
       if (projectRef.current !== projectId) return;
       setTasks((current) => current.map((task) => task.id === selected.id ? { ...task, variant: result.variant,
         reviewStatus: invalidatedReviewStatus(task),
@@ -558,6 +564,10 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
           ? { status: "ready", error: null } : task.generation } : task));
       setDrafts((current) => {
         if (JSON.stringify(current[selected.id]) !== JSON.stringify(draftTracks)) return current;
+        const next = { ...current }; delete next[selected.id]; return next;
+      });
+      setPackagingDrafts((current) => {
+        if (!current[selected.id] || JSON.stringify(current[selected.id]) !== JSON.stringify(packagingDrafts[selected.id])) return current;
         const next = { ...current }; delete next[selected.id]; return next;
       });
       setTransitionDrafts((current) => {
@@ -570,6 +580,20 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
       });
       onPersistedChange?.();
     } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法保存变体。"); }
+    finally { if (projectRef.current === projectId) setBusy(false); }
+  }
+
+  async function updateReframe(clipId: string, action: "analyze" | "cancel") {
+    if (!selected) return;
+    setBusy(true); setError("");
+    try {
+      const result = action === "analyze"
+        ? await analyzeBatchReframe(projectId, selected.id, clipId, selected.variant.revision)
+        : await cancelBatchReframe(projectId, selected.id, clipId, selected.variant.revision);
+      if (projectRef.current !== projectId) return;
+      setTasks((current) => current.map((task) => task.id === selected.id ? { ...task, variant: result.variant } : task));
+      setDrafts((current) => current[selected.id] ? { ...current, [selected.id]: mergeServerReframeFacts(current[selected.id], result.variant.tracks) } : current);
+    } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法更新主体分析。"); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
 
@@ -860,6 +884,12 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
             {([ ["start", "起点（秒）"], ["inPoint", "入点（秒）"], ["duration", "时长（秒）"], ["speed", "速度"], ["volume", "音量"], ["fadeIn", "淡入（秒）"], ["fadeOut", "淡出（秒）"] ] as const).map(([key, label]) =>
               <label key={key}>{clipName(clip, assets)} {label}<input type="number" min="0" step="0.1" value={clip[key]} onChange={(event) => changeClips(track.id, (clips) => clips.map((item) => item.id === clip.id ? { ...item, [key]: Number(event.target.value) } : item))} /></label>)}
           </div>
+          {track.kind === "video" && <ReframeControls clipId={clip.id} assetUrl={assets.find((asset) => asset.id === clip.assetId)?.url ?? ""}
+            reframe={clip.reframe as Reframe | undefined} analysis={selected.variant.reframeAnalysis?.[clip.id]} disabled={busy}
+            onChange={(reframe) => changeClips(track.id, (clips) => clips.map((item) => item.id === clip.id ? { ...item, reframe } : item))}
+            onAnalyze={() => void updateReframe(clip.id, "analyze")} onCancel={() => void updateReframe(clip.id, "cancel")}
+            candidates={assets.filter((asset) => asset.kind === "video" && asset.id !== clip.assetId).map((asset) => ({ id: asset.id, name: asset.name }))}
+            onReplace={(assetId) => changeClips(track.id, (clips) => clips.map((item) => item.id === clip.id ? { ...item, assetId, reframe: undefined } : item))} />}
           {track.kind === "video" && transition && <TransitionControls boundary={transition} name={boundaryName} onChange={change => changeTransition(transition, change)} />}
           </Fragment>;
         })}
@@ -889,6 +919,8 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
         {subtitleDirty && !subtitlesValid && <p role="status">每条字幕需填写不超过 120 字；时间须在当前画面范围内且至少相隔 1 毫秒。</p>}
         <button type="button" className="primary-action" disabled={busy || dirty || !subtitleDirty || !subtitlesValid} onClick={() => void saveSubtitles()}>保存字幕</button>
       </div>
+      {selectedPackaging && <PackagingControls value={selectedPackaging} cues={subtitleDraft} disabled={busy}
+        onChange={(packaging) => setPackagingDrafts((current) => ({ ...current, [selected.id]: packaging }))} />}
       <button type="button" className="primary-action" disabled={busy || !dirty} onClick={() => void saveVariant()}>保存变体</button>
       </>}
       <button type="button" className="secondary-action" disabled={busy || hasPendingVoice(selected) || dirty || contentDirty || subtitleDirty || !draftTracks.some((track) => track.kind === "video" && track.clips.length > 0) || latestRun?.status === "queued" || latestRun?.status === "running"} onClick={() => void preview()}>生成预览</button>
@@ -896,6 +928,7 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
       {dirty && <p>先保存变体，才能预览当前编辑。</p>}
       {contentDirty && <p>先保存卖点与脚本，才能预览当前编辑。</p>}
       {subtitleDirty && <p>先保存字幕，才能预览当前编辑。</p>}
+      {packagingDirty && <p>先保存商业包装，旧预览和审核会在保存后失效。</p>}
       {latestRun && <p>{latestRun.status === "queued" ? "排队中" : latestRun.status === "running" ? "渲染中" : latestRun.status === "completed" ? "预览已完成" : latestRun.status === "cancelled" ? "预览已取消" : `预览失败：${latestRun.error ?? "请重试"}`}</p>}
       {!presentation && latestCompleted?.url && <div><p>预览对应保存版本 {latestCompleted.revision}{latestCompleted.subtitleRevision !== undefined || subtitles.revision > 0 ? `／字幕版本 ${latestCompleted.subtitleRevision ?? 0}` : ""}
         {latestCompleted.revision !== selected.variant.revision || (latestCompleted.contentRevision ?? 0) !== (selected.contentRevision ?? 0) || (latestCompleted.subtitleRevision ?? 0) !== subtitles.revision || dirty || contentDirty || subtitleDirty ? "（当前编辑已变化）" : ""}</p>
