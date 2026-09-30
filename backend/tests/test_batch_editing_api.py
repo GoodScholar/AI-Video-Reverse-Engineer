@@ -239,7 +239,7 @@ def _reframe_delivery_client(tmp_path, *, source_lock=None, queue=None):
     timing = probe_source_timing(source, "ffprobe")
     raw = {"schemaVersion": 1, "sourceFingerprint": source_fingerprint(source), "sourceWidth": 64, "sourceHeight": 48,
            "targetAspect": {"width": 720, "height": 1280}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
-           "samples": [{"timeSeconds": point, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9}
+           "samples": [{"timeSeconds": point, "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9}
                        for point in timing.elapsed], "uncertaintyReasons": [], "status": "ready",
            "override": {"mode": "auto", "keyframes": []}}
     ready = normalize_reframe(raw, source_fingerprint=source_fingerprint(source), source_width=64, source_height=48,
@@ -1674,7 +1674,7 @@ def test_completed_export_download_rechecks_real_reframe_sources_but_keeps_cente
     assert timing.cfr
     raw = {"schemaVersion": 1, "sourceFingerprint": source_fingerprint(source), "sourceWidth": 64, "sourceHeight": 48,
            "targetAspect": {"width": 720, "height": 1280}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
-           "samples": [{"timeSeconds": point, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9}
+           "samples": [{"timeSeconds": point, "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9}
                        for point in timing.elapsed], "uncertaintyReasons": [], "status": "ready",
            "override": {"mode": "auto", "keyframes": []}}
     ready = normalize_reframe(raw, source_fingerprint=source_fingerprint(source), source_width=64, source_height=48,

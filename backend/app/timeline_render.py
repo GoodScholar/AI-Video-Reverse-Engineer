@@ -211,6 +211,12 @@ def inspect_timeline_media(state: dict, assets: dict, resolve_source, format: st
                     issues.append({**location, "level": "warning", "message": "视频不含音频流，此片段不会提供声音。"})
             except (ValueError, OSError, TimelineRenderError) as error:
                 issues.append({**location, "level": "error", "message": str(error)})
+    if not any(item["level"] == "error" for item in issues) and state.get("packaging") is not None:
+        try:
+            from .montage_packaging import PackagingError, validate_final_events
+            validate_final_events(state["packaging"], [], state["tracks"], batch=False)
+        except PackagingError as error:
+            issues.append({"level": "error", "label": "商业包装", "message": str(error)})
     if not any(item["level"] == "error" for item in issues):
         try:
             validate_workspace({"revision": state["revision"], "settings": state["settings"],

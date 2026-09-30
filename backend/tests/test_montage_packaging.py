@@ -103,8 +103,53 @@ def _reframed_track(*, start=0, duration=1, box=None):
         "reframe": {"sourceWidth": 1000, "sourceHeight": 1000, "samples": [
             {"timeSeconds": 0, "boxes": [box], "center": {"x": .5, "y": .5}, "confidence": .9},
             {"timeSeconds": 1, "boxes": [box], "center": {"x": .5, "y": .5}, "confidence": .9},
-        ], "override": {"mode": "auto", "keyframes": []}},
+        ], "status": "ready", "uncertaintyReasons": [], "override": {"mode": "auto", "keyframes": []}},
     }]}]
+
+
+def test_enabled_packaging_rejects_visible_clip_without_subject_decision_but_ignores_nonoverlap():
+    """A graphic event may not silently assume a visible clip has no subject."""
+    from app.montage_packaging import PackagingError, _subject_boxes
+
+    track = _reframed_track()[0]
+    track["clips"][0].pop("reframe")
+
+    with pytest.raises(PackagingError, match="主体信息缺失需人工构图"):
+        _subject_boxes([track], .2, .8, 720, 1280)
+    assert _subject_boxes([track], 1.1, 1.2, 720, 1280) == []
+
+    # Image clips share the visible-track contract; neither kind may become an
+    # implicit empty subject set merely because it does not have video samples.
+    track["clips"][0]["_stillImage"] = True
+    with pytest.raises(PackagingError, match="主体信息缺失需人工构图"):
+        _subject_boxes([track], .2, .8, 720, 1280)
+
+
+def test_batch_preview_and_export_preflight_share_the_missing_subject_block():
+    from app.montage_packaging import PackagingError, validate_final_events
+
+    track = _reframed_track()[0]
+    track["clips"][0].pop("reframe")
+    cues = [{"id": "cue", "start": .2, "end": .8, "text": "批量包装"}]
+    with pytest.raises(PackagingError, match="主体信息缺失需人工构图"):
+        validate_final_events(_packaging([]), cues, [track], batch=True)
+
+    cues[0].update(start=1.1, end=1.2)
+    assert validate_final_events(_packaging([]), cues, [track], batch=True)["elements"] == []
+
+
+@pytest.mark.parametrize("mode", ["center", "manual"])
+def test_explicit_reframe_risk_decision_allows_packaging_without_inventing_subject_boxes(mode):
+    """Center/manual is an explicit risk decision, never a fake empty detection result."""
+    from app.montage_packaging import _subject_boxes
+
+    track = _reframed_track()[0]
+    reframe = track["clips"][0]["reframe"]
+    reframe["samples"] = []
+    reframe["status"] = "review_required"
+    reframe["override"] = {"mode": mode, "keyframes": ([] if mode == "center" else [{"timeSeconds": 0, "x": .5, "y": .5}])}
+
+    assert _subject_boxes([track], .2, .8, 720, 1280) == []
 
 
 def test_auto_layout_avoids_a_moving_reframe_subject_inside_safe_area():

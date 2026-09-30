@@ -73,6 +73,13 @@ def _clip(asset_id: str, start: float, duration: float, **values):
     return clip
 
 
+def _accepted_center_reframe(width: int = 9, height: int = 16):
+    from app.montage_reframe import pending_reframe
+    reframe = pending_reframe(target_width=width, target_height=height, reason="测试中的显式人工构图")
+    reframe["override"] = {"mode": "center", "keyframes": []}
+    return reframe
+
+
 def _timeline(width=64, height=48, fps=24, tracks=(), transitions=()):
     return {"settings": {"width": width, "height": height, "fps": fps}, "tracks": list(tracks),
             "transitions": list(transitions)}
@@ -265,7 +272,7 @@ def test_packaging_uses_one_ass_subtitle_pass_and_keeps_preview_export_coordinat
         return real_build(*args, **kwargs)
     monkeypatch.setattr(timeline_render, "_build_command", capture)
     monkeypatch.setattr("app.batch_subtitles.caption_images", lambda *_: pytest.fail("包装不得走 PNG 字幕"))
-    timeline = _timeline(width=720, height=1280, tracks=[_track("video", [_clip("green", 0, .5)])])
+    timeline = _timeline(width=720, height=1280, tracks=[_track("video", [_clip("green", 0, .5, reframe=_accepted_center_reframe())])])
     cues = [{"id": "cue", "start": .1, "end": .3, "text": "唯一烧录"}]
     preview, export = tmp_path / "pack-preview.mp4", tmp_path / "pack-export.mp4"
 
@@ -314,7 +321,7 @@ def test_production_multiline_outline_pixels_stay_inside_the_compiler_bbox(tmp_p
     if not Path(ffmpeg).is_file():
         pytest.skip("包装真实描边证据需要含 libass 的 FFmpeg")
     background = _video(tmp_path / "outline-background.mp4", "0x123456", 440, duration=.5)
-    timeline = _timeline(width=720, height=1280, tracks=[_track("video", [_clip("background", 0, .5)])])
+    timeline = _timeline(width=720, height=1280, tracks=[_track("video", [_clip("background", 0, .5, reframe=_accepted_center_reframe())])])
     packaging = default_packaging()
     packaging["elements"] = [{
         "id": "outline-title", "kind": "title", "enabled": True, "start": .1, "end": .3,
@@ -377,7 +384,7 @@ def test_production_multiline_outline_pixels_stay_inside_the_compiler_bbox(tmp_p
 def test_packaging_rejects_default_missing_glyph_and_cleans_ass_on_renderer_failure(tmp_path, monkeypatch):
     from app.montage_packaging import default_packaging
     image, output = _image(tmp_path / "green.png", "green"), tmp_path / "bad-packaging.mp4"
-    timeline = _timeline(width=720, height=1280, tracks=[_track("video", [_clip("green", 0, .5)])])
+    timeline = _timeline(width=720, height=1280, tracks=[_track("video", [_clip("green", 0, .5, reframe=_accepted_center_reframe())])])
     with pytest.raises(TimelineRenderError, match="缺少"):
         render_timeline(timeline, {"green": image}, output, format="preview", packaging=default_packaging(),
                         packaging_cues=[{"id": "bad", "start": 0, "end": .4, "text": "\U00020000"}])
@@ -479,7 +486,7 @@ def test_reframe_moves_a_full_bleed_crop_in_source_time_without_black_padding(tm
         "schemaVersion": 1, "sourceFingerprint": source_fingerprint(source), "sourceWidth": 128, "sourceHeight": 48,
         "targetAspect": {"width": 1, "height": 2}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
             "samples": [
-                {"timeSeconds": point, "boxes": [{"x": .1, "y": .1, "width": .1, "height": .8, "label": "person", "confidence": .9}],
+                {"timeSeconds": point, "boxes": [{"x": .15 + .6 * point / 2.958333, "y": .1, "width": .1, "height": .8, "label": "person", "confidence": .9}],
                  "center": {"x": .2 + .6 * point / 2.958333, "y": .5}, "confidence": .9}
                 for point in (0, .5, 1, 1.5, 2, 2.5, 2.958333)
             ], "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []},

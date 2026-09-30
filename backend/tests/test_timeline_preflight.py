@@ -41,6 +41,28 @@ def test_actual_stream_duration_and_audio_are_checked(tmp_path):
     assert not wav['ready']
 
 
+def test_enabled_packaging_blocks_an_unanalysed_visible_clip_but_not_a_nonoverlap(tmp_path):
+    from app.montage_packaging import default_packaging
+
+    client, _ = setup(tmp_path)
+    draft = _workspace()
+    draft['packaging'] = default_packaging()
+    draft['packaging']['elements'] = [{
+        'id': 'title', 'kind': 'title', 'enabled': True, 'start': .2, 'end': .8,
+        'text': '主体安全', 'position': 'top', 'style': 'plain',
+    }]
+    assert client.put(BASE, json=draft).status_code == 200
+    blocked = client.post(BASE + '/preflight', json={'revision': 1, 'format': 'mp4'}).json()
+    assert not blocked['ready']
+    assert any('主体信息缺失需人工构图' in issue['message'] for issue in blocked['issues'])
+
+    draft['revision'] = 1
+    draft['packaging']['elements'][0]['start'] = 2.1
+    draft['packaging']['elements'][0]['end'] = 2.5
+    assert client.put(BASE, json=draft).status_code == 200
+    assert client.post(BASE + '/preflight', json={'revision': 2, 'format': 'mp4'}).json()['ready']
+
+
 def test_audio_probe_is_cached_and_muted_wav_is_blocked(tmp_path, monkeypatch):
     from app import timeline_render
     client, _ = setup(tmp_path)

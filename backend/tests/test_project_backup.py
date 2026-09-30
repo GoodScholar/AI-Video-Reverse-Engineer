@@ -2,6 +2,7 @@ import io
 import json
 import threading
 import zipfile
+import subprocess
 
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -143,6 +144,36 @@ def test_backup_rejects_a_ready_static_image_reframe_whose_center_crops_out_the_
                            "targetAspect": {"width": 9, "height": 16}, "detectorVersion": DETECTOR_VERSION,
                            "modelSha256": MODEL_SHA256, "samples": [{"timeSeconds": 0, "boxes": [{"x": .02, "y": .1, "width": .15, "height": .7,
                            "label": "person", "confidence": .9}], "center": {"x": .9, "y": .5}, "confidence": .9}], "uncertaintyReasons": [], "status": "ready",
+                           "override": {"mode": "auto", "keyframes": []},
+                       }}]}]
+        TimelineStore(tmp_path).save(pid, timeline)
+
+        assert client.post(f'/api/projects/{pid}/backup', json={}).status_code == 422
+
+
+def test_backup_rejects_a_ready_video_reframe_without_a_person_fact(tmp_path):
+    """A backup cannot preserve a forged video ready record that render would reject."""
+    from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256
+    from app.timeline import TimelineStore
+
+    video = tmp_path / "source.mp4"
+    subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    "color=red:size=64x48:rate=24:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video)],
+                   check=True, capture_output=True)
+    with TestClient(create_app(data_dir=tmp_path)) as client:
+        pid = create(client)
+        uploaded = client.post(f'/api/projects/{pid}/preproduction/assets?role=motion', files={
+            'file': ('source.mp4', video.read_bytes(), 'video/mp4'),
+        }).json()
+        asset_id = uploaded['assets'][0]['id']
+        timeline = TimelineStore(tmp_path).load(pid)
+        timeline['tracks'] = [{"id": "video", "name": "画面", "kind": "video", "muted": False, "hidden": False,
+            "clips": [{"id": "clip", "assetId": asset_id, "start": 0, "inPoint": 0, "duration": 1, "speed": 1,
+                       "volume": 1, "fadeIn": 0, "fadeOut": 0, "reframe": {
+                           "schemaVersion": 1, "sourceFingerprint": "a" * 64, "sourceWidth": 64, "sourceHeight": 48,
+                           "targetAspect": {"width": 9, "height": 16}, "detectorVersion": DETECTOR_VERSION,
+                           "modelSha256": MODEL_SHA256, "samples": [{"timeSeconds": 0, "boxes": [],
+                           "center": {"x": .5, "y": .5}, "confidence": .9}], "uncertaintyReasons": [], "status": "ready",
                            "override": {"mode": "auto", "keyframes": []},
                        }}]}]
         TimelineStore(tmp_path).save(pid, timeline)

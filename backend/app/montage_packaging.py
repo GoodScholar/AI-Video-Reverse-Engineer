@@ -341,10 +341,8 @@ def _interpolated_boxes(samples: list[dict[str, Any]], source_time: float) -> li
     return result or [box for sample in (left, right) for box in sample.get("boxes", []) if isinstance(box, dict)]
 
 
-def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width: int, height: int) -> list[tuple[float, float, float, float]]:
-    """Project only subjects active during an event onto its output canvas."""
-    from .montage_reframe import _center_at, _crop_position, crop_geometry
-    result = []
+def _visible_event_reframes(tracks: list[dict[str, Any]], start: float, end: float):
+    """Yield visible clip facts only after enforcing the packaging safety decision."""
     for track in tracks:
         if not isinstance(track, dict) or track.get("kind") != "video" or track.get("hidden"):
             continue
@@ -353,142 +351,162 @@ def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width
                 continue
             reframe = clip.get("reframe")
             if not isinstance(reframe, dict):
-                continue
-            source_w, source_h, samples = reframe.get("sourceWidth"), reframe.get("sourceHeight"), reframe.get("samples")
-            if type(source_w) is not int or type(source_h) is not int or source_w <= 0 or source_h <= 0 or not isinstance(samples, list):
-                continue
-            target = reframe.get("targetAspect") or {"width": width, "height": height}
-            if (not isinstance(target, dict) or type(target.get("width")) is not int or type(target.get("height")) is not int
-                    or target["width"] <= 0 or target["height"] <= 0
-                    or target["width"] * height != target["height"] * width):
-                raise PackagingError("主体构图目标与包装画布不一致，需人工确认。")
+                raise PackagingError("主体信息缺失需人工构图；请先分析主体，或选择中心裁剪/人工关键点。")
+            override = reframe.get("override")
+            mode = override.get("mode") if isinstance(override, dict) else None
+            if reframe.get("status") == "review_required":
+                if mode not in ("center", "manual", "replace"):
+                    raise PackagingError("主体信息缺失需人工构图；请先分析主体，或选择中心裁剪/人工关键点。")
+                # An explicit crop is a user-accepted risk, not detection
+                # evidence.  With no boxes we do not invent an empty subject
+                # occupancy area for the graphics compiler.
+                if not reframe.get("samples"):
+                    continue
+            elif reframe.get("status") != "ready":
+                raise PackagingError("主体信息缺失需人工构图；请先分析主体，或选择中心裁剪/人工关键点。")
+            yield clip, reframe
+
+
+def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width: int, height: int) -> list[tuple[float, float, float, float]]:
+    """Project only subjects active during an event onto its output canvas."""
+    from .montage_reframe import _center_at, _crop_position, crop_geometry
+    result = []
+    for clip, reframe in _visible_event_reframes(tracks, start, end):
+        source_w, source_h, samples = reframe.get("sourceWidth"), reframe.get("sourceHeight"), reframe.get("samples")
+        if type(source_w) is not int or type(source_h) is not int or source_w <= 0 or source_h <= 0 or not isinstance(samples, list):
+            continue
+        target = reframe.get("targetAspect") or {"width": width, "height": height}
+        if (not isinstance(target, dict) or type(target.get("width")) is not int or type(target.get("height")) is not int
+                or target["width"] <= 0 or target["height"] <= 0
+                or target["width"] * height != target["height"] * width):
+            raise PackagingError("主体构图目标与包装画布不一致，需人工确认。")
+        try:
+            crop_w, crop_h = crop_geometry(source_w, source_h, width, height)
+        except ValueError as error:
+            raise PackagingError("主体构图窗口无效，需人工确认。") from error
+        clip_start, clip_end = float(clip.get("start", 0)), float(clip.get("start", 0)) + float(clip.get("duration", 0))
+        overlap_start, overlap_end = max(start, clip_start), min(end, clip_end)
+        speed = clip.get("speed", 1)
+        in_point = clip.get("inPoint", 0)
+        if type(speed) not in (int, float) or speed <= 0 or type(in_point) not in (int, float):
+            raise PackagingError("主体构图窗口无效，需人工确认。")
+        source_start = float(in_point) + (overlap_start - clip_start) * float(speed)
+        source_end = float(in_point) + (overlap_end - clip_start) * float(speed)
+        clip_source_end = float(in_point) + float(clip.get("duration", 0)) * float(speed)
+        usable = [sample for sample in samples if isinstance(sample, dict) and isinstance(sample.get("timeSeconds"), (int, float))]
+        usable.sort(key=lambda sample: float(sample["timeSeconds"]))
+        def project(source_time: float, box: dict[str, Any]) -> tuple[float, float, float, float] | None:
             try:
-                crop_w, crop_h = crop_geometry(source_w, source_h, width, height)
-            except ValueError as error:
-                raise PackagingError("主体构图窗口无效，需人工确认。") from error
-            clip_start, clip_end = float(clip.get("start", 0)), float(clip.get("start", 0)) + float(clip.get("duration", 0))
-            overlap_start, overlap_end = max(start, clip_start), min(end, clip_end)
-            speed = clip.get("speed", 1)
-            in_point = clip.get("inPoint", 0)
-            if type(speed) not in (int, float) or speed <= 0 or type(in_point) not in (int, float):
-                raise PackagingError("主体构图窗口无效，需人工确认。")
-            source_start = float(in_point) + (overlap_start - clip_start) * float(speed)
-            source_end = float(in_point) + (overlap_end - clip_start) * float(speed)
-            clip_source_end = float(in_point) + float(clip.get("duration", 0)) * float(speed)
-            usable = [sample for sample in samples if isinstance(sample, dict) and isinstance(sample.get("timeSeconds"), (int, float))]
-            usable.sort(key=lambda sample: float(sample["timeSeconds"]))
-            def project(source_time: float, box: dict[str, Any]) -> tuple[float, float, float, float] | None:
-                try:
-                    crop_x, crop_y = _crop_position(_center_at(reframe, source_time), source_w, source_h, crop_w, crop_h)
-                except (KeyError, TypeError, ValueError):
-                    raise PackagingError("主体构图轨迹无效，需人工确认。") from None
-                try:
-                    x, y, box_w, box_h = (float(box[key]) for key in ("x", "y", "width", "height"))
-                except (AttributeError, KeyError, TypeError, ValueError):
-                    return None
-                return ((x * source_w - crop_x) * width / crop_w, (y * source_h - crop_y) * height / crop_h,
-                        ((x + box_w) * source_w - crop_x) * width / crop_w,
-                        ((y + box_h) * source_h - crop_y) * height / crop_h)
+                crop_x, crop_y = _crop_position(_center_at(reframe, source_time), source_w, source_h, crop_w, crop_h)
+            except (KeyError, TypeError, ValueError):
+                raise PackagingError("主体构图轨迹无效，需人工确认。") from None
+            try:
+                x, y, box_w, box_h = (float(box[key]) for key in ("x", "y", "width", "height"))
+            except (AttributeError, KeyError, TypeError, ValueError):
+                return None
+            return ((x * source_w - crop_x) * width / crop_w, (y * source_h - crop_y) * height / crop_h,
+                    ((x + box_w) * source_w - crop_x) * width / crop_w,
+                    ((y + box_h) * source_h - crop_y) * height / crop_h)
 
-            def boxes(sample: dict[str, Any]) -> list[dict[str, Any]]:
-                return [box for box in sample.get("boxes", []) if isinstance(box, dict)]
+        def boxes(sample: dict[str, Any]) -> list[dict[str, Any]]:
+            return [box for box in sample.get("boxes", []) if isinstance(box, dict)]
 
-            def paired_boxes(left_boxes: list[dict[str, Any]], right_boxes: list[dict[str, Any]]):
-                """Pair only explicit identities (or the sole unambiguous subject)."""
-                def same_label(left: dict[str, Any], right: dict[str, Any]) -> bool:
-                    label = left.get("label")
-                    return isinstance(label, str) and bool(label) and label == right.get("label")
+        def paired_boxes(left_boxes: list[dict[str, Any]], right_boxes: list[dict[str, Any]]):
+            """Pair only explicit identities (or the sole unambiguous subject)."""
+            def same_label(left: dict[str, Any], right: dict[str, Any]) -> bool:
+                label = left.get("label")
+                return isinstance(label, str) and bool(label) and label == right.get("label")
 
-                def unique_by_identity(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-                    identities: dict[str, list[dict[str, Any]]] = {}
-                    for item in items:
-                        identity = item.get("id")
-                        if isinstance(identity, str) and identity:
-                            identities.setdefault(identity, []).append(item)
-                    return {identity: items[0] for identity, items in identities.items() if len(items) == 1}
+            def unique_by_identity(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+                identities: dict[str, list[dict[str, Any]]] = {}
+                for item in items:
+                    identity = item.get("id")
+                    if isinstance(identity, str) and identity:
+                        identities.setdefault(identity, []).append(item)
+                return {identity: items[0] for identity, items in identities.items() if len(items) == 1}
 
-                if len(left_boxes) == len(right_boxes) == 1 and same_label(left_boxes[0], right_boxes[0]):
-                    return [(left_boxes[0], right_boxes[0])], [], []
-                left_ids, right_ids = unique_by_identity(left_boxes), unique_by_identity(right_boxes)
-                shared = {identity for identity in set(left_ids) & set(right_ids)
-                          if same_label(left_ids[identity], right_ids[identity])}
-                paired_left, paired_right = {id(left_ids[label]) for label in shared}, {id(right_ids[label]) for label in shared}
-                return ([(left_ids[label], right_ids[label]) for label in shared],
-                        [box for box in left_boxes if id(box) not in paired_left],
-                        [box for box in right_boxes if id(box) not in paired_right])
+            if len(left_boxes) == len(right_boxes) == 1 and same_label(left_boxes[0], right_boxes[0]):
+                return [(left_boxes[0], right_boxes[0])], [], []
+            left_ids, right_ids = unique_by_identity(left_boxes), unique_by_identity(right_boxes)
+            shared = {identity for identity in set(left_ids) & set(right_ids)
+                      if same_label(left_ids[identity], right_ids[identity])}
+            paired_left, paired_right = {id(left_ids[label]) for label in shared}, {id(right_ids[label]) for label in shared}
+            return ([(left_ids[label], right_ids[label]) for label in shared],
+                    [box for box in left_boxes if id(box) not in paired_left],
+                    [box for box in right_boxes if id(box) not in paired_right])
 
-            def interpolate(left_box: dict[str, Any], right_box: dict[str, Any], fraction: float) -> dict[str, float] | None:
-                try:
-                    return {key: float(left_box[key]) + (float(right_box[key]) - float(left_box[key])) * fraction
-                            for key in ("x", "y", "width", "height")}
-                except (KeyError, TypeError, ValueError):
-                    return None
+        def interpolate(left_box: dict[str, Any], right_box: dict[str, Any], fraction: float) -> dict[str, float] | None:
+            try:
+                return {key: float(left_box[key]) + (float(right_box[key]) - float(left_box[key])) * fraction
+                        for key in ("x", "y", "width", "height")}
+            except (KeyError, TypeError, ValueError):
+                return None
 
-            def append_sweep(left_sample: dict[str, Any], right_sample: dict[str, Any], segment_start: float,
-                             segment_end: float) -> None:
-                left_time, right_time = float(left_sample["timeSeconds"]), float(right_sample["timeSeconds"])
-                left_boxes, right_boxes = boxes(left_sample), boxes(right_sample)
-                pairs, left_only, right_only = paired_boxes(left_boxes, right_boxes)
-                swept = []
-                if left_time == right_time:
-                    pairs, left_only, right_only = [], left_boxes, []
-                for first, second in pairs:
-                    for point in (segment_start, segment_end):
-                        box = interpolate(first, second, (point - left_time) / (right_time - left_time))
-                        if box is not None:
-                            swept.append(project(point, box))
-                # When identity is ambiguous (A+B→A, changed detector labels,
-                # or duplicate labels), reserve every endpoint box.  The crop
-                # centre is still evaluated at the event/sample intersection,
-                # never at the unrelated whole-segment endpoint.
-                for box in left_only + right_only:
-                    swept.extend((project(segment_start, box), project(segment_end, box)))
-                swept = [box for box in swept if box is not None]
-                if not swept:
-                    return
-                left, top = min(box[0] for box in swept), min(box[1] for box in swept)
-                right, bottom = max(box[2] for box in swept), max(box[3] for box in swept)
-                if right > 0 and bottom > 0 and left < width and top < height:
-                    result.append((max(0, left), max(0, top), min(width, right), min(height, bottom)))
+        def append_sweep(left_sample: dict[str, Any], right_sample: dict[str, Any], segment_start: float,
+                         segment_end: float) -> None:
+            left_time, right_time = float(left_sample["timeSeconds"]), float(right_sample["timeSeconds"])
+            left_boxes, right_boxes = boxes(left_sample), boxes(right_sample)
+            pairs, left_only, right_only = paired_boxes(left_boxes, right_boxes)
+            swept = []
+            if left_time == right_time:
+                pairs, left_only, right_only = [], left_boxes, []
+            for first, second in pairs:
+                for point in (segment_start, segment_end):
+                    box = interpolate(first, second, (point - left_time) / (right_time - left_time))
+                    if box is not None:
+                        swept.append(project(point, box))
+            # When identity is ambiguous (A+B→A, changed detector labels,
+            # or duplicate labels), reserve every endpoint box.  The crop
+            # centre is still evaluated at the event/sample intersection,
+            # never at the unrelated whole-segment endpoint.
+            for box in left_only + right_only:
+                swept.extend((project(segment_start, box), project(segment_end, box)))
+            swept = [box for box in swept if box is not None]
+            if not swept:
+                return
+            left, top = min(box[0] for box in swept), min(box[1] for box in swept)
+            right, bottom = max(box[2] for box in swept), max(box[3] for box in swept)
+            if right > 0 and bottom > 0 and left < width and top < height:
+                result.append((max(0, left), max(0, top), min(width, right), min(height, bottom)))
 
-            if not usable:
-                raise PackagingError("主体检测时间覆盖未知，需人工确认。")
-            if clip.get("_stillImage"):
-                if len(usable) != 1 or float(usable[0]["timeSeconds"]) != 0:
-                    raise PackagingError("静态图片主体检测必须有唯一的 0 秒样本，需人工确认。")
-                append_sweep(usable[0], usable[0], 0, 0)
-                continue
-            first_time, last_time = float(usable[0]["timeSeconds"]), float(usable[-1]["timeSeconds"])
-            if source_start < first_time - 1e-9:
-                raise PackagingError("主体检测时间覆盖未知，需人工确认。")
+        if not usable:
+            raise PackagingError("主体检测时间覆盖未知，需人工确认。")
+        if clip.get("_stillImage"):
+            if len(usable) != 1 or float(usable[0]["timeSeconds"]) != 0:
+                raise PackagingError("静态图片主体检测必须有唯一的 0 秒样本，需人工确认。")
+            append_sweep(usable[0], usable[0], 0, 0)
+            continue
+        first_time, last_time = float(usable[0]["timeSeconds"]), float(usable[-1]["timeSeconds"])
+        if source_start < first_time - 1e-9:
+            raise PackagingError("主体检测时间覆盖未知，需人工确认。")
 
-            # Each interval is clipped before interpolation, so an event at
-            # .9-.1 of a 0-1 movement only reserves that final tenth.
-            covered_until = last_time
-            for left_sample, right_sample in zip(usable, usable[1:]):
-                left_time, right_time = float(left_sample["timeSeconds"]), float(right_sample["timeSeconds"])
-                segment_start, segment_end = max(source_start, left_time), min(source_end, right_time)
-                if segment_start < segment_end:
-                    append_sweep(left_sample, right_sample, segment_start, segment_end)
+        # Each interval is clipped before interpolation, so an event at
+        # .9-.1 of a 0-1 movement only reserves that final tenth.
+        covered_until = last_time
+        for left_sample, right_sample in zip(usable, usable[1:]):
+            left_time, right_time = float(left_sample["timeSeconds"]), float(right_sample["timeSeconds"])
+            segment_start, segment_end = max(source_start, left_time), min(source_end, right_time)
+            if segment_start < segment_end:
+                append_sweep(left_sample, right_sample, segment_start, segment_end)
 
-            # Task1 samples are real display-frame PTS.  Its last selected
-            # frame is a finite half-open hold, never an unbounded terminal
-            # keyframe.  Persisted duration wins; old records may use their
-            # measured sampling cadence or prior real sample interval.  With
-            # no such evidence, refuse automatic layout rather than returning
-            # an empty occupancy set after the last sample.
-            hold = reframe.get("frameDurationSeconds")
-            if not isinstance(hold, (int, float)) or not math.isfinite(hold) or hold <= 0:
-                hold = reframe.get("samplingIntervalSeconds")
-            if (not isinstance(hold, (int, float)) or not math.isfinite(hold) or hold <= 0) and len(usable) > 1:
-                hold = last_time - float(usable[-2]["timeSeconds"])
-            if isinstance(hold, (int, float)) and math.isfinite(hold) and hold > 0:
-                covered_until = min(last_time + float(hold), clip_source_end)
-                tail_start, tail_end = max(source_start, last_time), min(source_end, covered_until)
-                if tail_start < tail_end:
-                    append_sweep(usable[-1], usable[-1], tail_start, tail_end)
-            if source_end > covered_until + 1e-9:
-                raise PackagingError("主体检测时间覆盖未知，需人工确认。")
+        # Task1 samples are real display-frame PTS.  Its last selected
+        # frame is a finite half-open hold, never an unbounded terminal
+        # keyframe.  Persisted duration wins; old records may use their
+        # measured sampling cadence or prior real sample interval.  With
+        # no such evidence, refuse automatic layout rather than returning
+        # an empty occupancy set after the last sample.
+        hold = reframe.get("frameDurationSeconds")
+        if not isinstance(hold, (int, float)) or not math.isfinite(hold) or hold <= 0:
+            hold = reframe.get("samplingIntervalSeconds")
+        if (not isinstance(hold, (int, float)) or not math.isfinite(hold) or hold <= 0) and len(usable) > 1:
+            hold = last_time - float(usable[-2]["timeSeconds"])
+        if isinstance(hold, (int, float)) and math.isfinite(hold) and hold > 0:
+            covered_until = min(last_time + float(hold), clip_source_end)
+            tail_start, tail_end = max(source_start, last_time), min(source_end, covered_until)
+            if tail_start < tail_end:
+                append_sweep(usable[-1], usable[-1], tail_start, tail_end)
+        if source_end > covered_until + 1e-9:
+            raise PackagingError("主体检测时间覆盖未知，需人工确认。")
     return result
 
 
@@ -543,7 +561,11 @@ def validate_final_events(packaging: dict[str, Any], cues: list[dict[str, Any]],
     if _PROOF_FONT.get() is None:
         private_font_path()
     checked = validate_packaging(packaging, cues, tracks, batch=batch)
-    _element_events(checked, cues, 0, 0)
+    for event in _element_events(checked, cues, 0, 0):
+        # Preflight has no output dimensions, but it can still prove that each
+        # visible event interval has a deliberate subject decision.  Geometry
+        # and avoidance are checked by _subject_boxes during ASS compilation.
+        list(_visible_event_reframes(tracks, event["start"], event["end"]))
     return checked
 
 

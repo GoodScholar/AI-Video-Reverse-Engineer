@@ -112,6 +112,63 @@ def test_still_image_rejects_malformed_or_zero_confidence_auto_person_facts():
         validate_stored_reframe(analysis, still_image=True)
 
 
+@pytest.mark.parametrize("boxes,center", [
+    ([], {"x": .5, "y": .5}),
+    ([{"x": .2, "y": .1, "width": .3, "height": .7, "label": "product", "confidence": .9}], {"x": .5, "y": .5}),
+    ([{"x": .2, "y": .1, "width": .3, "height": .7, "label": "person", "confidence": .9},
+      {"x": .6, "y": .1, "width": .2, "height": .7, "label": "product", "confidence": .9}], {"x": .5, "y": .5}),
+    ([{"x": .02, "y": .1, "width": .15, "height": .7, "label": "person", "confidence": .9}], {"x": .9, "y": .5}),
+])
+def test_video_auto_reframe_never_accepts_untrusted_subject_facts(boxes, center):
+    """A ready video result must prove one visible person in every real crop window."""
+    analysis = _analysis(samples=[
+        {"timeSeconds": 0, "boxes": boxes, "center": center, "confidence": .9},
+        {"timeSeconds": 1, "boxes": boxes, "center": center, "confidence": .9},
+    ])
+    timing = SourceTiming((0, 1), (1, 1), True, None)
+
+    normalized = normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
+                                   source_timing=timing, required_start=0, required_end=2)
+
+    assert normalized["status"] == "review_required"
+    assert "唯一可信 person" in normalized["uncertaintyReasons"][-1] or "裁窗" in normalized["uncertaintyReasons"][-1]
+    with pytest.raises(ReframeError):
+        validate_stored_reframe(analysis)
+    with pytest.raises(ReframeError):
+        reframe_filter(analysis, source_width=1920, source_height=1080, output_width=720, output_height=1280,
+                       in_point=0, speed=1, duration=1, source_timing=timing)
+
+
+def test_video_worker_malformed_ready_box_is_sanitized_to_review_but_cannot_be_stored_or_rendered():
+    """Worker output cannot turn a malformed box into durable rendering authority."""
+    analysis = _analysis(samples=[
+        {"timeSeconds": 0, "boxes": [{"x": .9, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}],
+         "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 1, "boxes": [{"x": .9, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}],
+         "center": {"x": .5, "y": .5}, "confidence": .9},
+    ])
+    timing = SourceTiming((0, 1), (1, 1), True, None)
+
+    normalized = normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
+                                   source_timing=timing, required_start=0, required_end=2)
+
+    assert normalized["status"] == "review_required"
+    assert normalized["samples"] == []
+    with pytest.raises(ReframeError):
+        validate_stored_reframe(analysis)
+    with pytest.raises(ReframeError):
+        reframe_filter(analysis, source_width=1920, source_height=1080, output_width=720, output_height=1280,
+                       in_point=0, speed=1, duration=1, source_timing=timing)
+
+
+def test_ready_video_rejects_uncertainty_even_when_its_person_box_is_valid():
+    analysis = _analysis()
+    analysis["uncertaintyReasons"] = ["商品或遮挡无法排除"]
+
+    with pytest.raises(ReframeError, match="完成的主体裁剪"):
+        validate_stored_reframe(analysis)
+
+
 @pytest.mark.parametrize("override", [
     {"mode": "manual", "keyframes": [{"timeSeconds": .1, "x": .5, "y": .5}]},
     {"mode": "manual", "keyframes": [
@@ -161,9 +218,9 @@ def test_normalize_reframe_rejects_analysis_for_another_or_invalid_source(field,
 
 def test_normalize_reframe_accepts_a_real_half_open_final_frame_only_when_sampling_cadence_covers_it():
     analysis = _analysis(samples=[
-        {"timeSeconds": 0.0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
-        {"timeSeconds": 1.0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
-        {"timeSeconds": 1.966667, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 0.0, "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 1.0, "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 1.966667, "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9},
     ])
 
     stored = normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
@@ -178,28 +235,28 @@ def test_normalize_reframe_accepts_a_real_half_open_final_frame_only_when_sampli
 
 def test_normalize_reframe_rejects_worker_timing_holes_and_long_tail_but_accepts_real_frame_tolerance():
     analysis = _analysis(samples=[
-        {"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
-        {"timeSeconds": 10, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
-        {"timeSeconds": 19.958333, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 0, "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 10, "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 19.958333, "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9},
     ])
     analysis.update(frameDurationSeconds=1 / 24, samplingIntervalSeconds=.5)
     assert normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
                              required_start=0, required_end=20)["status"] == "review_required"
 
     analysis["samples"] = [
-        {"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
-        {"timeSeconds": .5, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
-        {"timeSeconds": 1.958333, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 0, "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": .5, "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 1.958333, "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9},
     ]
     assert normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
                              required_start=0, required_end=2)["status"] == "review_required"
 
     analysis["samples"] = [
-        {"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
-        {"timeSeconds": .5, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
-        {"timeSeconds": 1.0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
-        {"timeSeconds": 1.5, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
-        {"timeSeconds": 1.958333, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 0, "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": .5, "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 1.0, "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 1.5, "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 1.958333, "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9},
     ]
     normalized = normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
                                    required_start=0, required_end=2)
@@ -268,8 +325,8 @@ def test_local_detector_spools_large_child_output_and_reaps_cancelled_child(tmp_
 def test_normalize_reframe_requires_server_pts_evidence_for_auto_ready():
     """客户端声明的宽松 cadence 不能让 [0,10] 冒充 [0,20)。"""
     analysis = _analysis(samples=[
-        {"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
-        {"timeSeconds": 10, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 0, "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 10, "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9},
     ])
     analysis.update(frameDurationSeconds=1, samplingIntervalSeconds=2)
     timing = SourceTiming((0.0, 10.0, 19.958333), (.041667, .041667, .041667), True, None)
@@ -284,8 +341,8 @@ def test_normalize_reframe_requires_server_pts_evidence_for_auto_ready():
 def test_normalize_reframe_uses_the_same_integer_half_open_boundary_as_the_worker():
     """A non-zero container PTS can encode 2.1 as 4.1 - 2.0 just below 2.1 in binary."""
     analysis = _analysis(samples=[
-        {"timeSeconds": 2.033334, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
-        {"timeSeconds": 2.066667, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 2.033334, "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 2.066667, "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9},
     ])
     timing = SourceTiming((0.0, 4.033334 - 2.0, 4.066667 - 2.0, 4.1 - 2.0),
                           (.033333, .033333, .033333, .033333), True, None)
