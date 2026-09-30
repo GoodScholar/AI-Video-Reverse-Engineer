@@ -164,9 +164,15 @@ def validate_timeline_history(store, project_id, timeline, assets):
         if run.get('error') is not None and not isinstance(run['error'], str):
             fail('备份中的渲染错误信息无效。')
         snapshot = run.get('snapshot')
-        if not isinstance(snapshot, dict) or set(snapshot) not in ({'settings', 'tracks'}, {'settings', 'tracks', 'transitions'}):
+        if not isinstance(snapshot, dict) or set(snapshot) not in ({'settings', 'tracks'}, {'settings', 'tracks', 'transitions'}, {'settings', 'tracks', 'packaging'}, {'settings', 'tracks', 'transitions', 'packaging'}):
             fail('备份中的渲染快照无效。')
         _, tracks = validate_workspace({'revision': run['revision'], **snapshot}, assets)
+        if snapshot.get('packaging') is not None:
+            try:
+                from .montage_packaging import validate_packaging
+                validate_packaging(snapshot['packaging'], [], tracks)
+            except ValueError:
+                fail('备份中的包装字体或模板无效。')
         used = {clip['assetId'] for track in tracks for clip in track['clips']}
         sources = run.get('sources')
         if not isinstance(sources, dict) or set(sources) != used:

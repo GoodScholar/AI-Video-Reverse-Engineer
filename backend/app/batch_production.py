@@ -11,6 +11,8 @@ from .durable_runs import LOCAL_RUN_POLICY, RunConflict, freeze_run_input
 from .timeline import validate_transitions, validate_workspace
 from .video_aspect import PRODUCT_PRESETS, ratio_label, resolve_product_aspect, valid_aspect_mode
 
+_PACKAGING_UNSET = object()
+
 
 class BatchProductionError(ValueError):
     """A business-rule failure that an HTTP adapter may translate."""
@@ -70,6 +72,8 @@ def frozen_edit_snapshot(task: dict[str, Any]) -> dict[str, Any]:
     snapshot = {"settings": deepcopy(variant["settings"]), "tracks": deepcopy(variant["tracks"])}
     if variant.get("transitions"):
         snapshot["transitions"] = deepcopy(variant["transitions"])
+    if variant.get("packaging") is not None:
+        snapshot["packaging"] = deepcopy(variant["packaging"])
     return {
         "contentRevision": content_revision,
         "variantRevision": variant_revision,
@@ -195,7 +199,7 @@ def create_batch(selling_point: str, script: str, aspect: dict[str, Any] | None 
                 {"id": "audio", "name": "声音", "kind": "audio", "muted": False, "hidden": False, "clips": []},
             ],
             "transitions": [],
-            "subtitles": {"revision": 0, "cues": [], "recognitions": []},
+            "subtitles": {"revision": 0, "cues": [], "recognitions": []}, "packaging": None,
             "runs": [], "exports": [],
         },
     }
@@ -466,7 +470,7 @@ def save_variant(task: dict[str, Any], *, expected_revision: int, tracks: list[d
                  settings: dict[str, Any], aspect_mode: str | None, assets: dict[str, dict[str, Any]],
                  validate_subtitles: Callable[[list, list], Any] | None = None,
                  aspect_was_explicit: bool = True,
-                 transitions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                 transitions: list[dict[str, Any]] | None = None, packaging: Any = _PACKAGING_UNSET) -> dict[str, Any]:
     variant = task["variant"]
     if type(expected_revision) is not int or expected_revision != variant["revision"]:
         raise BatchProductionError("batch_variant_conflict", "变体已更新，请刷新后重试。")
@@ -498,9 +502,14 @@ def save_variant(task: dict[str, Any], *, expected_revision: int, tracks: list[d
                 raise ValueError("输出尺寸与所选视频比例不一致")
         if validate_subtitles is not None:
             validate_subtitles(subtitles_for(variant)["cues"], tracks)
+        if packaging is not _PACKAGING_UNSET and packaging is not None:
+            from .montage_packaging import validate_packaging
+            packaging = validate_packaging(packaging, subtitles_for(variant)["cues"], tracks, batch=True)
     except (KeyError, TypeError, ValueError) as error:
         raise BatchProductionError("batch_variant_invalid", str(error), 422) from None
     variant.update(tracks=tracks, transitions=transitions, settings=settings, aspectMode=mode, resolvedAspect=resolved)
+    if packaging is not _PACKAGING_UNSET:
+        variant["packaging"] = packaging
     variant["aspectReason"] = (resolution["reason"] if resolution else
                                ("单条作品覆盖批次视频比例。" if aspect_was_explicit else
                                 variant.get("aspectReason", "沿用作品已保存的输出尺寸。")))
@@ -535,6 +544,8 @@ def submit_preview(task: dict[str, Any], *, expected_revision: int, assets: dict
     frozen["snapshot"] = {"settings": settings, "tracks": tracks}
     if variant.get("transitions"):
         frozen["snapshot"]["transitions"] = validate_transitions(variant["transitions"], tracks)
+    if variant.get("packaging") is not None:
+        frozen["snapshot"]["packaging"] = deepcopy(variant["packaging"])
     run = {
         "id": run_id, "revision": frozen["variantRevision"],
         "contentRevision": frozen["contentRevision"], "subtitleRevision": frozen["subtitleRevision"],

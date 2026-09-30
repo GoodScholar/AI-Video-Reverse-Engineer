@@ -4,6 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.9"
 dependencies = [
   "fastapi==0.115.12",
+  "fonttools==4.60.2",
   "httpx==0.28.1",
   "keyring==25.7.0",
   "Pillow==11.3.0",

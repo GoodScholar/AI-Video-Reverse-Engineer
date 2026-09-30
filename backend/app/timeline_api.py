@@ -83,7 +83,7 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
         return {"revision": state["revision"], "settings": state["settings"], "tracks": state["tracks"],
                 "transitions": state.get("transitions", []), "assets": public_assets(project_id),
                 "runs": [public_run(project_id, run) for run in state["runs"]],
-                "reframeAnalysis": state.get("reframeAnalysis", {})}
+                "reframeAnalysis": state.get("reframeAnalysis", {}), "packaging": state.get("packaging")}
 
     def schedule_reframe(project_id, clip_id, *, expected_revision=None):
         run_id = uuid4().hex
@@ -357,6 +357,15 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             state["settings"] = settings
             state["tracks"] = tracks
             state["transitions"] = validate_transitions(transition_input, tracks)
+            if "packaging" in body:
+                if body["packaging"] is None:
+                    state.pop("packaging", None)
+                else:
+                    from .montage_packaging import PackagingError, validate_packaging
+                    try:
+                        state["packaging"] = validate_packaging(body["packaging"], [], tracks)
+                    except PackagingError as error:
+                        fail("timeline_packaging_invalid", str(error), 422)
             state["revision"] += 1
             save(project_id, state)
             return response(project_id, state)
@@ -475,6 +484,8 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                    "snapshot": {"settings": settings, "tracks": tracks,
                                 "transitions": validate_transitions(state.get("transitions", []), tracks)},
                    "sources": sources}
+            if state.get("packaging") is not None:
+                run["snapshot"]["packaging"] = state["packaging"]
             state["runs"].append(run)
             save(project_id, state)
             queue_run(project_id, run_id)

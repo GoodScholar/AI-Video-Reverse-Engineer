@@ -78,6 +78,8 @@ def render_timeline(
     ffprobe_path: str = "ffprobe",
     cancelled: Callable[[], bool] = lambda: False,
     subtitles_path: Optional[Path] = None,
+    packaging: Optional[dict] = None,
+    packaging_cues: Optional[list] = None,
 ) -> dict:
     """将已校验的时间线渲染为 MP4、预览 MP4 或 PCM WAV。
 
@@ -90,6 +92,8 @@ def render_timeline(
         raise TimelineRenderError("时间线渲染已取消。")
     if subtitles_path is not None and (format == "wav" or not Path(subtitles_path).is_file()):
         raise TimelineRenderError("字幕文件不可用。")
+    if packaging is None:
+        packaging = timeline.get("packaging")
 
     settings = timeline.get("settings") or {}
     width = _positive_even(settings.get("width"), "输出宽度")
@@ -120,9 +124,19 @@ def render_timeline(
     commands_dir = output.parent / (".reframe-" + uuid.uuid4().hex)
     temporary = output.with_name(".%s.%s%s" % (output.stem, uuid.uuid4().hex, output.suffix))
     try:
+        ass_path = None
+        if packaging is not None:
+            if format == "wav":
+                raise TimelineRenderError("WAV 不支持图文包装。")
+            from .montage_packaging import PackagingError, compile_ass, private_font_path
+            try:
+                ass_path = output.parent / ".packaging.ass"
+                ass_path.write_text(compile_ass(packaging, packaging_cues or [], tracks, width, height, private_font_path()), encoding="utf-8")
+            except (OSError, PackagingError) as error:
+                raise TimelineRenderError(str(error)) from error
         command, expected = _build_command(
             clips, transitions, duration, render_width, render_height, fps, format, ffmpeg_path, captions,
-            reframe_commands_dir=commands_dir,
+            reframe_commands_dir=commands_dir, ass_path=ass_path,
         )
         command.append(str(temporary))
         _run_ffmpeg(command, cancelled, cwd=commands_dir if commands_dir.exists() else (Path(subtitles_path).parent if subtitles_path is not None else None))
@@ -140,6 +154,8 @@ def render_timeline(
         _remove_file(temporary)
         raise TimelineRenderError("无法写入时间线渲染输出：%s" % error) from error
     finally:
+        if 'ass_path' in locals() and ass_path is not None:
+            _remove_file(ass_path)
         shutil.rmtree(commands_dir, ignore_errors=True)
 
 
@@ -386,6 +402,7 @@ def _build_command(
     ffmpeg_path: str,
     captions: Optional[list[tuple[Path, float, float]]] = None,
     reframe_commands_dir: Optional[Path] = None,
+    ass_path: Optional[Path] = None,
 ) -> Tuple[List[str], dict]:
     command = [
         ffmpeg_path, "-hide_banner", "-nostdin", "-v", "error", "-y",
@@ -538,6 +555,12 @@ def _build_command(
                 current, input_index, caption_margin, _number(start), _number(end), following))
             current = following
             input_index += 1
+
+    if ass_path is not None:
+        from .montage_packaging import private_font_path
+        filters.append("[vout]ass=filename=%s:fontsdir=%s[packaged]" % (
+            str(ass_path), str(private_font_path().parent)))
+        filters.append("[packaged]null[vout]")
 
     command.extend(["-filter_complex", ";".join(filters)])
     expected = {"duration": duration}

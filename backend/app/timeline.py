@@ -74,11 +74,14 @@ def validate_state(state: Any) -> None:
     if (not isinstance(state.get("settings"), dict) or not isinstance(state.get("tracks"), list)
             or not isinstance(state.get("transitions", []), list) or not isinstance(state.get("runs"), list)):
         raise ValueError("时间线状态无效")
+    if "packaging" in state and state["packaging"] is not None and not isinstance(state["packaging"], dict):
+        raise ValueError("时间线包装无效")
 
 
 def validate_workspace(value: Any, assets: Dict[str, Dict[str, Any]]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     if not isinstance(value, dict) or set(value) not in (
         {"revision", "settings", "tracks"}, {"revision", "settings", "tracks", "transitions"},
+        {"revision", "settings", "tracks", "packaging"}, {"revision", "settings", "tracks", "transitions", "packaging"},
     ):
         raise ValueError("请求字段无效")
     revision = value["revision"]

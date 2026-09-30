@@ -205,6 +205,9 @@ def _validate_state(value: Any) -> None:
         if not isinstance(runs, list):
             raise ValueError("短视频变体无效")
         _validate_timeline_shape(variant["revision"], settings, tracks, variant.get("transitions", []))
+        if variant.get("packaging") is not None:
+            from .montage_packaging import validate_packaging
+            validate_packaging(variant["packaging"], variant.get("subtitles", {}).get("cues", []), tracks, batch=True)
         subtitles = variant.get("subtitles")
         if subtitles is not None:
             if (not isinstance(subtitles, dict) or type(subtitles.get("revision")) is not int or subtitles["revision"] < 0
@@ -434,6 +437,16 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             for run in task["variant"].get("exports", [])
         ]
         return result
+
+    def require_packaging_font(snapshot: dict, cues: list, *, batch: bool) -> None:
+        packaging = snapshot.get("packaging") if isinstance(snapshot, dict) else None
+        if packaging is None:
+            return
+        from .montage_packaging import PackagingError, validate_packaging
+        try:
+            validate_packaging(packaging, cues, snapshot.get("tracks", []), batch=batch)
+        except PackagingError as error:
+            raise BatchProductionError("batch_packaging_invalid", str(error)) from error
 
     def clip_for(task: dict[str, Any], clip_id: str, proposal_id: str | None = None):
         if proposal_id is not None:
@@ -890,6 +903,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 save(project_id, state)
                 snapshot = run["snapshot"]
                 names = dict(run["sources"])
+                require_packaging_font(snapshot, run.get("subtitleCues", []), batch=True)
             sources = render_inputs.resolve(store.path(project_id, "runs", run_id), names)
             staging = store.path(project_id, "runs", run_id, "preview.mp4")
             actual_renderer = renderer
@@ -902,6 +916,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 subtitle_file = store.path(project_id, "runs", run_id, "subtitles.srt")
                 write_srt(subtitle_file, subtitle_cues)
             render_options = {"subtitles_path": subtitle_file} if subtitle_file else {}
+            if snapshot.get("packaging") is not None:
+                render_options["packaging_cues"] = subtitle_cues
             media = actual_renderer(snapshot, sources, staging, format="preview", ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
                                     cancelled=lambda: run_cancelled(project_id, task_id, run_id), **render_options)
             regular_file(staging)
@@ -944,6 +960,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 run["status"] = LOCAL_RUN_POLICY.start(run["status"])
                 save(project_id, state)
                 snapshot, names, cues = run["snapshot"], dict(run["sources"]), run["subtitles"]
+                require_packaging_font(snapshot, cues, batch=True)
             directory = store.path(project_id, "exports", run_id)
             sources = render_inputs.resolve(directory, names)
             subtitle_file = None
@@ -955,9 +972,11 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             if actual_renderer is None:
                 from .timeline_render import render_timeline
                 actual_renderer = render_timeline
+            render_options = {"subtitles_path": subtitle_file} if subtitle_file else {}
+            if snapshot.get("packaging") is not None:
+                render_options["packaging_cues"] = cues
             media = actual_renderer(snapshot, sources, staging, format="mp4", ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
-                                    cancelled=lambda: export_cancelled(project_id, task_id, run_id),
-                                    **({"subtitles_path": subtitle_file} if subtitle_file else {}))
+                                    cancelled=lambda: export_cancelled(project_id, task_id, run_id), **render_options)
             regular_file(staging)
             with lock:
                 state = state_for(project_id)
@@ -1179,7 +1198,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
     @router.put("/{task_id}/variant")
     def save_variant(project_id: str, task_id: str, body: dict[str, Any]):
         project_for(project_id)
-        if not isinstance(body, dict) or not {"revision", "tracks"} <= set(body) or set(body) - {"revision", "tracks", "transitions", "settings", "aspectMode"}:
+        if not isinstance(body, dict) or not {"revision", "tracks"} <= set(body) or set(body) - {"revision", "tracks", "transitions", "settings", "aspectMode", "packaging"}:
             raise HTTPException(422, detail={"code": "batch_variant_invalid", "message": "变体内容无效。"})
         with source_lock or nullcontext(), lock:
             state = state_for(project_id)
@@ -1196,6 +1215,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 aspect_mode=body.get("aspectMode", variant.get("aspectMode")), assets=assets_for(project_id),
                 validate_subtitles=_validate_cues, aspect_was_explicit="aspectMode" in body,
                 transitions=body.get("transitions", variant.get("transitions", [])),
+                **({"packaging": body["packaging"]} if "packaging" in body else {}),
             )
             save(project_id, state)
             return {"variant": public_task(project_id, task)["variant"]}
@@ -1901,8 +1921,17 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         source_snapshots = {}
         try:
             for (child_id, run_id), (_child, preview) in planned_snapshots.items():
-                source_snapshots[(child_id, run_id)] = production_call(
-                    prepare_approved_source_snapshot, project_id, run_id, preview, assets)
+                try:
+                    source_snapshots[(child_id, run_id)] = prepare_approved_source_snapshot(
+                        project_id, run_id, preview, assets)
+                except BatchProductionError as error:
+                    # A source already different from its approved preview is
+                    # a durable failed delivery record (the existing contract),
+                    # not a lock-free proof/CAS conflict.  A change *during*
+                    # proof preparation remains retryable and must escape.
+                    if error.code != "batch_asset_unavailable":
+                        raise
+                    source_snapshots[(child_id, run_id)] = error
         except BaseException:
             cleanup_prepared_sources()
             raise
@@ -1936,6 +1965,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
 
             def export_sources(run_id, child, preview, available):
                 proof = source_snapshots.get((child["id"], run_id))
+                if isinstance(proof, BatchProductionError):
+                    raise proof
                 if proof is None:
                     raise BatchProductionError("batch_export_reframe_conflict", "导出准备已变化，请刷新后重试。")
                 consume_source_snapshot(project_id, preview, proof, available)
@@ -2025,6 +2056,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             if run["status"] != "completed":
                 raise HTTPException(409, detail={"code": "batch_export_unavailable", "message": "成片尚不可用。"})
             try:
+                require_packaging_font(run.get("snapshot", {}), run.get("subtitles", []), batch=True)
                 consume_reframe_safety(project_id, task, run, proof, assets_for(project_id))
                 if run["output"] != run_id + ".mp4":
                     raise ValueError("成片关联无效")
@@ -2058,6 +2090,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             if run["status"] != "completed":
                 raise HTTPException(409, detail={"code": "batch_preview_unavailable", "message": "预览尚不可用。"})
             try:
+                require_packaging_font(run.get("snapshot", {}), run.get("subtitleCues", []), batch=True)
                 output = run["output"]
                 if output != run_id + ".mp4":
                     raise ValueError("输出关联无效")
