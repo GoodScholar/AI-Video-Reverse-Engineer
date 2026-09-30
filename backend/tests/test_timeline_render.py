@@ -305,6 +305,53 @@ def test_packaging_uses_one_ass_subtitle_pass_and_keeps_preview_export_coordinat
     assert text_bbox(preview, .4)[0] is None and text_bbox(export, .4)[0] is None
 
 
+def test_production_multiline_outline_pixels_stay_inside_the_compiler_bbox(tmp_path):
+    """The real libass fill *and* semi-transparent outline fit the production prediction."""
+    from app.montage_packaging import _element_events, compile_ass, default_packaging, private_font_path
+
+    ffmpeg = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"
+    if not Path(ffmpeg).is_file():
+        pytest.skip("包装真实描边证据需要含 libass 的 FFmpeg")
+    background = _video(tmp_path / "outline-background.mp4", "0x123456", 440, duration=.5)
+    timeline = _timeline(width=720, height=1280, tracks=[_track("video", [_clip("background", 0, .5)])])
+    packaging = default_packaging()
+    packaging["elements"] = [{
+        "id": "outline-title", "kind": "title", "enabled": True, "start": .1, "end": .3,
+        "text": "多行描边\n完整边界", "position": "top", "style": "emphasis",
+    }]
+    ass = compile_ass(packaging, [], [], 720, 1280, private_font_path())
+    ass_path = tmp_path / "production-multiline-outline.ass"
+    ass_path.write_text(ass, encoding="utf-8")
+    rendered, control = tmp_path / "production-multiline-outline.mp4", tmp_path / "outline-control.mp4"
+    render_timeline(timeline, {"background": background}, rendered, format="mp4", packaging=packaging,
+                    packaging_cues=[], ffmpeg_path=ffmpeg, ffprobe_path="/opt/homebrew/opt/ffmpeg-full/bin/ffprobe")
+    render_timeline(timeline, {"background": background}, control, format="mp4", ffmpeg_path=ffmpeg,
+                    ffprobe_path="/opt/homebrew/opt/ffmpeg-full/bin/ffprobe")
+    frame, base_frame = tmp_path / "production-multiline-outline.png", tmp_path / "outline-control.png"
+    for video, image in ((rendered, frame), (control, base_frame)):
+        _run(ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-y", "-ss", "0.2", "-i", str(video),
+             "-frames:v", "1", str(image))
+    with Image.open(frame).convert("RGB") as actual, Image.open(base_frame).convert("RGB") as baseline:
+        points = [(x, y) for y in range(actual.height) for x in range(actual.width)
+                  if sum(abs(left - right) for left, right in zip(actual.getpixel((x, y)), baseline.getpixel((x, y)))) > 8]
+    assert points  # compare against a real no-ASS render, not a yellow-fill colour threshold
+    actual_box = [min(x for x, _y in points), min(y for _x, y in points),
+                  max(x for x, _y in points) + 1, max(y for _x, y in points) + 1]
+    event = _element_events(packaging, [], 720, 1280)[0]
+    predicted_box = [360 - event["width"] / 2, 64, 360 + event["width"] / 2, 64 + event["height"]]
+    (tmp_path / "production-multiline-outline-predicted.json").write_text(json.dumps(predicted_box), encoding="utf-8")
+    (tmp_path / "production-multiline-outline-actual.json").write_text(json.dumps(actual_box), encoding="utf-8")
+    fontselect = subprocess.run(
+        [ffmpeg, "-hide_banner", "-nostdin", "-v", "verbose", "-i", str(background),
+         "-vf", "ass=filename=%s:fontsdir=%s" % (ass_path, private_font_path().parent),
+         "-ss", "0.2", "-frames:v", "1", "-f", "null", "-"], check=True, capture_output=True, text=True,
+    ).stderr
+    (tmp_path / "production-multiline-outline-fontselect.log").write_text(fontselect, encoding="utf-8")
+    assert "fontselect" in fontselect and "NotoSansCJKsc-Regular" in fontselect
+    assert predicted_box[0] <= actual_box[0] and predicted_box[1] <= actual_box[1]
+    assert predicted_box[2] >= actual_box[2] and predicted_box[3] >= actual_box[3]
+
+
 def test_packaging_rejects_default_missing_glyph_and_cleans_ass_on_renderer_failure(tmp_path, monkeypatch):
     from app.montage_packaging import default_packaging
     image, output = _image(tmp_path / "green.png", "green"), tmp_path / "bad-packaging.mp4"

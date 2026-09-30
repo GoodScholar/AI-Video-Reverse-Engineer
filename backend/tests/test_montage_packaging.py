@@ -175,7 +175,8 @@ def test_subject_sweep_blocks_middle_crossing_and_keeps_appearing_boxes():
     # At a transition both clips contribute independently; no endpoint list is dropped.
     other = {**tracks[0]["clips"][0], "id": "transition-right", "start": .5,
              "reframe": {**reframe, "samples": [{"timeSeconds": 0, "boxes": [{"x": .42, "y": .1, "width": .16, "height": .2,
-                 "label": "right", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9}]}}
+                 "label": "right", "confidence": .9}], "center": {"x": .5, "y": .5}, "confidence": .9}],
+                 "frameDurationSeconds": .5}}
     tracks[0]["clips"].append(other)
     during_transition = _subject_boxes(tracks, .5, .6, 720, 1280)
     assert any(box[1] < 300 for box in during_transition) and any(box[0] < 360 < box[2] for box in during_transition)
@@ -205,3 +206,71 @@ def test_sweep_keeps_offscreen_endpoints_and_short_lifecycle_boxes_conservativel
     tracks[0]["clips"].append(later)
     assert _subject_boxes(tracks, 0, .2, 720, 1280)  # current clip only
     assert not _subject_boxes(tracks, 1.1, 1.2, 720, 1280)  # neither clip covers the gap
+
+
+def test_subject_sweep_uses_only_the_event_subsegment_and_the_real_last_frame_hold():
+    """A tail-frame subject and a late moving subject must not disappear or sweep all history."""
+    from app.montage_packaging import PackagingError, _subject_boxes
+
+    tracks = _reframed_track(duration=.51)
+    reframe = tracks[0]["clips"][0]["reframe"]
+    reframe["frameDurationSeconds"] = .05
+    reframe["samples"] = [{
+        "timeSeconds": .45,
+        "boxes": [{"x": .45, "y": .42, "width": .1, "height": .18, "label": "person", "confidence": .9}],
+        "center": {"x": .5, "y": .5}, "confidence": .9,
+    }]
+
+    # Task1's selected final frame owns [.45, .50), so a .48-.50 event
+    # cannot silently place graphics on the detected subject.
+    tail = _subject_boxes(tracks, .48, .50, 720, 1280)
+    assert tail and any(box[0] < 360 < box[2] for box in tail)
+    # The hold is finite; the clip's extra .01s has no detector authorization.
+    with pytest.raises(PackagingError, match="时间覆盖未知"):
+        _subject_boxes(tracks, .50, .51, 720, 1280)
+
+    tracks = _reframed_track()
+    reframe = tracks[0]["clips"][0]["reframe"]
+    reframe["samples"] = [
+        {"timeSeconds": 0, "boxes": [{"x": .05, "y": .42, "width": .1, "height": .18,
+                                          "label": "person", "confidence": .9}],
+         "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 1, "boxes": [{"x": .85, "y": .42, "width": .1, "height": .18,
+                                          "label": "person", "confidence": .9}],
+         "center": {"x": .5, "y": .5}, "confidence": .9},
+    ]
+
+    # The .9-1 event sees only the final tenth of the path; the old full
+    # 0-1 union falsely occupied the centre.  A mid-path event remains blocked.
+    late = _subject_boxes(tracks, .9, 1, 720, 1280)
+    assert late and not any(box[0] < 360 < box[2] for box in late)
+    middle = _subject_boxes(tracks, .45, .55, 720, 1280)
+    assert any(box[0] < 360 < box[2] for box in middle)
+
+
+def test_subject_sweep_keeps_each_ambiguous_endpoint_and_both_transition_sides_in_a_short_event():
+    """A+B→A must not zip-away B, and an overlapping clip is independently occupied."""
+    from app.montage_packaging import _subject_boxes
+
+    tracks = _reframed_track()
+    reframe = tracks[0]["clips"][0]["reframe"]
+    reframe["samples"] = [
+        {"timeSeconds": 0, "boxes": [
+            {"x": .05, "y": .42, "width": .1, "height": .18, "label": "A", "confidence": .9},
+            {"x": .45, "y": .42, "width": .1, "height": .18, "label": "B", "confidence": .9}],
+         "center": {"x": .5, "y": .5}, "confidence": .9},
+        {"timeSeconds": 1, "boxes": [
+            {"x": .85, "y": .42, "width": .1, "height": .18, "label": "A", "confidence": .9}],
+         "center": {"x": .5, "y": .5}, "confidence": .9},
+    ]
+    right = {**tracks[0]["clips"][0], "id": "right-clip", "start": .9, "duration": .1,
+             "reframe": {**reframe, "frameDurationSeconds": .1, "samples": [{
+                 "timeSeconds": 0, "boxes": [{"x": .42, "y": .1, "width": .16, "height": .2,
+                                                  "label": "right", "confidence": .9}],
+                 "center": {"x": .5, "y": .5}, "confidence": .9,
+             }]}}
+    tracks[0]["clips"].append(right)
+
+    occupied = _subject_boxes(tracks, .92, .98, 720, 1280)
+    assert any(box[0] < 360 < box[2] and box[1] < 640 < box[3] for box in occupied)  # disappearing B
+    assert any(box[1] < 300 for box in occupied)  # incoming transition clip
