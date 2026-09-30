@@ -488,6 +488,55 @@ def test_download_probe_does_not_block_get_or_cancelling_another_export(tmp_path
         assert result["response"].content == b"delivery"
 
 
+def test_packaging_proof_hash_is_outside_lock_and_consumed_once_per_download(tmp_path, monkeypatch):
+    """A completed delivery must not hold the project lock while hashing/compiling its font proof."""
+    from app import montage_packaging
+    from app.montage_packaging import default_packaging
+
+    with _reframe_delivery_client(tmp_path) as fixture:
+        state = json.loads(fixture.state_path.read_text(encoding="utf-8"))
+        task = state["tasks"][0]
+        package = default_packaging()
+        task["variant"]["packaging"] = deepcopy(package)
+        for record in [task["variant"], *task["variant"]["runs"], *task["variant"]["exports"]]:
+            target = record["snapshot"] if "snapshot" in record else record
+            target["packaging"] = deepcopy(package)
+            for track in target["tracks"]:
+                for clip in track["clips"]:
+                    clip.pop("reframe", None)
+        active = deepcopy(task["variant"]["exports"][0])
+        active.update(id="active", status="queued", error=None)
+        task["variant"]["exports"].append(active)
+        fixture.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        entered, release, read_done = threading.Event(), threading.Event(), threading.Event()
+        original = montage_packaging._hash_font
+        calls = []
+        def blocked_hash(path):
+            calls.append(path)
+            entered.set()
+            assert release.wait(5), "测试未释放字体 proof"
+            return original(path)
+        monkeypatch.setattr(montage_packaging, "_hash_font", blocked_hash)
+        result = {}
+        downloading = threading.Thread(target=lambda: result.setdefault(
+            "response", fixture.client.get(f"{fixture.base}/{fixture.task['id']}/exports/delivery/output")
+        ))
+        downloading.start()
+        assert entered.wait(2)
+        reader = threading.Thread(target=lambda: (fixture.client.get(fixture.base), read_done.set()))
+        reader.start()
+        try:
+            assert read_done.wait(.5), "字体 hash/event proof 期间普通读取不应等待项目锁"
+            assert fixture.client.post(f"{fixture.base}/{fixture.task['id']}/exports/active/cancel").status_code == 200
+        finally:
+            release.set()
+        downloading.join(5)
+        reader.join(5)
+        assert result["response"].content == b"delivery"
+        assert len(calls) == 1, "第二锁窗口只能消费 proof，不能重复读取字体"
+
+
 def test_download_rejects_a_run_identity_changed_during_its_probe(tmp_path, monkeypatch):
     from app import montage_reframe
 

@@ -91,12 +91,13 @@ def initial_proposal_packaging(*, script: str, selling_point: str, duration: flo
 
 
 def _valid_packaging_snapshot(snapshot: dict[str, Any], cues: list[dict[str, Any]]) -> bool:
+    """Lock-safe lifecycle predicate; final glyph/font work uses request proofs."""
     package = snapshot.get("packaging") if isinstance(snapshot, dict) else None
     if package is None:
         return True
     try:
-        from .montage_packaging import validate_final_events
-        validate_final_events(package, cues, snapshot.get("tracks", []), batch=True)
+        from .montage_packaging import validate_packaging
+        validate_packaging(package, cues, snapshot.get("tracks", []), batch=True)
         return True
     except ValueError:
         return False

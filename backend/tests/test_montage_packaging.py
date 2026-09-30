@@ -42,10 +42,10 @@ def test_compiler_uses_verified_private_font_and_literal_ass_escaping():
 
 def test_rejects_tampered_font_unknown_glyph_and_bad_subtitle_cue_reference(monkeypatch):
     from app import montage_packaging
-    from app.montage_packaging import PackagingError, validate_packaging
+    from app.montage_packaging import PackagingError, validate_final_events, validate_packaging
 
     with pytest.raises(PackagingError, match="字体"):
-        validate_packaging(_packaging([_element("title", text="𠀀")]), [], [])
+        validate_final_events(_packaging([_element("title", text="𠀀")]), [], [], batch=False)
     with pytest.raises(PackagingError, match="cueId"):
         validate_packaging(_packaging([{
             "id": "subtitle-one", "kind": "subtitle", "enabled": True, "cueId": "missing",
@@ -53,7 +53,28 @@ def test_rejects_tampered_font_unknown_glyph_and_bad_subtitle_cue_reference(monk
         }]), [{"id": "cue-1", "start": 0, "end": 1, "text": "字幕"}], [], batch=True)
     monkeypatch.setattr(montage_packaging, "FONT_SHA256", "00" * 32)
     with pytest.raises(PackagingError, match="字体"):
-        validate_packaging(_packaging([_element("title")]), [], [])
+        validate_final_events(_packaging([_element("title")]), [], [], batch=False)
+
+
+def test_structure_validation_never_opens_font_but_request_proof_binds_font_and_snapshot(monkeypatch):
+    """State loading may validate shape under a lock; byte/font work belongs to a proof."""
+    from app import montage_packaging
+    from app.montage_packaging import (PackagingProofConflict, consume_packaging_proof,
+                                       prepare_packaging_proof, validate_packaging)
+
+    package = _packaging([_element("title", text="锁外证明")])
+    def must_not_open_font():
+        raise AssertionError("structure validation opened the controlled font")
+    monkeypatch.setattr(montage_packaging, "private_font_path", must_not_open_font)
+    assert validate_packaging(package, [], []) == package
+    monkeypatch.undo()
+
+    snapshot = {"settings": {"width": 720, "height": 1280}, "tracks": [], "packaging": package}
+    proof = prepare_packaging_proof(snapshot, [], batch=False)
+    assert proof is not None
+    consume_packaging_proof(proof, snapshot, [], batch=False)
+    with pytest.raises(PackagingProofConflict):
+        consume_packaging_proof(proof, {**snapshot, "tracks": [{"id": "changed"}]}, [], batch=False)
 
 
 def test_batch_subtitle_is_cue_style_overlay_not_a_second_transcript():

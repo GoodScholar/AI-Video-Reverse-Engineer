@@ -576,13 +576,24 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         ]
         return result
 
-    def require_packaging_font(snapshot: dict, cues: list, *, batch: bool) -> None:
+    def prepare_packaging_proof(snapshot: dict, cues: list, *, batch: bool):
         packaging = snapshot.get("packaging") if isinstance(snapshot, dict) else None
         if packaging is None:
-            return
-        from .montage_packaging import PackagingError, validate_final_events
+            return None
+        from .montage_packaging import PackagingError, PackagingProofConflict, prepare_packaging_proof as prepare
         try:
-            validate_final_events(packaging, cues, snapshot.get("tracks", []), batch=batch)
+            return prepare(snapshot, cues, batch=batch)
+        except PackagingProofConflict as error:
+            raise BatchProductionError("batch_packaging_conflict", str(error)) from error
+        except PackagingError as error:
+            raise BatchProductionError("batch_packaging_invalid", str(error)) from error
+
+    def consume_packaging_proof(proof, snapshot: dict, cues: list, *, batch: bool) -> None:
+        from .montage_packaging import PackagingError, PackagingProofConflict, consume_packaging_proof as consume
+        try:
+            consume(proof, snapshot, cues, batch=batch)
+        except PackagingProofConflict as error:
+            raise BatchProductionError("batch_packaging_conflict", str(error)) from error
         except PackagingError as error:
             raise BatchProductionError("batch_packaging_invalid", str(error)) from error
 
@@ -1094,16 +1105,21 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     return
                 run["status"] = LOCAL_RUN_POLICY.start(run["status"])
                 save(project_id, state)
-                snapshot = run["snapshot"]
+                snapshot = deepcopy(run["snapshot"])
                 names = dict(run["sources"])
-                require_packaging_font(snapshot, run.get("subtitleCues", []), batch=True)
+                subtitle_cues = deepcopy(run.get("subtitleCues", []))
+            packaging_proof = prepare_packaging_proof(snapshot, subtitle_cues, batch=True)
+            with lock:
+                run = find_run(task_for(state_for(project_id), task_id)["variant"], run_id)
+                if run["status"] != "running":
+                    return
+                consume_packaging_proof(packaging_proof, run["snapshot"], run.get("subtitleCues", []), batch=True)
             sources = render_inputs.resolve(store.path(project_id, "runs", run_id), names)
             staging = store.path(project_id, "runs", run_id, "preview.mp4")
             actual_renderer = renderer
             if actual_renderer is None:
                 from .timeline_render import render_timeline
                 actual_renderer = render_timeline
-            subtitle_cues = run.get("subtitleCues", [])
             subtitle_file = None
             if subtitle_cues and snapshot.get("packaging") is None:
                 subtitle_file = store.path(project_id, "runs", run_id, "subtitles.srt")
@@ -1152,8 +1168,13 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     return
                 run["status"] = LOCAL_RUN_POLICY.start(run["status"])
                 save(project_id, state)
-                snapshot, names, cues = run["snapshot"], dict(run["sources"]), run["subtitles"]
-                require_packaging_font(snapshot, cues, batch=True)
+                snapshot, names, cues = deepcopy(run["snapshot"]), dict(run["sources"]), deepcopy(run["subtitles"])
+            packaging_proof = prepare_packaging_proof(snapshot, cues, batch=True)
+            with lock:
+                run = find_export(task_for(state_for(project_id), task_id)["variant"], run_id)
+                if run["status"] != "running":
+                    return
+                consume_packaging_proof(packaging_proof, run["snapshot"], run["subtitles"], batch=True)
             directory = store.path(project_id, "exports", run_id)
             sources = render_inputs.resolve(directory, names)
             subtitle_file = None
@@ -2157,12 +2178,17 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                                                                         (deepcopy(child), deepcopy(run))),
                 id_factory=reserve_id,
             )
-        media_cache, frozen_timing_cache, current_timing_cache, proofs = {}, {}, {}, {}
+        media_cache, frozen_timing_cache, current_timing_cache, proofs, packaging_proofs, candidate_identities = {}, {}, {}, {}, {}, {}
         for key, (child, run) in candidates.items():
+            candidate_identities[key] = safety_run_identity(child, run)
             proofs[key] = production_call(
                 prepare_reframe_safety, project_id, child, run, assets,
                 media_cache=media_cache, frozen_timing_cache=frozen_timing_cache,
                 current_timing_cache=current_timing_cache,
+            )
+            packaging_proofs[key] = production_call(
+                prepare_packaging_proof, run.get("snapshot", {}),
+                run.get("subtitles", run.get("subtitleCues", [])), batch=True,
             )
 
         def cleanup_prepared_sources(run_ids=None):
@@ -2206,16 +2232,14 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             # Report proof staleness as a retryable CAS conflict before the
             # production lifecycle can collapse it into a generic approval error.
             current_children = {child["id"]: child for child in children}
-            for (child_id, run_id), proof in proofs.items():
-                if proof is None:
-                    continue
+            for (child_id, run_id), identity in candidate_identities.items():
                 child = current_children.get(child_id)
                 current_run = next((item for item in child["variant"]["runs"]
                                     if item["id"] == run_id), None) if child else None
                 if current_run is None and child is not None:
                     current_run = next((item for item in child["variant"].get("exports", [])
                                         if item["id"] == run_id), None)
-                if current_run is None or proof["identity"] != safety_run_identity(child, current_run):
+                if current_run is None or identity != safety_run_identity(child, current_run):
                     cleanup_prepared_sources()
                     raise HTTPException(409, detail={"code": "batch_export_reframe_conflict",
                                                      "message": "主体构图验证期间版本已变化，请刷新后重试。"})
@@ -2244,8 +2268,11 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 prepared = production_call(
                     export_approved_versions, parent, children, assets=assets,
                     snapshot_sources=export_sources, preview_available=preview_available,
-                    reframe_safe=lambda child, run: consume_reframe_safety(
-                        project_id, child, run, proofs.get((child["id"], run["id"])), assets),
+                    reframe_safe=lambda child, run: (
+                        consume_reframe_safety(project_id, child, run, proofs.get((child["id"], run["id"])), assets),
+                        consume_packaging_proof(packaging_proofs.get((child["id"], run["id"])), run.get("snapshot", {}),
+                                                run.get("subtitles", run.get("subtitleCues", [])), batch=True),
+                    ),
                     id_factory=actual_id,
                 )
             except BaseException:
@@ -2301,16 +2328,12 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             run = find_export(task["variant"], run_id)
             if run["status"] != "completed":
                 raise HTTPException(409, detail={"code": "batch_export_unavailable", "message": "成片尚不可用。"})
-            try:
-                require_packaging_font(run.get("snapshot", {}), run.get("subtitles", []), batch=True)
-            except BatchProductionError as error:
-                raise HTTPException(409, detail={"code": error.code, "message": error.message}) from None
-            if not current_delivery_output(task, run):
-                raise HTTPException(409, detail={"code": "batch_export_stale", "message": "成片不是当前已审核版本，请重新预览并导出。"})
             task, run, assets = deepcopy(task), deepcopy(run), deepcopy(assets_for(project_id))
+            delivery_identity = safety_run_identity(task, run)
         try:
             proof = prepare_reframe_safety(project_id, task, run, assets, media_cache={}, frozen_timing_cache={},
                                            current_timing_cache={})
+            packaging_proof = prepare_packaging_proof(run.get("snapshot", {}), run.get("subtitles", []), batch=True)
         except BatchProductionError as error:
             raise HTTPException(409, detail={"code": error.code, "message": error.message}) from None
         with source_lock or nullcontext(), lock:
@@ -2319,13 +2342,12 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             if run["status"] != "completed":
                 raise HTTPException(409, detail={"code": "batch_export_unavailable", "message": "成片尚不可用。"})
             try:
-                require_packaging_font(run.get("snapshot", {}), run.get("subtitles", []), batch=True)
-            except BatchProductionError as error:
-                raise HTTPException(409, detail={"code": error.code, "message": error.message}) from None
-            if not current_delivery_output(task, run):
-                raise HTTPException(409, detail={"code": "batch_export_stale", "message": "成片不是当前已审核版本，请重新预览并导出。"})
-            try:
                 consume_reframe_safety(project_id, task, run, proof, assets_for(project_id))
+                if delivery_identity != safety_run_identity(task, run):
+                    raise BatchProductionError("batch_packaging_conflict", "包装验证期间交付身份已变化，请刷新后重试。")
+                consume_packaging_proof(packaging_proof, run.get("snapshot", {}), run.get("subtitles", []), batch=True)
+                if not current_delivery_output(task, run):
+                    raise HTTPException(409, detail={"code": "batch_export_stale", "message": "成片不是当前已审核版本，请重新预览并导出。"})
                 if run["output"] != run_id + ".mp4":
                     raise ValueError("成片关联无效")
                 path = store.path(project_id, "deliverables", run["output"])
@@ -2358,18 +2380,33 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             run = find_run(task["variant"], run_id)
             if run["status"] != "completed":
                 raise HTTPException(409, detail={"code": "batch_preview_unavailable", "message": "预览尚不可用。"})
-            try:
-                require_packaging_font(run.get("snapshot", {}), run.get("subtitleCues", []), batch=True)
-            except BatchProductionError as error:
-                raise HTTPException(409, detail={"code": error.code, "message": error.message}) from None
             if not current_preview_output(task, run):
                 raise HTTPException(409, detail={"code": "batch_preview_stale", "message": "预览不是当前版本，请重新生成。"})
             try:
+                snapshot, cues = deepcopy(run.get("snapshot", {})), deepcopy(run.get("subtitleCues", []))
+                preview_identity = safety_run_identity(task, deepcopy(run))
+            except (OSError, ValueError, KeyError):
+                raise HTTPException(409, detail={"code": "batch_preview_unavailable", "message": "预览文件不可用。"}) from None
+        try:
+            packaging_proof = prepare_packaging_proof(snapshot, cues, batch=True)
+        except BatchProductionError as error:
+            raise HTTPException(409, detail={"code": error.code, "message": error.message}) from None
+        with lock:
+            task = task_for(state_for(project_id), task_id)
+            run = find_run(task["variant"], run_id)
+            if run["status"] != "completed" or not current_preview_output(task, run):
+                raise HTTPException(409, detail={"code": "batch_preview_stale", "message": "预览不是当前版本，请重新生成。"})
+            try:
+                if preview_identity != safety_run_identity(task, run):
+                    raise BatchProductionError("batch_packaging_conflict", "包装验证期间预览身份已变化，请刷新后重试。")
+                consume_packaging_proof(packaging_proof, run.get("snapshot", {}), run.get("subtitleCues", []), batch=True)
                 output = run["output"]
                 if output != run_id + ".mp4":
                     raise ValueError("输出关联无效")
                 path = store.path(project_id, "outputs", output)
                 regular_file(path)
+            except BatchProductionError as error:
+                raise HTTPException(409, detail={"code": error.code, "message": error.message}) from None
             except (OSError, ValueError, KeyError):
                 raise HTTPException(409, detail={"code": "batch_preview_unavailable", "message": "预览文件不可用。"}) from None
         return FileResponse(path, media_type="video/mp4", filename="preview.mp4")

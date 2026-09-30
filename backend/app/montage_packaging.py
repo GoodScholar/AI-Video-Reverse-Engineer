@@ -8,8 +8,13 @@ encoded literally for libass.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+import os
+import stat
 from copy import deepcopy
+from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -28,14 +33,108 @@ STYLES = {"plain", "emphasis", "banner"}
 _FONT = Path(__file__).with_name("fonts") / "controlled" / "NotoSansCJKsc-Regular.otf"
 _FONT_INFO: tuple[str, str, dict[int, str], dict[int, str], dict[str, tuple[int, int]], int] | None = None
 _FONT_LOCK = RLock()
+_PROOF_FONT: ContextVar["_FontFact | None"] = ContextVar("packaging_proof_font", default=None)
 
 
 class PackagingError(ValueError):
     pass
 
 
+class PackagingProofConflict(PackagingError):
+    """A lock-free packaging proof no longer names the bytes it checked."""
+
+
+@dataclass(frozen=True)
+class _FontFact:
+    path: str
+    identity: tuple[int, int, int, int, int]
+    digest: str
+    cmap: dict[int, str]
+    metrics: dict[str, tuple[int, int]]
+    real_dim: int
+
+
+@dataclass(frozen=True)
+class PackagingProof:
+    digest: str
+    batch: bool
+    font: _FontFact
+
+
+def _font_identity(path: Path) -> tuple[int, int, int, int, int]:
+    info = os.stat(path)
+    if not stat.S_ISREG(info.st_mode):
+        raise PackagingError("受控字体不可用或哈希不匹配。")
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _hash_font(path: Path) -> tuple[str, tuple[int, int, int, int, int]]:
+    """Hash the opened controlled file and reject path replacement while reading."""
+    before = _font_identity(path)
+    descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        opened_identity = (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+        if opened_identity != before or not stat.S_ISREG(opened.st_mode):
+            raise PackagingProofConflict("受控字体在验证期间发生变化。")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        after_fd = os.fstat(descriptor)
+        after_identity = (after_fd.st_dev, after_fd.st_ino, after_fd.st_size, after_fd.st_mtime_ns, after_fd.st_ctime_ns)
+    finally:
+        os.close(descriptor)
+    after = _font_identity(path)
+    if after_identity != before or after != before:
+        raise PackagingProofConflict("受控字体在验证期间发生变化。")
+    return digest.hexdigest(), before
+
+
+def _read_font_fact() -> _FontFact:
+    """Do the expensive font/content proof once, outside application locks."""
+    path = _FONT.resolve(strict=True)
+    digest, identity = _hash_font(path)
+    if digest != FONT_SHA256:
+        raise PackagingError("受控字体不可用或哈希不匹配。")
+    face = None
+    try:
+        from fontTools.ttLib import TTFont
+        face = TTFont(path, lazy=True)
+        names = {entry.nameID: entry.toUnicode() for entry in face["name"].names if entry.nameID in (1, 4, 6)}
+        if names.get(1) != FONT_FAMILY or names.get(4) != FONT_FAMILY or names.get(6) != FONT_POSTSCRIPT:
+            raise PackagingError("受控字体身份无效。")
+        real_dim = face["OS/2"].usWinAscent + face["OS/2"].usWinDescent
+        if real_dim <= 0:
+            raise PackagingError("受控字体真实尺寸无效。")
+        fact = _FontFact(str(path), identity, digest, face.getBestCmap(), dict(face["hmtx"].metrics), real_dim)
+    except PackagingError:
+        raise
+    except Exception as error:
+        raise PackagingError("无法验证受控字体。") from error
+    finally:
+        if face is not None:
+            face.close()
+    try:
+        if _font_identity(path) != identity:
+            raise PackagingProofConflict("受控字体在验证期间发生变化。")
+    except OSError as error:
+        raise PackagingProofConflict("受控字体在验证期间不可读取。") from error
+    return fact
+
+
+def _input_digest(snapshot: dict[str, Any], cues: list[dict[str, Any]], *, batch: bool) -> str:
+    try:
+        value = {"snapshot": snapshot, "cues": cues, "batch": batch}
+        return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+    except (TypeError, ValueError) as error:
+        raise PackagingError("包装证明输入无效。") from error
+
+
 def private_font_path() -> Path:
     """Return the only allowed font after hash and metadata verification."""
+    prepared = _PROOF_FONT.get()
+    if prepared is not None:
+        return Path(prepared.path)
     global _FONT_INFO
     with _FONT_LOCK:
         actual_hash = hashlib.sha256(_FONT.read_bytes()).hexdigest() if _FONT.is_file() else None
@@ -93,7 +192,6 @@ def _verify_font(value: Any) -> None:
     expected = default_packaging()["font"]
     if not isinstance(value, dict) or value != expected:
         raise PackagingError("字体引用无效。")
-    private_font_path()
 
 
 def _validate_text(value: Any) -> str:
@@ -105,9 +203,13 @@ def _validate_text(value: Any) -> str:
 def _glyphs(text: str) -> None:
     """Reject unsupported user glyphs before libass can silently fall back."""
     try:
-        private_font_path()
-        assert _FONT_INFO is not None
-        cmap = _FONT_INFO[3]
+        prepared = _PROOF_FONT.get()
+        if prepared is not None:
+            cmap = prepared.cmap
+        else:
+            private_font_path()
+            assert _FONT_INFO is not None
+            cmap = _FONT_INFO[3]
     except PackagingError:
         raise
     except Exception as error:
@@ -150,7 +252,7 @@ def validate_packaging(value: Any, cues: list[dict[str, Any]], tracks: list[dict
             if cue_id not in cue_by_id:
                 raise PackagingError("字幕 cueId 不存在。")
             if raw["enabled"]:
-                _glyphs(_validate_text(cue_by_id[cue_id].get("text")))
+                _validate_text(cue_by_id[cue_id].get("text"))
             elements.append({"id": element_id, "kind": kind, "enabled": raw["enabled"], "cueId": cue_id,
                              "position": raw["position"], "style": raw["style"]})
             continue
@@ -160,8 +262,6 @@ def validate_packaging(value: Any, cues: list[dict[str, Any]], tracks: list[dict
         if end <= start:
             raise PackagingError("包装元素时序无效。")
         text = _validate_text(raw["text"])
-        if raw["enabled"]:
-            _glyphs(text)
         elements.append({"id": element_id, "kind": kind, "enabled": raw["enabled"], "start": start, "end": end,
                          "text": text, "position": raw["position"], "style": raw["style"]})
     return {"schemaVersion": 1, "templateId": TEMPLATE_ID, "templateVersion": TEMPLATE_VERSION,
@@ -194,14 +294,20 @@ def _ass_time(seconds: float) -> str:
 
 def _advance(text: str, size: float) -> float:
     """libass/FreeType REAL_DIM advance in ASS script pixels."""
-    private_font_path()
-    assert _FONT_INFO is not None
-    cmap, metrics, real_dim = _FONT_INFO[3], _FONT_INFO[4], _FONT_INFO[5]
+    prepared = _PROOF_FONT.get()
+    if prepared is not None:
+        cmap, metrics, real_dim = prepared.cmap, prepared.metrics, prepared.real_dim
+    else:
+        private_font_path()
+        assert _FONT_INFO is not None
+        cmap, metrics, real_dim = _FONT_INFO[3], _FONT_INFO[4], _FONT_INFO[5]
     return sum(metrics[cmap[ord(char)]][0] for char in text if char not in "\n\t" and ord(char) in cmap) * size / real_dim
 
 
 def _font_height(size: float) -> float:
     """FT_SIZE_REQUEST_TYPE_REAL_DIM makes Win ascent+descent equal Fontsize."""
+    if _PROOF_FONT.get() is not None:
+        return size
     private_font_path()
     assert _FONT_INFO is not None
     return size
@@ -427,9 +533,52 @@ def _element_events(packaging: dict[str, Any], cues: list[dict[str, Any]], width
 
 def validate_final_events(packaging: dict[str, Any], cues: list[dict[str, Any]], tracks: list[dict[str, Any]], *, batch: bool) -> dict[str, Any]:
     """Validate every final ASS event, including default canonical cues."""
+    # Rendering and lock-free proof generation keep the terminal font check;
+    # state-store shape validation intentionally does not read this 16 MB file.
+    if _PROOF_FONT.get() is None:
+        private_font_path()
     checked = validate_packaging(packaging, cues, tracks, batch=batch)
     _element_events(checked, cues, 0, 0)
     return checked
+
+
+def prepare_packaging_proof(snapshot: dict[str, Any], cues: list[dict[str, Any]], *, batch: bool) -> PackagingProof | None:
+    """Prepare one request-local terminal packaging proof outside project locks."""
+    packaging = snapshot.get("packaging") if isinstance(snapshot, dict) else None
+    if packaging is None:
+        return None
+    digest = _input_digest(snapshot, cues, batch=batch)
+    try:
+        fact = _read_font_fact()
+    except FileNotFoundError as error:
+        raise PackagingError("受控字体不可用或哈希不匹配。") from error
+    except OSError as error:
+        raise PackagingProofConflict("受控字体在验证期间不可读取。") from error
+    token = _PROOF_FONT.set(fact)
+    try:
+        validate_final_events(packaging, cues, snapshot.get("tracks", []), batch=batch)
+    finally:
+        _PROOF_FONT.reset(token)
+    return PackagingProof(digest, batch, fact)
+
+
+def consume_packaging_proof(proof: PackagingProof | None, snapshot: dict[str, Any], cues: list[dict[str, Any]], *, batch: bool) -> None:
+    """Consume a request-local proof with digest/stat checks only (never font IO)."""
+    packaging = snapshot.get("packaging") if isinstance(snapshot, dict) else None
+    if packaging is None:
+        if proof is not None:
+            raise PackagingProofConflict("包装证明已过期，请刷新后重试。")
+        return
+    if proof is None or proof.batch != batch or proof.digest != _input_digest(snapshot, cues, batch=batch):
+        raise PackagingProofConflict("包装证明已过期，请刷新后重试。")
+    try:
+        path = _FONT.resolve(strict=True)
+        if str(path) != proof.font.path or _font_identity(path) != proof.font.identity:
+            raise PackagingProofConflict("受控字体在验证期间发生变化。")
+    except PackagingProofConflict:
+        raise
+    except OSError as error:
+        raise PackagingProofConflict("受控字体在验证期间不可读取。") from error
 
 
 def compile_ass(packaging: dict[str, Any], cues: list[dict[str, Any]], tracks: list[dict[str, Any]], width: int, height: int, font_path: Path | str | None = None) -> str:

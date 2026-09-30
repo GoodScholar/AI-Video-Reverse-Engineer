@@ -583,6 +583,26 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                     validate_packaging(snapshot["packaging"], [], snapshot.get("tracks", []))
             except (KeyError, OSError, ValueError):
                 fail("timeline_output_unavailable", "渲染结果不可用。")
+            snapshot = json.loads(json.dumps(snapshot))
+        try:
+            from .montage_packaging import PackagingError, prepare_packaging_proof
+            packaging_proof = prepare_packaging_proof(snapshot, [], batch=False)
+        except PackagingError:
+            fail("timeline_output_unavailable", "渲染结果不可用。")
+        with lock:
+            state = state_for(project_id)
+            run = find_run(state, run_id)
+            if run["status"] != "completed" or run.get("snapshot") != snapshot:
+                fail("timeline_output_unavailable", "渲染结果不可用。")
+            try:
+                from .montage_packaging import consume_packaging_proof
+                consume_packaging_proof(packaging_proof, run.get("snapshot", {}), [], batch=False)
+                output = run["output"]
+                validate_storage_id(output)
+                path = store.path(project_id, "outputs", output)
+                _regular_file(path)
+            except (KeyError, OSError, ValueError):
+                fail("timeline_output_unavailable", "渲染结果不可用。")
         media_type = "audio/wav" if run["format"] == "wav" else "video/mp4"
         return FileResponse(path, media_type=media_type, filename="timeline" + path.suffix)
 
