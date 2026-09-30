@@ -5,9 +5,11 @@
 """
 
 import json
+import hashlib
 import math
 import os
 import signal
+import shutil
 import subprocess
 import time
 import uuid
@@ -44,6 +46,8 @@ class _Media:
         width: Optional[int],
         height: Optional[int],
         fps: Optional[float],
+        sample_aspect_ratio: Optional[str],
+        rotation: float,
     ):
         self.duration = duration
         self.video_duration = video_duration
@@ -54,6 +58,8 @@ class _Media:
         self.width = width
         self.height = height
         self.fps = fps
+        self.sample_aspect_ratio = sample_aspect_ratio
+        self.rotation = rotation
 
 
 def render_timeline(
@@ -103,15 +109,17 @@ def render_timeline(
     if subtitles_path is not None:
         from .batch_subtitles import caption_images
         captions = caption_images(Path(subtitles_path), render_width, render_height)
-    command, expected = _build_command(
-        clips, transitions, duration, render_width, render_height, fps, format, ffmpeg_path, captions
-    )
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    commands_dir = output.parent / (".reframe-" + uuid.uuid4().hex)
+    command, expected = _build_command(
+        clips, transitions, duration, render_width, render_height, fps, format, ffmpeg_path, captions,
+        reframe_commands_dir=commands_dir,
+    )
     temporary = output.with_name(".%s.%s%s" % (output.stem, uuid.uuid4().hex, output.suffix))
     command.append(str(temporary))
     try:
-        _run_ffmpeg(command, cancelled, cwd=Path(subtitles_path).parent if subtitles_path is not None else None)
+        _run_ffmpeg(command, cancelled, cwd=commands_dir if commands_dir.exists() else (Path(subtitles_path).parent if subtitles_path is not None else None))
         if cancelled():
             raise TimelineRenderError("时间线渲染已取消。")
         media = _verify_output(temporary, format, expected, ffprobe_path)
@@ -125,6 +133,8 @@ def render_timeline(
     except OSError as error:
         _remove_file(temporary)
         raise TimelineRenderError("无法写入时间线渲染输出：%s" % error) from error
+    finally:
+        shutil.rmtree(commands_dir, ignore_errors=True)
 
 
 def inspect_timeline_media(state: dict, assets: dict, resolve_source, format: str, ffprobe_path: str) -> list:
@@ -237,6 +247,7 @@ def _collect_clips(tracks: list, sources: Dict[str, Path], ffprobe_path: str, fo
                 "track_id": track.get("id"),
                 "clip_index": clip_index,
                 "end": start + clip_duration,
+                "reframe": clip.get("reframe"),
             })
     return result
 
@@ -250,7 +261,7 @@ def _collect_transitions(value: object, clips: List[dict]) -> List[dict]:
 def _probe_media(source: Path, ffprobe_path: str) -> _Media:
     command = [
         ffprobe_path, "-v", "error", "-show_entries",
-        "format=duration,format_name:stream=codec_type,duration,width,height,avg_frame_rate,r_frame_rate",
+        "format=duration,format_name:stream=codec_type,duration,width,height,avg_frame_rate,r_frame_rate,sample_aspect_ratio:stream_tags=rotate:stream_side_data=rotation",
         "-of", "json", str(source),
     ]
     try:
@@ -285,6 +296,14 @@ def _probe_media(source: Path, ffprobe_path: str) -> _Media:
         fps = float(Fraction(frame_rate)) if frame_rate not in (None, "0/0") else None
     except (ValueError, ZeroDivisionError):
         fps = None
+    sample_aspect_ratio = video_stream.get("sample_aspect_ratio") if isinstance(video_stream.get("sample_aspect_ratio"), str) else None
+    try:
+        rotation = float((video_stream.get("tags") or {}).get("rotate", 0))
+        for side_data in video_stream.get("side_data_list") or []:
+            if isinstance(side_data, dict) and "rotation" in side_data:
+                rotation = float(side_data["rotation"])
+    except (TypeError, ValueError):
+        rotation = float("nan")
     return _Media(
         duration,
         _first_stream_duration(streams, "video"),
@@ -295,6 +314,8 @@ def _probe_media(source: Path, ffprobe_path: str) -> _Media:
         width,
         height,
         fps,
+        sample_aspect_ratio,
+        rotation,
     )
 
 
@@ -330,6 +351,7 @@ def _build_command(
     format: str,
     ffmpeg_path: str,
     captions: Optional[list[tuple[Path, float, float]]] = None,
+    reframe_commands_dir: Optional[Path] = None,
 ) -> Tuple[List[str], dict]:
     command = [
         ffmpeg_path, "-hide_banner", "-nostdin", "-v", "error", "-y",
@@ -358,9 +380,13 @@ def _build_command(
                 continue
             command.extend(_input_arguments(clip, fps))
             label = "v%d" % len(video_labels)
+            command_file = None
+            if clip.get("reframe") is not None and reframe_commands_dir is not None:
+                reframe_commands_dir.mkdir(parents=True, exist_ok=True)
+                command_file = reframe_commands_dir / ("crop-" + hashlib.sha256(str(clip["id"]).encode()).hexdigest()[:16] + ".cmd")
             filters.append(_video_filter(
                 input_index, clip, width, height, fps, label,
-                local=clip["id"] in transitioned_video_ids,
+                local=clip["id"] in transitioned_video_ids, reframe_commands_file=command_file,
             ))
             video_labels[clip["id"]] = label
             input_index += 1
@@ -500,8 +526,32 @@ def _input_arguments(clip: dict, fps: float) -> List[str]:
 
 
 def _video_filter(index: int, clip: dict, width: int, height: int, fps: float, label: str,
-                  *, local: bool = False) -> str:
+                  *, local: bool = False, reframe_commands_file: Optional[Path] = None) -> str:
     position = "PTS-STARTPTS" if local else "PTS-STARTPTS+%s/TB" % _number(clip["start"])
+    reframe = clip.get("reframe")
+    if reframe is not None:
+        media = clip["media"]
+        if (media.width is None or media.height is None or media.sample_aspect_ratio not in (None, "1:1", "0:1")
+                or not math.isfinite(media.rotation) or abs(media.rotation) > .001):
+            raise TimelineRenderError("主体裁剪不支持旋转或非方形像素的源视频。")
+        try:
+            from .montage_reframe import ReframeError, reframe_filter, source_fingerprint
+            aspect = reframe["targetAspect"]
+            if aspect["width"] * height != aspect["height"] * width:
+                raise ReframeError("主体裁剪目标比例与当前输出不一致。")
+            framing = reframe_filter(
+                reframe, source_width=media.width, source_height=media.height,
+                output_width=width, output_height=height, in_point=clip["in_point"],
+                speed=clip["speed"], duration=clip["duration"], source_hash=source_fingerprint(clip["source"]),
+                crop_name="reframe_" + hashlib.sha256(str(clip["id"]).encode()).hexdigest()[:12],
+                commands_path=reframe_commands_file,
+            )
+        except (OSError, KeyError, ReframeError) as error:
+            raise TimelineRenderError(str(error)) from error
+        return (
+            "[%d:v]setpts=PTS-STARTPTS,%s,setpts=(PTS-STARTPTS)/%s,trim=duration=%s,"
+            "fps=%s,format=yuv420p,settb=AVTB,setpts=%s[%s]"
+        ) % (index, framing, _number(clip["speed"]), _number(clip["duration"]), _number(fps), position, label)
     return (
         "[%d:v]setpts=PTS-STARTPTS,setpts=(PTS-STARTPTS)/%s,trim=duration=%s,"
         "scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black,"

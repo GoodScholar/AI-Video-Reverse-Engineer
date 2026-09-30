@@ -12,3 +12,19 @@ backend/person_worker/.venv/bin/python backend/person_worker/run_person.py \
 ```
 
 提取模式要求输出目录已创建且为空，输出 `pose.mp4`、`mask.mp4`、`overlay.mp4`、`landmarks.jsonl`、`quality.json` 与 `metadata.json`。视频会用 FFmpeg 转为 H.264/yuv420p。模型来源、SHA-256、体积及依赖版本在 `models/provenance.json` 和 `requirements.lock` 中固定。
+
+## 混剪主体满幅裁剪
+
+`run_reframe.py` 使用同一固定的 MediaPipe `0.10.21` 本地环境和 EfficientDet Lite0 对象检测模型；它只输出归一化人物框与源时间中心轨迹，不使用 YOLO 或云服务。权重不会自动下载，先将已校验的模型安装到 Git 忽略目录：
+
+```sh
+mkdir -p backend/person_worker/models
+cp /path/to/efficientdet_lite0.tflite backend/person_worker/models/efficientdet_lite0.tflite
+shasum -a 256 backend/person_worker/models/efficientdet_lite0.tflite
+# 必须是 2e04c53bfeac0ac2a30c057c7e2a777594ce39baaac35a92f74fb1e8c4fc4e0b
+backend/person_worker/.venv/bin/python backend/person_worker/run_reframe.py \
+  --input source.mp4 --model backend/person_worker/models/efficientdet_lite0.tflite \
+  --start 2 --end 4 --target-width 9 --target-height 16
+```
+
+模型许可与固定哈希见 `backend/MODEL_NOTICES.md`。检测到主体缺失、多个主体或不可解码源时间时，worker 返回 `review_required`，不会伪造自动构图。

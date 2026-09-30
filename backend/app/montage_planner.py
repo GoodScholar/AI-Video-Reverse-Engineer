@@ -191,6 +191,8 @@ def _clip(
     timeline_start: float,
     requested_duration: float,
     minimum_duration: float,
+    target_width: int,
+    target_height: int,
 ) -> tuple[dict[str, Any], list[str]]:
     available = float(candidate["outPointSeconds"]) - float(candidate["inPointSeconds"])
     duration = min(requested_duration, available)
@@ -198,6 +200,7 @@ def _clip(
         f"候选仅有 {available:.3f} 秒，短于旁白所需 {minimum_duration:.3f} 秒"
     ]
     clip_id = f"montage-clip-{hashlib.sha256((segment_id + ':' + candidate['candidateId']).encode()).hexdigest()[:20]}"
+    from .montage_reframe import pending_reframe
     return {
         "id": clip_id,
         "assetId": candidate["assetId"],
@@ -208,6 +211,8 @@ def _clip(
         "volume": 1,
         "fadeIn": 0,
         "fadeOut": 0,
+        "reframe": pending_reframe(target_width=target_width, target_height=target_height,
+                                    reason="尚未完成主体分析，需在本地队列检测后确认构图"),
     }, unmet
 
 
@@ -223,9 +228,11 @@ def plan_montage(
     variant_ordinal: int = 0,
     proposal_generation: int = 0,
     selling_point: str = "",
+    target_width: int = 9,
+    target_height: int = 16,
 ) -> dict[str, Any]:
     """Create a frozen proposal without mutating a saved edit sequence."""
-    if not segments:
+    if not segments or type(target_width) is not int or type(target_height) is not int or target_width <= 0 or target_height <= 0:
         raise MontagePlanningError("montage_script_empty", "已确认脚本没有可规划的段落。")
     if any(not _number(value) or value < 0 for value in beat_times) or beat_times != sorted(set(beat_times)):
         raise MontagePlanningError("montage_beats_invalid", "音乐节拍必须递增且不能重复。")
@@ -279,7 +286,7 @@ def plan_montage(
             alternatives = []
             for alternative in fallback_ranked:
                 alternative_clip, alternative_unmet = _clip(
-                    alternative, segment["id"], timeline_start, requested_duration, narration_duration,
+                    alternative, segment["id"], timeline_start, requested_duration, narration_duration, target_width, target_height,
                 )
                 alternatives.append({
                     "candidate": deepcopy(alternative), "clip": alternative_clip, "unmet": alternative_unmet,
@@ -301,12 +308,12 @@ def plan_montage(
             reasons = [reason for reason in reasons if not reason.startswith("镜头结束")]
             reasons.append(f"候选覆盖完整旁白但不足以延伸到节拍 {beat_snap:.3f} 秒，因此未吸附")
         selected_clip, segment_unmet = _clip(
-            chosen, segment["id"], timeline_start, requested_duration, narration_duration,
+            chosen, segment["id"], timeline_start, requested_duration, narration_duration, target_width, target_height,
         )
         alternatives = []
         for alternative in ranked[1:]:
             alternative_clip, alternative_unmet = _clip(
-                alternative, segment["id"], timeline_start, requested_duration, narration_duration,
+                alternative, segment["id"], timeline_start, requested_duration, narration_duration, target_width, target_height,
             )
             alternatives.append({
                 "candidate": deepcopy(alternative), "clip": alternative_clip, "unmet": alternative_unmet,

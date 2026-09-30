@@ -236,7 +236,9 @@ def _settings(value: Any) -> Dict[str, int]:
 
 
 def _clip(value: Any, assets: Dict[str, Dict[str, Any]], track_kind: str) -> Dict[str, Any]:
-    _keys(value, ("id", "assetId", "start", "inPoint", "duration", "speed", "volume", "fadeIn", "fadeOut"))
+    expected = {"id", "assetId", "start", "inPoint", "duration", "speed", "volume", "fadeIn", "fadeOut"}
+    if not isinstance(value, dict) or set(value) not in (expected, expected | {"reframe"}):
+        raise ValueError("请求字段无效")
     clip_id = _identifier(value["id"], "片段标识符")
     asset_id = _identifier(value["assetId"], "素材标识符")
     asset = assets.get(asset_id)
@@ -265,7 +267,16 @@ def _clip(value: Any, assets: Dict[str, Dict[str, Any]], track_kind: str) -> Dic
         source_duration = _number(source_duration, "素材时长")
         if in_point + duration * speed > source_duration + 1e-8:
             raise ValueError("片段超出素材可用时长")
-    return {"id": clip_id, "assetId": asset_id, "start": start, "inPoint": in_point, "duration": duration, "speed": speed, "volume": volume, "fadeIn": fade_in, "fadeOut": fade_out}
+    normalized = {"id": clip_id, "assetId": asset_id, "start": start, "inPoint": in_point, "duration": duration, "speed": speed, "volume": volume, "fadeIn": fade_in, "fadeOut": fade_out}
+    if "reframe" in value:
+        if track_kind != "video" or asset.get("kind") != "video":
+            raise ValueError("主体裁剪只能用于视频素材")
+        from .montage_reframe import ReframeError, validate_stored_reframe
+        try:
+            normalized["reframe"] = validate_stored_reframe(value["reframe"])
+        except ReframeError as error:
+            raise ValueError(str(error)) from error
+    return normalized
 
 
 def _keys(value: Any, expected: Tuple[str, ...]) -> None:

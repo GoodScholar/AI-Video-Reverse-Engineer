@@ -11,6 +11,7 @@ from PIL import Image
 from app.batch_subtitles import write_srt
 from app import timeline_render
 from app.timeline_render import TimelineRenderError, _output_size, render_timeline
+from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint
 
 
 pytestmark = pytest.mark.skipif(
@@ -255,6 +256,34 @@ def test_png_with_faster_speed_remains_visible_for_the_whole_output_clip(tmp_pat
 
     pixel = _rgb_at(output, 1.5)
     assert pixel[0] > 180 and pixel[2] < 60
+
+
+def test_reframe_moves_a_full_bleed_crop_in_source_time_without_black_padding(tmp_path):
+    """A crop applied after speed conversion would not reach the blue source side at 2x."""
+    source = tmp_path / "split.mp4"
+    _run("ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y",
+         "-f", "lavfi", "-i", "color=red:size=64x48:rate=24:duration=3",
+         "-f", "lavfi", "-i", "color=blue:size=64x48:rate=24:duration=3",
+         "-filter_complex", "[0:v][1:v]hstack=inputs=2", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source))
+    analysis = {
+        "schemaVersion": 1, "sourceFingerprint": source_fingerprint(source), "sourceWidth": 128, "sourceHeight": 48,
+        "targetAspect": {"width": 1, "height": 2}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+        "samples": [
+            {"timeSeconds": 0, "boxes": [{"x": .1, "y": .1, "width": .1, "height": .8, "label": "person", "confidence": .9}],
+             "center": {"x": .2, "y": .5}, "confidence": .9},
+            {"timeSeconds": 3, "boxes": [{"x": .7, "y": .1, "width": .1, "height": .8, "label": "person", "confidence": .9}],
+             "center": {"x": .8, "y": .5}, "confidence": .9},
+        ], "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []},
+    }
+    output = tmp_path / "reframe.mp4"
+    render_timeline(_timeline(width=24, height=48, tracks=[_track("video", [
+        _clip("split", 0, 1.5, speed=2, reframe=analysis),
+    ])]), {"split": source}, output, format="mp4")
+
+    first, last = _rgb_at(output, .15), _rgb_at(output, 1.3)
+    assert first[0] > 150 and first[2] < 70
+    assert last[2] > 130 and last[0] < 80
+    assert min(first) >= 0 and min(last) >= 0
 
 
 def test_rejects_video_clip_past_the_end_of_its_video_stream_even_if_audio_is_longer(tmp_path):

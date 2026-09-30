@@ -344,7 +344,7 @@ class BatchStore:
                 temporary.unlink(missing_ok=True)
 
 
-def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", source_lock=None, renderer=None, voice_service=None, segment_reranker=None, segment_vectorizer_version=None):
+def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", source_lock=None, renderer=None, voice_service=None, segment_reranker=None, segment_vectorizer_version=None, reframe_analyzer=None):
     store = BatchStore(Path(data_dir))
     project_assets = ProjectAssets(Path(data_dir))
     render_inputs = RenderInputPreparation(project_assets)
@@ -412,6 +412,100 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             for run in task["variant"].get("exports", [])
         ]
         return result
+
+    def clip_for(task: dict[str, Any], clip_id: str, proposal_id: str | None = None):
+        if proposal_id is not None:
+            proposal = montage_proposal_for(task, proposal_id)
+            clip = next((item.get("selectedClip") for item in proposal["segments"]
+                         if (item.get("selectedClip") or {}).get("id") == clip_id), None)
+            if clip is None:
+                raise ValueError("混剪提案片段不存在。")
+            return clip
+        clip = next((clip for track in task["variant"]["tracks"] for clip in track.get("clips", [])
+                     if clip.get("id") == clip_id), None)
+        if clip is None:
+            raise ValueError("变体片段不存在。")
+        return clip
+
+    def schedule_reframes(project_id: str, task_id: str, clip_ids: list[str], *, proposal_id: str | None = None):
+        """One existing compute job per submit; late workers may only write same clip identity."""
+        with source_lock or nullcontext(), lock:
+            state = state_for(project_id)
+            task = task_for(state, task_id)
+            variant = task["variant"]
+            analysis = variant.setdefault("reframeAnalysis", {})
+            jobs = []
+            for clip_id in clip_ids:
+                clip = clip_for(task, clip_id, proposal_id)
+                asset = assets_for(project_id).get(clip["assetId"])
+                if asset is None or asset.get("kind") != "video":
+                    raise ValueError("主体裁剪仅支持可用视频素材。")
+                source = project_assets.file(project_id, asset)
+                from .montage_reframe import pending_reframe, source_fingerprint
+                clip.setdefault("reframe", pending_reframe(target_width=variant["settings"]["width"],
+                                                            target_height=variant["settings"]["height"],
+                                                            reason="已提交本地主体分析"))
+                identity = {"assetId": clip["assetId"], "inPoint": clip["inPoint"], "duration": clip["duration"],
+                            "speed": clip["speed"], "sourceFingerprint": source_fingerprint(source)}
+                analysis[clip_id] = {"status": "queued", "error": None, "proposalId": proposal_id,
+                                     "identity": identity}
+                jobs.append((clip_id, identity, source, dict(clip["reframe"]["targetAspect"])))
+            save(project_id, state)
+
+        def process(_pid):
+            completed, failures = {}, {}
+            for clip_id, identity, source, aspect in jobs:
+                try:
+                    from .montage_reframe import normalize_reframe, run_local_detector
+                    raw = reframe_analyzer(source, identity["inPoint"], identity["inPoint"] + identity["duration"] * identity["speed"], aspect) if reframe_analyzer else run_local_detector(
+                        source, start=identity["inPoint"], end=identity["inPoint"] + identity["duration"] * identity["speed"],
+                        target_width=aspect["width"], target_height=aspect["height"])
+                    completed[clip_id] = normalize_reframe(raw, source_fingerprint=identity["sourceFingerprint"],
+                        source_width=raw["sourceWidth"], source_height=raw["sourceHeight"],
+                        required_start=identity["inPoint"], required_end=identity["inPoint"] + identity["duration"] * identity["speed"])
+                except Exception as error:
+                    failures[clip_id] = str(error)[:300] or "本地主体分析失败。"
+            with source_lock or nullcontext(), lock:
+                state = state_for(project_id)
+                task = task_for(state, task_id)
+                changed = False
+                renderable_changed = False
+                for clip_id, identity, _source, _aspect in jobs:
+                    record = task["variant"].get("reframeAnalysis", {}).get(clip_id)
+                    if record is None or record.get("identity") != identity:
+                        continue
+                    try:
+                        clip = clip_for(task, clip_id, proposal_id)
+                    except ValueError:
+                        continue
+                    current = {key: clip.get(key) for key in ("assetId", "inPoint", "duration", "speed")}
+                    if current != {key: identity[key] for key in current}:
+                        continue
+                    if clip_id in completed:
+                        # A user override survives a late automatic result; boxes/reasons stay from the worker.
+                        override = clip.get("reframe", {}).get("override")
+                        result = completed[clip_id]
+                        if isinstance(override, dict) and override.get("mode") != "auto":
+                            result = {**result, "override": deepcopy(override)}
+                        clip["reframe"] = result
+                        record.update(status="completed", error=None)
+                        renderable_changed = True
+                    else:
+                        record.update(status="failed", error=failures.get(clip_id, "本地主体分析失败。"))
+                    changed = True
+                if changed:
+                    # A proposal is not a versioned renderable variant; adopted analysis increments the variant once.
+                    if proposal_id is None and renderable_changed:
+                        task["variant"]["revision"] += 1
+                    save(project_id, state)
+        key = "batch-reframe:" + task_id + ":" + (proposal_id or "variant")
+        if not compute_queue.submit(key, project_id, process):
+            with source_lock or nullcontext(), lock:
+                state = state_for(project_id)
+                task = task_for(state, task_id)
+                for clip_id, *_ in jobs:
+                    task["variant"].get("reframeAnalysis", {}).get(clip_id, {}).update(status="failed", error="本地处理队列不可用。")
+                save(project_id, state)
 
     def regular_file(path: Path):
         descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -951,6 +1045,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     variant_ordinal=variant_ordinal,
                     proposal_generation=len(task.get("montageProposals", [])),
                     selling_point=task["sellingPoint"],
+                    target_width=task["variant"]["settings"]["width"],
+                    target_height=task["variant"]["settings"]["height"],
                 )
             except MontagePlanningError as error:
                 raise HTTPException(422, detail={"code": error.code, "message": error.message}) from None
@@ -960,7 +1056,29 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             proposals = task.setdefault("montageProposals", [])
             proposals.append(proposal)
             save(project_id, state)
+            # Queue all chosen first-pass clips together; users never need to click each one.
+            schedule_reframes(project_id, task_id, [clip["id"] for clip in proposal["clips"]], proposal_id=proposal["id"])
             return {"proposal": deepcopy(proposal)}
+
+    @router.post("/{task_id}/variant/reframes/{clip_id}/analyze", status_code=202)
+    def analyze_variant_reframe(project_id: str, task_id: str, clip_id: str, body: dict[str, Any]):
+        project_for(project_id)
+        if not isinstance(body, dict) or set(body) != {"revision"} or type(body["revision"]) is not int:
+            raise HTTPException(422, detail={"code": "reframe_request_invalid", "message": "主体分析请求无效。"})
+        with lock:
+            task = task_for(state_for(project_id), task_id)
+            if task["variant"]["revision"] != body["revision"]:
+                raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "变体已更新，请刷新后重试。"})
+            try:
+                clip_for(task, clip_id)
+            except ValueError:
+                raise HTTPException(404, detail={"code": "reframe_clip_missing", "message": "变体片段不存在。"}) from None
+        try:
+            schedule_reframes(project_id, task_id, [clip_id])
+        except (OSError, ValueError):
+            raise HTTPException(409, detail={"code": "reframe_source_unavailable", "message": "主体分析素材不可用。"}) from None
+        with lock:
+            return {"variant": public_task(project_id, task_for(state_for(project_id), task_id))["variant"]}
 
     @router.put("/{task_id}/montage-proposals/{proposal_id}")
     def update_montage_proposal(project_id: str, task_id: str, proposal_id: str, body: dict[str, Any]):
@@ -1205,6 +1323,9 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 } for segment, clip in zip(proposal["segments"], proposed_clips)],
             )
             save(project_id, state)
+            # If adoption races the draft job, submit a variant CAS job too.  It
+            # deduplicates at the compute key level and is the renderable owner.
+            schedule_reframes(project_id, task_id, [clip["id"] for clip in proposed_clips])
             return {"proposal": deepcopy(proposal), "variant": public_task(project_id, task)["variant"]}
 
     def process_voiceover(project_id, task_id, job_id):
