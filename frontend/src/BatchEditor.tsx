@@ -921,7 +921,7 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
         {subtitleDirty && !subtitlesValid && <p role="status">每条字幕需填写不超过 120 字；时间须在当前画面范围内且至少相隔 1 毫秒。</p>}
         <button type="button" className="primary-action" disabled={busy || tracksDirty || transitionsDirty || aspectDirty || !subtitleDirty || !subtitlesValid} onClick={() => void saveSubtitles()}>保存字幕</button>
       </div>
-      {selectedPackaging && <PackagingControls value={selectedPackaging} cues={subtitleDraft} disabled={busy}
+      {selectedPackaging && <PackagingControls value={selectedPackaging} cues={subtitleDraft} subtitleMode="cue" disabled={busy}
         onChange={(packaging) => setPackagingDrafts((current) => ({ ...current, [selected.id]: packaging }))} />}
       <button type="button" className="primary-action" disabled={busy || !dirty} onClick={() => void saveVariant()}>保存变体</button>
       </>}

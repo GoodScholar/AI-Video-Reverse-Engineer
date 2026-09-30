@@ -20,6 +20,7 @@ export type ReframeAnalysis = { id?: string; status: "queued" | "running" | "com
 export type PackagingElement = { id: string; kind: "subtitle" | "keyword" | "title" | "selling-point" | "cta"; enabled: boolean; position: "auto" | "top" | "middle" | "bottom"; style: "plain" | "emphasis" | "banner"; start?: number; end?: number; text?: string; cueId?: string };
 export type Packaging = { schemaVersion: 1; templateId: "commercial-clean"; templateVersion: 1; font: { id: string; version: string; sha256: string; source: string; license: "OFL-1.1" };
   safeArea: { left: number; right: number; top: number; bottom: number }; elements: PackagingElement[] };
+export type SubtitleMode = "cue" | "inline";
 
 const FONT = { id: "noto-sans-cjk-sc-regular", version: "Version 2.004;hotconv 1.0.118;makeotfexe 2.5.65603", sha256: "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b", source: "Noto Sans CJK SC", license: "OFL-1.1" as const };
 const kinds: PackagingElement["kind"][] = ["title", "keyword", "selling-point", "subtitle", "cta"];
@@ -180,7 +181,7 @@ function packagingErrors(value: Packaging) {
   return errors;
 }
 
-export function PackagingControls({ value, cues, onChange, disabled }: { value: Packaging; cues: BatchCue[]; onChange: (next: Packaging) => void; disabled: boolean }) {
+export function PackagingControls({ value, cues, subtitleMode, onChange, disabled }: { value: Packaging; cues: BatchCue[]; subtitleMode: SubtitleMode; onChange: (next: Packaging) => void; disabled: boolean }) {
   const errors = useMemo(() => packagingErrors(value), [value]);
   const update = (change: Partial<Packaging>) => onChange({ ...value, ...change });
   const updateElement = (id: string, change: Partial<PackagingElement>) => update({ elements: value.elements.map((item) => item.id === id ? { ...item, ...change } as PackagingElement : item) });
@@ -189,17 +190,17 @@ export function PackagingControls({ value, cues, onChange, disabled }: { value: 
     while (value.elements.some((item) => item.id === `${kind}-${serial}`)) serial += 1;
     const id = `${kind}-${serial}`;
     const base = { id, kind, enabled: true, position: kind === "subtitle" ? "bottom" : "top", style: kind === "title" ? "banner" : "plain" } as const;
-    update({ elements: [...value.elements, kind === "subtitle" ? { ...base, cueId: cues[0]?.id ?? "" } : { ...base, start: 0, end: 2, text: kind === "cta" ? "立即了解" : "" }] });
+    update({ elements: [...value.elements, kind === "subtitle" && subtitleMode === "cue" ? { ...base, cueId: cues[0]?.id ?? "" } : { ...base, start: 0, end: 2, text: kind === "cta" ? "立即了解" : "" }] });
   };
   return <section className="packaging-controls" aria-label="商业包装">
     <header><div><h5>商业包装</h5><p>模板、五类图文元素和安全区只修改草稿；保存后旧预览与审核会失效，最终以真实渲染预览核对。</p></div><label>模板<select aria-label="包装模板" value={value.templateId} disabled={disabled} onChange={() => update({ templateId: "commercial-clean", templateVersion: 1 })}><option value="commercial-clean">商业清爽</option></select></label><button type="button" className="secondary-action" disabled={disabled || !value.elements.some((item) => item.enabled)} onClick={() => update({ elements: value.elements.map((item) => ({ ...item, enabled: false })) })}>关闭已启用包装</button></header>
     {errors.map((error) => <p key={error} className="reframe-error" role="alert">{error}</p>)}
     <div className="packaging-safe-area"><strong>安全区</strong>{(["left", "right", "top", "bottom"] as const).map((side) => <label key={side}>{side}<input aria-label={`安全区 ${side}`} type="number" min="0" max=".45" step=".01" value={value.safeArea[side]} disabled={disabled}
       onChange={(event) => update({ safeArea: { ...value.safeArea, [side]: Number(event.target.value) } })} /></label>)}</div>
-    <div className="packaging-add">{kinds.map((kind) => <button key={kind} type="button" className="secondary-action" disabled={disabled || (kind === "subtitle" && !cues.length)} onClick={() => add(kind)}>添加{kind}</button>)}</div>
+    <div className="packaging-add">{kinds.map((kind) => <button key={kind} type="button" className="secondary-action" disabled={disabled || (kind === "subtitle" && subtitleMode === "cue" && !cues.length)} onClick={() => add(kind)}>添加{kind}</button>)}</div>
     {value.elements.map((element) => <article key={element.id} className="packaging-element"><header><strong>{element.kind}</strong><label><input aria-label={`${element.id} 启用`} type="checkbox" checked={element.enabled} disabled={disabled} onChange={(event) => updateElement(element.id, { enabled: event.target.checked })} />启用</label>
       <button type="button" className="secondary-action" disabled={disabled} onClick={() => update({ elements: value.elements.filter((item) => item.id !== element.id) })}>删除</button></header>
-      {element.kind === "subtitle" ? <label>字幕正本<select aria-label={`${element.id} 字幕正本`} value={element.cueId ?? ""} disabled={disabled} onChange={(event) => updateElement(element.id, { cueId: event.target.value })}>{cues.map((cue) => <option key={cue.id} value={cue.id}>{cue.text || cue.id}</option>)}</select></label>
+      {element.kind === "subtitle" && subtitleMode === "cue" ? <label>字幕正本<select aria-label={`${element.id} 字幕正本`} value={element.cueId ?? ""} disabled={disabled} onChange={(event) => updateElement(element.id, { cueId: event.target.value })}>{cues.map((cue) => <option key={cue.id} value={cue.id}>{cue.text || cue.id}</option>)}</select></label>
         : <><label>文字<input aria-label={`${element.id} 文字`} value={element.text ?? ""} disabled={disabled} onChange={(event) => updateElement(element.id, { text: event.target.value })} /></label><label>开始<input aria-label={`${element.id} 开始`} type="number" min="0" step=".1" value={element.start ?? 0} disabled={disabled} onChange={(event) => updateElement(element.id, { start: Number(event.target.value) })} /></label><label>结束<input aria-label={`${element.id} 结束`} type="number" min=".1" step=".1" value={element.end ?? 2} disabled={disabled} onChange={(event) => updateElement(element.id, { end: Number(event.target.value) })} /></label></>}
       <label>位置<select aria-label={`${element.id} 位置`} value={element.position} disabled={disabled} onChange={(event) => updateElement(element.id, { position: event.target.value as PackagingElement["position"] })}><option value="auto">自动避让</option><option value="top">顶部</option><option value="middle">中部</option><option value="bottom">底部</option></select></label>
       <label>样式<select aria-label={`${element.id} 样式`} value={element.style} disabled={disabled} onChange={(event) => updateElement(element.id, { style: event.target.value as PackagingElement["style"] })}><option value="plain">普通</option><option value="emphasis">强调</option><option value="banner">横幅</option></select></label></article>)}

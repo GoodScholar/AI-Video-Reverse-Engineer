@@ -267,7 +267,7 @@ describe("PackagingControls", () => {
       { id: "title", kind: "title", enabled: true, start: 0, end: 2, text: "旧标题", position: "top", style: "banner" },
       { id: "subtitle", kind: "subtitle", enabled: true, cueId: "cue-a", position: "bottom", style: "plain" },
       ] });
-      return <PackagingControls value={value} cues={[{ id: "cue-a", start: 0, end: 1, text: "第一句" }, { id: "cue-b", start: 1, end: 2, text: "第二句" }]}
+      return <PackagingControls value={value} cues={[{ id: "cue-a", start: 0, end: 1, text: "第一句" }, { id: "cue-b", start: 1, end: 2, text: "第二句" }]} subtitleMode="cue"
         onChange={(next) => { setValue(next); onChange(next); }} disabled={false} />;
     }
     render(<Editor />);
@@ -287,14 +287,40 @@ describe("PackagingControls", () => {
 
   it("将字体错误和安全区错误直接呈现给编辑者", async () => {
     render(<PackagingControls value={{ ...defaultPackaging(), font: { ...defaultPackaging().font, sha256: "bad" },
-      safeArea: { left: .5, right: .5, top: .05, bottom: .05 } }} cues={[]} onChange={vi.fn()} disabled={false} />);
+      safeArea: { left: .5, right: .5, top: .05, bottom: .05 } }} cues={[]} subtitleMode="cue" onChange={vi.fn()} disabled={false} />);
     expect(screen.getAllByRole("alert").map((item) => item.textContent).join(" ")).toContain("受控字体引用无效");
     expect(screen.getAllByRole("alert").map((item) => item.textContent).join(" ")).toContain("安全区没有可用空间");
   });
 
+  it("inline 模式可在没有 cue 时添加并编辑独立字幕正文和时段", async () => {
+    const onChange = vi.fn();
+    function Editor() {
+      const [value, setValue] = useState<Packaging>(defaultPackaging());
+      return <PackagingControls value={value} cues={[]} subtitleMode="inline" disabled={false}
+        onChange={(next) => { setValue(next); onChange(next); }} />;
+    }
+    render(<Editor />);
+
+    await userEvent.click(screen.getByRole("button", { name: "添加subtitle" }));
+    await userEvent.type(screen.getByLabelText("subtitle-1 文字"), "手动字幕");
+    fireEvent.change(screen.getByLabelText("subtitle-1 开始"), { target: { value: "1.2" } });
+    fireEvent.change(screen.getByLabelText("subtitle-1 结束"), { target: { value: "2.8" } });
+
+    expect(screen.queryByLabelText("subtitle-1 字幕正本")).not.toBeInTheDocument();
+    expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ elements: [
+      expect.objectContaining({ id: "subtitle-1", kind: "subtitle", text: "手动字幕", start: 1.2, end: 2.8 }),
+    ] }));
+    expect(onChange.mock.calls[onChange.mock.calls.length - 1]?.[0].elements[0]).not.toHaveProperty("cueId");
+  });
+
+  it("cue 模式在没有字幕正本时仍禁用添加字幕", () => {
+    render(<PackagingControls value={defaultPackaging()} cues={[]} subtitleMode="cue" onChange={vi.fn()} disabled={false} />);
+    expect(screen.getByRole("button", { name: "添加subtitle" })).toBeDisabled();
+  });
+
   it("模板可选择且可一次关闭全部已启用包装", async () => {
     const onChange = vi.fn(); const value = { ...defaultPackaging(), elements: [{ id: "title", kind: "title" as const, enabled: true, start: 0, end: 2, text: "标题", position: "top" as const, style: "banner" as const }] };
-    render(<PackagingControls value={value} cues={[]} onChange={onChange} disabled={false} />);
+    render(<PackagingControls value={value} cues={[]} subtitleMode="cue" onChange={onChange} disabled={false} />);
     expect(screen.getByLabelText("包装模板")).toHaveValue("commercial-clean");
     await userEvent.click(screen.getByRole("button", { name: "关闭已启用包装" }));
     expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ elements: [expect.objectContaining({ enabled: false })] }));
@@ -303,7 +329,7 @@ describe("PackagingControls", () => {
   it("删除后新增同类元素仍生成唯一 id", async () => {
     function Editor() {
       const [value, setValue] = useState<Packaging>({ ...defaultPackaging(), elements: [{ id: "title-1", kind: "title", enabled: true, start: 0, end: 2, text: "旧", position: "top", style: "banner" }, { id: "title-2", kind: "title", enabled: true, start: 0, end: 2, text: "留存", position: "top", style: "banner" }] });
-      return <PackagingControls value={value} cues={[]} onChange={setValue} disabled={false} />;
+      return <PackagingControls value={value} cues={[]} subtitleMode="cue" onChange={setValue} disabled={false} />;
     }
     render(<Editor />);
     await userEvent.click(screen.getAllByRole("button", { name: "删除" })[0]);

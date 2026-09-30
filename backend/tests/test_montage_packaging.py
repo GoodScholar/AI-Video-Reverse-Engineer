@@ -138,10 +138,10 @@ def test_batch_preview_and_export_preflight_share_the_missing_subject_block():
     assert validate_final_events(_packaging([]), cues, [track], batch=True)["elements"] == []
 
 
-@pytest.mark.parametrize("mode", ["center", "manual"])
-def test_explicit_reframe_risk_decision_allows_packaging_without_inventing_subject_boxes(mode):
-    """Center/manual is an explicit risk decision, never a fake empty detection result."""
-    from app.montage_packaging import _subject_boxes
+@pytest.mark.parametrize("mode", ["center", "manual", "replace"])
+def test_explicit_reframe_risk_without_observed_subject_facts_blocks_packaging(mode):
+    """A crop decision alone cannot prove a packaging event avoids subjects."""
+    from app.montage_packaging import PackagingError, _subject_boxes
 
     track = _reframed_track()[0]
     reframe = track["clips"][0]["reframe"]
@@ -149,7 +149,26 @@ def test_explicit_reframe_risk_decision_allows_packaging_without_inventing_subje
     reframe["status"] = "review_required"
     reframe["override"] = {"mode": mode, "keyframes": ([] if mode == "center" else [{"timeSeconds": 0, "x": .5, "y": .5}])}
 
-    assert _subject_boxes([track], .2, .8, 720, 1280) == []
+    with pytest.raises(PackagingError, match="包装避让证据缺失"):
+        _subject_boxes([track], .2, .8, 720, 1280)
+
+
+@pytest.mark.parametrize(("sample_confidence", "boxes"), [
+    (.9, []),
+    (.9, [{"x": .2, "y": .2, "width": .2, "height": .2, "label": "person", "confidence": 0}]),
+    (0, [{"x": .2, "y": .2, "width": .2, "height": .2, "label": "person", "confidence": .9}]),
+])
+def test_review_observation_without_a_positive_subject_box_cannot_authorize_packaging(sample_confidence, boxes):
+    from app.montage_packaging import PackagingError, _subject_boxes
+
+    track = _reframed_track()[0]
+    reframe = track["clips"][0]["reframe"]
+    reframe.update(status="review_required", samples=[{
+        "timeSeconds": .5, "boxes": boxes, "center": {"x": .5, "y": .5}, "confidence": sample_confidence,
+    }], override={"mode": "center", "keyframes": []})
+
+    with pytest.raises(PackagingError, match="包装避让证据缺失"):
+        _subject_boxes([track], .2, .8, 720, 1280)
 
 
 @pytest.mark.parametrize("mode", ["center", "manual", "replace"])
@@ -169,6 +188,21 @@ def test_explicit_reframe_risk_decision_keeps_partial_real_boxes_without_pts_cov
     assert "Dialogue:" in compile_ass(packaging, [], [track], 720, 1280, private_font_path())
     cues = [{"id": "cue", "start": .2, "end": .8, "text": "人工决定"}]
     assert validate_final_events(_packaging([]), cues, [track], batch=True)["elements"] == []
+
+
+@pytest.mark.parametrize("mode", ["center", "manual", "replace"])
+def test_explicit_reframe_risk_blocks_partial_subject_facts_outside_packaging_event(mode):
+    """Partial review facts are usable only when the event contains an observation."""
+    from app.montage_packaging import PackagingError, _subject_boxes
+
+    track = _reframed_track()[0]
+    reframe = track["clips"][0]["reframe"]
+    reframe.update(status="review_required", uncertaintyReasons=["历史分析中断"], samples=reframe["samples"][:1])
+    reframe["samples"][0]["timeSeconds"] = .1
+    reframe["override"] = {"mode": mode, "keyframes": ([] if mode == "center" else [{"timeSeconds": 0, "x": .5, "y": .5}])}
+
+    with pytest.raises(PackagingError, match="包装避让证据缺失"):
+        _subject_boxes([track], .2, .8, 720, 1280)
 
 
 def test_auto_review_with_partial_samples_still_requires_pts_coverage():

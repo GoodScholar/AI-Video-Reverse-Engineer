@@ -341,6 +341,49 @@ def _interpolated_boxes(samples: list[dict[str, Any]], source_time: float) -> li
     return result or [box for sample in (left, right) for box in sample.get("boxes", []) if isinstance(box, dict)]
 
 
+_MISSING_PACKAGING_AVOIDANCE_FACT = "包装避让证据缺失；请先分析主体，或禁用/调整包装元素后再试。"
+
+
+def _review_observes_event(clip: dict[str, Any], reframe: dict[str, Any], start: float, end: float) -> bool:
+    """Return whether a review-required crop has a usable subject observation in this event."""
+    samples = reframe.get("samples")
+    if not isinstance(samples, list):
+        return False
+
+    def has_subject(sample: dict[str, Any]) -> bool:
+        sample_confidence = sample.get("confidence")
+        if type(sample_confidence) not in (int, float) or not math.isfinite(sample_confidence) or sample_confidence <= 0:
+            return False
+        boxes = sample.get("boxes")
+        if not isinstance(boxes, list):
+            return False
+        for box in boxes:
+            if not isinstance(box, dict) or not isinstance(box.get("label"), str) or not box["label"].strip():
+                continue
+            values = [box.get(key) for key in ("x", "y", "width", "height", "confidence")]
+            if (all(type(value) in (int, float) and math.isfinite(value) for value in values)
+                    and box["width"] > 0 and box["height"] > 0 and box["confidence"] > 0):
+                return True
+        return False
+
+    observed = [sample for sample in samples if isinstance(sample, dict)
+                and type(sample.get("timeSeconds")) in (int, float)
+                and math.isfinite(sample["timeSeconds"]) and has_subject(sample)]
+    if clip.get("_stillImage"):
+        return any(float(sample["timeSeconds"]) == 0 for sample in observed)
+    speed, in_point = clip.get("speed", 1), clip.get("inPoint", 0)
+    if type(speed) not in (int, float) or speed <= 0 or type(in_point) not in (int, float):
+        return False
+    clip_start = clip.get("start", 0)
+    duration = clip.get("duration", 0)
+    if type(clip_start) not in (int, float) or type(duration) not in (int, float) or duration <= 0:
+        return False
+    overlap_start, overlap_end = max(start, clip_start), min(end, clip_start + duration)
+    source_start = float(in_point) + (overlap_start - float(clip_start)) * float(speed)
+    source_end = float(in_point) + (overlap_end - float(clip_start)) * float(speed)
+    return any(source_start <= float(sample["timeSeconds"]) < source_end for sample in observed)
+
+
 def _visible_event_reframes(tracks: list[dict[str, Any]], start: float, end: float):
     """Yield visible clip facts only after enforcing the packaging safety decision."""
     for track in tracks:
@@ -357,11 +400,12 @@ def _visible_event_reframes(tracks: list[dict[str, Any]], start: float, end: flo
             if reframe.get("status") == "review_required":
                 if mode not in ("center", "manual", "replace"):
                     raise PackagingError("主体信息缺失需人工构图；请先分析主体，或选择中心裁剪/人工关键点。")
-                # An explicit crop is a user-accepted risk, not detection
-                # evidence.  With no boxes we do not invent an empty subject
-                # occupancy area for the graphics compiler.
-                if not reframe.get("samples"):
-                    continue
+                # A crop decision permits rendering, but cannot prove that a
+                # graphic event avoids subjects.  Partial facts are valid only
+                # at their actual observed PTS; never extend or interpolate
+                # them across an unobserved event interval.
+                if not _review_observes_event(clip, reframe, start, end):
+                    raise PackagingError(_MISSING_PACKAGING_AVOIDANCE_FACT)
             elif reframe.get("status") != "ready":
                 raise PackagingError("主体信息缺失需人工构图；请先分析主体，或选择中心裁剪/人工关键点。")
             yield clip, reframe

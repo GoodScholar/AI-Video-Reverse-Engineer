@@ -24,7 +24,7 @@ from PIL import Image
 
 from app.batch_editing_api import create_batch_editing_router
 from app.montage_packaging import PackagingError, compile_ass, default_packaging, private_font_path
-from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, pending_reframe, source_fingerprint
+from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint
 from app.timeline_render import TimelineRenderError, render_timeline
 
 
@@ -54,11 +54,16 @@ def _commands(directory: Path, text: str) -> None:
         f"stable-input-output-directory={directory}\n{text}\n", encoding="utf-8")
 
 
-def _source(path: Path, *, color: str = "0x172554", duration: float = 5.0) -> Path:
-    _run(FFMPEG, "-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
-         f"color=c={color}:s=320x180:r=30:d={duration}", "-f", "lavfi", "-i",
-         f"sine=frequency=440:sample_rate=48000:duration={duration}", "-shortest", "-c:v", "libx264",
-         "-pix_fmt", "yuv420p", "-c:a", "aac", path)
+def _source(path: Path, *, color: str = "0x172554", duration: float = 5.0, subject: bool = False) -> Path:
+    command = [FFMPEG, "-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
+               f"color=c={color}:s=320x180:r=30:d={duration}", "-f", "lavfi", "-i",
+               f"sine=frequency=440:sample_rate=48000:duration={duration}"]
+    if subject:
+        # This red 30x30 source-pixel subject remains visibly left of the
+        # portrait crop's centred text.  The matching facts below observe this
+        # exact x=110, y=75 rectangle at each packaging event PTS.
+        command.extend(["-vf", "drawbox=x=110:y=75:w=30:h=30:color=red:t=fill"])
+    _run(*command, "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", path)
     return path
 
 
@@ -71,19 +76,21 @@ def _moving_subject_source(path: Path, *, colour: str, moving: bool, y: int) -> 
     return path
 
 
-def _manual_subject_reframe(source: Path, *, moving: bool, colour: str, y: int) -> dict:
+def _manual_subject_reframe(source: Path, *, moving: bool, colour: str, y: int,
+                            sample_times: tuple[float, ...] = (0.0, 1.3)) -> dict:
     def box(time: float) -> dict:
         x = (20 + 80 * time if moving else 160) / 320
         return {"x": x, "y": y / 180, "width": 30 / 320, "height": 70 / 180,
                 "label": colour + "-subject", "confidence": .99}
-    centres = ((.11, .55), (.44, .55)) if moving else ((.55, .55), (.55, .55))
+    def center(time: float) -> tuple[float, float]:
+        return ((.11 + .25 * time, .55) if moving else (.55, .55))
     return {"schemaVersion": 1, "sourceFingerprint": source_fingerprint(source), "sourceWidth": 320, "sourceHeight": 180,
             "targetAspect": {"width": 720, "height": 1280}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
-            "samples": [{"timeSeconds": point, "boxes": [box(point)], "center": {"x": center[0], "y": center[1]}, "confidence": .99}
-                        for point, center in zip((0.0, 1.3), centres)],
+            "samples": [{"timeSeconds": point, "boxes": [box(point)], "center": {"x": center(point)[0], "y": center(point)[1]}, "confidence": .99}
+                        for point in sample_times],
             "frameDurationSeconds": .04, "uncertaintyReasons": ["实际色块主体已人工确认轨迹"], "status": "review_required",
-            "override": {"mode": "manual", "keyframes": [{"timeSeconds": point, "x": center[0], "y": center[1]}
-                                                          for point, center in zip((0.0, 1.3), centres)]}}
+            "override": {"mode": "manual", "keyframes": [{"timeSeconds": point, "x": center(point)[0], "y": center(point)[1]}
+                                                          for point in sample_times]}}
 
 
 def _colour_bbox(frame: Path, colour: str) -> list[int] | None:
@@ -110,9 +117,22 @@ def _disjoint(left: list[int], right: list[int]) -> bool:
     return left[2] <= right[0] or right[2] <= left[0] or left[3] <= right[1] or right[3] <= left[1]
 
 
-def _tracks(duration: float = 5.0) -> list[dict]:
-    reframe = pending_reframe(target_width=720, target_height=1280, reason="真实包装证据显式采用中心构图")
-    reframe["override"] = {"mode": "center", "keyframes": []}
+def _subject_exclusion(box: list[int]) -> list[int]:
+    """Exclude the H.264 halo around control subject pixels from ASS-only diffs."""
+    return [max(0, box[0] - 32), max(0, box[1] - 32), box[2] + 32, box[3] + 32]
+
+
+def _tracks(source: Path, duration: float = 5.0) -> list[dict]:
+    observations = [point for point in (.5, 1.4, 2.3, 3.2, 4.1) if point < duration]
+    reframe = {"schemaVersion": 1, "sourceFingerprint": source_fingerprint(source), "sourceWidth": 320, "sourceHeight": 180,
+               "targetAspect": {"width": 720, "height": 1280}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+               "samples": [{"timeSeconds": point,
+                            "boxes": [{"x": 110 / 320, "y": 75 / 180, "width": 30 / 320, "height": 30 / 180,
+                                       "label": "red-subject", "confidence": .99}],
+                            "center": {"x": .5, "y": .5}, "confidence": .99}
+                           for point in observations],
+               "frameDurationSeconds": .04, "uncertaintyReasons": ["实际红色色块主体的已观测 PTS"],
+               "status": "review_required", "override": {"mode": "center", "keyframes": []}}
     return [{"id": "video", "name": "画面", "kind": "video", "muted": False, "hidden": False, "clips": [
         {"id": "clip", "assetId": "shot", "start": 0, "inPoint": 0, "duration": duration,
          "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0, "reframe": reframe},
@@ -151,17 +171,18 @@ def _frame(video: Path, second: float, destination: Path) -> Path:
     return destination
 
 
-def _difference_bbox(rendered: Path, control: Path) -> tuple[list[int] | None, tuple[int, int]]:
+def _difference_bbox(rendered: Path, control: Path, *, exclude: list[list[int]] | None = None) -> tuple[list[int] | None, tuple[int, int]]:
     with Image.open(rendered).convert("RGB") as actual, Image.open(control).convert("RGB") as baseline:
         points = [(x, y) for y in range(actual.height) for x in range(actual.width)
-                  if sum(abs(left - right) for left, right in zip(actual.getpixel((x, y)), baseline.getpixel((x, y)))) > 12]
+                  if not any(box[0] <= x < box[2] and box[1] <= y < box[3] for box in (exclude or []))
+                  and sum(abs(left - right) for left, right in zip(actual.getpixel((x, y)), baseline.getpixel((x, y)))) > 12]
         if not points:
             return None, actual.size
         return [min(x for x, _y in points), min(y for _x, y in points),
                 max(x for x, _y in points) + 1, max(y for _x, y in points) + 1], actual.size
 
 
-def _diff_metrics(rendered: Path, control: Path) -> dict[str, object]:
+def _diff_metrics(rendered: Path, control: Path, *, exclude: list[list[int]] | None = None) -> dict[str, object]:
     """Actual ASS-vs-control pixels, normalized for preview/export codec size."""
     with Image.open(rendered).convert("RGB") as actual, Image.open(control).convert("RGB") as baseline:
         changed, bins, channels = 0, set(), [0, 0, 0]
@@ -169,6 +190,8 @@ def _diff_metrics(rendered: Path, control: Path) -> dict[str, object]:
         dark = 0
         for y in range(actual.height):
             for x in range(actual.width):
+                if any(box[0] <= x < box[2] and box[1] <= y < box[3] for box in (exclude or [])):
+                    continue
                 pixel, reference = actual.getpixel((x, y)), baseline.getpixel((x, y))
                 if sum(abs(left - right) for left, right in zip(pixel, reference)) <= 12:
                     continue
@@ -195,11 +218,11 @@ def _normal(box: list[int], size: tuple[int, int]) -> list[float]:
     return [box[0] / size[0], box[1] / size[1], box[2] / size[0], box[3] / size[1]]
 
 
-def test_real_five_element_pixel_timing_safe_area_and_preview_export_matrix():
+def test_real_five_element_layout_uses_actual_subject_facts_at_each_event_pts():
     directory = _evidence_dir("five-elements")
     _commands(directory, "render_timeline: ffmpeg-full/libass, packaged and same-source unpackaged preview/mp4 controls; extract PNG frames with ffmpeg-full")
-    source = _source(directory / "source.mp4")
-    timeline, package = _timeline(_tracks()), _package()
+    source = _source(directory / "source.mp4", subject=True)
+    timeline, package = _timeline(_tracks(source)), _package()
     ass = compile_ass(package, [], timeline["tracks"], 720, 1280, private_font_path())
     (directory / "packaging.ass").write_text(ass, encoding="utf-8")
     assert "\\\u2060N" in ass and "\\{" in ass and "\\}" in ass and "\\N真换行" in ass
@@ -215,24 +238,32 @@ def test_real_five_element_pixel_timing_safe_area_and_preview_export_matrix():
 
     samples = {"title": (.50, "top"), "selling-point": (1.40, "middle"), "keyword": (2.30, "top"),
                "cta": (3.20, "bottom"), "subtitle": (4.10, "bottom")}
-    matrix: dict[str, object] = {"thresholds": {"bboxNormalizedDelta": .015, "safeArea": [.05, .95], "pixelDifference": 12}, "elements": {}}
+    matrix: dict[str, object] = {"thresholds": {"bboxNormalizedDelta": .015, "safeArea": [.05, .95],
+        "pixelDifference": 12, "subjectRule": "each event PTS has actual red source pixels disjoint from ASS pixels"},
+        "elements": {}}
     for kind, (second, position) in samples.items():
         preview_frame, export_frame, control_frame = (_frame(preview, second, directory / f"preview-{kind}.png"),
             _frame(exported, second, directory / f"export-{kind}.png"), _frame(preview_control, second, directory / f"preview-control-{kind}.png"))
         export_control_frame = _frame(export_control, second, directory / f"export-control-{kind}.png")
-        preview_box, preview_size = _difference_bbox(preview_frame, control_frame)
-        export_box, export_size = _difference_bbox(export_frame, export_control_frame)
+        preview_subject, export_subject = _colour_bbox(control_frame, "red"), _colour_bbox(export_control_frame, "red")
+        assert preview_subject and export_subject, (kind, preview_subject, export_subject)
+        preview_box, preview_size = _difference_bbox(preview_frame, control_frame, exclude=[_subject_exclusion(preview_subject)])
+        export_box, export_size = _difference_bbox(export_frame, export_control_frame, exclude=[_subject_exclusion(export_subject)])
         assert preview_box and export_box, kind
         preview_normal, export_normal = _normal(preview_box, preview_size), _normal(export_box, export_size)
         assert max(abs(left - right) for left, right in zip(preview_normal, export_normal)) < .015
-        assert .05 <= export_normal[0] < export_normal[2] <= .95 and .05 <= export_normal[1] < export_normal[3] <= .95
-        center_y = (export_normal[1] + export_normal[3]) / 2
-        assert (center_y < .30 if position == "top" else .30 < center_y < .70 if position == "middle" else center_y > .70)
+        for normal in (preview_normal, export_normal):
+            assert .05 <= normal[0] < normal[2] <= .95 and .05 <= normal[1] < normal[3] <= .95
+            center_y = (normal[1] + normal[3]) / 2
+            assert (center_y < .30 if position == "top" else .30 < center_y < .70 if position == "middle" else center_y > .70)
+        assert _disjoint(preview_box, preview_subject) and _disjoint(export_box, export_subject), kind
         matrix["elements"][kind] = {"sample": second, "preview": preview_normal, "export": export_normal,
-                                     "maxDelta": max(abs(left - right) for left, right in zip(preview_normal, export_normal))}
+            "maxDelta": max(abs(left - right) for left, right in zip(preview_normal, export_normal)),
+            "actualRedSubject": {"preview": preview_subject, "export": export_subject}}
     for second in (.05, .95, 1.90, 2.80, 3.70, 4.65):
         packaged, baseline = _frame(exported, second, directory / f"outside-{second}.png"), _frame(export_control, second, directory / f"control-outside-{second}.png")
-        assert _difference_bbox(packaged, baseline)[0] is None
+        subject = _colour_bbox(baseline, "red")
+        assert subject and _difference_bbox(packaged, baseline, exclude=[_subject_exclusion(subject)])[0] is None
     (directory / "pixel-matrix.json").write_text(json.dumps(matrix, ensure_ascii=False, indent=2), encoding="utf-8")
     probe = _run(FFPROBE, "-v", "error", "-show_streams", "-show_format", "-of", "json", exported)
     (directory / "export-ffprobe.json").write_text(probe.stdout, encoding="utf-8")
@@ -251,9 +282,11 @@ def test_real_moving_subject_reframe_and_transition_keep_actual_text_pixels_clea
     _commands(directory, "render_timeline: two real 320x180 moving-colour sources + manual retained reframe trajectories + dissolve overlap; packaged/unpackaged pixel controls")
     red, blue = _moving_subject_source(directory / "red-moving.mp4", colour="red", moving=True, y=95), _moving_subject_source(directory / "blue-subject.mp4", colour="blue", moving=False, y=105)
     left = {"id": "red-clip", "assetId": "red", "start": 0, "inPoint": 0, "duration": 1.3, "speed": 1, "volume": 0, "fadeIn": 0, "fadeOut": 0,
-            "reframe": _manual_subject_reframe(red, moving=True, colour="red", y=95)}
+            "reframe": _manual_subject_reframe(red, moving=True, colour="red", y=95,
+                                                 sample_times=(0.0, .99, 1.10, 1.23, 1.3))}
     right = {"id": "blue-clip", "assetId": "blue", "start": .9, "inPoint": 0, "duration": 1.3, "speed": 1, "volume": 0, "fadeIn": 0, "fadeOut": 0,
-             "reframe": _manual_subject_reframe(blue, moving=False, colour="blue", y=105)}
+             "reframe": _manual_subject_reframe(blue, moving=False, colour="blue", y=105,
+                                                  sample_times=(0.0, .09, .20, .33, 1.3))}
     tracks = [{"id": "video", "name": "真实主体", "kind": "video", "muted": False, "hidden": False, "clips": [left, right]}]
     timeline = {"settings": {"width": 720, "height": 1280, "fps": 30}, "tracks": tracks,
                 "transitions": [{"id": "dissolve", "leftClipId": "red-clip", "rightClipId": "blue-clip", "template": "dissolve", "enabled": True,
@@ -302,7 +335,7 @@ def test_real_api_lifecycle_renders_downloads_stales_and_regenerates():
     project_id, jobs = "task23", []
     root = directory / "project-files" / project_id / "preproduction"
     (root / "assets").mkdir(parents=True, exist_ok=True)
-    source = _source(root / "assets" / "shot.mp4", duration=5)
+    source = _source(root / "assets" / "shot.mp4", duration=5, subject=True)
     shutil.copy2(source, root / "assets" / "shot-two.mp4")
     (root / "state.json").write_text(json.dumps({"schemaVersion": 1, "revision": 1, "brief": {}, "shots": [],
         "assets": [{"id": "shot", "name": "真实镜头", "kind": "video", "file": "shot.mp4", "duration": 5},
@@ -313,7 +346,8 @@ def test_real_api_lifecycle_renders_downloads_stales_and_regenerates():
             jobs.append((kind, pid, handler)); return True
     app = FastAPI()
     app.include_router(create_batch_editing_router(directory, lambda _: SimpleNamespace(id=project_id), Queue(),
-                       ffmpeg_path=str(FFMPEG), ffprobe_path=str(FFPROBE)))
+                       ffmpeg_path=str(FFMPEG), ffprobe_path=str(FFPROBE),
+                       reframe_analyzer=lambda path, *_args: _tracks(path)[0]["clips"][0]["reframe"]))
     base = f"/api/projects/{project_id}/batch-edits"
     with TestClient(app) as api:
         parent = api.post(base, json={"sellingPoint": "真实卖点", "script": "真实包装"}).json()["task"]
@@ -334,17 +368,25 @@ def test_real_api_lifecycle_renders_downloads_stales_and_regenerates():
         kind, pid, handler = jobs.pop(0)
         assert kind.startswith("batch-reframe:")
         handler(pid)
-        tracks = cancelled.json()["variant"]["tracks"]
+        # Cancellation is retained as its own recovery path.  A subsequent
+        # server-side analysis writes the red source-pixel observations that
+        # packaging later relies on; client PUT still changes only the crop.
+        analysis = api.post(f"{base}/{task['id']}/variant/reframes/clip/analyze", json={"revision": 1})
+        assert analysis.status_code == 202, analysis.text
+        kind, pid, handler = jobs.pop(0)
+        assert kind.startswith("batch-reframe:")
+        handler(pid)
+        tracks = next(item for item in api.get(base).json()["tasks"] if item["id"] == task["id"])["variant"]["tracks"]
         tracks[0]["clips"][0]["reframe"]["override"] = {"mode": "center", "keyframes": []}
-        centered = api.put(f"{base}/{task['id']}/variant", json={"revision": 1, "tracks": tracks})
+        centered = api.put(f"{base}/{task['id']}/variant", json={"revision": 2, "tracks": tracks})
         assert centered.status_code == 200, centered.text
         tracks = centered.json()["variant"]["tracks"]
         cues = [{"id": "cue-1", "start": 3.8, "end": 4.45, "text": "字幕正本"}]
-        assert api.put(f"{base}/{task['id']}/subtitles", json={"revision": 0, "timelineRevision": 2, "cues": cues}).status_code == 200
+        assert api.put(f"{base}/{task['id']}/subtitles", json={"revision": 0, "timelineRevision": 3, "cues": cues}).status_code == 200
         package = _package()
         package["elements"][-1] = {"id": "subtitle", "kind": "subtitle", "enabled": True,
                                     "cueId": "cue-1", "position": "bottom", "style": "plain"}
-        saved = api.put(f"{base}/{task['id']}/variant", json={"revision": 2, "tracks": tracks, "packaging": package})
+        saved = api.put(f"{base}/{task['id']}/variant", json={"revision": 3, "tracks": tracks, "packaging": package})
         assert saved.status_code == 200, saved.text
 
         def drain(expected_kind: str):
@@ -352,7 +394,7 @@ def test_real_api_lifecycle_renders_downloads_stales_and_regenerates():
             assert kind == expected_kind
             handler(pid)
 
-        preview = api.post(f"{base}/{task['id']}/variant/previews", json={"revision": 3})
+        preview = api.post(f"{base}/{task['id']}/variant/previews", json={"revision": 4})
         assert preview.status_code == 202, preview.text
         preview_id = preview.json()["variant"]["runs"][-1]["id"]
         drain("batch-preview:" + preview_id)
@@ -377,23 +419,28 @@ def test_real_api_lifecycle_renders_downloads_stales_and_regenerates():
         render_timeline(control_timeline, {"shot": source}, preview_control, format="preview", ffmpeg_path=str(FFMPEG), ffprobe_path=str(FFPROBE))
         render_timeline(control_timeline, {"shot": source}, export_control, format="mp4", ffmpeg_path=str(FFMPEG), ffprobe_path=str(FFPROBE))
         api_matrix = {"thresholds": {"eventOutside": "null", "previewExportBBoxDelta": .02, "pixelDifference": 12,
-                                      "normalizedAreaDelta": .012, "maskGridIoU": .45, "meanRgbDelta": 35, "histogramL1": .50}, "elements": {}}
+            "normalizedAreaDelta": .012, "maskGridIoU": .45, "meanRgbDelta": 35, "histogramL1": .50,
+            "safeArea": [.05, .95], "subjectRule": "actual red source pixels disjoint from ASS pixels"}, "elements": {}}
         for kind, second in {"title": .5, "selling-point": 1.4, "keyword": 2.3, "cta": 3.2, "subtitle": 4.1}.items():
             pframe, eframe = _frame(api_preview, second, directory / f"api-preview-{kind}.png"), _frame(api_export, second, directory / f"api-export-{kind}.png")
             pcontrol, econtrol = _frame(preview_control, second, directory / f"api-preview-control-{kind}.png"), _frame(export_control, second, directory / f"api-export-control-{kind}.png")
-            pbox, psize = _difference_bbox(pframe, pcontrol)
-            ebox, esize = _difference_bbox(eframe, econtrol)
+            preview_subject, export_subject = _colour_bbox(pcontrol, "red"), _colour_bbox(econtrol, "red")
+            assert preview_subject and export_subject, (kind, preview_subject, export_subject)
+            pbox, psize = _difference_bbox(pframe, pcontrol, exclude=[_subject_exclusion(preview_subject)])
+            ebox, esize = _difference_bbox(eframe, econtrol, exclude=[_subject_exclusion(export_subject)])
             assert pbox and ebox, kind
             pn, en = _normal(pbox, psize), _normal(ebox, esize)
             assert max(abs(a - b) for a, b in zip(pn, en)) < .02
-            preview_metrics, export_metrics = _diff_metrics(pframe, pcontrol), _diff_metrics(eframe, econtrol)
+            for normal in (pn, en):
+                assert .05 <= normal[0] < normal[2] <= .95 and .05 <= normal[1] < normal[3] <= .95
+            assert _disjoint(pbox, preview_subject) and _disjoint(ebox, export_subject), kind
+            preview_metrics = _diff_metrics(pframe, pcontrol, exclude=[_subject_exclusion(preview_subject)])
+            export_metrics = _diff_metrics(eframe, econtrol, exclude=[_subject_exclusion(export_subject)])
             area_delta = abs(preview_metrics["normalizedArea"] - export_metrics["normalizedArea"])
             mask_iou = _iou(preview_metrics["maskBins"], export_metrics["maskBins"])
             mean_delta = max(abs(left - right) for left, right in zip(preview_metrics["meanRgb"], export_metrics["meanRgb"]))
             histogram_l1 = sum(abs(left - right) for left, right in zip(preview_metrics["histogram"], export_metrics["histogram"]))
             assert area_delta < .012 and mask_iou > .45 and mean_delta < 35 and histogram_l1 < .50
-            # These are measured pixel groups (not input style labels): dark
-            # changed regions expose libass outline and banner background.
             if kind in {"title", "keyword"}:
                 assert preview_metrics["darkChangedPixels"] > 100 and export_metrics["darkChangedPixels"] > 100
             if kind in {"selling-point", "cta"}:
@@ -401,20 +448,23 @@ def test_real_api_lifecycle_renders_downloads_stales_and_regenerates():
             api_matrix["elements"][kind] = {"sample": second, "preview": pn, "export": en,
                 "maxDelta": max(abs(a - b) for a, b in zip(pn, en)), "previewPixels": preview_metrics,
                 "exportPixels": export_metrics, "comparison": {"normalizedAreaDelta": area_delta, "maskGridIoU": mask_iou,
-                "meanRgbDelta": mean_delta, "histogramL1": histogram_l1}}
+                "meanRgbDelta": mean_delta, "histogramL1": histogram_l1},
+                "actualRedSubject": {"preview": preview_subject, "export": export_subject}}
             for phase, moment in {"before": second - .35, "after": second + .35}.items():
                 for label, video, control in (("preview", api_preview, preview_control), ("export", api_export, export_control)):
-                    assert _difference_bbox(_frame(video, moment, directory / f"api-{label}-{kind}-{phase}.png"),
-                                            _frame(control, moment, directory / f"api-{label}-control-{kind}-{phase}.png"))[0] is None
+                    actual = _frame(video, moment, directory / f"api-{label}-{kind}-{phase}.png")
+                    baseline = _frame(control, moment, directory / f"api-{label}-control-{kind}-{phase}.png")
+                    subject = _colour_bbox(baseline, "red")
+                    assert subject and _difference_bbox(actual, baseline, exclude=[_subject_exclusion(subject)])[0] is None
         (directory / "frozen-five-element-matrix.json").write_text(json.dumps(api_matrix, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        changed = api.put(f"{base}/{task['id']}/variant", json={"revision": 3, "tracks": tracks,
+        changed = api.put(f"{base}/{task['id']}/variant", json={"revision": 4, "tracks": tracks,
                           "packaging": {**package, "elements": [{**item, "text": "立即领取"} if item["id"] == "cta" else item for item in package["elements"]]}})
         assert changed.status_code == 200, changed.text
         assert api.get(f"{base}/{task['id']}/variant/previews/{preview_id}/output").status_code == 409
         assert api.get(f"{base}/{task['id']}/exports/{export_id}/output").status_code == 409
 
-        refreshed = api.post(f"{base}/{task['id']}/variant/previews", json={"revision": 4})
+        refreshed = api.post(f"{base}/{task['id']}/variant/previews", json={"revision": 5})
         assert refreshed.status_code == 202, refreshed.text
         refreshed_id = refreshed.json()["variant"]["runs"][-1]["id"]
         drain("batch-preview:" + refreshed_id)
@@ -431,8 +481,8 @@ def test_real_api_lifecycle_renders_downloads_stales_and_regenerates():
 def test_packaging_failure_matrix_rejects_before_fallback_and_cleans_temporary_files(monkeypatch):
     directory = _evidence_dir("failure-matrix")
     _commands(directory, "compile_ass validation rejection matrix; render_timeline cancellation before process launch")
-    source = _source(directory / "source.mp4", duration=1)
-    timeline, package = _timeline(_tracks(1), duration=1), _package()
+    source = _source(directory / "source.mp4", duration=1, subject=True)
+    timeline, package = _timeline(_tracks(source, 1), duration=1), _package()
     package["elements"] = [{"id": "title", "kind": "title", "enabled": True, "start": 0, "end": .8,
                             "text": "注入{\\pos(1,1)}\\N", "position": "top", "style": "plain"}]
     ass = compile_ass(package, [], [], 720, 1280, private_font_path())
@@ -511,8 +561,8 @@ def test_started_ffmpeg_cancel_and_no_libass_are_explicit_and_leave_no_packaging
     """Cancellation must occur after process start, and missing libass is not a generic encode error."""
     directory = _evidence_dir("failure-runtime")
     _commands(directory, "render_timeline with executable FFmpeg shims: each fresh marker records pid/time/temporary partial output before polling cancellation; no-ass shim returns exact filter error")
-    source = _source(directory / "source.mp4", duration=1)
-    timeline, package = _timeline(_tracks(1)), _package()
+    source = _source(directory / "source.mp4", duration=1, subject=True)
+    timeline, package = _timeline(_tracks(source, 1)), _package()
     package["elements"] = [{"id": "title", "kind": "title", "enabled": True, "start": 0, "end": .8,
                             "text": "取消清理", "position": "top", "style": "plain"}]
     rounds = []

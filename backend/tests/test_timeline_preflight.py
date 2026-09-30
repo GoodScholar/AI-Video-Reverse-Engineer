@@ -96,6 +96,37 @@ def test_preflight_allows_explicit_risk_with_only_observed_partial_subject_sampl
     assert client.post(BASE + '/preflight', json={'revision': 1, 'format': 'mp4'}).json()['ready']
 
 
+@pytest.mark.parametrize('sample_time', [None, .1])
+def test_preflight_blocks_review_risk_without_an_observation_inside_packaging_event(tmp_path, sample_time):
+    from app.montage_packaging import default_packaging
+    from app.montage_reframe import pending_reframe
+    from app.timeline import TimelineStore
+
+    client, _ = setup(tmp_path)
+    draft = _workspace()
+    draft['packaging'] = default_packaging()
+    draft['packaging']['elements'] = [{
+        'id': 'title', 'kind': 'title', 'enabled': True, 'start': .2, 'end': .8,
+        'text': '人工构图', 'position': 'auto', 'style': 'plain',
+    }]
+    assert client.put(BASE, json=draft).status_code == 200
+    reframe = pending_reframe(target_width=1280, target_height=720, reason='历史分析中断')
+    reframe.update(sourceWidth=64, sourceHeight=48, override={'mode': 'center', 'keyframes': []})
+    if sample_time is not None:
+        reframe['samples'] = [{
+            'timeSeconds': sample_time, 'boxes': [{'x': .35, 'y': .2, 'width': .3, 'height': .6,
+                                                    'label': 'person', 'confidence': .9}],
+            'center': {'x': .5, 'y': .5}, 'confidence': .9,
+        }]
+    state = TimelineStore(tmp_path).load('p1')
+    state['tracks'][0]['clips'][0]['reframe'] = reframe
+    TimelineStore(tmp_path).save('p1', state)
+
+    result = client.post(BASE + '/preflight', json={'revision': 1, 'format': 'mp4'}).json()
+    assert not result['ready']
+    assert any('包装避让证据缺失' in issue['message'] for issue in result['issues'])
+
+
 def test_audio_probe_is_cached_and_muted_wav_is_blocked(tmp_path, monkeypatch):
     from app import timeline_render
     client, _ = setup(tmp_path)

@@ -89,6 +89,24 @@ describe("TimelineEditor", () => {
     expect(title).toHaveValue("窄列标题");
   });
 
+  it("时间线可添加并保存不关联 cue 的手动字幕正文和时段", async () => {
+    const saved = workspace(3);
+    mockedGet.mockResolvedValue(workspace());
+    mockedSave.mockImplementation(async (_projectId, draft) => ({ ...saved, ...draft }));
+    render(<TimelineEditor projectId="inline-subtitle" />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "添加subtitle" }));
+    await userEvent.type(screen.getByLabelText("subtitle-1 文字"), "时间线手动字幕");
+    fireEvent.change(screen.getByLabelText("subtitle-1 开始"), { target: { value: "1.2" } });
+    fireEvent.change(screen.getByLabelText("subtitle-1 结束"), { target: { value: "2.8" } });
+    await userEvent.click(screen.getByRole("button", { name: "保存时间线" }));
+
+    expect(mockedSave).toHaveBeenCalledWith("inline-subtitle", expect.objectContaining({ packaging: expect.objectContaining({ elements: [
+      expect.objectContaining({ id: "subtitle-1", kind: "subtitle", text: "时间线手动字幕", start: 1.2, end: 2.8 }),
+    ] }) }));
+    expect(mockedSave.mock.calls[0][1].packaging?.elements[0]).not.toHaveProperty("cueId");
+  });
+
   it("向项目备份报告内存草稿状态，保存后解除保护", async () => {
     mockedGet.mockResolvedValue(workspace());
     const onDraftChange = vi.fn();
