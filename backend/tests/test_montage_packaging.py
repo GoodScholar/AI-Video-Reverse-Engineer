@@ -34,7 +34,7 @@ def test_compiler_uses_verified_private_font_and_literal_ass_escaping():
 
     assert "PlayResX: 720" in result
     assert "PlayResY: 1280" in result
-    assert "Plain,NotoSansCJKsc-Regular" in result
+    assert "G0,NotoSansCJKsc-Regular,38" in result
     assert "\\\u2060N" in result
     assert "\\{" in result and "\\}" in result
     assert "\\N第二行" in result
@@ -103,3 +103,47 @@ def test_transition_and_full_subject_occupancy_require_manual_review():
 
     with pytest.raises(PackagingError, match="人工"):
         compile_ass(packaging, [], tracks, 720, 1280, private_font_path())
+
+
+def test_batch_cues_are_emitted_once_with_an_empty_packaging_template():
+    from app.montage_packaging import compile_ass, private_font_path
+
+    ass = compile_ass(_packaging([]), [{"id": "cue-one", "start": .2, "end": .8, "text": "唯一正本字幕"}], [], 720, 1280,
+                      private_font_path())
+
+    assert ass.count("唯一正本字幕") == 1
+    assert "Dialogue: 0,0:00:00.20,0:00:00.80,G0" in ass
+
+
+def test_subject_projection_uses_aspect_ratio_clip_time_manual_center_and_even_crop():
+    from app.montage_packaging import _subject_boxes
+
+    tracks = _reframed_track(start=5, duration=2, box={"x": .75, "y": .4, "width": .15, "height": .2,
+                                                        "label": "person", "confidence": .9})
+    clip = tracks[0]["clips"][0]
+    clip["inPoint"], clip["speed"] = 2, 2
+    clip["reframe"]["targetAspect"] = {"width": 9, "height": 16}  # 9:16, not 720:1280 exact dimensions.
+    clip["reframe"]["samples"] = [
+        {"timeSeconds": 2, "boxes": [{"x": .8, "y": .4, "width": .1, "height": .2, "label": "person", "confidence": .9}], "center": {"x": .1, "y": .5}, "confidence": .9},
+        {"timeSeconds": 6, "boxes": [{"x": .8, "y": .4, "width": .1, "height": .2, "label": "person", "confidence": .9}], "center": {"x": .8, "y": .5}, "confidence": .9},
+    ]
+    clip["reframe"]["override"] = {"mode": "manual", "keyframes": [{"timeSeconds": 2, "x": .9, "y": .5}]}
+
+    # Output 5.0 maps to source 2.0; later detection samples cannot block it.
+    early = _subject_boxes(tracks, 5, 5.1, 720, 1280)
+    assert early and min(box[0] for box in early) > 300
+    # Manual centre, rather than the detector's .1 centre, keeps the .8 box in crop.
+
+
+def test_multiline_real_advances_are_not_character_count_estimates():
+    from app.montage_packaging import PackagingError, compile_ass, private_font_path
+
+    # Full-width glyphs have a wider true advance than narrow Latin glyphs.
+    narrow = compile_ass(_packaging([_element("title", text="iiii\niiii", position="top")]), [], [], 720, 1280,
+                         private_font_path())
+    wide = compile_ass(_packaging([_element("title", text="全全\n全全", position="top")]), [], [], 720, 1280,
+                       private_font_path())
+    assert "\\pos(360," in narrow and "\\pos(360," in wide
+    with pytest.raises(PackagingError, match="文字超出"):
+        compile_ass(_packaging([_element("title", text="全" * 40, position="top")]), [], [], 720, 1280,
+                    private_font_path())

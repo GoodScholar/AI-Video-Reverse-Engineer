@@ -563,6 +563,10 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 validate_storage_id(output)
                 path = store.path(project_id, "outputs", output)
                 _regular_file(path)
+                snapshot = run.get("snapshot", {})
+                if snapshot.get("packaging") is not None:
+                    from .montage_packaging import validate_packaging
+                    validate_packaging(snapshot["packaging"], [], snapshot.get("tracks", []))
             except (KeyError, OSError, ValueError):
                 fail("timeline_output_unavailable", "渲染结果不可用。")
         media_type = "audio/wav" if run["format"] == "wav" else "video/mp4"

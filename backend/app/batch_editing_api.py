@@ -757,7 +757,17 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             frozen = {asset_id: stable_source_fact(path) for asset_id, path in frozen_sources.items()}
             current = {asset_id: {**stable_source_fact(path), "assetFile": assets[asset_id].get("file")}
                        for asset_id, path in current_paths.items()}
-            sources = snapshot_approved_sources(project_id, destination, preview, assets)
+            # A mismatch already present when this request starts remains the
+            # historical failed-delivery result.  Once this proof begins,
+            # however, ``freeze_approved`` is part of the CAS and every
+            # replacement (including same-byte rename) is a retryable 409.
+            if any(current[asset_id]["fingerprint"] != frozen[asset_id]["fingerprint"] for asset_id in frozen):
+                raise BatchProductionError("batch_asset_unavailable", "原素材缺失或变化，请重新预览审核。")
+            try:
+                sources = render_inputs.freeze_approved(
+                    project_id, destination, store.path(project_id, "runs", preview["id"]), preview["sources"], assets)
+            except (RenderInputError, KeyError, ValueError, OSError) as error:
+                raise SourceProofConflict("素材在快照复制期间变化") from error
             try:
                 changed = (any(source_identity(frozen_sources[asset_id]) != {key: fact[key] for key in fact if key != "fingerprint"}
                                for asset_id, fact in frozen.items())
@@ -771,6 +781,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             return {"sources": sources, "frozen": frozen, "current": current}
         except SourceProofConflict as error:
             raise BatchProductionError("batch_export_reframe_conflict", "导出准备期间素材已变化，请刷新后重试。") from error
+        except BatchProductionError:
+            raise
         except HTTPException:
             raise BatchProductionError("batch_asset_unavailable", "原素材缺失或变化，请重新预览审核。") from None
         except (KeyError, OSError, ValueError, RenderInputError) as error:
@@ -912,7 +924,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 actual_renderer = render_timeline
             subtitle_cues = run.get("subtitleCues", [])
             subtitle_file = None
-            if subtitle_cues:
+            if subtitle_cues and snapshot.get("packaging") is None:
                 subtitle_file = store.path(project_id, "runs", run_id, "subtitles.srt")
                 write_srt(subtitle_file, subtitle_cues)
             render_options = {"subtitles_path": subtitle_file} if subtitle_file else {}
@@ -964,7 +976,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             directory = store.path(project_id, "exports", run_id)
             sources = render_inputs.resolve(directory, names)
             subtitle_file = None
-            if cues:
+            if cues and snapshot.get("packaging") is None:
                 subtitle_file = directory / "subtitles.srt"
                 write_srt(subtitle_file, cues)
             staging = directory / "final.mp4"
@@ -1932,6 +1944,9 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     if error.code != "batch_asset_unavailable":
                         raise
                     source_snapshots[(child_id, run_id)] = error
+        except BatchProductionError as error:
+            cleanup_prepared_sources()
+            raise HTTPException(409, detail={"code": error.code, "message": error.message}) from None
         except BaseException:
             cleanup_prepared_sources()
             raise

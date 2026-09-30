@@ -115,8 +115,11 @@ def render_timeline(
         raise TimelineRenderError("时间线没有可渲染的片段。")
 
     render_width, render_height = _output_size(width, height, format)
+    # An explicit packaging snapshot owns all graphics, including ordinary
+    # subtitle cues.  Do not create legacy PNG captions in that mode: doing so
+    # would burn the same transcript twice and introduce an uncontrolled font.
     captions = []
-    if subtitles_path is not None:
+    if subtitles_path is not None and packaging is None:
         from .batch_subtitles import caption_images
         captions = caption_images(Path(subtitles_path), render_width, render_height)
     output = Path(output)

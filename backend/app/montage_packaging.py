@@ -186,13 +186,32 @@ def _font_height(size: float) -> float:
     return (os2.usWinAscent + os2.usWinDescent) * size / units
 
 
-def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width: int, height: int) -> list[tuple[float, float, float, float]]:
-    """Project all intersecting reframe boxes into target canvas coordinates.
+def _interpolated_boxes(samples: list[dict[str, Any]], source_time: float) -> list[dict[str, float]]:
+    """Return detector boxes at one source PTS, interpolating stable labels."""
+    usable = [sample for sample in samples if isinstance(sample, dict) and isinstance(sample.get("timeSeconds"), (int, float))]
+    if not usable:
+        return []
+    left = next((sample for sample in reversed(usable) if sample["timeSeconds"] <= source_time), usable[0])
+    right = next((sample for sample in usable if sample["timeSeconds"] >= source_time), usable[-1])
+    if left is right or right["timeSeconds"] == left["timeSeconds"]:
+        return [box for box in left.get("boxes", []) if isinstance(box, dict)]
+    fraction = (source_time - left["timeSeconds"]) / (right["timeSeconds"] - left["timeSeconds"])
+    result = []
+    for first, second in zip(left.get("boxes", []), right.get("boxes", [])):
+        if not isinstance(first, dict) or not isinstance(second, dict) or first.get("label") != second.get("label"):
+            continue
+        try:
+            result.append({key: float(first[key]) + (float(second[key]) - float(first[key])) * fraction
+                           for key in ("x", "y", "width", "height")})
+        except (KeyError, TypeError, ValueError):
+            continue
+    # A detector identity change is not safe to interpolate: reserve both ends.
+    return result or [box for sample in (left, right) for box in sample.get("boxes", []) if isinstance(box, dict)]
 
-    During an xfade both adjacent clips overlap in timeline time, so this
-    naturally reserves both subjects. Every stored sample is used to avoid a
-    moving person crossing an otherwise clear overlay between endpoints.
-    """
+
+def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width: int, height: int) -> list[tuple[float, float, float, float]]:
+    """Project only subjects active during an event onto its output canvas."""
+    from .montage_reframe import _center_at, _crop_position, crop_geometry
     result = []
     for track in tracks:
         if not isinstance(track, dict) or track.get("kind") != "video" or track.get("hidden"):
@@ -207,19 +226,31 @@ def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width
             if type(source_w) is not int or type(source_h) is not int or source_w <= 0 or source_h <= 0 or not isinstance(samples, list):
                 continue
             target = reframe.get("targetAspect") or {"width": width, "height": height}
-            if not isinstance(target, dict) or target.get("width") != width or target.get("height") != height:
+            if (not isinstance(target, dict) or type(target.get("width")) is not int or type(target.get("height")) is not int
+                    or target["width"] <= 0 or target["height"] <= 0
+                    or target["width"] * height != target["height"] * width):
                 raise PackagingError("主体构图目标与包装画布不一致，需人工确认。")
-            crop_w = min(source_w, round(source_h * width / height))
-            crop_h = min(source_h, round(source_w * height / width))
-            if crop_w <= 0 or crop_h <= 0:
+            try:
+                crop_w, crop_h = crop_geometry(source_w, source_h, width, height)
+            except ValueError as error:
+                raise PackagingError("主体构图窗口无效，需人工确认。") from error
+            clip_start, clip_end = float(clip.get("start", 0)), float(clip.get("start", 0)) + float(clip.get("duration", 0))
+            overlap_start, overlap_end = max(start, clip_start), min(end, clip_end)
+            speed = clip.get("speed", 1)
+            in_point = clip.get("inPoint", 0)
+            if type(speed) not in (int, float) or speed <= 0 or type(in_point) not in (int, float):
                 raise PackagingError("主体构图窗口无效，需人工确认。")
-            for sample in samples:
-                center = sample.get("center") if isinstance(sample, dict) else None
-                if not isinstance(center, dict) or type(center.get("x")) not in (int, float) or type(center.get("y")) not in (int, float):
-                    continue
-                crop_x = min(max(float(center["x"]) * source_w - crop_w / 2, 0), source_w - crop_w)
-                crop_y = min(max(float(center["y"]) * source_h - crop_h / 2, 0), source_h - crop_h)
-                for box in sample.get("boxes", []):
+            source_start = float(in_point) + (overlap_start - clip_start) * float(speed)
+            source_end = float(in_point) + (overlap_end - clip_start) * float(speed)
+            times = [source_start, source_end]
+            times.extend(float(sample["timeSeconds"]) for sample in samples if isinstance(sample, dict)
+                         and isinstance(sample.get("timeSeconds"), (int, float)) and source_start < sample["timeSeconds"] < source_end)
+            for source_time in sorted(set(times)):
+                try:
+                    crop_x, crop_y = _crop_position(_center_at(reframe, source_time), source_w, source_h, crop_w, crop_h)
+                except (KeyError, TypeError, ValueError):
+                    raise PackagingError("主体构图轨迹无效，需人工确认。") from None
+                for box in _interpolated_boxes(samples, source_time):
                     try:
                         x, y, box_w, box_h = (float(box[key]) for key in ("x", "y", "width", "height"))
                     except (AttributeError, KeyError, TypeError, ValueError):
@@ -238,19 +269,38 @@ def _overlaps(left: tuple[float, float, float, float], right: tuple[float, float
 def _element_events(packaging: dict[str, Any], cues: list[dict[str, Any]], width: int, height: int) -> list[dict[str, Any]]:
     cue_by_id = {cue["id"]: cue for cue in cues if isinstance(cue, dict) and isinstance(cue.get("id"), str)}
     events = []
+    overrides = {item["cueId"]: item for item in packaging["elements"]
+                 if item["kind"] == "subtitle" and "cueId" in item}
+    # Packaging is an explicit rendering mode.  Its empty template still
+    # renders the canonical cues once, with the controlled Noto ASS style.
+    for cue in cues:
+        if not isinstance(cue, dict) or not isinstance(cue.get("id"), str):
+            continue
+        override = overrides.get(cue["id"])
+        if override is not None and not override["enabled"]:
+            continue
+        item = {"id": "cue-" + cue["id"], "kind": "subtitle", "enabled": True,
+                "position": "bottom", "style": "plain"}
+        if override is not None:
+            item.update(override)
+        text, start, end = cue.get("text"), cue.get("start"), cue.get("end")
+        if isinstance(text, str) and isinstance(start, (int, float)) and isinstance(end, (int, float)) and end > start:
+            events.append({**item, "text": text, "start": float(start), "end": float(end)})
     for item in packaging["elements"]:
         if not item["enabled"]:
             continue
         if item["kind"] == "subtitle" and "cueId" in item:
-            cue = cue_by_id[item["cueId"]]
-            text, start, end = cue["text"], float(cue["start"]), float(cue["end"])
-        else:
-            text, start, end = item["text"], item["start"], item["end"]
+            continue
+        text, start, end = item["text"], item["start"], item["end"]
+        events.append({**item, "text": text, "start": start, "end": end})
+    for item in events:
         size = {"title": 56, "cta": 48, "selling-point": 42, "keyword": 44, "subtitle": 38}[item["kind"]]
         outline = {"plain": 3, "emphasis": 5, "banner": 14}[item["style"]]
-        events.append({**item, "text": text, "start": start, "end": end, "size": size,
-                       "width": _advance(max(text.split("\n"), key=len), size) + outline * 2,
-                       "height": _font_height(size) + outline * 2})
+        line_widths = [_advance(line, size) for line in item["text"].split("\n")]
+        # ASS uses the selected face's Win ascender/descender per line; the
+        # compiler has no unbounded animation, so this is its maximum frame.
+        item.update(size=size, outline=outline, width=max(line_widths, default=0) + outline * 2,
+                    height=_font_height(size) * len(line_widths) + outline * 2)
     return events
 
 
@@ -266,13 +316,16 @@ def compile_ass(packaging: dict[str, Any], cues: list[dict[str, Any]], tracks: l
     top, bottom = height * safe["top"], height * (1 - safe["bottom"])
     lines = ["[Script Info]", "ScriptType: v4.00+", "WrapStyle: 2", "ScaledBorderAndShadow: yes",
              f"PlayResX: {width}", f"PlayResY: {height}", "", "[V4+ Styles]",
-             "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding",
-             f"Style: Plain,{FONT_POSTSCRIPT},40,&H00FFFFFF,&H00FFFFFF,&H90000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,0,0,0,1",
-             f"Style: Emphasis,{FONT_POSTSCRIPT},44,&H0000D7FF,&H0000D7FF,&H90000000,&H00000000,1,0,0,0,100,100,0,0,1,3,0,2,0,0,0,1",
-             f"Style: Banner,{FONT_POSTSCRIPT},42,&H00FFFFFF,&H00FFFFFF,&H001F2937,&H001F2937,1,0,0,0,100,100,0,0,3,12,0,2,0,0,0,1",
-             "", "[Events]", "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text"]
+             "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding"]
+    events = _element_events(checked, cues, width, height)
+    for index, item in enumerate(events):
+        primary, outline_colour, back, bold, border = (("&H00FFFFFF", "&H90000000", "&H00000000", 0, 1) if item["style"] == "plain" else
+                                                        ("&H0000D7FF", "&H90000000", "&H00000000", 1, 1) if item["style"] == "emphasis" else
+                                                        ("&H00FFFFFF", "&H001F2937", "&H001F2937", 1, 3))
+        lines.append(f"Style: G{index},{FONT_POSTSCRIPT},{item['size']},{primary},{primary},{outline_colour},{back},{bold},0,0,0,100,100,0,0,{border},{item['outline']},0,2,0,0,0,1")
+    lines.extend(["", "[Events]", "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text"])
     occupied: list[tuple[float, float, float, float, float, float]] = []
-    for index, item in enumerate(_element_events(checked, cues, width, height)):
+    for index, item in enumerate(events):
         if item["width"] > right - left:
             raise PackagingError("文字超出安全区，需人工调整。")
         x = width / 2
@@ -294,8 +347,7 @@ def compile_ass(packaging: dict[str, Any], cues: list[dict[str, Any]], tracks: l
             raise PackagingError("包装布局无可用安全区，需人工确认。")
         y, box = selected
         occupied.append((item["start"], item["end"], *box))
-        style = {"plain": "Plain", "emphasis": "Emphasis", "banner": "Banner"}[item["style"]]
         # \\an5 with explicit centre is invariant for preview and export dimensions.
         lines.append("Dialogue: %d,%s,%s,%s,,0,0,0,,{\\an5\\pos(%d,%d)}%s" % (
-            index, _ass_time(item["start"]), _ass_time(item["end"]), style, round(x), round(y), escape_ass_text(item["text"])))
+            index, _ass_time(item["start"]), _ass_time(item["end"]), "G" + str(index), round(x), round(y), escape_ass_text(item["text"])))
     return "\n".join(lines) + "\n"

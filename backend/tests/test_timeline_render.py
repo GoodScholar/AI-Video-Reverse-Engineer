@@ -252,6 +252,37 @@ def test_long_horizontal_caption_fits_inside_preview_safe_area(tmp_path):
         assert caption.height <= round(270 * 0.45)
 
 
+def test_packaging_uses_one_ass_subtitle_pass_and_keeps_preview_export_coordinates(tmp_path, monkeypatch):
+    """Packaging owns cues even with no user elements; legacy PNG is forbidden."""
+    from app.montage_packaging import default_packaging
+    image = _image(tmp_path / "green.png", "green")
+    subtitles = tmp_path / "subtitles.srt"
+    write_srt(subtitles, [{"id": "cue", "start": .1, "end": .45, "text": "唯一烧录"}])
+    captured, real_build = [], timeline_render._build_command
+    def capture(*args, **kwargs):
+        captured.append((args[8], Path(kwargs["ass_path"]).read_text(encoding="utf-8")))
+        return real_build(*args, **kwargs)
+    monkeypatch.setattr(timeline_render, "_build_command", capture)
+    monkeypatch.setattr("app.batch_subtitles.caption_images", lambda *_: pytest.fail("包装不得走 PNG 字幕"))
+    timeline = _timeline(width=720, height=1280, tracks=[_track("video", [_clip("green", 0, .5)])])
+    cues = [{"id": "cue", "start": .1, "end": .45, "text": "唯一烧录"}]
+    preview, export = tmp_path / "pack-preview.mp4", tmp_path / "pack-export.mp4"
+
+    ffmpeg = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"
+    ffprobe = "/opt/homebrew/opt/ffmpeg-full/bin/ffprobe"
+    if not Path(ffmpeg).is_file():
+        pytest.skip("包装真实渲染需要含 libass 的 FFmpeg")
+    preview_media = render_timeline(timeline, {"green": image}, preview, format="preview", subtitles_path=subtitles,
+                                    packaging=default_packaging(), packaging_cues=cues, ffmpeg_path=ffmpeg, ffprobe_path=ffprobe)
+    export_media = render_timeline(timeline, {"green": image}, export, format="mp4", subtitles_path=subtitles,
+                                   packaging=default_packaging(), packaging_cues=cues, ffmpeg_path=ffmpeg, ffprobe_path=ffprobe)
+
+    assert preview_media["width"] == 630 and export_media["width"] == 720
+    assert [items for items, _ass in captured] == [[], []]
+    assert all(ass.count("唯一烧录") == 1 and "\\pos(360," in ass for _items, ass in captured)
+    assert all(not path.exists() for path in tmp_path.glob(".packaging.ass"))
+
+
 @pytest.mark.parametrize(('width', 'height'), [
     (1680, 720), (1280, 720), (960, 720), (720, 720), (720, 960), (720, 1280),
 ])
