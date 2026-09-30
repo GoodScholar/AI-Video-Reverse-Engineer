@@ -537,6 +537,32 @@ def test_packaging_proof_hash_is_outside_lock_and_consumed_once_per_download(tmp
         assert len(calls) == 1, "第二锁窗口只能消费 proof，不能重复读取字体"
 
 
+def test_submit_reuses_one_packaging_proof_for_current_preview_and_delivery(tmp_path, monkeypatch):
+    """The two-stage callback may consume both records, but must prepare identical input once."""
+    from app import montage_packaging
+    from app.montage_packaging import default_packaging
+
+    with _reframe_delivery_client(tmp_path) as fixture:
+        child = _add_export_child(fixture, "child", reframed=False)
+        state = json.loads(fixture.state_path.read_text(encoding="utf-8"))
+        stored = next(task for task in state["tasks"] if task["id"] == child["id"])
+        package = default_packaging()
+        stored["variant"]["packaging"] = deepcopy(package)
+        for record in [*stored["variant"]["runs"], *stored["variant"]["exports"]]:
+            record["snapshot"]["packaging"] = deepcopy(package)
+        fixture.state_path.write_text(json.dumps(state), encoding="utf-8")
+        original, calls = montage_packaging.prepare_packaging_proof, []
+        def counted(snapshot, cues, *, batch):
+            calls.append((snapshot, cues, batch))
+            return original(snapshot, cues, batch=batch)
+        monkeypatch.setattr(montage_packaging, "prepare_packaging_proof", counted)
+
+        response = fixture.client.post(f"{fixture.base}/{fixture.task['id']}/exports", json={"taskIds": ["child"]})
+
+        assert response.status_code == 202, response.text
+        assert len(calls) == 1
+
+
 def test_download_rejects_a_run_identity_changed_during_its_probe(tmp_path, monkeypatch):
     from app import montage_reframe
 

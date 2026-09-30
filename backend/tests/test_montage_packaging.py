@@ -75,6 +75,10 @@ def test_structure_validation_never_opens_font_but_request_proof_binds_font_and_
     consume_packaging_proof(proof, snapshot, [], batch=False)
     with pytest.raises(PackagingProofConflict):
         consume_packaging_proof(proof, {**snapshot, "tracks": [{"id": "changed"}]}, [], batch=False)
+    original = montage_packaging._font_identity
+    monkeypatch.setattr(montage_packaging, "_font_identity", lambda path: (*original(path)[:-1], original(path)[-1] + 1))
+    with pytest.raises(PackagingProofConflict):
+        consume_packaging_proof(proof, snapshot, [], batch=False)
 
 
 def test_batch_subtitle_is_cue_style_overlay_not_a_second_transcript():

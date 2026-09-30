@@ -1,5 +1,6 @@
 import io
 import json
+import threading
 import zipfile
 
 from fastapi.testclient import TestClient
@@ -78,6 +79,48 @@ def test_backup_rejects_invalid_current_timeline_packaging_without_a_render_hist
         TimelineStore(tmp_path).save(pid, timeline)
 
         assert client.post(f'/api/projects/{pid}/backup', json={}).status_code == 422
+
+
+def test_backup_packaging_proof_releases_global_lock_and_rejects_changed_snapshot(tmp_path, monkeypatch):
+    """The expensive proof is lock-free; its captured timeline cannot be archived after an edit."""
+    from app import montage_packaging
+    from app.montage_packaging import default_packaging
+    from app.timeline import TimelineStore
+
+    with TestClient(create_app(data_dir=tmp_path)) as client:
+        pid = create(client)
+        client.get(f'/api/projects/{pid}/timeline')
+        timeline = TimelineStore(tmp_path).load(pid)
+        timeline['packaging'] = default_packaging()
+        TimelineStore(tmp_path).save(pid, timeline)
+        entered, release, read_done = threading.Event(), threading.Event(), threading.Event()
+        original = montage_packaging._hash_font
+        def blocked_hash(path):
+            entered.set()
+            assert release.wait(5), '测试未释放备份字体 proof'
+            return original(path)
+        monkeypatch.setattr(montage_packaging, '_hash_font', blocked_hash)
+        result = {}
+        worker = threading.Thread(target=lambda: result.setdefault(
+            'response', client.post(f'/api/projects/{pid}/backup', json={})
+        ))
+        worker.start()
+        assert entered.wait(2)
+        reader = threading.Thread(target=lambda: (client.get(f'/api/projects/{pid}/timeline'), read_done.set()))
+        reader.start()
+        try:
+            assert read_done.wait(.5), '字体 proof 期间读取不应等待全局写锁'
+            current = client.get(f'/api/projects/{pid}/timeline').json()
+            changed = client.put(f'/api/projects/{pid}/timeline', json={
+                'revision': current['revision'], 'settings': current['settings'], 'tracks': current['tracks'],
+                'transitions': current['transitions'],
+            })
+            assert changed.status_code == 200, changed.text
+        finally:
+            release.set()
+        worker.join(5)
+        reader.join(5)
+        assert result['response'].status_code == 409
 
 
 def test_backup_rejects_a_ready_static_image_reframe_whose_center_crops_out_the_person(tmp_path):

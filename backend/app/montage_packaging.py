@@ -130,6 +130,11 @@ def _input_digest(snapshot: dict[str, Any], cues: list[dict[str, Any]], *, batch
         raise PackagingError("包装证明输入无效。") from error
 
 
+def packaging_proof_key(snapshot: dict[str, Any], cues: list[dict[str, Any]], *, batch: bool) -> str:
+    """Canonical request-local memoization key; never a persistent authorization."""
+    return _input_digest(snapshot, cues, batch=batch)
+
+
 def private_font_path() -> Path:
     """Return the only allowed font after hash and metadata verification."""
     prepared = _PROOF_FONT.get()

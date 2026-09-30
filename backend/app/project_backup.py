@@ -9,6 +9,7 @@ import stat
 import tempfile
 import zipfile
 import zlib
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from uuid import uuid4
@@ -104,7 +105,70 @@ def rebind_managed_json(name, value, old_id, new_id, old_root, new_root):
     return changed
 
 
-def validate_core(data_root, project):
+def _packaging_inputs(data_root, project_id):
+    """Return immutable final-event inputs after stores have done lock-safe shape checks."""
+    timeline = TimelineStore(data_root).load(project_id)
+    inputs = []
+    if timeline.get('packaging') is not None:
+        inputs.append(({'settings': timeline['settings'], 'tracks': timeline['tracks'],
+                        'packaging': timeline['packaging']}, [], False))
+    for run in timeline.get('runs', []):
+        snapshot = run.get('snapshot', {}) if isinstance(run, dict) else {}
+        if snapshot.get('packaging') is not None:
+            inputs.append((snapshot, [], False))
+    from .batch_editing_api import BatchStore
+    batch = BatchStore(data_root).load(project_id, persist_migration=False)
+    for task in batch['tasks']:
+        variant = task['variant']
+        cues = variant.get('subtitles', {}).get('cues', [])
+        if variant.get('packaging') is not None:
+            inputs.append(({'settings': variant['settings'], 'tracks': variant['tracks'],
+                           **({'transitions': variant['transitions']} if variant.get('transitions') else {}),
+                           'packaging': variant['packaging']}, cues, True))
+        for proposal in task.get('montageProposals', []):
+            package = proposal.get('packaging') if isinstance(proposal, dict) else None
+            if package is not None:
+                tracks = [{**track, 'clips': proposal.get('clips', [])} if track.get('kind') == 'video' else track
+                          for track in variant['tracks']]
+                inputs.append(({'settings': variant['settings'], 'tracks': tracks, 'packaging': package}, [], False))
+        for run in variant.get('runs', []):
+            if run.get('snapshot', {}).get('packaging') is not None:
+                inputs.append((run['snapshot'], run.get('subtitleCues', []), True))
+        for delivery in variant.get('exports', []):
+            if delivery.get('snapshot', {}).get('packaging') is not None:
+                inputs.append((delivery['snapshot'], delivery.get('subtitles', []), True))
+    return deepcopy(timeline), deepcopy(batch), [(deepcopy(snapshot), deepcopy(cues), batch_mode)
+                                                   for snapshot, cues, batch_mode in inputs]
+
+
+def _backup_state_digest(project, timeline, batch):
+    try:
+        value = {'project': project.model_dump(mode='json'), 'timeline': timeline, 'batch': batch}
+        return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+                                         allow_nan=False).encode()).hexdigest()
+    except (TypeError, ValueError) as error:
+        fail('项目状态无效，无法完整备份。')
+
+
+def _prepare_packaging_proofs(inputs):
+    from .montage_packaging import PackagingError, prepare_packaging_proof
+    try:
+        return [prepare_packaging_proof(snapshot, cues, batch=batch_mode)
+                for snapshot, cues, batch_mode in inputs]
+    except PackagingError:
+        fail('备份中的当前包装字体或模板无效。')
+
+
+def _consume_packaging_proofs(inputs, proofs):
+    from .montage_packaging import PackagingError, consume_packaging_proof
+    try:
+        for (snapshot, cues, batch_mode), proof in zip(inputs, proofs, strict=True):
+            consume_packaging_proof(proof, snapshot, cues, batch=batch_mode)
+    except PackagingError:
+        fail('项目在备份验证期间发生变化，请重试。', 409)
+
+
+def validate_core(data_root, project, *, final_packaging=True):
     pid = project.id
     prep_store = PreproductionStore(data_root)
     project_assets = ProjectAssets(data_root)
@@ -144,8 +208,8 @@ def validate_core(data_root, project):
                                              'tracks': timeline['tracks'], 'transitions': timeline.get('transitions', [])}, assets)
     if timeline.get('packaging') is not None:
         try:
-            from .montage_packaging import validate_final_events
-            validate_final_events(timeline['packaging'], [], timeline_tracks, batch=False)
+            from .montage_packaging import validate_packaging
+            validate_packaging(timeline['packaging'], [], timeline_tracks, batch=False)
         except ValueError:
             fail('备份中的当前包装字体或模板无效。')
     validate_timeline_history(TimelineStore(data_root), pid, timeline, assets)
@@ -159,6 +223,9 @@ def validate_core(data_root, project):
         from .reference_media_storage import resolve_reference_media_path
         if not resolve_reference_media_path(data_root, pid, project.referenceMedia).is_file():
             fail("备份缺少参考素材。")
+    if final_packaging:
+        _timeline, _batch, inputs = _packaging_inputs(data_root, pid)
+        _prepare_packaging_proofs(inputs)
 
 
 def validate_timeline_history(store, project_id, timeline, assets):
@@ -214,7 +281,24 @@ def create_backup_router(data_dir, get_project, parse_project, register_project,
                 check_idle(payload)
                 source = safe_child(root, 'project-files', project.id)
                 before = inventory(source)
-                validate_core(root, project)
+                # The global write lock protects the immutable state capture,
+                # not the 16 MB font hash/TTFont/event proof.
+                validate_core(root, project, final_packaging=False)
+                timeline, batch, packaging_inputs = _packaging_inputs(root, project.id)
+                state_digest = _backup_state_digest(project, timeline, batch)
+            proofs = _prepare_packaging_proofs(packaging_inputs)
+            with lock:
+                project = get_project(project_id)
+                if is_project_active is not None and is_project_active(project_id):
+                    fail("项目处理进程尚未退出，请等待完全停止后再备份。", 409)
+                if project is None:
+                    fail("项目不存在。", 404)
+                validate_core(root, project, final_packaging=False)
+                current_timeline, current_batch, current_inputs = _packaging_inputs(root, project.id)
+                if (_backup_state_digest(project, current_timeline, current_batch) != state_digest
+                        or current_inputs != packaging_inputs or before != inventory(source)):
+                    fail("项目在备份验证期间发生变化，请重试。", 409)
+                _consume_packaging_proofs(current_inputs, proofs)
                 manifest = {'format': 'aivre-project', 'version': 1, 'project': payload,
                             'sourceRoot': str(source), 'files': {}}
                 target = folder / 'project.zip'

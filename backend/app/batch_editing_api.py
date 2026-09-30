@@ -597,6 +597,13 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         except PackagingError as error:
             raise BatchProductionError("batch_packaging_invalid", str(error)) from error
 
+    def packaging_proof_key(snapshot: dict, cues: list, *, batch: bool) -> str:
+        from .montage_packaging import PackagingError, packaging_proof_key as key
+        try:
+            return key(snapshot, cues, batch=batch)
+        except PackagingError as error:
+            raise BatchProductionError("batch_packaging_invalid", str(error)) from error
+
     def clip_for(task: dict[str, Any], clip_id: str, proposal_id: str | None = None):
         if proposal_id is not None:
             proposal = montage_proposal_for(task, proposal_id)
@@ -2186,10 +2193,11 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 media_cache=media_cache, frozen_timing_cache=frozen_timing_cache,
                 current_timing_cache=current_timing_cache,
             )
-            packaging_proofs[key] = production_call(
-                prepare_packaging_proof, run.get("snapshot", {}),
-                run.get("subtitles", run.get("subtitleCues", [])), batch=True,
-            )
+            snapshot, cues = run.get("snapshot", {}), run.get("subtitles", run.get("subtitleCues", []))
+            proof_key = production_call(packaging_proof_key, snapshot, cues, batch=True)
+            if proof_key not in packaging_proofs:
+                packaging_proofs[proof_key] = production_call(prepare_packaging_proof, snapshot, cues, batch=True)
+            packaging_proofs[key] = packaging_proofs[proof_key]
 
         def cleanup_prepared_sources(run_ids=None):
             targets = set(run_ids) if run_ids is not None else {run_id for _child_id, run_id in planned_snapshots}
@@ -2264,15 +2272,16 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             except BaseException:
                 cleanup_prepared_sources()
                 raise
+            def consume_export_proofs(child, run):
+                consume_reframe_safety(project_id, child, run, proofs.get((child["id"], run["id"])), assets)
+                consume_packaging_proof(packaging_proofs.get((child["id"], run["id"])), run.get("snapshot", {}),
+                                        run.get("subtitles", run.get("subtitleCues", [])), batch=True)
+
             try:
                 prepared = production_call(
                     export_approved_versions, parent, children, assets=assets,
                     snapshot_sources=export_sources, preview_available=preview_available,
-                    reframe_safe=lambda child, run: (
-                        consume_reframe_safety(project_id, child, run, proofs.get((child["id"], run["id"])), assets),
-                        consume_packaging_proof(packaging_proofs.get((child["id"], run["id"])), run.get("snapshot", {}),
-                                                run.get("subtitles", run.get("subtitleCues", [])), batch=True),
-                    ),
+                    reframe_safe=consume_export_proofs,
                     id_factory=actual_id,
                 )
             except BaseException:
