@@ -620,7 +620,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
 
     def schedule_reframes(project_id: str, task_id: str, clip_ids: list[str], *, proposal_id: str | None = None,
                           expected_revision: int | None = None, staged_state: dict | None = None,
-                          expected_state: dict | None = None):
+                          expected_state: dict | None = None, reuse_existing: bool = False):
         """One existing compute job per submit; late workers may only write same clip identity."""
         run_id = uuid4().hex
         with source_lock or nullcontext(), lock:
@@ -731,9 +731,22 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                         continue
                     if existing.get("status") in ("queued", "running"):
                         raise HTTPException(409, detail={"code": "batch_variant_conflict", "message": "主体分析状态已更新，请刷新后重试。"})
-                if clip.get("reframe", {}).get("sourceFingerprint") != source_fact["fingerprint"]:
-                    clip["reframe"] = pending_reframe(target_width=aspect["width"], target_height=aspect["height"],
-                                                       reason="已提交本地主体分析")
+                previous_reframe = clip.get("reframe", {})
+                previous_fingerprint = previous_reframe.get("sourceFingerprint")
+                if reuse_existing and previous_fingerprint == source_fact["fingerprint"] and previous_fingerprint:
+                    # A full lock-free proof confirms that these saved facts
+                    # (including a deliberate manual decision) still bind the source.
+                    continue
+                pending = pending_reframe(target_width=aspect["width"], target_height=aspect["height"],
+                                          reason="已提交本地主体分析")
+                override = previous_reframe.get("override")
+                if (not previous_fingerprint and isinstance(override, dict)
+                        and override.get("mode") != "auto"):
+                    pending["override"] = deepcopy(override)
+                clip["reframe"] = pending
+                if (reuse_existing and existing is not None and existing.get("identity") == identity
+                        and existing.get("status") in ("queued", "running")):
+                    continue
                 analysis[item["id"]] = {"id": run_id, "status": "queued", "error": None, "proposalId": proposal_id,
                                         "identity": identity}
                 jobs.append((item["id"], identity, source, dict(aspect),
@@ -1972,12 +1985,12 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                                  for item in proposal["segments"] for message in item.get("unmet", [])]
             proposal.update(revision=proposal["revision"] + 1, status="draft")
             changed_reframes = [item["selectedClip"]["id"] for item in proposal["segments"]
-                                if item.get("selectedClip") and item["selectedClip"].get("reframe", {}).get("status") == "review_required"]
+                                if item.get("selectedClip")]
             staged_state = state
             response = {"proposal": deepcopy(proposal)}
         if changed_reframes:
             schedule_reframes(project_id, task_id, changed_reframes, proposal_id=proposal_id,
-                              staged_state=staged_state, expected_state=expected_state)
+                              staged_state=staged_state, expected_state=expected_state, reuse_existing=True)
         else:
             commit_staged_batch_state(project_id, expected_state, staged_state)
         return response
@@ -2149,13 +2162,15 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                         and all(clip.get(key) == identity.get(key) for key in ("assetId", "inPoint", "duration", "speed"))):
                     record["adopted"] = True
                     adopted_pending.append(clip["id"])
-            # Keep an in-flight draft as the authoritative job; only clips
-            # without that exact draft identity need a new variant analysis.
-            missing = [clip["id"] for clip in proposed_clips if clip["id"] not in adopted_pending]
+            # Every adopted or reused clip is proofed again outside the lock.
+            # schedule_reframes retains a matching active draft without adding
+            # a duplicate job, but schedules a new one when its source changed.
+            missing = [clip["id"] for clip in proposed_clips]
             staged_state = state
             response = {"proposal": deepcopy(proposal), "variant": public_task(project_id, task)["variant"]}
         if missing:
-            schedule_reframes(project_id, task_id, missing, staged_state=staged_state, expected_state=expected_state)
+            schedule_reframes(project_id, task_id, missing, staged_state=staged_state, expected_state=expected_state,
+                              reuse_existing=True)
         else:
             commit_staged_batch_state(project_id, expected_state, staged_state)
         return response

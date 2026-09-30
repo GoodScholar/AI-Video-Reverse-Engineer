@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import stat
+from copy import deepcopy
 from contextlib import nullcontext
 from pathlib import Path
 from threading import RLock
@@ -197,7 +198,15 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             if current_aspect != request["targetAspect"]:
                 fail("timeline_conflict", "时间线输出比例已更新，请刷新后重试。")
             from .montage_reframe import pending_reframe
-            clip.setdefault("reframe", pending_reframe(target_width=current_aspect["width"], target_height=current_aspect["height"], reason="已提交本地主体分析"))
+            previous_reframe = clip.get("reframe", {})
+            previous_fingerprint = previous_reframe.get("sourceFingerprint")
+            if previous_fingerprint != proof["fingerprint"]:
+                pending = pending_reframe(target_width=current_aspect["width"], target_height=current_aspect["height"], reason="已提交本地主体分析")
+                override = previous_reframe.get("override")
+                if (not previous_fingerprint and isinstance(override, dict)
+                        and override.get("mode") != "auto"):
+                    pending["override"] = deepcopy(override)
+                clip["reframe"] = pending
             identity = {**request["clip"], "sourceFingerprint": proof["fingerprint"], "targetAspect": current_aspect}
             source = current_source
             source_timing, trusted_size = proof["timing"], proof["size"]

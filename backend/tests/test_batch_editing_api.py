@@ -1709,6 +1709,33 @@ def test_montage_proposal_apply_proof_allows_get_then_leaves_variant_unchanged_o
         assert queue.jobs == []
 
 
+def test_montage_proposal_apply_pts_proof_does_not_block_get(tmp_path, monkeypatch):
+    from app import montage_reframe
+
+    app, queue = _proposal_reframe_app(tmp_path)
+    with TestClient(app) as client:
+        project_id, base, task, proposal = _create_montage_proposal(client, tmp_path)
+        queue.jobs.clear()
+        state_path = tmp_path / "project-files" / project_id / "batch-edits" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["tasks"][0]["variant"]["reframeAnalysis"] = {}
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        entered, release = threading.Event(), threading.Event()
+        original = montage_reframe.probe_source_timing
+        def blocked(path, probe):
+            entered.set(); assert release.wait(5); return original(path, probe)
+        monkeypatch.setattr(montage_reframe, "probe_source_timing", blocked)
+        result = {}
+        thread = threading.Thread(target=lambda: result.setdefault("response", client.post(
+            f"{base}/{task['id']}/montage-proposals/{proposal['id']}/apply",
+            json={"revision": 0, "proposalRevision": 0, "strategy": "overwrite"}, headers=INTENT)))
+        thread.start(); assert entered.wait(5)
+        assert client.get(base).status_code == 200
+        release.set(); thread.join(5)
+        assert result["response"].status_code == 200
+        assert len(queue.jobs) == 1
+
+
 def test_batch_reframe_proof_deduplicates_shared_source_and_keeps_multi_clip_submit_atomic(tmp_path, monkeypatch):
     """Two adopted clips sharing one file receive one proof and one all-or-nothing queue job."""
     from app import montage_reframe, timeline_render

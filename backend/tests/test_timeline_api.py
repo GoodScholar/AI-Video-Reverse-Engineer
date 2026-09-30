@@ -145,6 +145,22 @@ def test_timeline_image_manual_override_rejects_nonzero_or_multiple_keyframes_an
     assert client.get(BASE).json()["tracks"][0]["clips"][0]["reframe"]["override"] == {"mode": "center", "keyframes": []}
 
 
+def test_timeline_empty_fingerprint_center_survives_explicit_analysis(tmp_path):
+    client, queue = setup(tmp_path)
+    _add_image_asset(tmp_path)
+    assert client.put(BASE, json=_image_workspace()).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    pending = client.get(BASE).json()
+    assert pending["tracks"][0]["clips"][0]["reframe"]["sourceFingerprint"] == ""
+    pending["tracks"][0]["clips"][0]["reframe"]["override"] = {"mode": "center", "keyframes": []}
+    assert client.put(BASE, json={"revision": pending["revision"], "settings": pending["settings"],
+                                  "tracks": pending["tracks"]}).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/cancel", json={"revision": 2}).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 2}).status_code == 202
+    queue.run(); queue.run()
+    assert client.get(BASE).json()["tracks"][0]["clips"][0]["reframe"]["override"] == {"mode": "center", "keyframes": []}
+
+
 def test_timeline_image_reframe_analysis_cas_rejects_an_old_output_aspect(tmp_path):
     from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint
     def analyzer(source, identity):
@@ -356,6 +372,26 @@ def test_timeline_reframe_proves_source_outside_lock_and_aborts_stale_submission
     current = client.get(BASE).json()
     assert current["reframeAnalysis"] == {}
     assert queue.jobs == []
+
+
+def test_timeline_reframe_probe_media_proof_does_not_block_get(tmp_path, monkeypatch):
+    from app import timeline_render
+
+    client, queue = setup(tmp_path)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    entered, release = threading.Event(), threading.Event()
+    original = timeline_render._probe_media
+    def blocked(path, probe):
+        entered.set(); assert release.wait(5); return original(path, probe)
+    monkeypatch.setattr(timeline_render, "_probe_media", blocked)
+    result = {}
+    thread = threading.Thread(target=lambda: result.setdefault("response", client.post(
+        BASE + "/reframes/clip1/analyze", json={"revision": 1})))
+    thread.start(); assert entered.wait(5)
+    assert client.get(BASE).status_code == 200
+    release.set(); thread.join(5)
+    assert result["response"].status_code == 202
+    assert queue.jobs
 
 
 def test_timeline_reframe_source_replaced_during_proof_never_creates_a_job(tmp_path, monkeypatch):
