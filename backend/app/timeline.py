@@ -276,7 +276,7 @@ def _clip(value: Any, assets: Dict[str, Dict[str, Any]], track_kind: str) -> Dic
             raise ValueError("主体裁剪只能用于画面素材")
         from .montage_reframe import ReframeError, validate_stored_reframe
         try:
-            normalized["reframe"] = validate_stored_reframe(value["reframe"])
+            normalized["reframe"] = validate_stored_reframe(value["reframe"], still_image=asset.get("kind") == "image")
         except ReframeError as error:
             raise ValueError(str(error)) from error
     return normalized

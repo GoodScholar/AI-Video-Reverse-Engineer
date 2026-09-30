@@ -349,6 +349,66 @@ describe("TimelineEditor", () => {
     expect(mockedSave.mock.calls[0][1]).toMatchObject({ revision: 5, tracks: [{ clips: [{ start: 9 }] }, {}] });
   });
 
+  it("恢复图片人工构图冲突草稿时合并异步主体事实，只提交人工覆盖", async () => {
+    const server = workspace(5);
+    server.tracks[0].clips[0].reframe = {
+      schemaVersion: 1, sourceFingerprint: "a".repeat(64), sourceWidth: 64, sourceHeight: 48,
+      targetAspect: { width: 1280, height: 720 }, detectorVersion: "mediapipe-object-detector-0.10.21", modelSha256: "model",
+      samples: [{ timeSeconds: 0, boxes: [{ x: .2, y: .1, width: .3, height: .7, label: "person", confidence: .9 }], center: { x: .35, y: .45 }, confidence: .9 }],
+      uncertaintyReasons: [], status: "ready", override: { mode: "auto", keyframes: [] },
+    };
+    const draft = structuredClone(server);
+    draft.revision = 2;
+    draft.tracks[0].clips[0].reframe = { ...server.tracks[0].clips[0].reframe!, sourceFingerprint: "", sourceWidth: 0,
+      sourceHeight: 0, samples: [], uncertaintyReasons: ["已提交本地主体分析"], status: "review_required", override: {
+        mode: "manual", keyframes: [{ timeSeconds: 0, x: .54, y: .48 }],
+      }};
+    sessionStorage.setItem("aivre:timeline-draft:image-facts-conflict", JSON.stringify({
+      revision: 2, draft: { revision: 2, settings: draft.settings, tracks: draft.tracks },
+    }));
+    mockedGet.mockResolvedValue(server);
+    mockedSave.mockResolvedValue({ ...server, revision: 6 });
+
+    render(<TimelineEditor projectId="image-facts-conflict" />);
+    await userEvent.click(await screen.findByRole("button", { name: "恢复草稿并继续编辑" }));
+    await userEvent.click(screen.getByRole("button", { name: "开场.jpg" }));
+    await userEvent.click(screen.getByRole("button", { name: "保存时间线" }));
+
+    expect(mockedSave.mock.calls[0][1].tracks[0].clips[0].reframe).toMatchObject({
+      samples: server.tracks[0].clips[0].reframe!.samples,
+      override: { mode: "manual", keyframes: [{ timeSeconds: 0, x: .54, y: .48 }] },
+    });
+  });
+
+  it("同版本缓存也不会以旧 pending 图片事实覆盖服务端分析结果", async () => {
+    const server = workspace(5);
+    server.tracks[0].clips[0].reframe = {
+      schemaVersion: 1, sourceFingerprint: "a".repeat(64), sourceWidth: 64, sourceHeight: 48,
+      targetAspect: { width: 1280, height: 720 }, detectorVersion: "mediapipe-object-detector-0.10.21", modelSha256: "model",
+      samples: [{ timeSeconds: 0, boxes: [{ x: .2, y: .1, width: .3, height: .7, label: "person", confidence: .9 }], center: { x: .35, y: .45 }, confidence: .9 }],
+      uncertaintyReasons: [], status: "ready", override: { mode: "auto", keyframes: [] },
+    };
+    const draft = structuredClone(server);
+    draft.tracks[0].clips[0].reframe = { ...server.tracks[0].clips[0].reframe!, sourceFingerprint: "", sourceWidth: 0,
+      sourceHeight: 0, samples: [], uncertaintyReasons: ["已提交本地主体分析"], status: "review_required", override: {
+        mode: "manual", keyframes: [{ timeSeconds: 0, x: .54, y: .48 }],
+      }};
+    sessionStorage.setItem("aivre:timeline-draft:image-facts-current", JSON.stringify({
+      revision: 5, draft: { revision: 5, settings: draft.settings, tracks: draft.tracks },
+    }));
+    mockedGet.mockResolvedValue(server);
+    mockedSave.mockResolvedValue({ ...server, revision: 6 });
+
+    render(<TimelineEditor projectId="image-facts-current" />);
+    await userEvent.click(await screen.findByRole("button", { name: "开场.jpg" }));
+    await userEvent.click(screen.getByRole("button", { name: "保存时间线" }));
+
+    expect(mockedSave.mock.calls[0][1].tracks[0].clips[0].reframe).toMatchObject({
+      samples: server.tracks[0].clips[0].reframe!.samples,
+      override: { mode: "manual", keyframes: [{ timeSeconds: 0, x: .54, y: .48 }] },
+    });
+  });
+
   it("放弃冲突草稿才清除缓存并使用服务端内容", async () => {
     const key = "aivre:timeline-draft:discard";
     sessionStorage.setItem(key, JSON.stringify({ revision: 1, draft: workspace(1) }));

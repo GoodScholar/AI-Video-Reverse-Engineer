@@ -1484,6 +1484,58 @@ def test_batch_reframe_repeat_cancel_retry_and_source_cas(tmp_path):
         assert "素材" in deleted["error"]
 
 
+def test_batch_image_reframe_rejects_invalid_manual_keyframes_and_stale_output_aspect(tmp_path):
+    project_id = "reframe-image-batch"
+    root = tmp_path / "project-files" / project_id / "preproduction"
+    (root / "assets").mkdir(parents=True)
+    source = root / "assets" / "source.png"
+    Image.new("RGB", (64, 48), "red").save(source)
+    (root / "state.json").write_text(json.dumps({"schemaVersion": 1, "revision": 1, "brief": {}, "shots": [],
+        "assets": [{"id": "source", "name": "source", "kind": "image", "file": "source.png", "width": 64, "height": 48}]}), encoding="utf-8")
+    jobs = []
+    class Queue:
+        def submit(self, _kind, pid, handler):
+            jobs.append((pid, handler)); return True
+    def analyzer(path, _start, _end, aspect):
+        return {"schemaVersion": 1, "sourceFingerprint": source_fingerprint(path), "sourceWidth": 64, "sourceHeight": 48,
+                "targetAspect": aspect, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+                "samples": [{"timeSeconds": 0, "boxes": [{"x": .2, "y": .1, "width": .3, "height": .7,
+                                                               "label": "person", "confidence": .9}],
+                             "center": {"x": .35, "y": .45}, "confidence": .9}],
+                "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []}}
+    app = FastAPI()
+    app.include_router(create_batch_editing_router(tmp_path, lambda _: SimpleNamespace(id=project_id), Queue(), reframe_analyzer=analyzer))
+    with TestClient(app) as client:
+        base = f"/api/projects/{project_id}/batch-edits"
+        task = client.post(base, json={"sellingPoint": "x", "script": "x"}).json()["task"]
+        tracks = task["variant"]["tracks"]
+        tracks[0]["clips"] = [{"id": "clip", "assetId": "source", "start": 0, "inPoint": 0, "duration": 2,
+                               "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0}]
+        variant_path = f"{base}/{task['id']}/variant"
+        assert client.put(variant_path, json={"revision": 0, "tracks": tracks}).status_code == 200
+        reframe_path = variant_path + "/reframes/clip"
+        assert client.post(reframe_path + "/analyze", json={"revision": 1}).status_code == 202
+        queued = client.get(base).json()["tasks"][0]["variant"]
+        assert queued["reframeAnalysis"]["clip"]["identity"]["targetAspect"] == {"width": 720, "height": 1280}
+
+        for keyframes in ([{"timeSeconds": .1, "x": .5, "y": .5}], [
+            {"timeSeconds": 0, "x": .5, "y": .5}, {"timeSeconds": .1, "x": .6, "y": .5},
+        ]):
+            invalid_tracks = deepcopy(queued["tracks"])
+            invalid_tracks[0]["clips"][0]["reframe"]["override"] = {"mode": "manual", "keyframes": keyframes}
+            assert client.put(variant_path, json={"revision": queued["revision"], "tracks": invalid_tracks}).status_code == 422
+
+        changed = client.put(variant_path, json={
+            "revision": queued["revision"], "tracks": queued["tracks"],
+            "settings": {"width": 1280, "height": 720, "fps": 30}, "aspectMode": "16:9",
+        })
+        assert changed.status_code == 200, changed.text
+        jobs.pop()[1](project_id)
+        record = client.get(base).json()["tasks"][0]["variant"]["reframeAnalysis"]["clip"]
+        assert record["status"] == "failed"
+        assert "输出比例" in record["error"]
+
+
 def test_batch_reframe_never_accepts_worker_dimensions_when_the_source_probe_has_none(tmp_path, monkeypatch):
     """A batch analysis cannot become ready from self-reported worker dimensions."""
     from app import timeline_render

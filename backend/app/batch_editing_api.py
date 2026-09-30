@@ -625,7 +625,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                                                             target_height=variant["settings"]["height"],
                                                             reason="已提交本地主体分析"))
                 identity = {"assetId": clip["assetId"], "inPoint": clip["inPoint"], "duration": clip["duration"],
-                            "speed": clip["speed"], "sourceFingerprint": source_fingerprint(source)}
+                            "speed": clip["speed"], "sourceFingerprint": source_fingerprint(source),
+                            "targetAspect": {"width": variant["settings"]["width"], "height": variant["settings"]["height"]}}
                 if identity["sourceFingerprint"] not in source_probes:
                     timing = None if still_image else probe_source_timing(source, ffprobe_path)
                     try:
@@ -697,6 +698,10 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                         current_fingerprint = None
                     if current != {key: identity[key] for key in current} or current_fingerprint != identity["sourceFingerprint"]:
                         record.update(status="failed", error="分析期间素材已变化，请重新主体分析。")
+                        changed = True
+                        continue
+                    if {"width": task["variant"]["settings"]["width"], "height": task["variant"]["settings"]["height"]} != identity["targetAspect"]:
+                        record.update(status="failed", error="分析期间输出比例已变化，请重新主体分析。")
                         changed = True
                         continue
                     if clip_id in completed:

@@ -7,7 +7,7 @@ import time
 from types import SimpleNamespace
 
 from app import montage_reframe
-from app.montage_reframe import MODEL_SHA256, ReframeError, SourceTiming, normalize_reframe, pending_reframe, probe_source_timing, reframe_filter, retain_server_reframe_facts, run_local_detector
+from app.montage_reframe import MODEL_SHA256, ReframeError, SourceTiming, normalize_reframe, pending_reframe, probe_source_timing, reframe_filter, retain_server_reframe_facts, run_local_detector, validate_stored_reframe
 
 
 def _analysis(*, override=None, samples=None, status="ready"):
@@ -56,6 +56,62 @@ def test_still_image_auto_reframe_accepts_exactly_one_real_zero_second_sample_wi
 
     assert stored["status"] == "ready"
     assert [sample["timeSeconds"] for sample in stored["samples"]] == [0]
+
+
+@pytest.mark.parametrize("boxes", [
+    [],
+    [{"x": .2, "y": .1, "width": .3, "height": .7, "label": "product", "confidence": .9}],
+    [
+        {"x": .1, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9},
+        {"x": .6, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9},
+    ],
+])
+def test_still_image_unsafe_auto_facts_become_review_required(boxes):
+    """IMAGE mode may only automatically frame one positive-confidence person."""
+    analysis = _analysis(samples=[{
+        "timeSeconds": 0, "boxes": boxes, "center": {"x": .5, "y": .5}, "confidence": .9,
+    }])
+
+    normalized = normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
+                                   still_image=True)
+
+    assert normalized["status"] == "review_required"
+    assert "唯一可信 person" in normalized["uncertaintyReasons"][-1]
+    with pytest.raises(ReframeError, match="唯一可信 person"):
+        validate_stored_reframe(analysis, still_image=True)
+
+
+def test_still_image_rejects_malformed_or_zero_confidence_auto_person_facts():
+    analysis = _analysis(samples=[{
+        "timeSeconds": 0,
+        "boxes": [{"x": .9, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": 0}],
+        "center": {"x": .5, "y": .5}, "confidence": 0,
+    }])
+
+    with pytest.raises(ReframeError):
+        normalize_reframe(analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
+                          still_image=True)
+    with pytest.raises(ReframeError):
+        validate_stored_reframe(analysis, still_image=True)
+
+
+@pytest.mark.parametrize("override", [
+    {"mode": "manual", "keyframes": [{"timeSeconds": .1, "x": .5, "y": .5}]},
+    {"mode": "manual", "keyframes": [
+        {"timeSeconds": 0, "x": .5, "y": .5}, {"timeSeconds": .2, "x": .6, "y": .5},
+    ]},
+])
+def test_still_image_manual_override_requires_one_zero_second_keyframe(override):
+    with pytest.raises(ReframeError, match="静态图片"):
+        validate_stored_reframe(_analysis(override=override), still_image=True)
+
+
+def test_still_image_center_override_remains_a_valid_manual_risk_decision():
+    stored = validate_stored_reframe(_analysis(status="review_required", samples=[], override={
+        "mode": "center", "keyframes": [],
+    }), still_image=True)
+
+    assert stored["override"] == {"mode": "center", "keyframes": []}
 
 
 @pytest.mark.parametrize("field,value", [("assetId", "replacement"), ("inPoint", 1), ("duration", 3), ("speed", 1.25)])

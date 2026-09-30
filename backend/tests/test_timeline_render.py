@@ -424,7 +424,9 @@ def test_reframed_still_image_is_full_bleed_without_black_padding(tmp_path):
     reframe = {
         "schemaVersion": 1, "sourceFingerprint": source_fingerprint(image), "sourceWidth": 64, "sourceHeight": 48,
         "targetAspect": {"width": 24, "height": 48}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
-        "samples": [{"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9}],
+        "samples": [{"timeSeconds": 0, "boxes": [{"x": .35, "y": .1, "width": .3, "height": .8,
+                                                       "label": "person", "confidence": .9}],
+                     "center": {"x": .5, "y": .5}, "confidence": .9}],
         "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []},
     }
     output = tmp_path / "still-reframe.mp4"
@@ -434,6 +436,20 @@ def test_reframed_still_image_is_full_bleed_without_black_padding(tmp_path):
 
     pixel = _rgb_at(output, .5)
     assert pixel[0] > 180 and pixel[1] < 70 and pixel[2] < 70
+
+
+def test_reframed_still_image_rejects_forged_ready_without_a_unique_person(tmp_path):
+    image = _image(tmp_path / "red.png", "red")
+    reframe = {
+        "schemaVersion": 1, "sourceFingerprint": source_fingerprint(image), "sourceWidth": 64, "sourceHeight": 48,
+        "targetAspect": {"width": 24, "height": 48}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+        "samples": [{"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9}],
+        "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []},
+    }
+
+    with pytest.raises(TimelineRenderError, match="唯一可信 person"):
+        render_timeline(_timeline(width=24, height=48, tracks=[_track("video", [_clip("red", 0, 1, reframe=reframe)])]),
+                        {"red": image}, tmp_path / "forged.mp4", format="mp4")
 
 
 def test_reframe_moves_a_full_bleed_crop_in_source_time_without_black_padding(tmp_path):

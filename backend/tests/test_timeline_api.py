@@ -57,6 +57,25 @@ def _workspace(revision=0, tracks=None):
     }
 
 
+def _add_image_asset(tmp_path):
+    root = tmp_path / "project-files" / PROJECT_ID / "preproduction"
+    image = root / "assets" / "image.png"
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
+        "color=red:size=64x48", "-frames:v", "1", str(image),
+    ], check=True, capture_output=True, text=True)
+    state_path = root / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["assets"].append({"id": "image", "name": "静态图", "kind": "image", "file": "image.png", "width": 64, "height": 48})
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+
+def _image_workspace(revision=0):
+    workspace = _workspace(revision)
+    workspace["tracks"][0]["clips"][0]["assetId"] = "image"
+    return workspace
+
+
 def setup(tmp_path, renderer=None, reframe_analyzer=None):
     _asset_root(tmp_path)
     queue = Queue()
@@ -103,6 +122,50 @@ def test_timeline_reframe_analyze_cancel_and_retry_are_durable(tmp_path):
     forged = completed["tracks"]
     forged[0]["clips"][0]["reframe"]["status"] = "ready"
     assert client.put(BASE, json={"revision": completed["revision"], "settings": completed["settings"], "tracks": forged}).status_code == 422
+
+
+def test_timeline_image_manual_override_rejects_nonzero_or_multiple_keyframes_and_persists_center(tmp_path):
+    client, _ = setup(tmp_path)
+    _add_image_asset(tmp_path)
+    assert client.put(BASE, json=_image_workspace()).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    queued = client.get(BASE).json()
+
+    for keyframes in ([{"timeSeconds": .1, "x": .5, "y": .5}], [
+        {"timeSeconds": 0, "x": .5, "y": .5}, {"timeSeconds": .1, "x": .6, "y": .5},
+    ]):
+        attempted = json.loads(json.dumps(queued))
+        attempted["tracks"][0]["clips"][0]["reframe"]["override"] = {"mode": "manual", "keyframes": keyframes}
+        assert client.put(BASE, json={"revision": queued["revision"], "settings": queued["settings"], "tracks": attempted["tracks"]}).status_code == 422
+
+    queued["tracks"][0]["clips"][0]["reframe"]["override"] = {"mode": "center", "keyframes": []}
+    saved = client.put(BASE, json={"revision": queued["revision"], "settings": queued["settings"], "tracks": queued["tracks"]})
+    assert saved.status_code == 200
+    assert client.get(BASE).json()["tracks"][0]["clips"][0]["reframe"]["override"] == {"mode": "center", "keyframes": []}
+
+
+def test_timeline_image_reframe_analysis_cas_rejects_an_old_output_aspect(tmp_path):
+    from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint
+    def analyzer(source, identity):
+        return {"schemaVersion": 1, "sourceFingerprint": source_fingerprint(source), "sourceWidth": 64, "sourceHeight": 48,
+                "targetAspect": identity["targetAspect"], "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+                "samples": [{"timeSeconds": 0, "boxes": [{"x": .2, "y": .1, "width": .3, "height": .7,
+                                                               "label": "person", "confidence": .9}],
+                             "center": {"x": .35, "y": .45}, "confidence": .9}],
+                "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []}}
+    client, queue = setup(tmp_path, reframe_analyzer=analyzer)
+    _add_image_asset(tmp_path)
+    assert client.put(BASE, json=_image_workspace()).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    queued = client.get(BASE).json()
+    assert queued["reframeAnalysis"]["clip1"]["identity"]["targetAspect"] == {"width": 1280, "height": 720}
+    queued["settings"] = {"width": 720, "height": 1280, "fps": 30}
+    assert client.put(BASE, json={"revision": queued["revision"], "settings": queued["settings"], "tracks": queued["tracks"]}).status_code == 200
+    queue.run()
+
+    record = client.get(BASE).json()["reframeAnalysis"]["clip1"]
+    assert record["status"] == "failed"
+    assert "输出比例" in record["error"]
 
 
 def test_candidate_replacement_persists_pending_reframe_and_manual_render(tmp_path):

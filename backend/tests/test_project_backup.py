@@ -3,6 +3,7 @@ import json
 import zipfile
 
 from fastapi.testclient import TestClient
+from PIL import Image
 from app.main import create_app
 
 
@@ -74,6 +75,33 @@ def test_backup_rejects_invalid_current_timeline_packaging_without_a_render_hist
         package = default_packaging()
         package['templateId'] = 'unknown-template'
         timeline['packaging'] = package
+        TimelineStore(tmp_path).save(pid, timeline)
+
+        assert client.post(f'/api/projects/{pid}/backup', json={}).status_code == 422
+
+
+def test_backup_rejects_a_forged_ready_static_image_reframe(tmp_path):
+    from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256
+    from app.timeline import TimelineStore
+
+    with TestClient(create_app(data_dir=tmp_path)) as client:
+        pid = create(client)
+        image = io.BytesIO()
+        Image.new('RGB', (64, 48), 'red').save(image, format='PNG')
+        prep = client.post(f'/api/projects/{pid}/preproduction/assets?role=character', files={
+            'file': ('still.png', image.getvalue(), 'image/png'),
+        }).json()
+        asset_id = prep['assets'][0]['id']
+        timeline = TimelineStore(tmp_path).load(pid)
+        timeline['tracks'] = [{"id": "video", "name": "画面", "kind": "video", "muted": False, "hidden": False,
+            "clips": [{"id": "still", "assetId": asset_id, "start": 0, "inPoint": 0, "duration": 1, "speed": 1,
+                       "volume": 1, "fadeIn": 0, "fadeOut": 0, "reframe": {
+                           "schemaVersion": 1, "sourceFingerprint": "a" * 64, "sourceWidth": 64, "sourceHeight": 48,
+                           "targetAspect": {"width": 1280, "height": 720}, "detectorVersion": DETECTOR_VERSION,
+                           "modelSha256": MODEL_SHA256, "samples": [{"timeSeconds": 0, "boxes": [],
+                           "center": {"x": .5, "y": .5}, "confidence": .9}], "uncertaintyReasons": [], "status": "ready",
+                           "override": {"mode": "auto", "keyframes": []},
+                       }}]}]
         TimelineStore(tmp_path).save(pid, timeline)
 
         assert client.post(f'/api/projects/{pid}/backup', json={}).status_code == 422

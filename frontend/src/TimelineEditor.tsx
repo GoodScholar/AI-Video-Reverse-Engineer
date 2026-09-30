@@ -135,7 +135,7 @@ export function TimelineEditor({ projectId, onDraftChange, preproductionRevision
   function loadDraft(next: TimelineWorkspace, draft: Draft | null) {
     if (!mounted.current || projectRef.current !== projectId) return;
     const conflict = draft && draft.revision !== next.revision ? draft : null;
-    const current = draft && !conflict ? { ...next, settings: draft.settings, tracks: draft.tracks, transitions: draft.transitions ?? [], packaging: draft.packaging } : next;
+    const current = draft && !conflict ? { ...next, settings: draft.settings, tracks: mergeServerReframeFacts(draft.tracks, next.tracks), transitions: draft.transitions ?? [], packaging: draft.packaging } : next;
     workspaceRef.current = current;
     savedSnapshotRef.current = snapshot(draftOf(next));
     setConflictDraft(conflict); setWorkspace(current); setSavedSnapshot(savedSnapshotRef.current);
@@ -157,7 +157,7 @@ export function TimelineEditor({ projectId, onDraftChange, preproductionRevision
   function resolveDraft(restoreDraft: boolean) {
     if (!workspace || !conflictDraft) return;
     if (restoreDraft) {
-      const next = { ...workspace, settings: conflictDraft.settings, tracks: conflictDraft.tracks, transitions: conflictDraft.transitions ?? [], packaging: conflictDraft.packaging };
+      const next = { ...workspace, settings: conflictDraft.settings, tracks: mergeServerReframeFacts(conflictDraft.tracks, workspace.tracks), transitions: conflictDraft.transitions ?? [], packaging: conflictDraft.packaging };
       workspaceRef.current = next; setWorkspace(next); setSelectedTrackId(next.tracks[0]?.id ?? null);
     }
     setConflictDraft(null);

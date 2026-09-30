@@ -102,7 +102,8 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             from .montage_reframe import pending_reframe, probe_source_timing, source_fingerprint
             clip.setdefault("reframe", pending_reframe(target_width=state["settings"]["width"], target_height=state["settings"]["height"], reason="已提交本地主体分析"))
             identity = {"assetId": clip["assetId"], "inPoint": clip["inPoint"], "duration": clip["duration"],
-                        "speed": clip["speed"], "sourceFingerprint": source_fingerprint(source)}
+                        "speed": clip["speed"], "sourceFingerprint": source_fingerprint(source),
+                        "targetAspect": {"width": state["settings"]["width"], "height": state["settings"]["height"]}}
             source_timing = None if still_image else probe_source_timing(source, ffprobe_path)
             try:
                 from .timeline_render import _probe_media
@@ -128,7 +129,7 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                     raise ValueError("无法获取可信源尺寸，不能完成主体分析。")
                 raw = reframe_analyzer(source, identity) if reframe_analyzer else run_local_detector(
                     source, start=0 if still_image else identity["inPoint"], end=0 if still_image else identity["inPoint"] + identity["duration"] * identity["speed"],
-                    target_width=state["settings"]["width"], target_height=state["settings"]["height"],
+                    target_width=identity["targetAspect"]["width"], target_height=identity["targetAspect"]["height"],
                     source_timing=source_timing, media_kind="image" if still_image else "video",
                     cancelled=lambda: (state_for(project_id).get("reframeAnalysis", {}).get(clip_id, {}).get("id") != run_id
                                        or state_for(project_id).get("reframeAnalysis", {}).get(clip_id, {}).get("status") == "cancelled"))
@@ -157,6 +158,8 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                             {key: identity[key] for key in ("assetId", "inPoint", "duration", "speed")}
                             or current_fingerprint != identity["sourceFingerprint"]):
                         record.update(status="failed", error="分析期间素材或片段已变化，请重新主体分析。")
+                    elif {"width": state["settings"]["width"], "height": state["settings"]["height"]} != identity["targetAspect"]:
+                        record.update(status="failed", error="分析期间输出比例已变化，请重新主体分析。")
                     else:
                         override = clip.get("reframe", {}).get("override")
                         clip["reframe"] = {**result, **({"override": override} if isinstance(override, dict) and override.get("mode") != "auto" else {})}
