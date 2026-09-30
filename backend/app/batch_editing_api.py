@@ -23,6 +23,7 @@ from .batch_production import (
     apply_aigc_handoff,
     complete_voiceover,
     create_batch as new_task,
+    clear_legacy_cue_migration,
     current_delivery_output,
     current_preview_output,
     create_batch_variants,
@@ -30,6 +31,7 @@ from .batch_production import (
     export_approved_versions,
     review_current_version,
     review_status,
+    has_ambiguous_packaging_dependency,
     reusable_preview,
     queue_voiceover,
     save_content as save_batch_content,
@@ -179,8 +181,8 @@ def _shared_montage_usage(batch_members: list[dict[str, Any]], current_task_id: 
 def _migrate_legacy_recognition_cues(value: Any) -> bool:
     """Namespace completed legacy ``line-1`` cues before strict validation.
 
-    Only unambiguous references are rewritten.  Ambiguous legacy references
-    stay invalid rather than being silently attached to a later recognition.
+    Only unambiguous references are rewritten. Ambiguous history remains
+    readable, explicitly marked, and never guessed at render time.
     """
     if not isinstance(value, dict) or not isinstance(value.get("tasks"), list):
         return False
@@ -192,8 +194,10 @@ def _migrate_legacy_recognition_cues(value: Any) -> bool:
         if not isinstance(recognitions, list):
             continue
         candidates: dict[str, list[str]] = {}
+        pending: list[tuple[dict[str, Any], dict[str, Any], str, str]] = []
         for recognition in recognitions:
-            if not isinstance(recognition, dict) or recognition.get("status") != "completed":
+            if (not isinstance(recognition, dict) or recognition.get("status") != "completed"
+                    or recognition.get("legacyCueAmbiguity") is True):
                 continue
             run_id, cues = recognition.get("id"), recognition.get("cues")
             if not isinstance(run_id, str) or not isinstance(cues, list):
@@ -204,28 +208,25 @@ def _migrate_legacy_recognition_cues(value: Any) -> bool:
                 old_id = cue["id"]
                 new_id = run_id + "-" + old_id
                 candidates.setdefault(old_id, []).append(new_id)
-                cue["id"] = new_id
-                changed = True
+                pending.append((recognition, cue, old_id, new_id))
         mapping = {old_id: names[0] for old_id, names in candidates.items() if len(names) == 1}
         ambiguous = {old_id for old_id, names in candidates.items() if len(names) > 1}
-        def has_ambiguous_cue(cues):
-            return isinstance(cues, list) and any(
-                isinstance(cue, dict) and cue.get("id") in ambiguous for cue in cues
-            )
-        def has_ambiguous_packaging(snapshot):
-            package = snapshot.get("packaging") if isinstance(snapshot, dict) else None
-            return isinstance(package, dict) and any(
-                isinstance(element, dict) and element.get("cueId") in ambiguous
-                for element in package.get("elements", [])
-            )
-        if (has_ambiguous_cue(subtitles.get("cues")) or has_ambiguous_packaging(variant)
-                or has_ambiguous_packaging(task.get("proposal"))
-                or any(has_ambiguous_packaging(proposal) for proposal in task.get("montageProposals", []) if isinstance(proposal, dict))
-                or any(has_ambiguous_cue(run.get("subtitleCues")) or has_ambiguous_packaging(run.get("snapshot"))
-                       for run in variant.get("runs", []) if isinstance(run, dict))
-                or any(has_ambiguous_cue(delivery.get("subtitles")) or has_ambiguous_packaging(delivery.get("snapshot"))
-                       for delivery in variant.get("exports", []) if isinstance(delivery, dict))):
-            raise ValueError("字幕识别 cue 身份歧义")
+        for recognition, cue, old_id, new_id in pending:
+            if old_id in mapping:
+                cue["id"] = new_id
+                changed = True
+            elif old_id in ambiguous:
+                recognition["legacyCueAmbiguity"] = True
+                changed = True
+        if ambiguous:
+            marker = {
+                "code": "legacy_cue_ambiguity", "cueIds": sorted(ambiguous),
+                "runIds": sorted({recognition["id"] for recognition, _cue, old_id, _new_id in pending
+                                  if old_id in ambiguous}),
+            }
+            if subtitles.get("migrationRequired") != marker:
+                subtitles["migrationRequired"] = marker
+                changed = True
         if not mapping:
             continue
         def rewrite_cues(cues):
@@ -303,6 +304,12 @@ def _validate_state(value: Any) -> None:
             if (not isinstance(subtitles, dict) or type(subtitles.get("revision")) is not int or subtitles["revision"] < 0
                     or not isinstance(subtitles.get("recognitions"), list)):
                 raise ValueError("字幕记录无效")
+            marker = subtitles.get("migrationRequired")
+            if marker is not None and (not isinstance(marker, dict) or marker.get("code") != "legacy_cue_ambiguity"
+                                       or not isinstance(marker.get("cueIds"), list) or not marker["cueIds"]
+                                       or not isinstance(marker.get("runIds"), list) or not marker["runIds"]
+                                       or any(not _valid_id(item) for item in [*marker["cueIds"], *marker["runIds"]])):
+                raise ValueError("字幕迁移状态无效")
             _validate_cues(subtitles.get("cues"), tracks)
             for recognition in subtitles["recognitions"]:
                 if (not isinstance(recognition, dict) or not _valid_id(recognition.get("id"))
@@ -315,8 +322,11 @@ def _validate_state(value: Any) -> None:
                     raise ValueError("字幕识别记录无效")
                 _validate_timeline_shape(recognition["timelineRevision"], recognition["snapshot"].get("settings"), recognition["snapshot"].get("tracks"), recognition["snapshot"].get("transitions", []))
                 _validate_cues(recognition.get("cues"), recognition["snapshot"]["tracks"])
+                if "legacyCueAmbiguity" in recognition and recognition["legacyCueAmbiguity"] is not True:
+                    raise ValueError("字幕识别迁移状态无效")
                 if recognition.get("status") == "completed" and any(
-                    not cue["id"].startswith(recognition["id"] + "-") for cue in recognition["cues"]
+                    not cue["id"].startswith(recognition["id"] + "-") and recognition.get("legacyCueAmbiguity") is not True
+                    for cue in recognition["cues"]
                 ):
                     raise ValueError("字幕识别 cue 身份无效")
                 if any(not _valid_id(asset_id) or not _valid_id(filename) for asset_id, filename in recognition["sources"].items()):
@@ -430,7 +440,7 @@ class BatchStore:
     def path(self, project_id: str, *parts: str) -> Path:
         return safe_child(self.root, "project-files", project_id, "batch-edits", *parts)
 
-    def load(self, project_id: str) -> dict[str, Any]:
+    def load(self, project_id: str, *, persist_migration: bool = True) -> dict[str, Any]:
         path = self.path(project_id, "state.json")
         if not path.exists():
             return {"schemaVersion": 1, "tasks": []}
@@ -439,7 +449,7 @@ class BatchStore:
         value = json.loads(path.read_text(encoding="utf-8"))
         migrated = _migrate_legacy_recognition_cues(value)
         _validate_state(value)
-        if migrated:
+        if migrated and persist_migration:
             self.save(project_id, value)
         return value
 
@@ -1026,6 +1036,13 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     # later retry cannot inherit an old style override.
                     persisted = [{**cue, "id": f"{run_id}-{cue['id']}"} for cue in cues]
                     _complete_local_run(run, {"cues": persisted})
+                    task = task_for(state, task_id)
+                    if (task["variant"]["subtitles"].get("migrationRequired") is not None
+                            and not has_ambiguous_packaging_dependency(task)):
+                        subtitles = task["variant"]["subtitles"]
+                        subtitles["cues"] = deepcopy(persisted)
+                        subtitles["revision"] += 1
+                        clear_legacy_cue_migration(task)
                     save(project_id, state)
         except Exception as error:
             with lock:

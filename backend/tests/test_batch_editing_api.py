@@ -47,6 +47,37 @@ def test_content_api_persists_explicit_cta_with_omit_null_and_cas(tmp_path):
         assert "cta" not in cleared.json()["task"]
 
 
+def test_get_keeps_an_ambiguous_legacy_recognition_readable_for_repair(tmp_path):
+    class Queue:
+        def submit(self, *_args):
+            return True
+
+    app = FastAPI()
+    app.include_router(create_batch_editing_router(tmp_path, lambda _project_id: object(), Queue()))
+    with TestClient(app) as client:
+        base = "/api/projects/p1/batch-edits"
+        task = client.post(base, json={"sellingPoint": "卖点", "script": "脚本"}).json()["task"]
+        state_path = tmp_path / "project-files" / "p1" / "batch-edits" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        stored = state["tasks"][0]
+        tracks = stored["variant"]["tracks"]
+        tracks[0]["clips"] = [{"id": "clip", "assetId": "shot", "start": 0, "inPoint": 0, "duration": 2,
+                                "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0}]
+        cue = {"id": "line-1", "start": 0, "end": 1, "text": "旧字幕"}
+        recognitions = [{"id": run_id, "status": "completed", "error": None, "language": "zh",
+                         "timelineRevision": 0, "subtitleRevision": 0, "cues": [deepcopy(cue)],
+                         "snapshot": {"settings": stored["variant"]["settings"], "tracks": tracks},
+                         "sources": {"shot": "shot.mp4"}}
+                        for run_id in ("recognition-one", "recognition-two")]
+        stored["variant"]["subtitles"].update(cues=[cue], recognitions=recognitions)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        response = client.get(base)
+
+        assert response.status_code == 200
+        assert response.json()["tasks"][0]["variant"]["subtitles"]["migrationRequired"]["code"] == "legacy_cue_ambiguity"
+
+
 def test_shared_montage_usage_counts_each_sibling_once_and_ignores_deleted_or_stale_selections():
     sibling = {
         "id": "task-b",

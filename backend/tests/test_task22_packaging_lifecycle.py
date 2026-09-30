@@ -139,7 +139,7 @@ def test_legacy_recognition_cues_migrate_to_their_run_namespace_idempotently(tmp
     assert second == first
 
 
-def test_legacy_recognition_migration_rejects_ambiguous_current_cue(tmp_path):
+def test_legacy_recognition_migration_keeps_ambiguous_history_readable_and_marked(tmp_path):
     import json
     from app.batch_editing_api import BatchStore
 
@@ -154,8 +154,39 @@ def test_legacy_recognition_migration_rejects_ambiguous_current_cue(tmp_path):
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps({"schemaVersion": 1, "tasks": [task]}), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="身份歧义"):
-        BatchStore(tmp_path).load("project")
+    loaded = BatchStore(tmp_path).load("project")
+    subtitles = loaded["tasks"][0]["variant"]["subtitles"]
+
+    assert [run["cues"][0]["id"] for run in subtitles["recognitions"]] == ["line-1", "line-1"]
+    assert subtitles["migrationRequired"] == {
+        "code": "legacy_cue_ambiguity", "cueIds": ["line-1"],
+        "runIds": ["recognition-one", "recognition-two"],
+    }
+
+
+def test_ambiguous_legacy_cue_blocks_packaging_preview_review_and_export_until_explicit_repair():
+    task = create_batch("卖点", "脚本", id_factory=iter(["task", "variant"]).__next__)
+    task["variant"].update(tracks=_tracks(), revision=1, packaging=_subtitle_package("line-1"))
+    task["variant"]["subtitles"].update(
+        cues=_cue("line-1"),
+        migrationRequired={"code": "legacy_cue_ambiguity", "cueIds": ["line-1"],
+                           "runIds": ["recognition-one", "recognition-two"]},
+    )
+
+    with pytest.raises(BatchProductionError, match="身份歧义"):
+        production.submit_preview(task, expected_revision=1, assets=_assets(), snapshot_sources=lambda *_: {})
+    with pytest.raises(BatchProductionError, match="身份歧义"):
+        production.review_current_version(task, run_id="missing", decision="approved", reason="确认",
+                                          preview_available=lambda _run: True)
+    with pytest.raises(BatchProductionError, match="身份歧义"):
+        production.export_approved_version(task, assets=_assets(), snapshot_sources=lambda *_: {})
+
+    task["variant"]["packaging"] = None
+    repaired = _cue("recognition-three-line-1", "新字幕")
+    save_subtitles(task, expected_revision=0, timeline_revision=1, cues=repaired,
+                   validate_cues=lambda cues, _tracks: cues)
+    assert task["variant"]["subtitles"]["cues"] == repaired
+    assert "migrationRequired" not in task["variant"]["subtitles"]
 
 
 def test_save_content_keeps_or_clears_only_explicit_cta_and_invalidates_completed_artifacts():

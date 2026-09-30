@@ -154,7 +154,7 @@ def validate_core(data_root, project):
     # Keep it in the same restore gate as timeline history so bad references
     # cannot be silently discarded by a round-trip.
     from .batch_editing_api import BatchStore
-    BatchStore(data_root).load(pid)
+    BatchStore(data_root).load(pid, persist_migration=False)
     if project.referenceMedia:
         from .reference_media_storage import resolve_reference_media_path
         if not resolve_reference_media_path(data_root, pid, project.referenceMedia).is_file():

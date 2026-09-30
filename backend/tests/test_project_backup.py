@@ -79,6 +79,46 @@ def test_backup_rejects_invalid_current_timeline_packaging_without_a_render_hist
         assert client.post(f'/api/projects/{pid}/backup', json={}).status_code == 422
 
 
+def test_backup_validates_legacy_cues_without_persisting_a_migration(tmp_path):
+    from app.batch_editing_api import BatchStore
+    from app.batch_production import create_batch
+
+    with TestClient(create_app(data_dir=tmp_path)) as client:
+        pid = create(client)
+        task = create_batch("卖点", "脚本", id_factory=iter(["task", "variant"]).__next__)
+        tracks = task["variant"]["tracks"]
+        tracks[0]["clips"] = [{"id": "clip", "assetId": "shot", "start": 0, "inPoint": 0, "duration": 2,
+                                "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0}]
+        recognition = {"id": "recognition-one", "status": "completed", "error": None, "language": "zh",
+                       "timelineRevision": 0, "subtitleRevision": 0,
+                       "cues": [{"id": "line-1", "start": 0, "end": 1, "text": "旧字幕"}],
+                       "snapshot": {"settings": task["variant"]["settings"], "tracks": tracks},
+                       "sources": {"shot": "shot.mp4"}}
+        task["variant"]["subtitles"].update(
+            cues=[{"id": "line-1", "start": 0, "end": 1, "text": "旧字幕"}],
+            recognitions=[recognition],
+        )
+        state = BatchStore(tmp_path).path(pid, "state.json")
+        state.parent.mkdir(parents=True)
+        state.write_text(json.dumps({"schemaVersion": 1, "tasks": [task]}), encoding="utf-8")
+        before, before_mtime = state.read_bytes(), state.stat().st_mtime_ns
+
+        first = client.post(f'/api/projects/{pid}/backup', json={})
+        second = client.post(f'/api/projects/{pid}/backup', json={})
+
+        assert first.status_code == second.status_code == 200
+        assert state.read_bytes() == before
+        assert state.stat().st_mtime_ns == before_mtime
+
+        ambiguous = {**recognition, "id": "recognition-two"}
+        task["variant"]["subtitles"]["recognitions"] = [recognition, ambiguous]
+        state.write_text(json.dumps({"schemaVersion": 1, "tasks": [task]}), encoding="utf-8")
+        ambiguous_before = state.read_bytes()
+
+        assert client.post(f'/api/projects/{pid}/backup', json={}).status_code == 200
+        assert state.read_bytes() == ambiguous_before
+
+
 def test_backup_routes_require_trusted_browser_intent(tmp_path):
     with TestClient(create_app(data_dir=tmp_path)) as client:
         pid = create(client)

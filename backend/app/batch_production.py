@@ -204,6 +204,8 @@ def inspect_variant(task: dict[str, Any]) -> VariantLifecycle:
 
 def reusable_preview(task: dict[str, Any]) -> dict[str, Any] | None:
     """Return the latest preview that the bulk command may reuse."""
+    if has_ambiguous_packaging_dependency(task):
+        return None
     runs = task["variant"].get("runs", [])
     if not runs:
         return None
@@ -224,11 +226,15 @@ def review_status(task: dict[str, Any]) -> str:
 
 
 def current_preview_output(task: dict[str, Any], run: dict[str, Any]) -> bool:
+    if has_ambiguous_packaging_dependency(task):
+        return False
     fact = inspect_variant(task).preview
     return fact.status == "current" and fact.record is run
 
 
 def current_delivery_output(task: dict[str, Any], run: dict[str, Any]) -> bool:
+    if has_ambiguous_packaging_dependency(task):
+        return False
     lifecycle = inspect_variant(task)
     preview, review = lifecycle.preview.record, lifecycle.review.record
     version = current_version(task)
@@ -239,6 +245,31 @@ def current_delivery_output(task: dict[str, Any], run: dict[str, Any]) -> bool:
         and run.get("previewRunId") == preview.get("id") and run.get("review", {}).get("id") == review.get("id")
         and run.get("snapshot") == preview.get("snapshot") and run.get("subtitles", []) == preview.get("subtitleCues", [])
     )
+
+
+def has_ambiguous_packaging_dependency(task: dict[str, Any]) -> bool:
+    subtitles = task.get("variant", {}).get("subtitles", {})
+    marker = subtitles.get("migrationRequired") if isinstance(subtitles, dict) else None
+    if not isinstance(marker, dict) or marker.get("code") != "legacy_cue_ambiguity":
+        return False
+    cue_ids = set(marker.get("cueIds", []))
+    packaging = task.get("variant", {}).get("packaging")
+    return isinstance(packaging, dict) and any(
+        isinstance(element, dict) and element.get("kind") == "subtitle" and element.get("cueId") in cue_ids
+        for element in packaging.get("elements", [])
+    )
+
+
+def clear_legacy_cue_migration(task: dict[str, Any]) -> bool:
+    subtitles = subtitles_for(task["variant"])
+    marker = subtitles.get("migrationRequired")
+    if not isinstance(marker, dict) or marker.get("code") != "legacy_cue_ambiguity":
+        return False
+    legacy_ids = set(marker.get("cueIds", []))
+    if any(cue.get("id") in legacy_ids for cue in subtitles.get("cues", []) if isinstance(cue, dict)):
+        return False
+    subtitles.pop("migrationRequired", None)
+    return True
 
 
 def create_batch(selling_point: str, script: str, aspect: dict[str, Any] | None = None,
@@ -471,6 +502,7 @@ def save_subtitles(task: dict[str, Any], *, expected_revision: int, timeline_rev
         raise BatchProductionError("batch_subtitles_invalid", str(error), 422) from None
     subtitles["cues"] = saved_cues
     subtitles["revision"] += 1
+    clear_legacy_cue_migration(task)
     return subtitles
 
 
@@ -602,6 +634,8 @@ def submit_preview(task: dict[str, Any], *, expected_revision: int, assets: dict
                    snapshot_sources: Callable[[str, list, dict], dict[str, str]],
                    id_factory: Callable[[], str] = _new_id) -> dict[str, Any]:
     variant = task["variant"]
+    if has_ambiguous_packaging_dependency(task):
+        raise BatchProductionError("batch_subtitles_migration_required", "包装引用的历史字幕身份歧义，请重新识别或更新字幕后再预览。")
     if not _voice_is_current(task):
         raise BatchProductionError("batch_voiceover_stale", "配音未完成或脚本已修改，请按当前脚本重新生成配音。")
     if expected_revision != variant["revision"]:
@@ -637,6 +671,8 @@ def submit_preview(task: dict[str, Any], *, expected_revision: int, assets: dict
 def review_current_version(task: dict[str, Any], *, run_id: str, decision: str, reason: str,
                            preview_available: Callable[[dict[str, Any]], bool],
                            id_factory: Callable[[], str] = _new_id) -> dict[str, Any]:
+    if has_ambiguous_packaging_dependency(task):
+        raise BatchProductionError("batch_subtitles_migration_required", "包装引用的历史字幕身份歧义，请重新识别或更新字幕后再审核。")
     if not _voice_is_current(task):
         raise BatchProductionError("batch_voiceover_stale", "配音未完成或脚本已修改，请按当前脚本重新生成配音。")
     variant = task["variant"]
@@ -659,6 +695,8 @@ def review_current_version(task: dict[str, Any], *, run_id: str, decision: str, 
 
 def _approved_export_context(task: dict[str, Any], preview_available: Callable[[dict[str, Any]], bool],
                              reframe_safe: Callable[[dict[str, Any]], None] = lambda _run: None):
+    if has_ambiguous_packaging_dependency(task):
+        raise BatchProductionError("batch_subtitles_migration_required", "包装引用的历史字幕身份歧义，请重新识别或更新字幕后再导出。")
     variant = task["variant"]
     version = current_version(task)
     lifecycle = inspect_variant(task)
