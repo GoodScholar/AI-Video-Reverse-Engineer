@@ -20,6 +20,7 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 MODEL_SHA256 = "2e04c53bfeac0ac2a30c057c7e2a777594ce39baaac35a92f74fb1e8c4fc4e0b"
 DETECTOR_VERSION = "mediapipe-object-detector-0.10.21"
 _TIMING_TICKS_PER_SECOND = 1_000_000
+MAX_VIDEO_SAMPLES = 9_000
 
 
 def _timing_ticks(value: float) -> int | None:
@@ -66,8 +67,8 @@ def cfr_frame_time(frame_index: int, fps: float, previous_index: int) -> float |
     return frame_index / fps
 
 
-def select_sample_indices(frames: list[dict], start: float, end: float, sample_fps: float) -> list[int]:
-    """Keep first/last intersecting real frames and an at-most-2Hz interior."""
+def select_sample_indices(frames: list[dict], start: float, end: float, _sample_fps: float) -> list[int]:
+    """Keep every intersecting frame; unsampled frames cannot prove subject safety."""
     start_tick, end_tick = _timing_ticks(start), _timing_ticks(end)
     if start_tick is None or end_tick is None or start_tick >= end_tick:
         return []
@@ -76,17 +77,7 @@ def select_sample_indices(frames: list[dict], start: float, end: float, sample_f
         point, duration = _timing_ticks(frame["elapsedSeconds"]), _timing_ticks(frame["durationSeconds"])
         if point is not None and duration is not None and point < end_tick and point + duration > start_tick:
             intersecting.append(index)
-    if not intersecting:
-        return []
-    selected = [intersecting[0]]
-    next_target = start + 1 / sample_fps
-    for index in intersecting[1:-1]:
-        if frames[index]["elapsedSeconds"] >= next_target - .001:
-            selected.append(index)
-            next_target = frames[index]["elapsedSeconds"] + 1 / sample_fps
-    if intersecting[-1] != selected[-1]:
-        selected.append(intersecting[-1])
-    return selected
+    return intersecting
 
 
 def load_timing(path: str | None) -> tuple[list[dict], str | None]:
@@ -154,23 +145,23 @@ def analyze(source: Path, model: Path, start: float, end: float, target_width: i
         base_options=python.BaseOptions(model_asset_path=str(model)), running_mode=vision.RunningMode.VIDEO,
         score_threshold=.35, max_results=10,
     )
-    samples, reasons, last_timestamp = [], [], -1
     crop_width_ratio, crop_height_ratio = crop_window_ratios(width, height, target_width, target_height)
     selected_indices = select_sample_indices(frames, start, end, min(sample_fps, 2.0))
-    if not selected_indices or len(selected_indices) > 640:
+    if not selected_indices or len(selected_indices) > MAX_VIDEO_SAMPLES:
         capture.release()
         return _review_result(source, width, height, target_width, target_height, "源视频时间区间无法可靠采样")
-    try:
+    def detect(indices: list[int]) -> tuple[list[dict], list[str]]:
+        detected_samples, detected_reasons, last_timestamp = [], [], -1
         with vision.ObjectDetector.create_from_options(options) as detector:
-            for frame_index in selected_indices:
+            for frame_index in indices:
                 capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
                 ok, frame = capture.read()
                 if not ok:
-                    reasons.append("部分源时间无法解码")
+                    detected_reasons.append("部分源时间无法解码")
                     continue
                 decoded_index = round(capture.get(cv2.CAP_PROP_POS_FRAMES)) - 1
                 if decoded_index != frame_index:
-                    reasons.append("OpenCV 未读取到服务端确认的帧索引")
+                    detected_reasons.append("OpenCV 未读取到服务端确认的帧索引")
                     continue
                 actual_time = frames[frame_index]["elapsedSeconds"]
                 timestamp = max(last_timestamp + 1, round(actual_time * 1000))
@@ -188,17 +179,21 @@ def analyze(source: Path, model: Path, start: float, end: float, target_width: i
                                   "label": category.category_name, "confidence": float(category.score)})
                 person = [box for box in boxes if box["label"].lower() == "person"]
                 if len(person) != 1:
-                    reasons.append("未检测到唯一人物主体" if not person else "检测到多个可能主体")
+                    detected_reasons.append("未检测到唯一人物主体" if not person else "检测到多个可能主体")
                     continue
                 subject = person[0]
                 if subject["width"] > crop_width_ratio or subject["height"] > crop_height_ratio:
-                    reasons.append("主体框大于目标满幅裁剪窗，可能持续被裁切")
+                    detected_reasons.append("主体框大于目标满幅裁剪窗，可能持续被裁切")
                 if any(box["label"].lower() != "person" for box in boxes):
-                    reasons.append("检测到可能商品或遮挡物，无法确认满幅裁剪不会遮挡商品")
-                samples.append({"timeSeconds": round(actual_time, 6), "boxes": boxes,
-                                "center": {"x": round(subject["x"] + subject["width"] / 2, 6),
-                                           "y": round(subject["y"] + subject["height"] / 2, 6)},
-                                "confidence": round(subject["confidence"], 6)})
+                    detected_reasons.append("检测到可能商品或遮挡物，无法确认满幅裁剪不会遮挡商品")
+                detected_samples.append({"timeSeconds": round(actual_time, 6), "boxes": boxes,
+                                         "center": {"x": round(subject["x"] + subject["width"] / 2, 6),
+                                                    "y": round(subject["y"] + subject["height"] / 2, 6)},
+                                         "confidence": round(subject["confidence"], 6)})
+        return detected_samples, detected_reasons
+
+    try:
+        samples, reasons = detect(selected_indices)
     finally:
         capture.release()
     reasons = list(dict.fromkeys(reasons))

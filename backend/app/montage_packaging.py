@@ -68,6 +68,15 @@ def _font_identity(path: Path) -> tuple[int, int, int, int, int]:
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
+def current_font_identity() -> tuple[int, int, int, int, int]:
+    """Cheap identity used to stale rendered lifecycle records; final gates still hash bytes."""
+    return _font_identity(_FONT.resolve(strict=True))
+
+
+def proof_font_identity(proof: PackagingProof | None) -> tuple[int, int, int, int, int] | None:
+    return None if proof is None else proof.font.identity
+
+
 def _hash_font(path: Path) -> tuple[str, tuple[int, int, int, int, int]]:
     """Hash the opened controlled file and reject path replacement while reading."""
     before = _font_identity(path)

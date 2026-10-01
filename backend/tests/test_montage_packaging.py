@@ -185,18 +185,28 @@ def test_review_required_video_requires_real_frame_coverage_without_gaps_or_tail
 def test_review_required_mid_frame_event_projects_the_intersecting_frame_subject():
     """Coverage and occupancy must use the same half-open real-frame interval."""
     from app.montage_packaging import PackagingError, _subject_boxes, compile_ass, private_font_path
+    from app.montage_reframe import MODEL_SHA256, SourceTiming, normalize_reframe
 
     track = _reframed_track()[0]
     clip = track["clips"][0]
     clip.update(inPoint=2, speed=.5)
-    reframe = clip["reframe"]
-    sample = reframe["samples"][0]
-    sample.update(timeSeconds=2, boxes=[{
+    sample = {**clip["reframe"]["samples"][0], "timeSeconds": 2, "boxes": [{
         "x": .2, "y": 0, "width": .6, "height": .25,
         "label": "person", "confidence": .99,
-    }])
-    reframe.update(status="review_required", samples=[sample], frameDurationSeconds=.04,
-                   override={"mode": "center", "keyframes": []})
+    }]}
+    raw = {
+        "schemaVersion": 1, "sourceFingerprint": "a" * 64, "sourceWidth": 1000, "sourceHeight": 1000,
+        "targetAspect": {"width": 9, "height": 16},
+        "detectorVersion": "mediapipe-object-detector-0.10.21", "modelSha256": MODEL_SHA256,
+        "samples": [sample], "uncertaintyReasons": ["实际 worker 需要人工确认"],
+        "status": "review_required", "override": {"mode": "center", "keyframes": []},
+        "frameDurationSeconds": None, "samplingIntervalSeconds": None,
+    }
+    clip["reframe"] = normalize_reframe(
+        raw, source_fingerprint="a" * 64, source_width=1000, source_height=1000,
+        source_timing=SourceTiming((0, 2, 2.04), (.04, .04, .04), True, None),
+        required_start=2, required_end=2.5,
+    )
     context = {"asset": "video"}
 
     # Timeline .05-.075 maps to source 2.025-2.0375: wholly inside the
@@ -206,6 +216,40 @@ def test_review_required_mid_frame_event_projects_the_intersecting_frame_subject
     package = _packaging([_element("keyword", start=.05, end=.075, position="top", text="帧内主体")])
     with pytest.raises(PackagingError, match="无可用安全区"):
         compile_ass(package, [], [track], 720, 1280, private_font_path(), asset_media_kinds=context)
+
+
+def test_server_normalized_30fps_frames_cover_quantized_pts_without_hiding_a_missing_frame():
+    """The CFR envelope bridges 1µs decimal jitter, but not one omitted display frame."""
+    from app.montage_packaging import PackagingError, _subject_boxes
+    from app.montage_reframe import MODEL_SHA256, SourceTiming, normalize_reframe
+
+    points = (0, .033333, .066667, .1)
+    sample = {"boxes": [{"x": .35, "y": .2, "width": .3, "height": .5,
+                          "label": "person", "confidence": .9}],
+              "center": {"x": .5, "y": .5}, "confidence": .9}
+    raw = {
+        "schemaVersion": 1, "sourceFingerprint": "a" * 64, "sourceWidth": 1000, "sourceHeight": 1000,
+        "targetAspect": {"width": 9, "height": 16},
+        "detectorVersion": "mediapipe-object-detector-0.10.21", "modelSha256": MODEL_SHA256,
+        "samples": [{**sample, "timeSeconds": point} for point in points],
+        "uncertaintyReasons": ["商品边界需人工确认"], "status": "review_required",
+        "override": {"mode": "center", "keyframes": []},
+        "frameDurationSeconds": None, "samplingIntervalSeconds": None,
+    }
+    reframe = normalize_reframe(
+        raw, source_fingerprint="a" * 64, source_width=1000, source_height=1000,
+        source_timing=SourceTiming(points, (.033333, .033334, .033333, .033334), True, None),
+        required_start=.02, required_end=.11,
+    )
+    track = _reframed_track(duration=.12)[0]
+    track["clips"][0]["reframe"] = reframe
+    context = {"asset": "video"}
+
+    assert _subject_boxes([track], .02, .11, 720, 1280, asset_media_kinds=context)
+
+    reframe["samples"].pop(1)
+    with pytest.raises(PackagingError, match="覆盖"):
+        _subject_boxes([track], .02, .11, 720, 1280, asset_media_kinds=context)
 
 
 def test_only_titles_receive_the_fixed_template_fade():

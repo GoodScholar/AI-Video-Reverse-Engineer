@@ -28,6 +28,7 @@ SCHEMA_VERSION = 1
 MODEL_SHA256 = "2e04c53bfeac0ac2a30c057c7e2a777594ce39baaac35a92f74fb1e8c4fc4e0b"
 _OVERRIDE_MODES = frozenset(("auto", "center", "manual", "replace"))
 _TIMING_TICKS_PER_SECOND = 1_000_000
+MAX_VIDEO_SAMPLES = 9_000
 
 
 @dataclass(frozen=True)
@@ -140,7 +141,7 @@ def run_local_detector(source: Path, *, start: float, end: float, target_width: 
                 timing_file.flush()
                 command.extend(("--timing-json", timing_file.name))
             process = subprocess.Popen(command, stdout=stdout, stderr=stderr, text=True, start_new_session=True)
-            deadline = time.monotonic() + 300
+            deadline = time.monotonic() + 900
             while process.poll() is None:
                 if cancelled() or time.monotonic() >= deadline:
                     process.terminate()
@@ -258,6 +259,18 @@ def normalize_reframe(value: Any, *, source_fingerprint: str, source_width: int,
     optional_timing = {"frameDurationSeconds", "samplingIntervalSeconds"}
     if not isinstance(value, dict) or not required_keys <= set(value) or set(value) - required_keys - optional_timing:
         raise ReframeError("主体裁剪数据结构无效。")
+    if not still_image and source_timing is not None:
+        # Frame occupancy is a server-owned ffprobe fact.  The worker receives
+        # that timeline only to select decoded frames; its nullable/advisory
+        # timing fields must never decide how far a subject observation holds.
+        durations = source_timing.durations
+        # CFR timestamps can alternate by one microsecond after decimal
+        # quantization (for example 29.97 fps).  The largest server-observed
+        # duration is the common frame envelope; with every frame retained it
+        # bridges only that quantization, never an omitted display frame.
+        frame_duration = (max(durations) if source_timing.cfr and durations
+                          and all(math.isfinite(item) and item > 0 for item in durations) else None)
+        value = {**value, "frameDurationSeconds": frame_duration, "samplingIntervalSeconds": None}
     if value["schemaVersion"] != SCHEMA_VERSION or value["sourceFingerprint"] != source_fingerprint:
         raise ReframeError("主体裁剪结果与当前素材不匹配。")
     if value["sourceWidth"] != source_width or value["sourceHeight"] != source_height or source_width <= 0 or source_height <= 0:
@@ -454,7 +467,7 @@ def _source_samples_cover(timing: SourceTiming | None, samples: list[dict[str, A
 
 
 def _samples(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, list) or len(value) > 640:
+    if not isinstance(value, list) or len(value) > MAX_VIDEO_SAMPLES:
         raise ReframeError("主体检测采样无效。")
     normalized = []
     previous = -1.0

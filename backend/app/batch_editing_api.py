@@ -567,7 +567,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         if task.get("voiceover"):
             result["voiceover"] = {key: value for key, value in task["voiceover"].items() if key != "plan"}
         result["variant"]["runs"] = [
-            {**{key: value for key, value in run.items() if key not in ("snapshot", "sources", "output", "subtitleCues")},
+            {**{key: value for key, value in run.items() if key not in ("snapshot", "sources", "output", "subtitleCues", "packagingFontIdentity")},
              "settings": run["snapshot"]["settings"],
              **({"url": f"/api/projects/{project_id}/batch-edits/{task['id']}/variant/previews/{run['id']}/output"} if run["status"] == "completed" else {})}
             for run in task["variant"]["runs"]
@@ -1390,6 +1390,9 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 result = {"output": output.name}
                 if isinstance(media, dict):
                     result["media"] = media
+                if packaging_proof is not None:
+                    from .montage_packaging import proof_font_identity
+                    result["packagingFontIdentity"] = list(proof_font_identity(packaging_proof))
                 _complete_local_run(run, result)
                 save(project_id, state)
         except BaseException as error:

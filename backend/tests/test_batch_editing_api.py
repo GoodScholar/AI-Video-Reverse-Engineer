@@ -491,7 +491,7 @@ def test_download_probe_does_not_block_get_or_cancelling_another_export(tmp_path
 def test_packaging_proof_hash_is_outside_lock_and_consumed_once_per_download(tmp_path, monkeypatch):
     """A completed delivery must not hold the project lock while hashing/compiling its font proof."""
     from app import montage_packaging
-    from app.montage_packaging import default_packaging
+    from app.montage_packaging import current_font_identity, default_packaging
 
     with _reframe_delivery_client(tmp_path) as fixture:
         state = json.loads(fixture.state_path.read_text(encoding="utf-8"))
@@ -501,6 +501,8 @@ def test_packaging_proof_hash_is_outside_lock_and_consumed_once_per_download(tmp
         for record in [task["variant"], *task["variant"]["runs"], *task["variant"]["exports"]]:
             target = record["snapshot"] if "snapshot" in record else record
             target["packaging"] = deepcopy(package)
+            if "snapshot" in record:
+                record["packagingFontIdentity"] = list(current_font_identity())
             for track in target["tracks"]:
                 for clip in track["clips"]:
                     clip.pop("reframe", None)
@@ -540,7 +542,7 @@ def test_packaging_proof_hash_is_outside_lock_and_consumed_once_per_download(tmp
 def test_submit_reuses_one_packaging_proof_for_current_preview_and_delivery(tmp_path, monkeypatch):
     """The two-stage callback may consume both records, but must prepare identical input once."""
     from app import montage_packaging
-    from app.montage_packaging import default_packaging
+    from app.montage_packaging import current_font_identity, default_packaging
 
     with _reframe_delivery_client(tmp_path) as fixture:
         child = _add_export_child(fixture, "child", reframed=False)
@@ -550,6 +552,7 @@ def test_submit_reuses_one_packaging_proof_for_current_preview_and_delivery(tmp_
         stored["variant"]["packaging"] = deepcopy(package)
         for record in [*stored["variant"]["runs"], *stored["variant"]["exports"]]:
             record["snapshot"]["packaging"] = deepcopy(package)
+            record["packagingFontIdentity"] = list(current_font_identity())
         fixture.state_path.write_text(json.dumps(state), encoding="utf-8")
         original, calls = montage_packaging.prepare_packaging_proof, []
         def counted(snapshot, cues, *, batch, asset_media_kinds=None):

@@ -90,7 +90,13 @@ def initial_proposal_packaging(*, script: str, selling_point: str, duration: flo
     return package
 
 
-def _valid_packaging_snapshot(snapshot: dict[str, Any], cues: list[dict[str, Any]]) -> bool:
+def _current_packaging_font_identity() -> tuple[int, int, int, int, int]:
+    from .montage_packaging import current_font_identity
+    return current_font_identity()
+
+
+def _valid_packaging_snapshot(snapshot: dict[str, Any], cues: list[dict[str, Any]],
+                              font_identity: Any = None) -> bool:
     """Lock-safe lifecycle predicate; final glyph/font work uses request proofs."""
     package = snapshot.get("packaging") if isinstance(snapshot, dict) else None
     if package is None:
@@ -98,8 +104,9 @@ def _valid_packaging_snapshot(snapshot: dict[str, Any], cues: list[dict[str, Any
     try:
         from .montage_packaging import validate_packaging
         validate_packaging(package, cues, snapshot.get("tracks", []), batch=True)
-        return True
-    except ValueError:
+        return (isinstance(font_identity, (list, tuple)) and len(font_identity) == 5
+                and tuple(font_identity) == _current_packaging_font_identity())
+    except (OSError, ValueError):
         return False
 
 
@@ -155,7 +162,8 @@ def _preview_fact(task: dict[str, Any], voice: LifecycleFact) -> LifecycleFact:
             != current_version(task)
             or run.get("snapshot") != frozen["snapshot"]
             or run.get("subtitleCues", []) != frozen["subtitleCues"]
-            or not _valid_packaging_snapshot(run.get("snapshot", {}), run.get("subtitleCues", []))):
+            or not _valid_packaging_snapshot(run.get("snapshot", {}), run.get("subtitleCues", []),
+                                             run.get("packagingFontIdentity"))):
         return LifecycleFact("stale", "preview_stale")
     return LifecycleFact("current", record=run)
 

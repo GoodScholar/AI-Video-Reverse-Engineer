@@ -58,3 +58,23 @@ def test_worker_uses_the_ffprobe_microsecond_boundary_for_the_last_half_open_fra
     ], 2.0, 2.1, 2.0)
 
     assert selected == [1, 2]
+
+
+def test_worker_keeps_every_real_frame_needed_for_manual_packaging_coverage():
+    """A 2 Hz trajectory sample cannot stand in for unobserved subject frames."""
+    worker = Path(__file__).parents[1] / "person_worker" / "run_reframe.py"
+    spec = importlib.util.spec_from_file_location("reframe_worker_packaging_coverage", worker)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    frames = [
+        {"elapsedSeconds": index * .04, "durationSeconds": .04}
+        for index in range(4)
+    ]
+
+    assert module.select_sample_indices(frames, .01, .15, 2.0) == [0, 1, 2, 3]
+    long_frames = [
+        {"elapsedSeconds": index * .04, "durationSeconds": .04}
+        for index in range(7_500)
+    ]
+    complete = module.select_sample_indices(long_frames, 0, 300, 2.0)
+    assert len(complete) == 7_500 <= module.MAX_VIDEO_SAMPLES

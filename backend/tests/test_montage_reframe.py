@@ -43,6 +43,28 @@ def test_normalize_reframe_preserves_detection_facts_when_manual_override_is_sel
     assert reframe["samples"][1]["center"] == {"x": .7, "y": .5}
 
 
+def test_normalize_reframe_binds_real_frame_duration_from_server_timing():
+    """A real review result must remain usable for frame-local packaging after manual confirmation."""
+    analysis = _analysis(status="review_required", samples=[{
+        "timeSeconds": .04,
+        "boxes": [{"x": .2, "y": .1, "width": .3, "height": .7,
+                   "label": "person", "confidence": .9}],
+        "center": {"x": .35, "y": .45}, "confidence": .9,
+    }])
+    # This is the current real worker protocol.  Only the server's ffprobe
+    # timing is allowed to supply a frame occupancy interval.
+    analysis.update(frameDurationSeconds=None, samplingIntervalSeconds=None)
+    timing = SourceTiming((0, .04, .080001), (.04, .040001, .04), True, None)
+
+    stored = normalize_reframe(
+        analysis, source_fingerprint="a" * 64, source_width=1920, source_height=1080,
+        source_timing=timing, required_start=.04, required_end=.08,
+    )
+
+    assert stored["status"] == "review_required"
+    assert stored["frameDurationSeconds"] == pytest.approx(.040001)
+
+
 def test_still_image_auto_reframe_accepts_exactly_one_real_zero_second_sample_without_video_pts():
     """A still has one detector instant, not a fabricated video timeline."""
     analysis = _analysis(samples=[

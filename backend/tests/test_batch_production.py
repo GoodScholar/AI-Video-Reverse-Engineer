@@ -147,6 +147,28 @@ def test_inspection_keeps_delivery_current_after_the_same_preview_is_reapproved(
     assert lifecycle.delivery.record["id"] == "delivery"
 
 
+def test_font_file_identity_change_stales_the_preview_and_its_approval(monkeypatch):
+    """A declared font id/hash is not proof that the rendered controlled file still exists unchanged."""
+    from app.montage_packaging import default_packaging
+
+    task = create_batch("省时", "操作演示", id_factory=ids("task", "variant"))
+    task["variant"].update(revision=1, tracks=video_tracks(), packaging=default_packaging())
+    preview = completed_preview(task)
+    preview["snapshot"]["packaging"] = deepcopy(task["variant"]["packaging"])
+    preview["packagingFontIdentity"] = [1, 2, 3, 4, 5]
+    task["variant"]["runs"].append(preview)
+    task["reviews"].append(approved_review(task, preview))
+    monkeypatch.setattr(production, "_current_packaging_font_identity", lambda: (1, 2, 3, 4, 5), raising=False)
+
+    assert review_status(task) == "approved"
+
+    monkeypatch.setattr(production, "_current_packaging_font_identity", lambda: (1, 2, 3, 4, 6), raising=False)
+    assert review_status(task) == "stale"
+    with pytest.raises(BatchProductionError, match="当前版本"):
+        review_current_version(task, run_id="preview", decision="approved", reason="再次确认",
+                               preview_available=lambda _run: True)
+
+
 def test_inspection_reads_missing_legacy_revision_fields_as_zero():
     task = create_batch("省时", "操作演示", id_factory=ids("task", "variant"))
     task["variant"]["tracks"] = video_tracks()
