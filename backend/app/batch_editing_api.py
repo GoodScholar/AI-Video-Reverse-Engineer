@@ -549,6 +549,10 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         except (OSError, ValueError):
             raise HTTPException(503, detail={"code": "batch_assets_unavailable", "message": "项目素材无法读取。"}) from None
 
+    def packaging_media_kinds(assets):
+        return {asset_id: asset["kind"] for asset_id, asset in assets.items()
+                if isinstance(asset, dict) and asset.get("kind") in {"image", "video"}}
+
     def public_task(project_id: str, task: dict[str, Any]):
         result = {**task, "contentRevision": task.get("contentRevision", 0), "reviews": task.get("reviews", []),
                   "reviewStatus": review_status(task), "variant": {**task["variant"]}}
@@ -576,31 +580,31 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         ]
         return result
 
-    def prepare_packaging_proof(snapshot: dict, cues: list, *, batch: bool):
+    def prepare_packaging_proof(snapshot: dict, cues: list, *, batch: bool, asset_media_kinds: dict):
         packaging = snapshot.get("packaging") if isinstance(snapshot, dict) else None
         if packaging is None:
             return None
         from .montage_packaging import PackagingError, PackagingProofConflict, prepare_packaging_proof as prepare
         try:
-            return prepare(snapshot, cues, batch=batch)
+            return prepare(snapshot, cues, batch=batch, asset_media_kinds=asset_media_kinds)
         except PackagingProofConflict as error:
             raise BatchProductionError("batch_packaging_conflict", str(error)) from error
         except PackagingError as error:
             raise BatchProductionError("batch_packaging_invalid", str(error)) from error
 
-    def consume_packaging_proof(proof, snapshot: dict, cues: list, *, batch: bool) -> None:
+    def consume_packaging_proof(proof, snapshot: dict, cues: list, *, batch: bool, asset_media_kinds: dict) -> None:
         from .montage_packaging import PackagingError, PackagingProofConflict, consume_packaging_proof as consume
         try:
-            consume(proof, snapshot, cues, batch=batch)
+            consume(proof, snapshot, cues, batch=batch, asset_media_kinds=asset_media_kinds)
         except PackagingProofConflict as error:
             raise BatchProductionError("batch_packaging_conflict", str(error)) from error
         except PackagingError as error:
             raise BatchProductionError("batch_packaging_invalid", str(error)) from error
 
-    def packaging_proof_key(snapshot: dict, cues: list, *, batch: bool) -> str:
+    def packaging_proof_key(snapshot: dict, cues: list, *, batch: bool, asset_media_kinds: dict) -> str:
         from .montage_packaging import PackagingError, packaging_proof_key as key
         try:
-            return key(snapshot, cues, batch=batch)
+            return key(snapshot, cues, batch=batch, asset_media_kinds=asset_media_kinds)
         except PackagingError as error:
             raise BatchProductionError("batch_packaging_invalid", str(error)) from error
 
@@ -1350,12 +1354,14 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 snapshot = deepcopy(run["snapshot"])
                 names = dict(run["sources"])
                 subtitle_cues = deepcopy(run.get("subtitleCues", []))
-            packaging_proof = prepare_packaging_proof(snapshot, subtitle_cues, batch=True)
+            media_kinds = packaging_media_kinds(assets_for(project_id))
+            packaging_proof = prepare_packaging_proof(snapshot, subtitle_cues, batch=True, asset_media_kinds=media_kinds)
             with lock:
                 run = find_run(task_for(state_for(project_id), task_id)["variant"], run_id)
                 if run["status"] != "running":
                     return
-                consume_packaging_proof(packaging_proof, run["snapshot"], run.get("subtitleCues", []), batch=True)
+                consume_packaging_proof(packaging_proof, run["snapshot"], run.get("subtitleCues", []), batch=True,
+                                        asset_media_kinds=packaging_media_kinds(assets_for(project_id)))
             sources = render_inputs.resolve(store.path(project_id, "runs", run_id), names)
             staging = store.path(project_id, "runs", run_id, "preview.mp4")
             actual_renderer = renderer
@@ -1370,7 +1376,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             if snapshot.get("packaging") is not None:
                 render_options["packaging_cues"] = subtitle_cues
             media = actual_renderer(snapshot, sources, staging, format="preview", ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
-                                    cancelled=lambda: run_cancelled(project_id, task_id, run_id), **render_options)
+                                    cancelled=lambda: run_cancelled(project_id, task_id, run_id), asset_media_kinds=media_kinds,
+                                    **render_options)
             regular_file(staging)
             with lock:
                 state = state_for(project_id)
@@ -1411,12 +1418,14 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 run["status"] = LOCAL_RUN_POLICY.start(run["status"])
                 save(project_id, state)
                 snapshot, names, cues = deepcopy(run["snapshot"]), dict(run["sources"]), deepcopy(run["subtitles"])
-            packaging_proof = prepare_packaging_proof(snapshot, cues, batch=True)
+            media_kinds = packaging_media_kinds(assets_for(project_id))
+            packaging_proof = prepare_packaging_proof(snapshot, cues, batch=True, asset_media_kinds=media_kinds)
             with lock:
                 run = find_export(task_for(state_for(project_id), task_id)["variant"], run_id)
                 if run["status"] != "running":
                     return
-                consume_packaging_proof(packaging_proof, run["snapshot"], run["subtitles"], batch=True)
+                consume_packaging_proof(packaging_proof, run["snapshot"], run["subtitles"], batch=True,
+                                        asset_media_kinds=packaging_media_kinds(assets_for(project_id)))
             directory = store.path(project_id, "exports", run_id)
             sources = render_inputs.resolve(directory, names)
             subtitle_file = None
@@ -1432,7 +1441,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             if snapshot.get("packaging") is not None:
                 render_options["packaging_cues"] = cues
             media = actual_renderer(snapshot, sources, staging, format="mp4", ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
-                                    cancelled=lambda: export_cancelled(project_id, task_id, run_id), **render_options)
+                                    cancelled=lambda: export_cancelled(project_id, task_id, run_id), asset_media_kinds=media_kinds,
+                                    **render_options)
             regular_file(staging)
             with lock:
                 state = state_for(project_id)
@@ -2462,9 +2472,11 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 current_timing_cache=current_timing_cache,
             )
             snapshot, cues = run.get("snapshot", {}), run.get("subtitles", run.get("subtitleCues", []))
-            proof_key = production_call(packaging_proof_key, snapshot, cues, batch=True)
+            media_kinds = packaging_media_kinds(assets)
+            proof_key = production_call(packaging_proof_key, snapshot, cues, batch=True, asset_media_kinds=media_kinds)
             if proof_key not in packaging_proofs:
-                packaging_proofs[proof_key] = production_call(prepare_packaging_proof, snapshot, cues, batch=True)
+                packaging_proofs[proof_key] = production_call(prepare_packaging_proof, snapshot, cues, batch=True,
+                                                               asset_media_kinds=media_kinds)
             packaging_proofs[key] = packaging_proofs[proof_key]
 
         def cleanup_prepared_sources(run_ids=None):
@@ -2543,7 +2555,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             def consume_export_proofs(child, run):
                 consume_reframe_safety(project_id, child, run, proofs.get((child["id"], run["id"])), assets)
                 consume_packaging_proof(packaging_proofs.get((child["id"], run["id"])), run.get("snapshot", {}),
-                                        run.get("subtitles", run.get("subtitleCues", [])), batch=True)
+                                        run.get("subtitles", run.get("subtitleCues", [])), batch=True,
+                                        asset_media_kinds=packaging_media_kinds(assets))
 
             try:
                 prepared = production_call(
@@ -2610,7 +2623,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         try:
             proof = prepare_reframe_safety(project_id, task, run, assets, media_cache={}, frozen_timing_cache={},
                                            current_timing_cache={})
-            packaging_proof = prepare_packaging_proof(run.get("snapshot", {}), run.get("subtitles", []), batch=True)
+            packaging_proof = prepare_packaging_proof(run.get("snapshot", {}), run.get("subtitles", []), batch=True,
+                                                       asset_media_kinds=packaging_media_kinds(assets))
         except BatchProductionError as error:
             raise HTTPException(409, detail={"code": error.code, "message": error.message}) from None
         with source_lock or nullcontext(), lock:
@@ -2622,7 +2636,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 consume_reframe_safety(project_id, task, run, proof, assets_for(project_id))
                 if delivery_identity != safety_run_identity(task, run):
                     raise BatchProductionError("batch_packaging_conflict", "包装验证期间交付身份已变化，请刷新后重试。")
-                consume_packaging_proof(packaging_proof, run.get("snapshot", {}), run.get("subtitles", []), batch=True)
+                consume_packaging_proof(packaging_proof, run.get("snapshot", {}), run.get("subtitles", []), batch=True,
+                                        asset_media_kinds=packaging_media_kinds(assets_for(project_id)))
                 if not current_delivery_output(task, run):
                     raise HTTPException(409, detail={"code": "batch_export_stale", "message": "成片不是当前已审核版本，请重新预览并导出。"})
                 if run["output"] != run_id + ".mp4":
@@ -2665,7 +2680,9 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             except (OSError, ValueError, KeyError):
                 raise HTTPException(409, detail={"code": "batch_preview_unavailable", "message": "预览文件不可用。"}) from None
         try:
-            packaging_proof = prepare_packaging_proof(snapshot, cues, batch=True)
+            preview_assets = assets_for(project_id)
+            packaging_proof = prepare_packaging_proof(snapshot, cues, batch=True,
+                                                       asset_media_kinds=packaging_media_kinds(preview_assets))
         except BatchProductionError as error:
             raise HTTPException(409, detail={"code": error.code, "message": error.message}) from None
         with lock:
@@ -2676,7 +2693,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             try:
                 if preview_identity != safety_run_identity(task, run):
                     raise BatchProductionError("batch_packaging_conflict", "包装验证期间预览身份已变化，请刷新后重试。")
-                consume_packaging_proof(packaging_proof, run.get("snapshot", {}), run.get("subtitleCues", []), batch=True)
+                consume_packaging_proof(packaging_proof, run.get("snapshot", {}), run.get("subtitleCues", []), batch=True,
+                                        asset_media_kinds=packaging_media_kinds(assets_for(project_id)))
                 output = run["output"]
                 if output != run_id + ".mp4":
                     raise ValueError("输出关联无效")

@@ -81,6 +81,7 @@ def render_timeline(
     subtitles_path: Optional[Path] = None,
     packaging: Optional[dict] = None,
     packaging_cues: Optional[list] = None,
+    asset_media_kinds: Optional[dict[str, str]] = None,
 ) -> dict:
     """将已校验的时间线渲染为 MP4、预览 MP4 或 PCM WAV。
 
@@ -106,11 +107,16 @@ def render_timeline(
 
     clips = _collect_clips(tracks, sources, ffprobe_path, format)
     packaging_tracks = deepcopy(tracks)
-    still_clip_ids = {clip["id"] for clip in clips if clip["media"].image}
-    for track in packaging_tracks:
-        for clip in track.get("clips", []):
-            if clip.get("id") in still_clip_ids:
-                clip["_stillImage"] = True
+    detected_media_kinds = {clip["asset_id"]: ("image" if clip["media"].image else "video")
+                            for clip in clips if clip["kind"] == "video"}
+    if asset_media_kinds is None:
+        # Direct renderer users still obtain a read-only FFprobe fact.  API
+        # callers pass the authoritative ProjectAssets map and are checked
+        # below so mutable timeline data never decides image semantics.
+        asset_media_kinds = detected_media_kinds
+    if not isinstance(asset_media_kinds, dict) or any(asset_media_kinds.get(asset_id) != kind
+                                                       for asset_id, kind in detected_media_kinds.items()):
+        raise TimelineRenderError("服务端媒体类型与渲染素材不一致。")
     from .timeline import validate_transitions
     try:
         validate_transitions(timeline.get('transitions', []), tracks)
@@ -141,7 +147,8 @@ def render_timeline(
             from .montage_packaging import PackagingError, compile_ass, private_font_path
             try:
                 ass_path = output.parent / ".packaging.ass"
-                ass_path.write_text(compile_ass(packaging, packaging_cues or [], packaging_tracks, width, height, private_font_path()), encoding="utf-8")
+                ass_path.write_text(compile_ass(packaging, packaging_cues or [], packaging_tracks, width, height,
+                                                private_font_path(), asset_media_kinds=asset_media_kinds), encoding="utf-8")
             except (OSError, PackagingError) as error:
                 raise TimelineRenderError(str(error)) from error
         command, expected = _build_command(
@@ -214,7 +221,10 @@ def inspect_timeline_media(state: dict, assets: dict, resolve_source, format: st
     if not any(item["level"] == "error" for item in issues) and state.get("packaging") is not None:
         try:
             from .montage_packaging import PackagingError, validate_final_events
-            validate_final_events(state["packaging"], [], state["tracks"], batch=False)
+            asset_media_kinds = {asset_id: asset["kind"] for asset_id, asset in assets.items()
+                                 if isinstance(asset, dict) and asset.get("kind") in {"image", "video"}}
+            validate_final_events(state["packaging"], [], state["tracks"], batch=False,
+                                  asset_media_kinds=asset_media_kinds)
         except PackagingError as error:
             issues.append({"level": "error", "label": "商业包装", "message": str(error)})
     if not any(item["level"] == "error" for item in issues):
@@ -296,6 +306,7 @@ def _collect_clips(tracks: list, sources: Dict[str, Path], ffprobe_path: str, fo
                 _validate_source_range(media.audio_duration, in_point, needed_source_duration, "音频流")
             result.append({
                 "id": clip.get("id"),
+                "asset_id": asset_id,
                 "source": source,
                 "media": media,
                 "kind": kind,

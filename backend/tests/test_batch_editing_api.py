@@ -552,9 +552,9 @@ def test_submit_reuses_one_packaging_proof_for_current_preview_and_delivery(tmp_
             record["snapshot"]["packaging"] = deepcopy(package)
         fixture.state_path.write_text(json.dumps(state), encoding="utf-8")
         original, calls = montage_packaging.prepare_packaging_proof, []
-        def counted(snapshot, cues, *, batch):
-            calls.append((snapshot, cues, batch))
-            return original(snapshot, cues, batch=batch)
+        def counted(snapshot, cues, *, batch, asset_media_kinds=None):
+            calls.append((snapshot, cues, batch, asset_media_kinds))
+            return original(snapshot, cues, batch=batch, asset_media_kinds=asset_media_kinds)
         monkeypatch.setattr(montage_packaging, "prepare_packaging_proof", counted)
 
         response = fixture.client.post(f"{fixture.base}/{fixture.task['id']}/exports", json={"taskIds": ["child"]})

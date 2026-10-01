@@ -190,6 +190,76 @@ def test_timeline_image_reframe_analysis_cas_rejects_an_old_output_aspect(tmp_pa
     assert retried["tracks"][0]["clips"][0]["reframe"]["targetAspect"] == {"width": 720, "height": 1280}
 
 
+def test_static_image_packaging_preflight_render_and_completed_download_share_server_media_kind(tmp_path):
+    """A real image's single 0-second subject fact remains valid across every delivery gate."""
+    from app.montage_packaging import default_packaging
+    from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint
+
+    def analyzer(source, identity):
+        return {
+            "schemaVersion": 1,
+            "sourceFingerprint": source_fingerprint(source),
+            "sourceWidth": 64,
+            "sourceHeight": 48,
+            "targetAspect": identity["targetAspect"],
+            "detectorVersion": DETECTOR_VERSION,
+            "modelSha256": MODEL_SHA256,
+            "samples": [{
+                "timeSeconds": 0,
+                "boxes": [{"x": .2, "y": .1, "width": .3, "height": .7,
+                           "label": "person", "confidence": .9}],
+                "center": {"x": .35, "y": .45},
+                "confidence": .9,
+            }],
+            "uncertaintyReasons": [],
+            "status": "ready",
+            "override": {"mode": "auto", "keyframes": []},
+        }
+
+    observed_media_kinds = []
+
+    def renderer(_timeline, _sources, output, **kwargs):
+        observed_media_kinds.append(kwargs["asset_media_kinds"])
+        output.write_bytes(b"static-image-packaged")
+
+    client, queue = setup(tmp_path, renderer=renderer, reframe_analyzer=analyzer)
+    _add_image_asset(tmp_path)
+    assert client.put(BASE, json=_image_workspace()).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    queue.run()
+
+    analyzed = client.get(BASE).json()
+    assert analyzed["tracks"][0]["clips"][0]["reframe"]["status"] == "ready"
+    packaging = default_packaging()
+    packaging["elements"] = [{
+        "id": "image-title", "kind": "title", "enabled": True,
+        "start": .2, "end": .8, "text": "静态图包装",
+        "position": "top", "style": "emphasis",
+    }]
+    saved = client.put(BASE, json={
+        "revision": analyzed["revision"],
+        "settings": analyzed["settings"],
+        "tracks": analyzed["tracks"],
+        "packaging": packaging,
+    })
+    assert saved.status_code == 200, saved.text
+
+    revision = saved.json()["revision"]
+    preflight = client.post(BASE + "/preflight", json={"revision": revision, "format": "preview"})
+    assert preflight.status_code == 200, preflight.text
+    assert preflight.json()["ready"] is True
+
+    submitted = client.post(BASE + "/runs", json={"revision": revision, "format": "preview"})
+    assert submitted.status_code == 202, submitted.text
+    run_id = submitted.json()["runs"][-1]["id"]
+    queue.run()
+    assert client.get(BASE).json()["runs"][-1]["status"] == "completed"
+    downloaded = client.get(BASE + "/runs/" + run_id + "/output")
+    assert downloaded.status_code == 200
+    assert downloaded.content == b"static-image-packaged"
+    assert observed_media_kinds == [{"video": "video", "image": "image"}]
+
+
 def test_candidate_replacement_persists_pending_reframe_and_manual_render(tmp_path):
     """Saving a replacement must never resurrect old facts on read or render."""
     from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint

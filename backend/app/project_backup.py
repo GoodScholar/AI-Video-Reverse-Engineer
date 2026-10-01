@@ -108,6 +108,9 @@ def rebind_managed_json(name, value, old_id, new_id, old_root, new_root):
 def _packaging_inputs(data_root, project_id):
     """Return immutable final-event inputs after stores have done lock-safe shape checks."""
     timeline = TimelineStore(data_root).load(project_id)
+    assets = ProjectAssets(data_root).index(project_id)
+    media_kinds = {asset_id: asset['kind'] for asset_id, asset in assets.items()
+                   if isinstance(asset, dict) and asset.get('kind') in {'image', 'video'}}
     inputs = []
     if timeline.get('packaging') is not None:
         inputs.append(({'settings': timeline['settings'], 'tracks': timeline['tracks'],
@@ -137,7 +140,7 @@ def _packaging_inputs(data_root, project_id):
         for delivery in variant.get('exports', []):
             if delivery.get('snapshot', {}).get('packaging') is not None:
                 inputs.append((delivery['snapshot'], delivery.get('subtitles', []), True))
-    return deepcopy(timeline), deepcopy(batch), [(deepcopy(snapshot), deepcopy(cues), batch_mode)
+    return deepcopy(timeline), deepcopy(batch), [(deepcopy(snapshot), deepcopy(cues), batch_mode, deepcopy(media_kinds))
                                                    for snapshot, cues, batch_mode in inputs]
 
 
@@ -153,8 +156,8 @@ def _backup_state_digest(project, timeline, batch):
 def _prepare_packaging_proofs(inputs):
     from .montage_packaging import PackagingError, prepare_packaging_proof
     try:
-        return [prepare_packaging_proof(snapshot, cues, batch=batch_mode)
-                for snapshot, cues, batch_mode in inputs]
+        return [prepare_packaging_proof(snapshot, cues, batch=batch_mode, asset_media_kinds=media_kinds)
+                for snapshot, cues, batch_mode, media_kinds in inputs]
     except PackagingError:
         fail('备份中的当前包装字体或模板无效。')
 
@@ -162,8 +165,8 @@ def _prepare_packaging_proofs(inputs):
 def _consume_packaging_proofs(inputs, proofs):
     from .montage_packaging import PackagingError, consume_packaging_proof
     try:
-        for (snapshot, cues, batch_mode), proof in zip(inputs, proofs, strict=True):
-            consume_packaging_proof(proof, snapshot, cues, batch=batch_mode)
+        for (snapshot, cues, batch_mode, media_kinds), proof in zip(inputs, proofs, strict=True):
+            consume_packaging_proof(proof, snapshot, cues, batch=batch_mode, asset_media_kinds=media_kinds)
     except PackagingError:
         fail('项目在备份验证期间发生变化，请重试。', 409)
 

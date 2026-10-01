@@ -74,6 +74,10 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
         except (OSError, ValueError):
             fail("preproduction_storage_invalid", "前置工作台状态无法读取。", 503)
 
+    def packaging_media_kinds(assets):
+        return {asset_id: asset["kind"] for asset_id, asset in assets.items()
+                if isinstance(asset, dict) and asset.get("kind") in {"image", "video"}}
+
     def public_run(project_id, run):
         public = {key: value for key, value in run.items() if key not in ("snapshot", "sources", "output") and not key.startswith("_")}
         if run["status"] == "completed":
@@ -335,6 +339,7 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 active_workers.add((project_id, run_id))
                 snapshot = run["snapshot"]
                 source_names = dict(run["sources"])
+                media_kinds = packaging_media_kinds(asset_index(project_id))
             sources = render_inputs.resolve(store.path(project_id, "runs", run_id), source_names)
             suffix = ".wav" if run["format"] == "wav" else ".mp4"
             staging = store.path(project_id, "runs", run_id, "output" + suffix)
@@ -342,7 +347,9 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             if actual_renderer is None:
                 from .timeline_render import render_timeline
                 actual_renderer = render_timeline
-            actual_renderer(snapshot, sources, staging, format=run["format"], ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, cancelled=lambda: cancelled(project_id, run_id))
+            actual_renderer(snapshot, sources, staging, format=run["format"], ffmpeg_path=ffmpeg_path,
+                            ffprobe_path=ffprobe_path, cancelled=lambda: cancelled(project_id, run_id),
+                            asset_media_kinds=media_kinds)
             _regular_file(staging)
             with lock:
                 state = state_for(project_id)
@@ -454,7 +461,8 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 else:
                     from .montage_packaging import PackagingError, validate_packaging
                     try:
-                        checked["packaging"] = validate_packaging(body["packaging"], [], tracks)
+                        checked["packaging"] = validate_packaging(body["packaging"], [], tracks,
+                                                                   asset_media_kinds=packaging_media_kinds(assets))
                     except PackagingError as error:
                         fail("timeline_packaging_invalid", str(error), 422)
             return checked
@@ -486,7 +494,8 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 else:
                     from .montage_packaging import PackagingError, validate_packaging
                     try:
-                        state["packaging"] = validate_packaging(body["packaging"], [], tracks)
+                        state["packaging"] = validate_packaging(body["packaging"], [], tracks,
+                                                                   asset_media_kinds=packaging_media_kinds(asset_index(project_id)))
                     except PackagingError as error:
                         fail("timeline_packaging_invalid", str(error), 422)
             state["revision"] += 1
@@ -687,15 +696,17 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 path = store.path(project_id, "outputs", output)
                 _regular_file(path)
                 snapshot = run.get("snapshot", {})
+                media_kinds = packaging_media_kinds(asset_index(project_id))
                 if snapshot.get("packaging") is not None:
                     from .montage_packaging import validate_packaging
-                    validate_packaging(snapshot["packaging"], [], snapshot.get("tracks", []))
+                    validate_packaging(snapshot["packaging"], [], snapshot.get("tracks", []),
+                                       asset_media_kinds=media_kinds)
             except (KeyError, OSError, ValueError):
                 fail("timeline_output_unavailable", "渲染结果不可用。")
             snapshot = json.loads(json.dumps(snapshot))
         try:
             from .montage_packaging import PackagingError, prepare_packaging_proof
-            packaging_proof = prepare_packaging_proof(snapshot, [], batch=False)
+            packaging_proof = prepare_packaging_proof(snapshot, [], batch=False, asset_media_kinds=media_kinds)
         except PackagingError:
             fail("timeline_output_unavailable", "渲染结果不可用。")
         with lock:
@@ -705,7 +716,8 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 fail("timeline_output_unavailable", "渲染结果不可用。")
             try:
                 from .montage_packaging import consume_packaging_proof
-                consume_packaging_proof(packaging_proof, run.get("snapshot", {}), [], batch=False)
+                consume_packaging_proof(packaging_proof, run.get("snapshot", {}), [], batch=False,
+                                        asset_media_kinds=packaging_media_kinds(asset_index(project_id)))
                 output = run["output"]
                 validate_storage_id(output)
                 path = store.path(project_id, "outputs", output)

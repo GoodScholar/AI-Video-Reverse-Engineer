@@ -78,6 +78,10 @@ def _moving_subject_source(path: Path, *, colour: str, moving: bool, y: int) -> 
 
 def _manual_subject_reframe(source: Path, *, moving: bool, colour: str, y: int,
                             sample_times: tuple[float, ...] = (0.0, 1.3)) -> dict:
+    # Every entry is a real 30fps frame interval.  The prior sparse selected
+    # points were sufficient for placement snapshots but cannot authorize a
+    # review-required video event after the strict coverage gate.
+    sample_times = tuple(frame / 30 for frame in range(int(round(max(sample_times) * 30)) + 1))
     def box(time: float) -> dict:
         x = (20 + 80 * time if moving else 160) / 320
         return {"x": x, "y": y / 180, "width": 30 / 320, "height": 70 / 180,
@@ -88,7 +92,7 @@ def _manual_subject_reframe(source: Path, *, moving: bool, colour: str, y: int,
             "targetAspect": {"width": 720, "height": 1280}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
             "samples": [{"timeSeconds": point, "boxes": [box(point)], "center": {"x": center(point)[0], "y": center(point)[1]}, "confidence": .99}
                         for point in sample_times],
-            "frameDurationSeconds": .04, "uncertaintyReasons": ["实际色块主体已人工确认轨迹"], "status": "review_required",
+            "frameDurationSeconds": 1 / 30, "uncertaintyReasons": ["实际色块主体已人工确认轨迹"], "status": "review_required",
             "override": {"mode": "manual", "keyframes": [{"timeSeconds": point, "x": center(point)[0], "y": center(point)[1]}
                                                           for point in sample_times]}}
 
@@ -123,7 +127,7 @@ def _subject_exclusion(box: list[int]) -> list[int]:
 
 
 def _tracks(source: Path, duration: float = 5.0) -> list[dict]:
-    observations = [point for point in (.5, 1.4, 2.3, 3.2, 4.1) if point < duration]
+    observations = [frame / 30 for frame in range(int(duration * 30))]
     reframe = {"schemaVersion": 1, "sourceFingerprint": source_fingerprint(source), "sourceWidth": 320, "sourceHeight": 180,
                "targetAspect": {"width": 720, "height": 1280}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
                "samples": [{"timeSeconds": point,
@@ -131,7 +135,7 @@ def _tracks(source: Path, duration: float = 5.0) -> list[dict]:
                                        "label": "red-subject", "confidence": .99}],
                             "center": {"x": .5, "y": .5}, "confidence": .99}
                            for point in observations],
-               "frameDurationSeconds": .04, "uncertaintyReasons": ["实际红色色块主体的已观测 PTS"],
+               "frameDurationSeconds": 1 / 30, "uncertaintyReasons": ["实际红色色块主体的已观测 PTS"],
                "status": "review_required", "override": {"mode": "center", "keyframes": []}}
     return [{"id": "video", "name": "画面", "kind": "video", "muted": False, "hidden": False, "clips": [
         {"id": "clip", "assetId": "shot", "start": 0, "inPoint": 0, "duration": duration,
@@ -209,6 +213,39 @@ def _diff_metrics(rendered: Path, control: Path, *, exclude: list[list[int]] | N
                 "histogram": [value / (changed * 3) for value in histogram], "darkChangedPixels": dark}
 
 
+def _strict_subject_fidelity(rendered: Path, control: Path, *, colour: str = "red",
+                             threshold: int = 70) -> dict[str, float | int]:
+    """Compare unmasked real subject pixels; exclusion zones are never used here."""
+    with Image.open(rendered).convert("RGB") as actual, Image.open(control).convert("RGB") as baseline:
+        channel = 0 if colour == "red" else 2
+        others = (1, 2) if colour == "red" else (0, 1)
+
+        def mask(image):
+            return {(x, y) for y in range(image.height) for x in range(image.width)
+                    if all((pixel := image.getpixel((x, y)))[channel] > pixel[index] + threshold
+                           for index in others)}
+        packaged, reference = mask(actual), mask(baseline)
+        assert reference, (colour, threshold)
+        shared = packaged & reference
+        iou = len(shared) / len(packaged | reference) if packaged or reference else 1.0
+        rgb_delta = sum(sum(abs(left - right) for left, right in zip(actual.getpixel(point), baseline.getpixel(point)))
+                        for point in reference) / (len(reference) * 3)
+        return {"iou": iou, "packagedPixels": len(packaged), "controlPixels": len(reference),
+                "pixelDelta": abs(len(packaged) - len(reference)), "retainedRatio": len(shared) / len(reference),
+                "referenceMeanRgbDelta": rgb_delta}
+
+
+def _title_effect_metrics(rendered: Path, control: Path) -> dict[str, float | int]:
+    """Unmasked title energy; its top safe-area placement never intersects red subject pixels."""
+    with Image.open(rendered).convert("RGB") as actual, Image.open(control).convert("RGB") as baseline:
+        deltas = [sum(abs(left - right) for left, right in zip(actual.getpixel((x, y)), baseline.getpixel((x, y))))
+                  for y in range(actual.height // 3) for x in range(actual.width)]
+        changed = [value for value in deltas if value > 12]
+        assert changed
+        return {"changedPixels": len(changed), "normalizedArea": len(changed) / (actual.width * actual.height),
+                "meanRgbDelta": sum(changed) / (len(changed) * 3)}
+
+
 def _iou(left: list[list[int]], right: list[list[int]]) -> float:
     first, second = {tuple(item) for item in left}, {tuple(item) for item in right}
     return len(first & second) / len(first | second) if first or second else 1.0
@@ -257,9 +294,31 @@ def test_real_five_element_layout_uses_actual_subject_facts_at_each_event_pts():
             center_y = (normal[1] + normal[3]) / 2
             assert (center_y < .30 if position == "top" else .30 < center_y < .70 if position == "middle" else center_y > .70)
         assert _disjoint(preview_box, preview_subject) and _disjoint(export_box, export_subject), kind
+        preview_fidelity = _strict_subject_fidelity(preview_frame, control_frame)
+        export_fidelity = _strict_subject_fidelity(export_frame, export_control_frame)
+        for fidelity in (preview_fidelity, export_fidelity):
+            assert (fidelity["iou"] > .96 and fidelity["pixelDelta"] <= max(100, fidelity["controlPixels"] * .02)
+                    and fidelity["referenceMeanRgbDelta"] < 14)
         matrix["elements"][kind] = {"sample": second, "preview": preview_normal, "export": export_normal,
             "maxDelta": max(abs(left - right) for left, right in zip(preview_normal, export_normal)),
-            "actualRedSubject": {"preview": preview_subject, "export": export_subject}}
+            "actualRedSubject": {"preview": preview_subject, "export": export_subject},
+            "subjectFidelity": {"preview": preview_fidelity, "export": export_fidelity}}
+    # The fixed title fade is verified at its early, opaque-middle and late
+    # intervals in both render targets.  This observes pixels, not ASS text.
+    title_effects = {}
+    for label, second in (("early", .24), ("middle", .52), ("late", .79)):
+        preview_frame = _frame(preview, second, directory / f"preview-title-{label}.png")
+        export_frame = _frame(exported, second, directory / f"export-title-{label}.png")
+        preview_control_frame = _frame(preview_control, second, directory / f"preview-control-title-{label}.png")
+        export_control_frame = _frame(export_control, second, directory / f"export-control-title-{label}.png")
+        title_effects[label] = {"preview": _title_effect_metrics(preview_frame, preview_control_frame),
+                                "export": _title_effect_metrics(export_frame, export_control_frame)}
+        assert abs(title_effects[label]["preview"]["normalizedArea"] - title_effects[label]["export"]["normalizedArea"]) < .006
+    assert title_effects["early"]["preview"]["normalizedArea"] < title_effects["middle"]["preview"]["normalizedArea"]
+    assert title_effects["late"]["preview"]["normalizedArea"] < title_effects["middle"]["preview"]["normalizedArea"]
+    assert title_effects["early"]["export"]["normalizedArea"] < title_effects["middle"]["export"]["normalizedArea"]
+    assert title_effects["late"]["export"]["normalizedArea"] < title_effects["middle"]["export"]["normalizedArea"]
+    matrix["titleFade"] = title_effects
     for second in (.05, .95, 1.90, 2.80, 3.70, 4.65):
         packaged, baseline = _frame(exported, second, directory / f"outside-{second}.png"), _frame(export_control, second, directory / f"control-outside-{second}.png")
         subject = _colour_bbox(baseline, "red")
@@ -303,21 +362,35 @@ def test_real_moving_subject_reframe_and_transition_keep_actual_text_pixels_clea
     matrix = {"times": {}, "rule": "actual colour subject bbox ∩ ASS pixel-diff bbox = empty"}
     for second in (.99, 1.10, 1.23):
         actual, baseline = _frame(packaged, second, directory / f"packaged-{second}.png"), _frame(control, second, directory / f"control-{second}.png")
-        text = _literal_text_bbox(actual, baseline)
-        assert text, second
         subjects = {colour: box for colour in ("red", "blue") if (box := _colour_bbox(baseline, colour)) is not None}
         assert subjects, second
+        # 32px exclusion handles codec/style diff only.  The independent red
+        # mask below remains unmasked and would expose text drawn on a subject.
+        text, _size = _difference_bbox(actual, baseline, exclude=[_subject_exclusion(box) for box in subjects.values()])
+        assert text, second
         assert all(_disjoint(text, box) for box in subjects.values()), (second, text, subjects)
         if 1.02 <= second <= 1.25:
             assert set(subjects) == {"red", "blue"}, subjects
-        matrix["times"][str(second)] = {"text": text, "subjects": subjects}
+        fidelity = {colour: _strict_subject_fidelity(actual, baseline, colour=colour, threshold=35)
+                    for colour in subjects}
+        for subject in fidelity.values():
+            # Near the end of a dissolve, a faint subject can cross the colour
+            # classifier threshold after a one-level codec change.  Retention
+            # and RGB delta are evaluated on every unmasked control-subject
+            # pixel; stable masks additionally keep IoU/count limits.
+            assert subject["retainedRatio"] > .96 and subject["referenceMeanRgbDelta"] < 14
+            if subject["controlPixels"] >= 5_000:
+                assert (subject["iou"] > .96
+                        and subject["pixelDelta"] <= subject["controlPixels"] * .04)
+        matrix["times"][str(second)] = {"text": text, "subjects": subjects, "subjectFidelity": fidelity}
     # The same production entry rejects full-frame occupancy before it can run ffmpeg.
     blocked_tracks = json.loads(json.dumps(tracks))
     blocked_tracks[0]["clips"] = [blocked_tracks[0]["clips"][0]]
     observed = deepcopy(blocked_tracks[0]["clips"][0]["reframe"]["samples"][0])
-    observed["timeSeconds"] = 1.1
     observed["boxes"][0].update({"x": 0, "y": 0, "width": 1, "height": 1})
-    blocked_tracks[0]["clips"][0]["reframe"]["samples"] = [observed]
+    blocked_tracks[0]["clips"][0]["reframe"]["samples"] = [
+        {**observed, "timeSeconds": frame / 30} for frame in range(40)
+    ]
     blocked = {"settings": timeline["settings"], "tracks": blocked_tracks, "transitions": []}
     calls = []
     monkeypatch.setattr("app.timeline_render._run_ffmpeg", lambda *_args, **_kwargs: calls.append(True))

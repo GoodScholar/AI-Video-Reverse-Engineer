@@ -138,6 +138,61 @@ def test_batch_preview_and_export_preflight_share_the_missing_subject_block():
     assert validate_final_events(_packaging([]), cues, [track], batch=True)["elements"] == []
 
 
+def test_server_media_kind_context_distinguishes_a_still_from_a_video_and_binds_the_proof():
+    """A client-side clip flag must not turn a video observation into an image fact."""
+    from app.montage_packaging import (PackagingError, PackagingProofConflict, consume_packaging_proof,
+                                       prepare_packaging_proof, validate_final_events)
+
+    track = _reframed_track()[0]
+    reframe = track["clips"][0]["reframe"]
+    reframe.update(status="review_required", samples=reframe["samples"][:1],
+                   frameDurationSeconds=.04, override={"mode": "center", "keyframes": []})
+    # This legacy flag is deliberately ignored: only the server-owned context
+    # determines whether the 0-second observation can cover the full event.
+    track["clips"][0]["_stillImage"] = True
+    package = _packaging([_element("title", start=.2, end=.8, text="服务端媒介类型")])
+    with pytest.raises(PackagingError, match="覆盖"):
+        validate_final_events(package, [], [track], batch=False, asset_media_kinds={"asset": "video"})
+    assert validate_final_events(package, [], [track], batch=False,
+                                 asset_media_kinds={"asset": "image"})["elements"]
+
+    snapshot = {"settings": {"width": 720, "height": 1280}, "tracks": [track], "packaging": package}
+    proof = prepare_packaging_proof(snapshot, [], batch=False, asset_media_kinds={"asset": "image"})
+    with pytest.raises(PackagingProofConflict):
+        consume_packaging_proof(proof, snapshot, [], batch=False, asset_media_kinds={"asset": "video"})
+
+
+def test_review_required_video_requires_real_frame_coverage_without_gaps_or_tail_extrapolation():
+    """Removing a real frame interval, or using the sampling cadence as a hold, must block graphics."""
+    from app.montage_packaging import PackagingError, _subject_boxes
+
+    track = _reframed_track()[0]
+    reframe = track["clips"][0]["reframe"]
+    reframe.update(status="review_required", override={"mode": "manual", "keyframes": [{"timeSeconds": 0, "x": .5, "y": .5}]},
+                   frameDurationSeconds=.04, samplingIntervalSeconds=.5,
+                   samples=[{**sample, "timeSeconds": point} for sample, point in zip(reframe["samples"], (0, .5))])
+    context = {"asset": "video"}
+    with pytest.raises(PackagingError, match="覆盖"):
+        _subject_boxes([track], .04, .08, 720, 1280, asset_media_kinds=context)
+    with pytest.raises(PackagingError, match="覆盖"):
+        _subject_boxes([track], .54, .58, 720, 1280, asset_media_kinds=context)
+
+    # Consecutive real display-frame samples cover the half-open event exactly.
+    reframe["samples"] = [{**reframe["samples"][0], "timeSeconds": point} for point in (0, .04, .08, .12)]
+    assert _subject_boxes([track], .04, .12, 720, 1280, asset_media_kinds=context)
+
+
+def test_only_titles_receive_the_fixed_template_fade():
+    from app.montage_packaging import compile_ass, private_font_path
+
+    package = _packaging([_element("title", text="标题", position="top"), _element("keyword", text="关键词", position="bottom")])
+    ass = compile_ass(package, [], [], 720, 1280, private_font_path(), asset_media_kinds={})
+    title_line = next(line for line in ass.splitlines() if line.endswith("标题"))
+    keyword_line = next(line for line in ass.splitlines() if line.endswith("关键词"))
+    assert "\\fad(180,180)" in title_line
+    assert "\\fad(" not in keyword_line
+
+
 @pytest.mark.parametrize("mode", ["center", "manual", "replace"])
 def test_explicit_reframe_risk_without_observed_subject_facts_blocks_packaging(mode):
     """A crop decision alone cannot prove a packaging event avoids subjects."""
@@ -172,9 +227,9 @@ def test_review_observation_without_a_positive_subject_box_cannot_authorize_pack
 
 
 @pytest.mark.parametrize("mode", ["center", "manual", "replace"])
-def test_explicit_reframe_risk_decision_keeps_partial_real_boxes_without_pts_coverage(mode):
-    """An explicit decision may avoid observed boxes, but cannot invent a missing interval."""
-    from app.montage_packaging import _subject_boxes, compile_ass, private_font_path, validate_final_events
+def test_explicit_reframe_risk_decision_cannot_authorize_partial_frame_facts(mode):
+    """A crop override does not convert one observation into an event interval."""
+    from app.montage_packaging import PackagingError, _subject_boxes, compile_ass, private_font_path, validate_final_events
 
     track = _reframed_track()[0]
     reframe = track["clips"][0]["reframe"]
@@ -183,11 +238,15 @@ def test_explicit_reframe_risk_decision_keeps_partial_real_boxes_without_pts_cov
     reframe["override"] = {"mode": mode, "keyframes": ([] if mode == "center" else [{"timeSeconds": 0, "x": .5, "y": .5}])}
     packaging = _packaging([_element("title", start=.2, end=.8, position="auto", text="人工决定")])
 
-    # Ordinary compilation and batch preflight/export see the same event.
-    assert _subject_boxes([track], .2, .8, 720, 1280)
-    assert "Dialogue:" in compile_ass(packaging, [], [track], 720, 1280, private_font_path())
+    # Ordinary compilation and batch preflight/export share the same hard
+    # block; neither may interpolate or hold a sparse observation.
+    with pytest.raises(PackagingError, match="完整覆盖"):
+        _subject_boxes([track], .2, .8, 720, 1280)
+    with pytest.raises(PackagingError, match="完整覆盖"):
+        compile_ass(packaging, [], [track], 720, 1280, private_font_path())
     cues = [{"id": "cue", "start": .2, "end": .8, "text": "人工决定"}]
-    assert validate_final_events(_packaging([]), cues, [track], batch=True)["elements"] == []
+    with pytest.raises(PackagingError, match="完整覆盖"):
+        validate_final_events(_packaging([]), cues, [track], batch=True)
 
 
 @pytest.mark.parametrize("mode", ["center", "manual", "replace"])

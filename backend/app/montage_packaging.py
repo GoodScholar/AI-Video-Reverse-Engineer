@@ -122,17 +122,36 @@ def _read_font_fact() -> _FontFact:
     return fact
 
 
-def _input_digest(snapshot: dict[str, Any], cues: list[dict[str, Any]], *, batch: bool) -> str:
+def _normal_media_kinds(asset_media_kinds: dict[str, str] | None) -> dict[str, str]:
+    """Canonical server-owned asset kind facts used by packaging decisions.
+
+    Callers that own project assets must pass this mapping.  The conservative
+    video default is retained only for isolated legacy/template callers: it
+    can never accidentally grant an image's single-frame exemption.
+    """
+    if asset_media_kinds is None:
+        return {}
+    if not isinstance(asset_media_kinds, dict) or any(
+            not isinstance(asset_id, str) or kind not in {"image", "video"}
+            for asset_id, kind in asset_media_kinds.items()):
+        raise PackagingError("服务端媒体类型上下文无效。")
+    return dict(asset_media_kinds)
+
+
+def _input_digest(snapshot: dict[str, Any], cues: list[dict[str, Any]], *, batch: bool,
+                  asset_media_kinds: dict[str, str] | None = None) -> str:
     try:
-        value = {"snapshot": snapshot, "cues": cues, "batch": batch}
+        value = {"snapshot": snapshot, "cues": cues, "batch": batch,
+                 "assetMediaKinds": _normal_media_kinds(asset_media_kinds)}
         return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
     except (TypeError, ValueError) as error:
         raise PackagingError("包装证明输入无效。") from error
 
 
-def packaging_proof_key(snapshot: dict[str, Any], cues: list[dict[str, Any]], *, batch: bool) -> str:
+def packaging_proof_key(snapshot: dict[str, Any], cues: list[dict[str, Any]], *, batch: bool,
+                        asset_media_kinds: dict[str, str] | None = None) -> str:
     """Canonical request-local memoization key; never a persistent authorization."""
-    return _input_digest(snapshot, cues, batch=batch)
+    return _input_digest(snapshot, cues, batch=batch, asset_media_kinds=asset_media_kinds)
 
 
 def private_font_path() -> Path:
@@ -224,7 +243,9 @@ def _glyphs(text: str) -> None:
         raise PackagingError("受控字体缺少文字字符。")
 
 
-def validate_packaging(value: Any, cues: list[dict[str, Any]], tracks: list[dict[str, Any]], *, batch: bool = False) -> dict[str, Any]:
+def validate_packaging(value: Any, cues: list[dict[str, Any]], tracks: list[dict[str, Any]], *, batch: bool = False,
+                       asset_media_kinds: dict[str, str] | None = None) -> dict[str, Any]:
+    _normal_media_kinds(asset_media_kinds)
     if not isinstance(value, dict) or set(value) != {"schemaVersion", "templateId", "templateVersion", "font", "safeArea", "elements"}:
         raise PackagingError("包装结构无效。")
     if value["schemaVersion"] != 1 or value["templateId"] != TEMPLATE_ID or value["templateVersion"] != TEMPLATE_VERSION:
@@ -341,11 +362,22 @@ def _interpolated_boxes(samples: list[dict[str, Any]], source_time: float) -> li
     return result or [box for sample in (left, right) for box in sample.get("boxes", []) if isinstance(box, dict)]
 
 
-_MISSING_PACKAGING_AVOIDANCE_FACT = "包装避让证据缺失；请先分析主体，或禁用/调整包装元素后再试。"
+_MISSING_PACKAGING_AVOIDANCE_FACT = "包装避让证据缺失，未完整覆盖实际帧区间；请先分析主体，或禁用/调整包装元素后再试。"
 
 
-def _review_observes_event(clip: dict[str, Any], reframe: dict[str, Any], start: float, end: float) -> bool:
-    """Return whether a review-required crop has a usable subject observation in this event."""
+def _asset_media_kind(clip: dict[str, Any], asset_media_kinds: dict[str, str] | None) -> str:
+    asset_id = clip.get("assetId")
+    kinds = _normal_media_kinds(asset_media_kinds)
+    if not isinstance(asset_id, str):
+        raise PackagingError("服务端媒体类型上下文缺少素材。")
+    # Fail closed for old callers.  In particular, never infer image status
+    # from a mutable timeline field or file extension.
+    return kinds.get(asset_id, "video")
+
+
+def _review_observes_event(clip: dict[str, Any], reframe: dict[str, Any], start: float, end: float,
+                           *, asset_media_kinds: dict[str, str] | None) -> bool:
+    """Require contiguous real-frame subject coverage for a review event."""
     samples = reframe.get("samples")
     if not isinstance(samples, list):
         return False
@@ -369,7 +401,7 @@ def _review_observes_event(clip: dict[str, Any], reframe: dict[str, Any], start:
     observed = [sample for sample in samples if isinstance(sample, dict)
                 and type(sample.get("timeSeconds")) in (int, float)
                 and math.isfinite(sample["timeSeconds"]) and has_subject(sample)]
-    if clip.get("_stillImage"):
+    if _asset_media_kind(clip, asset_media_kinds) == "image":
         return any(float(sample["timeSeconds"]) == 0 for sample in observed)
     speed, in_point = clip.get("speed", 1), clip.get("inPoint", 0)
     if type(speed) not in (int, float) or speed <= 0 or type(in_point) not in (int, float):
@@ -381,10 +413,29 @@ def _review_observes_event(clip: dict[str, Any], reframe: dict[str, Any], start:
     overlap_start, overlap_end = max(start, clip_start), min(end, clip_start + duration)
     source_start = float(in_point) + (overlap_start - float(clip_start)) * float(speed)
     source_end = float(in_point) + (overlap_end - float(clip_start)) * float(speed)
-    return any(source_start <= float(sample["timeSeconds"]) < source_end for sample in observed)
+    frame_duration = reframe.get("frameDurationSeconds")
+    if (type(frame_duration) not in (int, float) or not math.isfinite(frame_duration)
+            or frame_duration <= 0):
+        return False
+    # Samples name decoded display frames.  They cover only their own
+    # half-open frame interval; samplingIntervalSeconds is an analysis cadence,
+    # never a visual hold/interpolation authorization.
+    intervals = sorted((float(sample["timeSeconds"]), float(sample["timeSeconds"]) + float(frame_duration))
+                       for sample in observed)
+    covered = source_start
+    for left, right in intervals:
+        if right <= covered + 1e-9:
+            continue
+        if left > covered + 1e-9:
+            return False
+        covered = max(covered, right)
+        if covered >= source_end - 1e-9:
+            return True
+    return covered >= source_end - 1e-9
 
 
-def _visible_event_reframes(tracks: list[dict[str, Any]], start: float, end: float):
+def _visible_event_reframes(tracks: list[dict[str, Any]], start: float, end: float, *,
+                            asset_media_kinds: dict[str, str] | None = None):
     """Yield visible clip facts only after enforcing the packaging safety decision."""
     for track in tracks:
         if not isinstance(track, dict) or track.get("kind") != "video" or track.get("hidden"):
@@ -404,18 +455,21 @@ def _visible_event_reframes(tracks: list[dict[str, Any]], start: float, end: flo
                 # graphic event avoids subjects.  Partial facts are valid only
                 # at their actual observed PTS; never extend or interpolate
                 # them across an unobserved event interval.
-                if not _review_observes_event(clip, reframe, start, end):
+                if not _review_observes_event(clip, reframe, start, end,
+                                              asset_media_kinds=asset_media_kinds):
                     raise PackagingError(_MISSING_PACKAGING_AVOIDANCE_FACT)
             elif reframe.get("status") != "ready":
                 raise PackagingError("主体信息缺失需人工构图；请先分析主体，或选择中心裁剪/人工关键点。")
             yield clip, reframe
 
 
-def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width: int, height: int) -> list[tuple[float, float, float, float]]:
+def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width: int, height: int, *,
+                   asset_media_kinds: dict[str, str] | None = None) -> list[tuple[float, float, float, float]]:
     """Project only subjects active during an event onto its output canvas."""
     from .montage_reframe import _center_at, _crop_position, crop_geometry
     result = []
-    for clip, reframe in _visible_event_reframes(tracks, start, end):
+    for clip, reframe in _visible_event_reframes(tracks, start, end,
+                                                  asset_media_kinds=asset_media_kinds):
         source_w, source_h, samples = reframe.get("sourceWidth"), reframe.get("sourceHeight"), reframe.get("samples")
         if type(source_w) is not int or type(source_h) is not int or source_w <= 0 or source_h <= 0 or not isinstance(samples, list):
             continue
@@ -523,7 +577,7 @@ def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width
             # turn a partially completed detector run into continuous facts.
             # Reserve only observations that really occurred in this event;
             # do not interpolate, extend holds, or demand auto PTS coverage.
-            if clip.get("_stillImage"):
+            if _asset_media_kind(clip, asset_media_kinds) == "image":
                 for sample in usable:
                     if float(sample["timeSeconds"]) == 0:
                         append_sweep(sample, sample, 0, 0)
@@ -533,7 +587,7 @@ def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width
                     if source_start <= sample_time < source_end:
                         append_sweep(sample, sample, sample_time, sample_time)
             continue
-        if clip.get("_stillImage"):
+        if _asset_media_kind(clip, asset_media_kinds) == "image":
             if len(usable) != 1 or float(usable[0]["timeSeconds"]) != 0:
                 raise PackagingError("静态图片主体检测必须有唯一的 0 秒样本，需人工确认。")
             append_sweep(usable[0], usable[0], 0, 0)
@@ -621,27 +675,30 @@ def _element_events(packaging: dict[str, Any], cues: list[dict[str, Any]], width
     return events
 
 
-def validate_final_events(packaging: dict[str, Any], cues: list[dict[str, Any]], tracks: list[dict[str, Any]], *, batch: bool) -> dict[str, Any]:
+def validate_final_events(packaging: dict[str, Any], cues: list[dict[str, Any]], tracks: list[dict[str, Any]], *, batch: bool,
+                          asset_media_kinds: dict[str, str] | None = None) -> dict[str, Any]:
     """Validate every final ASS event, including default canonical cues."""
     # Rendering and lock-free proof generation keep the terminal font check;
     # state-store shape validation intentionally does not read this 16 MB file.
     if _PROOF_FONT.get() is None:
         private_font_path()
-    checked = validate_packaging(packaging, cues, tracks, batch=batch)
+    checked = validate_packaging(packaging, cues, tracks, batch=batch, asset_media_kinds=asset_media_kinds)
     for event in _element_events(checked, cues, 0, 0):
         # Preflight has no output dimensions, but it can still prove that each
         # visible event interval has a deliberate subject decision.  Geometry
         # and avoidance are checked by _subject_boxes during ASS compilation.
-        list(_visible_event_reframes(tracks, event["start"], event["end"]))
+        list(_visible_event_reframes(tracks, event["start"], event["end"],
+                                     asset_media_kinds=asset_media_kinds))
     return checked
 
 
-def prepare_packaging_proof(snapshot: dict[str, Any], cues: list[dict[str, Any]], *, batch: bool) -> PackagingProof | None:
+def prepare_packaging_proof(snapshot: dict[str, Any], cues: list[dict[str, Any]], *, batch: bool,
+                            asset_media_kinds: dict[str, str] | None = None) -> PackagingProof | None:
     """Prepare one request-local terminal packaging proof outside project locks."""
     packaging = snapshot.get("packaging") if isinstance(snapshot, dict) else None
     if packaging is None:
         return None
-    digest = _input_digest(snapshot, cues, batch=batch)
+    digest = _input_digest(snapshot, cues, batch=batch, asset_media_kinds=asset_media_kinds)
     try:
         fact = _read_font_fact()
     except FileNotFoundError as error:
@@ -650,20 +707,23 @@ def prepare_packaging_proof(snapshot: dict[str, Any], cues: list[dict[str, Any]]
         raise PackagingProofConflict("受控字体在验证期间不可读取。") from error
     token = _PROOF_FONT.set(fact)
     try:
-        validate_final_events(packaging, cues, snapshot.get("tracks", []), batch=batch)
+        validate_final_events(packaging, cues, snapshot.get("tracks", []), batch=batch,
+                              asset_media_kinds=asset_media_kinds)
     finally:
         _PROOF_FONT.reset(token)
     return PackagingProof(digest, batch, fact)
 
 
-def consume_packaging_proof(proof: PackagingProof | None, snapshot: dict[str, Any], cues: list[dict[str, Any]], *, batch: bool) -> None:
+def consume_packaging_proof(proof: PackagingProof | None, snapshot: dict[str, Any], cues: list[dict[str, Any]], *, batch: bool,
+                            asset_media_kinds: dict[str, str] | None = None) -> None:
     """Consume a request-local proof with digest/stat checks only (never font IO)."""
     packaging = snapshot.get("packaging") if isinstance(snapshot, dict) else None
     if packaging is None:
         if proof is not None:
             raise PackagingProofConflict("包装证明已过期，请刷新后重试。")
         return
-    if proof is None or proof.batch != batch or proof.digest != _input_digest(snapshot, cues, batch=batch):
+    if proof is None or proof.batch != batch or proof.digest != _input_digest(snapshot, cues, batch=batch,
+                                                                               asset_media_kinds=asset_media_kinds):
         raise PackagingProofConflict("包装证明已过期，请刷新后重试。")
     try:
         path = _FONT.resolve(strict=True)
@@ -675,14 +735,16 @@ def consume_packaging_proof(proof: PackagingProof | None, snapshot: dict[str, An
         raise PackagingProofConflict("受控字体在验证期间不可读取。") from error
 
 
-def compile_ass(packaging: dict[str, Any], cues: list[dict[str, Any]], tracks: list[dict[str, Any]], width: int, height: int, font_path: Path | str | None = None) -> str:
+def compile_ass(packaging: dict[str, Any], cues: list[dict[str, Any]], tracks: list[dict[str, Any]], width: int, height: int,
+                font_path: Path | str | None = None, *, asset_media_kinds: dict[str, str] | None = None) -> str:
     """Compile all graphics into a single normalized PlayRes ASS document."""
     if type(width) is not int or type(height) is not int or width < 2 or height < 2:
         raise PackagingError("包装画布无效。")
     if font_path is not None and Path(font_path).resolve() != private_font_path().resolve():
         raise PackagingError("只能使用受控字体。")
     checked = validate_final_events(packaging, cues, tracks,
-                                    batch=any("cueId" in item for item in packaging.get("elements", []) if isinstance(item, dict)))
+                                    batch=any("cueId" in item for item in packaging.get("elements", []) if isinstance(item, dict)),
+                                    asset_media_kinds=asset_media_kinds)
     safe = checked["safeArea"]
     left, right = width * safe["left"], width * (1 - safe["right"])
     top, bottom = height * safe["top"], height * (1 - safe["bottom"])
@@ -704,7 +766,8 @@ def compile_ass(packaging: dict[str, Any], cues: list[dict[str, Any]], tracks: l
         candidates = (["bottom", "top", "middle"] if item["kind"] == "subtitle" else ["top", "bottom", "middle"])
         if item["position"] != "auto":
             candidates = [item["position"]]
-        subjects = _subject_boxes(tracks, item["start"], item["end"], width, height)
+        subjects = _subject_boxes(tracks, item["start"], item["end"], width, height,
+                                  asset_media_kinds=asset_media_kinds)
         selected = None
         for position in candidates:
             y = {"top": top + item["height"] / 2, "middle": (top + bottom) / 2,
@@ -720,6 +783,8 @@ def compile_ass(packaging: dict[str, Any], cues: list[dict[str, Any]], tracks: l
         y, box = selected
         occupied.append((item["start"], item["end"], *box))
         # \\an5 with explicit centre is invariant for preview and export dimensions.
-        lines.append("Dialogue: %d,%s,%s,%s,,0,0,0,,{\\an5\\pos(%d,%d)}%s" % (
-            index, _ass_time(item["start"]), _ass_time(item["end"]), "G" + str(index), round(x), round(y), escape_ass_text(item["text"])))
+        fade = "\\fad(180,180)" if item["kind"] == "title" else ""
+        lines.append("Dialogue: %d,%s,%s,%s,,0,0,0,,{\\an5\\pos(%d,%d)%s}%s" % (
+            index, _ass_time(item["start"]), _ass_time(item["end"]), "G" + str(index), round(x), round(y), fade,
+            escape_ass_text(item["text"])))
     return "\n".join(lines) + "\n"

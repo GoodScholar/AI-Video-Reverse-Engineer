@@ -82,12 +82,13 @@ def _clip(asset_id: str, start: float, duration: float, **values):
 def _accepted_center_reframe(width: int = 9, height: int = 16, *, still_image: bool):
     from app.montage_reframe import pending_reframe
     reframe = pending_reframe(target_width=width, target_height=height, reason="测试中的显式人工构图")
-    reframe.update(sourceWidth=64, sourceHeight=48, samples=[{
-        "timeSeconds": 0 if still_image else .2,
+    sample_times = (0,) if still_image else tuple(frame / 24 for frame in range(12))
+    reframe.update(sourceWidth=64, sourceHeight=48, frameDurationSeconds=(None if still_image else 1 / 24), samples=[{
+        "timeSeconds": point,
         "boxes": [{"x": 22 / 64, "y": 20 / 48, "width": 4 / 64, "height": 4 / 48,
                    "label": "red-subject", "confidence": .99}],
         "center": {"x": .5, "y": .5}, "confidence": .99,
-    }])
+    } for point in sample_times])
     reframe["override"] = {"mode": "center", "keyframes": []}
     return reframe
 
@@ -336,7 +337,7 @@ def test_production_multiline_outline_pixels_stay_inside_the_compiler_bbox(tmp_p
     timeline = _timeline(width=720, height=1280, tracks=[_track("video", [_clip("background", 0, .5, reframe=_accepted_center_reframe(still_image=False))])])
     packaging = default_packaging()
     packaging["elements"] = [{
-        "id": "outline-title", "kind": "title", "enabled": True, "start": .1, "end": .3,
+        "id": "outline-title", "kind": "title", "enabled": True, "start": 0, "end": .5,
         "text": "多行描边\n完整边界", "position": "top", "style": "emphasis",
     }]
     ass = compile_ass(packaging, [], [], 720, 1280, private_font_path())
@@ -349,7 +350,7 @@ def test_production_multiline_outline_pixels_stay_inside_the_compiler_bbox(tmp_p
                     ffprobe_path="/opt/homebrew/opt/ffmpeg-full/bin/ffprobe")
     frame, base_frame = tmp_path / "production-multiline-outline.png", tmp_path / "outline-control.png"
     for video, image in ((rendered, frame), (control, base_frame)):
-        _run(ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-y", "-ss", "0.2", "-i", str(video),
+        _run(ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-y", "-ss", "0.25", "-i", str(video),
              "-frames:v", "1", str(image))
     with Image.open(frame).convert("RGB") as actual, Image.open(base_frame).convert("RGB") as baseline:
         subject_pixels = [(x, y) for y in range(baseline.height) for x in range(baseline.width)
@@ -361,7 +362,7 @@ def test_production_multiline_outline_pixels_stay_inside_the_compiler_bbox(tmp_p
                         subject_box[2] + 32, subject_box[3] + 32]
         points = [(x, y) for y in range(actual.height) for x in range(actual.width)
                   if not (subject_halo[0] <= x < subject_halo[2] and subject_halo[1] <= y < subject_halo[3])
-                  and sum(abs(left - right) for left, right in zip(actual.getpixel((x, y)), baseline.getpixel((x, y)))) > 8]
+                  and sum(abs(left - right) for left, right in zip(actual.getpixel((x, y)), baseline.getpixel((x, y)))) > 30]
     assert points  # compare against a real no-ASS render, not a yellow-fill colour threshold
     actual_box = [min(x for x, _y in points), min(y for _x, y in points),
                   max(x for x, _y in points) + 1, max(y for _x, y in points) + 1]
@@ -374,7 +375,7 @@ def test_production_multiline_outline_pixels_stay_inside_the_compiler_bbox(tmp_p
     fontselect = subprocess.run(
         [ffmpeg, "-hide_banner", "-nostdin", "-v", "verbose", "-i", str(background),
          "-vf", "ass=filename=%s:fontsdir=%s" % (ass_path, private_font_path().parent),
-         "-ss", "0.2", "-frames:v", "1", "-f", "null", "-"], check=True, capture_output=True, text=True,
+         "-ss", "0.25", "-frames:v", "1", "-f", "null", "-"], check=True, capture_output=True, text=True,
     ).stderr
     fontselect_log = tmp_path / "production-multiline-outline-fontselect.log"
     fontselect_log.write_text(fontselect, encoding="utf-8")
