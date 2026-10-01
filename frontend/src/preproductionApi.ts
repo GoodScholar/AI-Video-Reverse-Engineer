@@ -127,6 +127,69 @@ export type PreproductionCheck = {
   message: string;
 };
 
+export type YoutubeProbe = {
+  canonicalUrl: string;
+  videoId: string;
+  title: string;
+  durationSeconds: number | null;
+  uploader: string | null;
+  status: "available" | "requires_login" | "temporarily_unavailable" | "unsupported_link";
+  adapter: { id: "yt-dlp"; version: string };
+  externalRequest: { probeHosts: string[]; downloadHosts: string[]; purpose: string; sessionPolicy: string };
+  lastRealVerificationAt: string | null;
+};
+
+export type YoutubeImportRequest = {
+  url: string;
+  role: AssetRole;
+  rightsConfirmed: boolean;
+  externalRequestAccepted: boolean;
+  useSession?: boolean;
+};
+
+export type YoutubeImportRun = {
+  id: string;
+  status: "queued" | "running" | "cancel_requested" | "completed" | "failed" | "cancelled";
+  error: string | null;
+  createdAt: string;
+  inputFingerprint: string;
+  idempotencyKey: string;
+  retryOf: string | null;
+  uploadedAssetId: string | null;
+};
+
+export type BilibiliProbe = {
+  canonicalUrl: string;
+  videoId: string;
+  title: string;
+  uploader: string | null;
+  parts: Array<{ number: number; cid: string; title: string; durationSeconds: number | null }>;
+  status: "available" | "requires_login" | "temporarily_unavailable" | "unsupported_link";
+  adapter: { id: "yt-dlp"; version: string };
+  externalRequest: { probeHosts: string[]; downloadHosts: string[]; purpose: string; sessionPolicy: string; shortLinkPolicy: string };
+  lastRealVerificationAt: string | null;
+};
+
+export type BilibiliImportRequest = {
+  url: string;
+  part: number;
+  role: AssetRole;
+  rightsConfirmed: boolean;
+  externalRequestAccepted: boolean;
+  useSession?: boolean;
+};
+
+export type BilibiliImportRun = {
+  id: string;
+  status: "queued" | "running" | "cancel_requested" | "completed" | "failed" | "cancelled";
+  error: string | null;
+  createdAt: string;
+  inputFingerprint: string;
+  idempotencyKey: string;
+  retryOf: string | null;
+  uploadedAssetId: string | null;
+};
+
 export type PreproductionWorkspace = {
   schemaVersion: 2;
   revision: number;
@@ -238,6 +301,30 @@ export function cancelYoutubeImportRun(projectId: string, runId: string): Promis
 
 export function retryYoutubeImportRun(projectId: string, runId: string): Promise<{ run: YoutubeImportRun }> {
   return request(`${baseUrl(projectId)}/youtube/imports/${encodeURIComponent(runId)}/retry`, { method: "POST", headers: jsonHeaders }, "无法重试 YouTube 导入，请重试。");
+}
+
+export function probeBilibiliVideo(projectId: string, url: string, useSession = false): Promise<BilibiliProbe> {
+  return request(`${baseUrl(projectId)}/bilibili/probe`, {
+    method: "POST", headers: jsonHeaders, body: JSON.stringify({ url, externalRequestAccepted: true, useSession }),
+  }, "无法读取 B站视频信息，请检查链接或稍后重试。");
+}
+
+export function importBilibiliVideo(projectId: string, body: BilibiliImportRequest): Promise<{ run: BilibiliImportRun }> {
+  return request(`${baseUrl(projectId)}/bilibili/import`, {
+    method: "POST", headers: jsonHeaders, body: JSON.stringify(body),
+  }, "无法导入 B站视频，请检查授权、分P、链接和网络状态。");
+}
+
+export function getBilibiliImportRun(projectId: string, runId: string): Promise<{ run: BilibiliImportRun }> {
+  return request(`${baseUrl(projectId)}/bilibili/imports/${encodeURIComponent(runId)}`, {}, "无法读取 B站导入状态，请重试。");
+}
+
+export function cancelBilibiliImportRun(projectId: string, runId: string): Promise<{ run: BilibiliImportRun }> {
+  return request(`${baseUrl(projectId)}/bilibili/imports/${encodeURIComponent(runId)}/cancel`, { method: "POST", headers: jsonHeaders }, "无法取消 B站导入，请重试。");
+}
+
+export function retryBilibiliImportRun(projectId: string, runId: string): Promise<{ run: BilibiliImportRun }> {
+  return request(`${baseUrl(projectId)}/bilibili/imports/${encodeURIComponent(runId)}/retry`, { method: "POST", headers: jsonHeaders }, "无法重试 B站导入，请重试。");
 }
 
 export function importReferenceAssets(projectId: string, revision: number): Promise<PreproductionWorkspace> {

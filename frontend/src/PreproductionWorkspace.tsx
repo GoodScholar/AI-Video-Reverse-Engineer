@@ -15,6 +15,11 @@ import {
   cancelYoutubeImportRun,
   retryYoutubeImportRun,
   probeYoutubeVideo,
+  importBilibiliVideo,
+  getBilibiliImportRun,
+  cancelBilibiliImportRun,
+  retryBilibiliImportRun,
+  probeBilibiliVideo,
   runPreproductionNode,
   savePreproductionWorkspace,
   uploadPreproductionAsset,
@@ -28,6 +33,8 @@ import {
   type PreproductionWorkspace as Workspace,
   type YoutubeProbe,
   type YoutubeImportRun,
+  type BilibiliProbe,
+  type BilibiliImportRun,
 } from "./preproductionApi";
 import "./preproduction.css";
 import { ReproductionFlow } from "./ReproductionFlow";
@@ -175,6 +182,12 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
   const [youtubeRun, setYoutubeRun] = useState<YoutubeImportRun | null>(null);
   const [youtubeDisclosureAccepted, setYoutubeDisclosureAccepted] = useState(false);
   const [youtubeUseSession, setYoutubeUseSession] = useState(false);
+  const [bilibiliUrl, setBilibiliUrl] = useState("");
+  const [bilibiliProbe, setBilibiliProbe] = useState<BilibiliProbe | null>(null);
+  const [bilibiliPart, setBilibiliPart] = useState<number | null>(null);
+  const [bilibiliRun, setBilibiliRun] = useState<BilibiliImportRun | null>(null);
+  const [bilibiliDisclosureAccepted, setBilibiliDisclosureAccepted] = useState(false);
+  const [bilibiliUseSession, setBilibiliUseSession] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState("");
@@ -264,6 +277,15 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
     void getYoutubeImportRun(project.id, runId).then(result => setYoutubeRun(result.run)).catch(() => {
       window.sessionStorage.removeItem(`aivre:youtube-import:${project.id}`);
       setYoutubeRun(null);
+    });
+  }, [project.id]);
+
+  useEffect(() => {
+    const runId = window.sessionStorage.getItem(`aivre:bilibili-import:${project.id}`);
+    if (!runId) { setBilibiliRun(null); return; }
+    void getBilibiliImportRun(project.id, runId).then(result => setBilibiliRun(result.run)).catch(() => {
+      window.sessionStorage.removeItem(`aivre:bilibili-import:${project.id}`);
+      setBilibiliRun(null);
     });
   }, [project.id]);
 
@@ -420,6 +442,47 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
     finally { if (mounted.current) setBusy(null); }
   }
 
+  async function probeBilibili() {
+    if (!bilibiliUrl.trim() || busy || dirty) return;
+    setBusy("bilibili-probe"); setError("");
+    try {
+      const next = await probeBilibiliVideo(project.id, bilibiliUrl.trim(), bilibiliUseSession);
+      setBilibiliProbe(next); setBilibiliPart(next.parts.length === 1 ? next.parts[0].number : null);
+    } catch (reason) { setBilibiliProbe(null); setBilibiliPart(null); setError(errorMessage(reason, "无法读取 B站视频信息。")); }
+    finally { if (mounted.current) setBusy(null); }
+  }
+
+  async function importBilibili() {
+    if (!bilibiliProbe || bilibiliPart === null || busy || dirty) return;
+    if (!window.confirm("请确认：你拥有所选 B站分P视频的使用权。系统不会自动登录、读取浏览器 Cookie 或绕过会员、私密、地区和 DRM 限制。")) return;
+    if (!window.confirm(`即将向 ${bilibiliProbe.externalRequest.downloadHosts.join("、")} 发起下载请求：${bilibiliProbe.externalRequest.purpose}`)) return;
+    setBusy("bilibili-import"); setError("");
+    try {
+      const started = await importBilibiliVideo(project.id, { url: bilibiliUrl.trim(), part: bilibiliPart, role: uploadRole, rightsConfirmed: true, externalRequestAccepted: true, useSession: bilibiliUseSession });
+      setBilibiliRun(started.run); window.sessionStorage.setItem(`aivre:bilibili-import:${project.id}`, started.run.id);
+    } catch (reason) { setError(errorMessage(reason, "无法导入 B站视频。")); }
+    finally { if (mounted.current) setBusy(null); }
+  }
+
+  async function refreshBilibiliRun() {
+    if (!bilibiliRun || busy) return;
+    setBusy("bilibili-status"); setError("");
+    try {
+      const next = await getBilibiliImportRun(project.id, bilibiliRun.id); setBilibiliRun(next.run);
+      if (["completed", "failed", "cancelled"].includes(next.run.status)) window.sessionStorage.removeItem(`aivre:bilibili-import:${project.id}`);
+      if (next.run.status === "completed") await reloadSavedWorkspace();
+    } catch (reason) { setError(errorMessage(reason, "无法读取 B站导入状态。")); }
+    finally { if (mounted.current) setBusy(null); }
+  }
+
+  async function changeBilibiliRun(action: "cancel" | "retry") {
+    if (!bilibiliRun || busy) return;
+    setBusy(`bilibili-${action}`); setError("");
+    try { setBilibiliRun((await (action === "cancel" ? cancelBilibiliImportRun(project.id, bilibiliRun.id) : retryBilibiliImportRun(project.id, bilibiliRun.id))).run); }
+    catch (reason) { setError(errorMessage(reason, "无法更新 B站导入状态。")); }
+    finally { if (mounted.current) setBusy(null); }
+  }
+
   async function uploadResult(event: ChangeEvent<HTMLInputElement>) {
     const input = event.currentTarget;
     const file = input.files?.[0];
@@ -540,6 +603,15 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
             <button type="button" className="secondary-action" disabled={Boolean(busy) || dirty || !youtubeUrl.trim() || !youtubeDisclosureAccepted} onClick={() => void probeYoutube()}>{busy === "youtube-probe" ? "正在读取…" : "读取链接"}</button>
             {youtubeProbe && <div role="status"><strong>{youtubeProbe.title}</strong><small>适配器：{youtubeProbe.adapter.id} {youtubeProbe.adapter.version} · 状态：{youtubeProbe.status} · 最近真实验证：{youtubeProbe.lastRealVerificationAt ?? "尚无真实验证（受控测试不计入）"}</small><p>{youtubeProbe.externalRequest.purpose}</p><button type="button" className="primary-action" disabled={Boolean(busy) || dirty} onClick={() => void importYoutube()}>{busy === "youtube-import" ? "正在创建导入…" : "确认权利并下载"}</button></div>}
             {youtubeRun && <div role="status"><strong>导入运行：{youtubeRun.status}</strong><small>{youtubeRun.error ? `诊断：${youtubeRun.error}` : `运行标识：${youtubeRun.id}`}</small><button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void refreshYoutubeRun()}>刷新导入状态</button>{["queued", "running", "cancel_requested"].includes(youtubeRun.status) && <button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void changeYoutubeRun("cancel")}>取消导入</button>}{["failed", "cancelled"].includes(youtubeRun.status) && <button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void changeYoutubeRun("retry")}>重试导入</button>}</div>}
+          </div>
+          <div className="preproduction-upload" aria-label="导入 B站视频">
+            <label>B站链接<input aria-label="B站链接" value={bilibiliUrl} placeholder="https://www.bilibili.com/video/BV... 或 https://b23.tv/..." onChange={(event) => { setBilibiliUrl(event.target.value); setBilibiliProbe(null); setBilibiliPart(null); }} /></label>
+            <p>读取链接会访问 B站页面和元数据 API；b23.tv 仅做有限 HTTPS 跳转解析，最终必须为标准 BV 视频页。不会自动下载合集。</p>
+            <label><input type="checkbox" checked={bilibiliDisclosureAccepted} onChange={(event) => setBilibiliDisclosureAccepted(event.target.checked)} />我已阅读并同意上述外发范围</label>
+            <label><input type="checkbox" checked={bilibiliUseSession} onChange={(event) => setBilibiliUseSession(event.target.checked)} />仅在此链接需要时使用系统安全存储中的合法 B站会话</label>
+            <button type="button" className="secondary-action" disabled={Boolean(busy) || dirty || !bilibiliUrl.trim() || !bilibiliDisclosureAccepted} onClick={() => void probeBilibili()}>{busy === "bilibili-probe" ? "正在读取…" : "读取链接与分P"}</button>
+            {bilibiliProbe && <div role="status"><strong>{bilibiliProbe.title}</strong><small>适配器：{bilibiliProbe.adapter.id} {bilibiliProbe.adapter.version} · 状态：{bilibiliProbe.status} · 最近真实验证：{bilibiliProbe.lastRealVerificationAt ?? "尚无真实验证（受控测试不计入）"}</small><p>{bilibiliProbe.parts.length > 1 ? "该视频有多个分P，请明确选择一个后再下载。" : "单分P视频已可选择。"}</p><label>选择分P<select aria-label="选择 B站分P" value={bilibiliPart ?? ""} onChange={(event) => setBilibiliPart(Number(event.target.value) || null)}><option value="">请选择</option>{bilibiliProbe.parts.map(part => <option key={part.number} value={part.number}>P{part.number} · {part.title} · {part.durationSeconds ?? "未知"}秒</option>)}</select></label><button type="button" className="primary-action" disabled={Boolean(busy) || dirty || bilibiliPart === null} onClick={() => void importBilibili()}>{busy === "bilibili-import" ? "正在创建导入…" : "确认权利并下载所选分P"}</button></div>}
+            {bilibiliRun && <div role="status"><strong>导入运行：{bilibiliRun.status}</strong><small>{bilibiliRun.error ? `诊断：${bilibiliRun.error}` : `运行标识：${bilibiliRun.id}`}</small><button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void refreshBilibiliRun()}>刷新导入状态</button>{["queued", "running", "cancel_requested"].includes(bilibiliRun.status) && <button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void changeBilibiliRun("cancel")}>取消导入</button>}{["failed", "cancelled"].includes(bilibiliRun.status) && <button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void changeBilibiliRun("retry")}>重试导入</button>}</div>}
           </div>
           <div className="preproduction-filters" role="group" aria-label="素材标签筛选"><button type="button" aria-pressed={roleFilter === "all"} className={roleFilter === "all" ? "is-active" : ""} onClick={() => setRoleFilter("all")}>全部</button>{(Object.entries(roleLabels) as Array<[AssetRole, string]>).map(([role, label]) => <button type="button" key={role} aria-pressed={roleFilter === role} className={roleFilter === role ? "is-active" : ""} onClick={() => setRoleFilter(role)}>{label}</button>)}</div>
           {visibleAssets.length ? <ul className="preproduction-assets">{visibleAssets.map((asset) => <li key={asset.id}><span className="preproduction-asset-kind">{asset.kind}</span><div className="preproduction-asset-info"><strong>{asset.name}</strong>{asset.notes && <p>{asset.notes}</p>}<button type="button" className="secondary-action" aria-label={`管理素材 ${asset.name}`} onClick={() => setManagedAssetId(asset.id)}>管理素材</button><span className="preproduction-asset-role">{roleLabels[asset.role]}</span>{asset.width && asset.height ? <small>{asset.width}×{asset.height}</small> : null}<a className="preproduction-asset-download" href={asset.url} download>下载{asset.name}</a><details className={`preproduction-asset-preview ${studioMode ? "studio-asset-preview" : ""}`} open={studioMode || undefined}><summary>预览</summary>{asset.kind === "image" ? <img src={asset.url} alt={`${asset.name} 预览`} /> : asset.kind === "video" ? <video controls preload="metadata" aria-label={`${asset.name} 预览`} src={asset.url} /> : asset.kind === "text" ? <TextAssetPreview url={asset.url} name={asset.name} /> : <audio controls preload="metadata" aria-label={`${asset.name} 预览`} src={asset.url} />}</details></div></li>)}</ul> : <p className="preproduction-empty">还没有匹配的素材。上传素材，或从已有参考和工具结果导入。</p>}

@@ -7,6 +7,8 @@ import {
   importPreparationShots,
   probeYoutubeVideo,
   importYoutubeVideo,
+  importBilibiliVideo,
+  probeBilibiliVideo,
   runPreproductionNode,
   savePreproductionWorkspace,
   saveCanvasLayout,
@@ -154,6 +156,17 @@ describe("preproductionApi", () => {
 
     expect(fetch).toHaveBeenNthCalledWith(1, "/api/projects/project-001/preproduction/youtube/probe", expect.objectContaining({ method: "POST", body: JSON.stringify({ url: "https://youtu.be/YE7VzlLtp-4", externalRequestAccepted: true, useSession: true }) }));
     expect(fetch).toHaveBeenNthCalledWith(2, "/api/projects/project-001/preproduction/youtube/import", expect.objectContaining({ method: "POST", body: JSON.stringify({ url: "https://youtu.be/YE7VzlLtp-4", role: "reference", rightsConfirmed: true, externalRequestAccepted: true, useSession: true }) }));
+  });
+
+  it("B站探测返回分P并仅在明确选择后提交导入", async () => {
+    const probe = { canonicalUrl: "https://www.bilibili.com/video/BV1xx411c7mD", videoId: "BV1xx411c7mD", title: "授权样片", uploader: "owner", parts: [{ number: 1, cid: "111", title: "第一集", durationSeconds: 1 }], status: "available" as const, adapter: { id: "yt-dlp" as const, version: "2026.08.19" }, externalRequest: { probeHosts: ["www.bilibili.com"], downloadHosts: ["B站授权媒体 CDN"], purpose: "读取", sessionPolicy: "默认不读取", shortLinkPolicy: "受限解析" }, lastRealVerificationAt: null };
+    vi.mocked(fetch).mockResolvedValueOnce(response(probe)).mockResolvedValueOnce(response({ run: { id: "bilibili-import-1", status: "queued", error: null, createdAt: "2026-10-02T00:00:00Z", inputFingerprint: "hash", idempotencyKey: "key", retryOf: null, uploadedAssetId: null } }));
+
+    await expect(probeBilibiliVideo("project-001", "https://b23.tv/abc123", false)).resolves.toEqual(probe);
+    await importBilibiliVideo("project-001", { url: "https://b23.tv/abc123", part: 1, role: "reference", rightsConfirmed: true, externalRequestAccepted: true });
+
+    expect(fetch).toHaveBeenNthCalledWith(1, "/api/projects/project-001/preproduction/bilibili/probe", expect.objectContaining({ method: "POST", body: JSON.stringify({ url: "https://b23.tv/abc123", externalRequestAccepted: true, useSession: false }) }));
+    expect(fetch).toHaveBeenNthCalledWith(2, "/api/projects/project-001/preproduction/bilibili/import", expect.objectContaining({ method: "POST", body: JSON.stringify({ url: "https://b23.tv/abc123", part: 1, role: "reference", rightsConfirmed: true, externalRequestAccepted: true }) }));
   });
 
   it("打包失败时读取后端检查错误而不下载旧结果", async () => {

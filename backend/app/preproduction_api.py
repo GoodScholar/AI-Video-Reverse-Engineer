@@ -62,6 +62,20 @@ from .youtube_import import (
     normalize_youtube_url,
     probe_downloaded_youtube_video,
 )
+from .bilibili_import import (
+    BILIBILI_ADAPTER,
+    MAX_BILIBILI_SOURCE_DURATION_SECONDS,
+    BilibiliImportError,
+    BilibiliImportRuns,
+    SystemBilibiliCookieStore,
+    YtDlpBilibiliAdapter,
+    bilibili_url_part,
+    bilibili_video_source,
+    normalize_bilibili_url,
+    probe_downloaded_bilibili_video,
+    public_bilibili_import_run,
+    resolve_bilibili_short_url,
+)
 from .shot_production import MAX_RESULT_VERSIONS, NODE_KINDS, ShotProduction, ShotProductionError, StepSource, public_result_versions
 from .shot_organization import ShotOrganization, ShotOrganizationError
 from .preproduction_transaction import WorkspaceTransaction, WorkspaceTransactionError
@@ -81,6 +95,16 @@ def youtube_external_request() -> dict[str, Any]:
         "downloadHosts": ["*.googlevideo.com"],
         "purpose": "读取公开视频元数据；确认权利后下载到本项目受管暂存区。",
         "sessionPolicy": "默认不读取或发送会话；仅在你明确勾选后，才读取系统安全存储中的合法会话并仅发送给 YouTube。",
+    }
+
+
+def bilibili_external_request() -> dict[str, Any]:
+    return {
+        "probeHosts": ["www.bilibili.com", "api.bilibili.com"],
+        "downloadHosts": ["B站授权媒体 CDN"],
+        "purpose": "读取公开视频与分P元数据；确认权利并明确选择分P后下载到本项目受管暂存区。",
+        "sessionPolicy": "默认不读取或发送会话；仅在你明确勾选后，才读取系统安全存储中的合法会话并仅发送给 B站。",
+        "shortLinkPolicy": "b23.tv 短链只会经无代理、最多三次的 HTTPS 跳转解析，最终必须是标准 BV 视频页。",
     }
 
 
@@ -194,6 +218,10 @@ class YoutubeImportRequest(BaseModel):
     idempotencyKey: str = Field(default="", max_length=128)
 
 
+class BilibiliImportRequest(YoutubeImportRequest):
+    part: int | None = Field(default=None, ge=1, le=9999)
+
+
 class CanvasLayoutUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     layoutRevision: int = Field(ge=0)
@@ -212,6 +240,9 @@ def create_preproduction_router(
     runner: Optional[Callable[..., list[str]]] = None,
     youtube_adapter: Any = None,
     youtube_session_store: Any = None,
+    bilibili_adapter: Any = None,
+    bilibili_session_store: Any = None,
+    bilibili_short_link_resolver: Any = None,
 ) -> APIRouter:
     """Create the router; ``runner`` is a test seam and defaults to execute_node."""
     root = Path(data_dir)
@@ -231,6 +262,10 @@ def create_preproduction_router(
     youtube_adapter = youtube_adapter or YtDlpYoutubeAdapter()
     youtube_runs = YoutubeImportRuns(root)
     youtube_cancel_events: dict[str, Event] = {}
+    bilibili_adapter = bilibili_adapter or YtDlpBilibiliAdapter(ffmpeg_path=ffmpeg_path)
+    bilibili_short_link_resolver = bilibili_short_link_resolver or resolve_bilibili_short_url
+    bilibili_runs = BilibiliImportRuns(root)
+    bilibili_cancel_events: dict[str, Event] = {}
     router = APIRouter(prefix="/api/projects/{project_id}/preproduction")
 
     def reconcile_youtube_imports(project_id: str) -> None:
@@ -251,6 +286,27 @@ def create_preproduction_router(
                 continue
             youtube_runs.transition(project_id, run["id"], status="completed", error=None, uploadedAssetId=asset["id"])
 
+    def reconcile_bilibili_imports(project_id: str) -> None:
+        assets = project_assets.index(project_id)
+        for run in bilibili_runs.list(project_id):
+            if run["status"] not in {"failed", "cancelled"} or run.get("uploadedAssetId"):
+                continue
+            input_data = run.get("input", {})
+            canonical = normalize_bilibili_url(str(input_data.get("url", "")))
+            part = input_data.get("part")
+            if canonical is None or not isinstance(part, int):
+                continue
+            bvid = canonical.split("/video/", 1)[-1].split("?", 1)[0]
+            asset = next((item for item in assets.values() if isinstance(item.get("videoSource"), dict)
+                          and item["videoSource"].get("sourceId") == f"source-bilibili-{bvid}-p{part}"), None)
+            if asset is None:
+                continue
+            try:
+                project_assets.file(project_id, asset)
+            except (OSError, ValueError, KeyError):
+                continue
+            bilibili_runs.transition(project_id, run["id"], status="completed", error=None, uploadedAssetId=asset["id"])
+
     if runner is None:
         from .preproduction_nodes import execute_node
         runner = execute_node
@@ -269,7 +325,9 @@ def create_preproduction_router(
             workspace_transaction.recover(project_id)
             project_assets.recover_local_video_installations(project_id)
             project_assets.recover_youtube_video_installations(project_id)
+            project_assets.recover_bilibili_video_installations(project_id)
             reconcile_youtube_imports(project_id)
+            reconcile_bilibili_imports(project_id)
             return store.load(project_id)
         except (OSError, ValueError):
             fail("preproduction_storage_invalid", "前置工作台状态无法读取。", 503)
@@ -382,6 +440,7 @@ def create_preproduction_router(
                 workspace_transaction.recover(project_id)
                 project_assets.recover_local_video_installations(project_id)
                 project_assets.recover_youtube_video_installations(project_id)
+                project_assets.recover_bilibili_video_installations(project_id)
                 state = store.load(project_id)
                 changed = False
                 for shot in state["shots"]:
@@ -400,6 +459,14 @@ def create_preproduction_router(
                     project_id = path.parents[2].name
                     youtube_runs.recover(project_id)
                     reconcile_youtube_imports(project_id)
+            except (OSError, ValueError):
+                continue
+        for path in base.glob("*/preproduction/bilibili-import/runs.json"):
+            try:
+                if not path.is_symlink():
+                    project_id = path.parents[2].name
+                    bilibili_runs.recover(project_id)
+                    reconcile_bilibili_imports(project_id)
             except (OSError, ValueError):
                 continue
 
@@ -779,6 +846,177 @@ def create_preproduction_router(
             if temporary is not None: temporary.unlink(missing_ok=True)
             shutil.rmtree(staging, ignore_errors=True)
             youtube_cancel_events.pop(run_id, None)
+
+    def bilibili_error(error: BilibiliImportError) -> None:
+        messages = {
+            "requires_login": "该 B站内容需要已授权会话；系统不会自动登录、读取浏览器 Cookie 或绕过访问限制。",
+            "temporarily_unavailable": "B站暂时不可用或站点适配已变化，请稍后重试。",
+            "unsupported_link": "该链接或内容受会员、私密、合集、互动、直播、DRM 或其他不支持的访问限制，不能导入。",
+        }
+        statuses = {"requires_login": 409, "temporarily_unavailable": 503, "unsupported_link": 422}
+        fail(f"bilibili_{error.status}", messages[error.status], statuses[error.status])
+
+    def bilibili_cookie(required: bool) -> str | None:
+        if not required: return None
+        try:
+            cookie = (bilibili_session_store or SystemBilibiliCookieStore()).get()
+        except Exception:
+            cookie = None
+        if not cookie: raise BilibiliImportError("requires_login")
+        return cookie
+
+    def bilibili_probe(body: BilibiliImportRequest, *, cancelled=None):
+        canonical = normalize_bilibili_url(body.url) or bilibili_short_link_resolver(body.url)
+        if canonical is None: raise BilibiliImportError("unsupported_link")
+        try:
+            probe = bilibili_adapter.probe
+            kwargs = {"cookie": bilibili_cookie(body.useSession)}
+            if cancelled is not None and "cancelled" in inspect.signature(probe).parameters: kwargs["cancelled"] = cancelled
+            result = probe(canonical, **kwargs)
+        except (BilibiliImportError, YoutubeImportCancelled):
+            raise
+        except Exception:
+            raise BilibiliImportError("temporarily_unavailable") from None
+        if result.status != "available" or result.canonical_url != canonical.split("?", 1)[0]:
+            raise BilibiliImportError("temporarily_unavailable")
+        if not result.parts or any(part.duration is not None and part.duration > MAX_BILIBILI_SOURCE_DURATION_SECONDS for part in result.parts):
+            raise BilibiliImportError("unsupported_link")
+        return result
+
+    def selected_bilibili_part(body: BilibiliImportRequest, probe) -> Any:
+        url_part = bilibili_url_part(body.url)
+        if body.part is not None and url_part is not None and body.part != url_part:
+            raise BilibiliImportError("unsupported_link")
+        selected = body.part if body.part is not None else url_part
+        if selected is None and len(probe.parts) != 1:
+            fail("bilibili_part_selection_required", "该视频有多个分P；请明确选择一个分P，系统不会自动下载合集或默认第一集。", 422)
+        selected = selected or 1
+        part = next((candidate for candidate in probe.parts if candidate.number == selected), None)
+        if part is None: raise BilibiliImportError("unsupported_link")
+        return part
+
+    @router.get("/bilibili/disclosure")
+    def bilibili_disclosure(project_id: str):
+        project_for(project_id)
+        return bilibili_external_request()
+
+    @router.post("/bilibili/probe")
+    def probe_bilibili(project_id: str, body: BilibiliImportRequest):
+        project_for(project_id)
+        if not body.externalRequestAccepted:
+            fail("bilibili_external_request_confirmation_required", "请先确认将向 B站 发起元数据请求。", 422)
+        try:
+            probe = bilibili_probe(body)
+        except BilibiliImportError as error:
+            bilibili_error(error)
+        return {
+            "canonicalUrl": probe.canonical_url, "videoId": probe.video_id, "title": probe.title, "uploader": probe.uploader,
+            "parts": [{"number": part.number, "cid": part.cid, "title": part.title, "durationSeconds": part.duration} for part in probe.parts],
+            "status": "available", "adapter": {"id": "yt-dlp", "version": str(getattr(bilibili_adapter, "version", BILIBILI_ADAPTER["version"]))},
+            "externalRequest": bilibili_external_request(), "lastRealVerificationAt": None,
+        }
+
+    @router.post("/bilibili/import")
+    def import_bilibili(project_id: str, body: BilibiliImportRequest):
+        project_for(project_id)
+        if not body.rightsConfirmed:
+            fail("bilibili_video_rights_required", "请先确认你拥有该 B站视频的使用权，再导入项目。", 422)
+        if not body.externalRequestAccepted:
+            fail("bilibili_external_request_confirmation_required", "请先确认将向 B站 发起下载请求。", 422)
+        try:
+            probe = bilibili_probe(body)
+            part = selected_bilibili_part(body, probe)
+        except BilibiliImportError as error:
+            bilibili_error(error)
+        snapshot = {"url": probe.canonical_url, "part": part.number, "role": body.role, "useSession": body.useSession, "adapter": dict(BILIBILI_ADAPTER)}
+        key = body.idempotencyKey.strip() or freeze_run_input(snapshot).fingerprint
+        try:
+            run, created = bilibili_runs.create_or_reuse(project_id, snapshot, key)
+        except OSError:
+            fail("bilibili_run_storage_failed", "B站导入运行无法保存。", 503)
+        if created:
+            bilibili_cancel_events[run["id"]] = Event()
+            if not compute_queue.submit("bilibili-import", run["id"], lambda run_id: execute_bilibili_import(project_id, run_id), project_id=project_id):
+                bilibili_runs.transition(project_id, run["id"], status="failed", error="queue_unavailable")
+                fail("bilibili_queue_unavailable", "B站导入队列不可用，请稍后重试。", 503)
+        return JSONResponse(status_code=202, content={"run": public_bilibili_import_run(run)})
+
+    @router.get("/bilibili/imports/{run_id}")
+    def get_bilibili_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try: return {"run": public_bilibili_import_run(bilibili_runs.get(project_id, run_id))}
+        except (KeyError, ValueError): fail("bilibili_import_not_found", "B站导入运行不存在。", 404)
+        except OSError: fail("bilibili_run_storage_failed", "B站导入运行无法读取。", 503)
+
+    @router.post("/bilibili/imports/{run_id}/cancel")
+    def cancel_bilibili_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try:
+            with source_lock or nullcontext(), lock: run = bilibili_runs.request_cancel(project_id, run_id)
+        except KeyError: fail("bilibili_import_not_found", "B站导入运行不存在。", 404)
+        except ValueError: fail("bilibili_import_not_cancellable", "该 B站导入运行当前不能取消。", 409)
+        if (event := bilibili_cancel_events.get(run_id)) is not None: event.set()
+        if run["status"] == "cancelled": shutil.rmtree(bilibili_runs.staging_dir(project_id, run_id), ignore_errors=True)
+        return JSONResponse(status_code=202, content={"run": public_bilibili_import_run(run)})
+
+    @router.post("/bilibili/imports/{run_id}/retry")
+    def retry_bilibili_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try: run, created = bilibili_runs.retry(project_id, run_id)
+        except KeyError: fail("bilibili_import_not_found", "B站导入运行不存在。", 404)
+        except ValueError: fail("bilibili_import_not_retryable", "该 B站导入运行当前不能重试。", 409)
+        except OSError: fail("bilibili_run_storage_failed", "B站导入运行无法保存。", 503)
+        if created:
+            bilibili_cancel_events[run["id"]] = Event()
+            if not compute_queue.submit("bilibili-import", run["id"], lambda candidate: execute_bilibili_import(project_id, candidate), project_id=project_id):
+                bilibili_runs.transition(project_id, run["id"], status="failed", error="queue_unavailable")
+                fail("bilibili_queue_unavailable", "B站导入队列不可用，请稍后重试。", 503)
+        return JSONResponse(status_code=202, content={"run": public_bilibili_import_run(run)})
+
+    def execute_bilibili_import(project_id: str, run_id: str) -> None:
+        temporary: Path | None = None
+        staging = bilibili_runs.staging_dir(project_id, run_id)
+        event = bilibili_cancel_events.setdefault(run_id, Event())
+        try:
+            run = bilibili_runs.get(project_id, run_id)
+            if run["status"] == "cancelled" or event.is_set():
+                bilibili_runs.transition(project_id, run_id, status="cancelled", error="cancelled"); return
+            if run["status"] != "queued": return
+            bilibili_runs.transition(project_id, run_id, status="running", error=None)
+            body = BilibiliImportRequest(url=run["input"]["url"], part=run["input"]["part"], role=run["input"]["role"], rightsConfirmed=True, externalRequestAccepted=True, useSession=bool(run["input"].get("useSession", False)))
+            probe = bilibili_probe(body, cancelled=event.is_set)
+            part = selected_bilibili_part(body, probe)
+            if event.is_set(): raise YoutubeImportCancelled()
+            staging.mkdir(parents=True, exist_ok=True)
+            descriptor, name = tempfile.mkstemp(dir=staging, prefix=".bilibili-", suffix=".mp4"); os.close(descriptor); temporary = Path(name)
+            download = bilibili_adapter.download
+            accepts_cancelled = "cancelled" in inspect.signature(download).parameters
+            downloaded = Path(download(probe, part, temporary, cookie=bilibili_cookie(body.useSession), **({"cancelled": event.is_set} if accepts_cancelled else {})))
+            if event.is_set(): raise YoutubeImportCancelled()
+            if downloaded.parent.resolve(strict=True) != staging.resolve(strict=True) or not downloaded.name.startswith(".bilibili-"):
+                raise OSError("unmanaged Bilibili staging output")
+            if downloaded != temporary: temporary.unlink(missing_ok=True); temporary = downloaded
+            metadata = probe_downloaded_bilibili_video(temporary, ffprobe_path=ffprobe_path, ffmpeg_path=ffmpeg_path)
+            if event.is_set(): raise YoutubeImportCancelled()
+            provenance = bilibili_video_source(probe=probe, part=part, metadata=metadata, content_hash=hashlib.sha256(temporary.read_bytes()).hexdigest(), confirmed_at=utc_timestamp())
+            with source_lock or nullcontext(), lock:
+                if event.is_set(): raise YoutubeImportCancelled()
+                installed = project_assets.install_platform_video(project_id, source=temporary, staging_root=staging, platform="bilibili", probe=probe,
+                                                                    role=run["input"]["role"], metadata=metadata, confirmed_at=utc_timestamp(), provenance=provenance)
+                bilibili_runs.transition(project_id, run_id, status="completed", error=None, uploadedAssetId=installed["id"])
+                temporary = None
+        except YoutubeImportCancelled:
+            bilibili_runs.transition(project_id, run_id, status="cancelled", error="cancelled")
+        except BilibiliImportError as error:
+            bilibili_runs.transition(project_id, run_id, status="failed", error="bilibili_" + error.status)
+        except ValueError:
+            bilibili_runs.transition(project_id, run_id, status="failed", error="bilibili_download_invalid")
+        except Exception:
+            bilibili_runs.transition(project_id, run_id, status="failed", error="bilibili_temporarily_unavailable")
+        finally:
+            if temporary is not None: temporary.unlink(missing_ok=True)
+            shutil.rmtree(staging, ignore_errors=True)
+            bilibili_cancel_events.pop(run_id, None)
 
     @router.post("/assets")
     async def upload_asset(project_id: str, role: Literal["character", "scene", "motion", "audio", "reference"] = Query(...), file: UploadFile = File(...), resultForShot: Optional[str] = Query(None), revision: Optional[int] = Query(None), derivation: Optional[str] = Form(None), rightsConfirmed: bool = Form(False)):

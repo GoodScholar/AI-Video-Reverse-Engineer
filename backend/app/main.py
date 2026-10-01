@@ -2504,6 +2504,8 @@ def create_app(
         data_dir, ensure_project_exists, compute_jobs,
         ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, source_lock=project_write_lock,
     ))
+    from .bilibili_session_api import create_bilibili_session_router
+    app.include_router(create_bilibili_session_router())
     from .image_generation import ImageGenerationConfigurations, ImageGenerationService, ImageGenerationSettings
     from .image_generation_api import create_image_generation_router
     image_generation_configurations = ImageGenerationConfigurations(

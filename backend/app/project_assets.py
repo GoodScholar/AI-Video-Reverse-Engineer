@@ -371,18 +371,73 @@ class ProjectAssets:
                     target.unlink()
             marker.unlink()
 
-    def install_youtube_video(
+    def install_platform_video(
         self,
         project_id: str,
         *,
         source: Path,
         staging_root: Path,
-        probe: YoutubeProbe,
+        platform: str,
+        probe: Any,
         role: str,
         metadata: Mapping[str, Any],
         confirmed_at: str,
+        provenance: Mapping[str, Any],
     ) -> dict[str, Any]:
-        """Install a checked YouTube download once by the immutable platform identity."""
+        """Atomically install one checked platform download by its immutable identity."""
+        if platform not in {"youtube", "bilibili"}:
+            raise ValueError("不支持的视频平台")
+        source = Path(source)
+        try:
+            if source.parent.resolve(strict=True) != Path(staging_root).resolve(strict=True) or not source.name.startswith(f".{platform}-"):
+                raise OSError("平台视频必须来自受管下载暂存区")
+        except OSError:
+            raise OSError("平台视频必须来自受管下载暂存区") from None
+        _regular_file(source)
+        content_hash = _sha256(source)
+        provenance = dict(provenance)
+        if provenance.get("contentHash") != content_hash:
+            raise LocalVideoInstallationConflict("平台视频内容哈希不一致")
+        with _result_install_lock(self._store.root):
+            state = self._store.load(project_id)
+            matches = [asset for asset in self.records_from(state)
+                       if isinstance(asset.get("videoSource"), dict)
+                       and asset["videoSource"].get("sourceId") == provenance["sourceId"]]
+            if len(matches) > 1:
+                raise LocalVideoInstallationConflict("同一平台视频对应多个项目素材")
+            if matches:
+                existing = matches[0]
+                try:
+                    stored_hash = _sha256(self.file(project_id, existing))
+                except (OSError, ValueError, KeyError):
+                    raise LocalVideoInstallationConflict("已导入的平台视频文件不可用") from None
+                if existing.get("sha256") != content_hash or stored_hash != content_hash:
+                    raise LocalVideoInstallationConflict("已导入的平台视频内容不一致")
+                return existing
+            asset_id = self.new_id(f"{platform}-video")
+            filename = asset_id + ".mp4"
+            record = {
+                "id": asset_id, "assetVersionId": asset_id + "-v1", "name": provenance["metadata"]["title"],
+                "kind": "video", "role": role, "file": filename, "sha256": content_hash,
+                "duration": metadata["duration"], "width": metadata["width"], "height": metadata["height"],
+                "videoSource": provenance,
+            }
+            marker = self._store.path(project_id, "assets", f"{platform}-video-{asset_id}.pending.json")
+            _write_local_video_marker(marker, {"version": 1, "assetId": asset_id, "file": filename})
+            try:
+                with self.install(project_id, state, source, record, move=True):
+                    if _sha256(self._store.path(project_id, "assets", filename)) != content_hash:
+                        raise LocalVideoInstallationConflict("平台视频安装后内容校验失败")
+                    state["revision"] += 1
+                    self._store.save(project_id, state)
+            finally:
+                marker.unlink(missing_ok=True)
+            return record
+
+    def install_youtube_video(
+        self, project_id: str, *, source: Path, staging_root: Path, probe: YoutubeProbe, role: str,
+        metadata: Mapping[str, Any], confirmed_at: str,
+    ) -> dict[str, Any]:
         source = Path(source)
         try:
             if source.parent.resolve(strict=True) != Path(staging_root).resolve(strict=True) or not source.name.startswith(".youtube-"):
@@ -391,61 +446,32 @@ class ProjectAssets:
             raise OSError("YouTube 视频必须来自受管下载暂存区") from None
         _regular_file(source)
         content_hash = _sha256(source)
-        provenance = youtube_video_source(probe=probe, metadata=dict(metadata), content_hash=content_hash, confirmed_at=confirmed_at)
-        with _result_install_lock(self._store.root):
-            state = self._store.load(project_id)
-            matches = [asset for asset in self.records_from(state)
-                       if isinstance(asset.get("videoSource"), dict)
-                       and asset["videoSource"].get("sourceId") == provenance["sourceId"]]
-            if len(matches) > 1:
-                raise LocalVideoInstallationConflict("同一 YouTube 视频对应多个项目素材")
-            if matches:
-                existing = matches[0]
-                try:
-                    stored_hash = _sha256(self.file(project_id, existing))
-                except (OSError, ValueError, KeyError):
-                    raise LocalVideoInstallationConflict("已导入的 YouTube 视频文件不可用") from None
-                if existing.get("sha256") != content_hash or stored_hash != content_hash:
-                    raise LocalVideoInstallationConflict("已导入的 YouTube 视频内容不一致")
-                return existing
-            asset_id = self.new_id("youtube-video")
-            filename = asset_id + ".mp4"
-            record = {
-                "id": asset_id, "assetVersionId": asset_id + "-v1", "name": provenance["metadata"]["title"],
-                "kind": "video", "role": role, "file": filename, "sha256": content_hash,
-                "duration": metadata["duration"], "width": metadata["width"], "height": metadata["height"],
-                "videoSource": provenance,
-            }
-            marker = self._store.path(project_id, "assets", f"youtube-video-{asset_id}.pending.json")
-            _write_local_video_marker(marker, {"version": 1, "assetId": asset_id, "file": filename})
-            try:
-                with self.install(project_id, state, source, record, move=True):
-                    if _sha256(self._store.path(project_id, "assets", filename)) != content_hash:
-                        raise LocalVideoInstallationConflict("YouTube 视频安装后内容校验失败")
-                    state["revision"] += 1
-                    self._store.save(project_id, state)
-            finally:
-                marker.unlink(missing_ok=True)
-            return record
+        return self.install_platform_video(
+            project_id, source=source, staging_root=staging_root, platform="youtube", probe=probe, role=role,
+            metadata=metadata, confirmed_at=confirmed_at,
+            provenance=youtube_video_source(probe=probe, metadata=dict(metadata), content_hash=content_hash, confirmed_at=confirmed_at),
+        )
 
-    def recover_youtube_video_installations(self, project_id: str) -> None:
+    def recover_platform_video_installations(self, project_id: str, platform: str) -> None:
         """Remove unregistered platform-download files after a process restart."""
+        if platform not in {"youtube", "bilibili"}:
+            raise ValueError("不支持的视频平台")
         assets_dir = self._store.path(project_id, "assets")
         if not assets_dir.exists():
             return
         if assets_dir.is_symlink() or not assets_dir.is_dir():
             raise OSError("项目素材目录无效")
         records = self.index_from(self._store.load(project_id))
-        for marker in assets_dir.glob("youtube-video-*.pending.json"):
+        for marker in assets_dir.glob(f"{platform}-video-*.pending.json"):
             if marker.is_symlink() or not marker.is_file():
-                raise OSError("YouTube 视频安装记录无效")
+                raise OSError("平台视频安装记录无效")
             try:
                 data = json.loads(marker.read_text(encoding="utf-8"))
                 if set(data) != {"version", "assetId", "file"} or data["version"] != 1:
                     raise ValueError
                 asset_id, filename = validate_storage_id(data["assetId"]), validate_storage_id(data["file"])
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-                raise OSError("YouTube 视频安装记录无效") from error
+                raise OSError("平台视频安装记录无效") from error
             target = self._store.path(project_id, "assets", filename)
             asset = records.get(asset_id)
             if asset is None or asset.get("file") != filename:
@@ -453,6 +479,12 @@ class ProjectAssets:
                     _regular_file(target)
                     target.unlink()
             marker.unlink()
+
+    def recover_youtube_video_installations(self, project_id: str) -> None:
+        self.recover_platform_video_installations(project_id, "youtube")
+
+    def recover_bilibili_video_installations(self, project_id: str) -> None:
+        self.recover_platform_video_installations(project_id, "bilibili")
 
     def _local_video_marker(self, project_id: str, asset_id: str) -> Path:
         return self._store.path(project_id, "assets", f"local-video-{asset_id}.pending.json")
