@@ -65,7 +65,7 @@ def test_enabled_packaging_blocks_an_unanalysed_visible_clip_but_not_a_nonoverla
 
 
 @pytest.mark.parametrize('mode', ['center', 'manual', 'replace'])
-def test_preflight_allows_explicit_risk_with_only_observed_partial_subject_samples(tmp_path, mode):
+def test_preflight_blocks_explicit_risk_with_only_partial_real_frame_coverage(tmp_path, mode):
     from app.montage_packaging import default_packaging
     from app.montage_reframe import pending_reframe
 
@@ -78,7 +78,7 @@ def test_preflight_allows_explicit_risk_with_only_observed_partial_subject_sampl
     }]
     assert client.put(BASE, json=draft).status_code == 200
     reframe = pending_reframe(target_width=1280, target_height=720, reason='历史分析中断')
-    reframe.update(sourceWidth=64, sourceHeight=48, samples=[{
+    reframe.update(sourceWidth=64, sourceHeight=48, frameDurationSeconds=.04, samples=[{
         'timeSeconds': .5, 'boxes': [{'x': .35, 'y': .2, 'width': .3, 'height': .6,
                                       'label': 'person', 'confidence': .9}],
         'center': {'x': .5, 'y': .5}, 'confidence': .9,
@@ -93,7 +93,9 @@ def test_preflight_allows_explicit_risk_with_only_observed_partial_subject_sampl
     state = store.load('p1')
     state['tracks'][0]['clips'][0]['reframe'] = reframe
     store.save('p1', state)
-    assert client.post(BASE + '/preflight', json={'revision': 1, 'format': 'mp4'}).json()['ready']
+    result = client.post(BASE + '/preflight', json={'revision': 1, 'format': 'mp4'}).json()
+    assert not result['ready']
+    assert any('未完整覆盖实际帧区间' in issue['message'] for issue in result['issues'])
 
 
 @pytest.mark.parametrize('sample_time', [None, .1])
