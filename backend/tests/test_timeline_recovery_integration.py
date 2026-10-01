@@ -16,7 +16,7 @@ def test_real_cancel_corrupt_source_and_retry(tmp_path):
             return response
         pid = call('post', '/api/projects', json={'name': '取消与损坏恢复'}).json()['id']
         base = f'/api/projects/{pid}'
-        prep = call('post', base + '/preproduction/assets?role=motion', files={'file': ('source.mp4', source.read_bytes(), 'video/mp4')}).json()
+        prep = call('post', base + '/preproduction/assets?role=motion', data={'rightsConfirmed':'true'}, files={'file': ('source.mp4', source.read_bytes(), 'video/mp4')}).json()
         aid = prep['assets'][0]['id']
         tl = base + '/timeline'
         clips = [{'id': f'c{i}', 'assetId': aid, 'start': i * 5, 'inPoint': 0, 'duration': 5, 'speed': 1, 'volume': 1, 'fadeIn': 0, 'fadeOut': 0} for i in range(60)]

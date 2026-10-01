@@ -45,6 +45,10 @@ const kindLabels: Record<NodeKind, string> = {
 const statusLabels = { pending: "待运行", queued: "已排队", running: "运行中", completed: "已完成", failed: "错误", stale: "已过期" } as const;
 const activeStatuses = new Set(["queued", "running"]);
 
+function isVideoFile(file: File) {
+  return file.type.startsWith("video/") || /\.(mp4|mov|webm)$/i.test(file.name);
+}
+
 function errorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
 }
@@ -328,8 +332,10 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
   async function upload(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     if (!file || busy || dirty) return;
+    const rightsConfirmed = !isVideoFile(file) || window.confirm("请确认：你拥有该本地视频的使用权，并同意将其导入当前项目。取消不会上传或登记素材。");
+    if (!rightsConfirmed) { event.target.value = ""; return; }
     setBusy("upload"); setError("");
-    try { accept(await uploadPreproductionAsset(project.id, uploadRole, file)); }
+    try { accept(await uploadPreproductionAsset(project.id, uploadRole, file, undefined, isVideoFile(file))); }
     catch (reason) { setError(errorMessage(reason, "无法上传素材。")); }
     finally { event.target.value = ""; if (mounted.current) setBusy(null); }
   }
@@ -338,8 +344,9 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
     const input = event.currentTarget;
     const file = input.files?.[0];
     if (!file || !workspace || !selectedShot || busy || dirty) return;
+    if (!window.confirm("请确认：你拥有该本地视频的使用权，并同意将其导入当前项目。取消不会上传或登记素材。")) { input.value = ""; return; }
     setBusy("result"); setError("");
-    try { accept(await uploadShotResult(project.id, selectedShot.id, workspace.revision, file)); }
+    try { accept(await uploadShotResult(project.id, selectedShot.id, workspace.revision, file, true)); }
     catch (reason) { if (mounted.current) setError(errorMessage(reason, "无法上传镜头结果。")); }
     finally { input.value = ""; if (mounted.current) setBusy(null); }
   }

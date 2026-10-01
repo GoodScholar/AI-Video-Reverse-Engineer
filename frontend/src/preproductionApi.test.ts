@@ -8,6 +8,7 @@ import {
   runPreproductionNode,
   savePreproductionWorkspace,
   saveCanvasLayout,
+  uploadPreproductionAsset,
   type PreproductionWorkspace,
 } from "./preproductionApi";
 
@@ -111,6 +112,16 @@ describe("preproductionApi", () => {
       "/api/projects/project-001/preproduction/import-shots",
       expect.objectContaining({ headers: { "Content-Type": "application/json", "X-AIVRE-Intent": "semantic-analysis" } }),
     );
+  });
+
+  it("本地视频上传仅在确认使用权后声明确认字段", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(response(workspace));
+    const file = new File(["video"], "素材.mp4", { type: "video/mp4" });
+
+    await uploadPreproductionAsset("project-001", "reference", file, undefined, true);
+
+    const body = vi.mocked(fetch).mock.calls[0][1]?.body as FormData;
+    expect(body.get("rightsConfirmed")).toBe("true");
   });
 
   it("打包失败时读取后端检查错误而不下载旧结果", async () => {

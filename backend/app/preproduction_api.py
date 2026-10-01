@@ -19,7 +19,7 @@ from typing import Any, Callable, Literal, Optional
 from urllib.parse import quote
 from uuid import uuid4
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.background import BackgroundTask
@@ -41,12 +41,14 @@ from .project_assets import (
     AssetInUseError,
     AssetReferencesUnavailableError,
     AssetStateConflict,
+    LocalVideoInstallationConflict,
     ProjectAssets,
 )
 from .preproduction_handoff import render_handoff
 from .preproduction_nodes import FFMPEG_TIMEOUT_SECONDS, MAX_MEDIA_DURATION_SECONDS, MAX_OUTPUT_DIMENSION, MAX_OUTPUT_PIXELS
 from .reference_media_storage import managed_reference_media_is_safe, resolve_reference_media_path
 from .reference_video import validate_storage_id
+from .video_sources import utc_timestamp
 from .shot_production import MAX_RESULT_VERSIONS, NODE_KINDS, ShotProduction, ShotProductionError, StepSource, public_result_versions
 from .shot_organization import ShotOrganization, ShotOrganizationError
 from .preproduction_transaction import WorkspaceTransaction, WorkspaceTransactionError
@@ -209,6 +211,7 @@ def create_preproduction_router(
     def state_for(project_id: str) -> dict[str, Any]:
         try:
             workspace_transaction.recover(project_id)
+            project_assets.recover_local_video_installations(project_id)
             return store.load(project_id)
         except (OSError, ValueError):
             fail("preproduction_storage_invalid", "前置工作台状态无法读取。", 503)
@@ -319,6 +322,7 @@ def create_preproduction_router(
                     continue
                 project_id = path.parents[1].name
                 workspace_transaction.recover(project_id)
+                project_assets.recover_local_video_installations(project_id)
                 state = store.load(project_id)
                 changed = False
                 for shot in state["shots"]:
@@ -526,7 +530,7 @@ def create_preproduction_router(
             return response(project_id, state)
 
     @router.post("/assets")
-    async def upload_asset(project_id: str, role: Literal["character", "scene", "motion", "audio", "reference"] = Query(...), file: UploadFile = File(...), resultForShot: Optional[str] = Query(None), revision: Optional[int] = Query(None)):
+    async def upload_asset(project_id: str, role: Literal["character", "scene", "motion", "audio", "reference"] = Query(...), file: UploadFile = File(...), resultForShot: Optional[str] = Query(None), revision: Optional[int] = Query(None), rightsConfirmed: bool = Form(False)):
         project_for(project_id)
         suffix = Path(file.filename or "").suffix.lower()
         if suffix not in _MEDIA_SUFFIXES:
@@ -542,6 +546,33 @@ def create_preproduction_router(
                 metadata = _probe_media(temporary, suffix, ffprobe_path, ffmpeg_path)
                 if resultForShot is not None and metadata["kind"] != "video":
                     fail("preproduction_result_invalid", "镜头结果必须上传视频。", 422)
+                if metadata["kind"] == "video" and not rightsConfirmed:
+                    fail("local_video_rights_required", "请先确认你拥有该本地视频的使用权，再导入项目。", 422)
+                if metadata["kind"] == "video":
+                    try:
+                        installed = project_assets.install_local_video(
+                            project_id,
+                            source=temporary,
+                            staging_root=root,
+                            original_name=file.filename or "素材.mp4",
+                            role=role,
+                            metadata=metadata,
+                            confirmed_at=utc_timestamp(),
+                            apply=(
+                                lambda latest, asset: decide(
+                                    production_for(project_id, latest).attach_result,
+                                    resultForShot,
+                                    asset["id"],
+                                )
+                            ) if resultForShot is not None else None,
+                            deduplicate=resultForShot is None,
+                        )
+                    except LocalVideoInstallationConflict as error:
+                        fail("local_video_source_conflict", str(error), 409)
+                    except OSError:
+                        fail("preproduction_storage_failed", "本地视频未能安全入库，请检查存储后重试。", 503)
+                    latest = state_for(project_id)
+                    return {**response(project_id, latest), "uploadedAssetId": installed["id"]}
                 asset_id = project_assets.new_id()
                 name = asset_id + suffix
                 record = {"id": asset_id, "name": _display_name(file.filename), "kind": metadata["kind"], "role": role,
@@ -553,7 +584,7 @@ def create_preproduction_router(
                         state["revision"] += 1
                     save(project_id, state)
                 temporary = None
-                return response(project_id, state)
+                return {**response(project_id, state), "uploadedAssetId": asset_id}
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)

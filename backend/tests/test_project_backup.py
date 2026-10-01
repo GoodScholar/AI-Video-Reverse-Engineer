@@ -130,7 +130,7 @@ def test_media_candidates_timeline_and_artifact_urls_roundtrip(tmp_path):
         state = client.get(prep_url).json()
         state = client.put(prep_url,json={'revision':state['revision'],'brief':state['brief'],'shots':[{'id':'s1','title':'保留镜头','duration':1,'prompt':'不改动提示词','assetIds':[],'nodes':[]}]}).json()
         for _ in range(2):
-            r = client.post(prep_url+f"/assets?role=motion&resultForShot=s1&revision={state['revision']}",files={'file':('result.mp4',media.read_bytes(),'video/mp4')})
+            r = client.post(prep_url+f"/assets?role=motion&resultForShot=s1&revision={state['revision']}",data={'rightsConfirmed':'true'},files={'file':('result.mp4',media.read_bytes(),'video/mp4')})
             assert r.status_code == 200, r.text
             state = r.json()
         timeline_url = f'/api/projects/{pid}/timeline'
@@ -226,7 +226,7 @@ def test_cancelled_render_worker_must_exit_before_backup(tmp_path, monkeypatch):
     with TestClient(create_app(data_dir=tmp_path / 'data')) as client:
         pid = create(client)
         prep = f'/api/projects/{pid}/preproduction'
-        asset = client.post(prep + '/assets?role=motion', files={'file': ('input.mp4', media.read_bytes(), 'video/mp4')}).json()['assets'][0]
+        asset = client.post(prep + '/assets?role=motion', data={'rightsConfirmed':'true'}, files={'file': ('input.mp4', media.read_bytes(), 'video/mp4')}).json()['assets'][0]
         from test_timeline_api import _workspace
         draft = _workspace(); draft['tracks'][0]['clips'][0]['assetId'] = asset['id']
         timeline = f'/api/projects/{pid}/timeline'

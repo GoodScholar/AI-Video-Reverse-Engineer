@@ -25,7 +25,7 @@ def test_local_workflow_from_upload_to_restore_and_cleanup(tmp_path):
         state = call('get', prep).json()
         state = call('put', prep, json={'revision': state['revision'], 'brief': state['brief'], 'shots': [{'id': 's1', 'title': '验收镜头', 'duration': 2, 'prompt': '', 'assetIds': [], 'nodes': []}]}).json()
         for _ in range(2):
-            state = call('post', prep + f'/assets?role=motion&resultForShot=s1&revision={state["revision"]}', files={'file': ('candidate.mp4', video.read_bytes(), 'video/mp4')}).json()
+            state = call('post', prep + f'/assets?role=motion&resultForShot=s1&revision={state["revision"]}', data={'rightsConfirmed': 'true'}, files={'file': ('candidate.mp4', video.read_bytes(), 'video/mp4')}).json()
         old, adopted = [item['assetId'] for item in state['shots'][0]['resultVersions']]
         state = call('put', prep + '/assets/' + adopted, json={'revision': state['revision'], 'name': '采用结果', 'notes': '保留节奏'}).json()
         state = call('post', prep + '/assets?role=audio', files={'file': ('voice.wav', audio.read_bytes(), 'audio/wav')}).json()

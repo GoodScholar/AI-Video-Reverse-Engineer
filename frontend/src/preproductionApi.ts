@@ -29,6 +29,20 @@ export type PreproductionAsset = {
   duration?: number;
   width?: number;
   height?: number;
+  assetVersionId?: string;
+  sha256?: string;
+  videoSource?: {
+    schemaVersion: 1;
+    sourceId: string;
+    sourceType: "local" | "youtube" | "bilibili" | "douyin" | "xiaohongshu" | "kuaishou";
+    originalReference: string;
+    adapter: { id: string; version: string };
+    probe: { durationSeconds: number; width: number; height: number };
+    rightsConfirmation?: { confirmedAt: string };
+    contentHash: string;
+    verifiedAt: string;
+    status: "available" | "requires_login" | "temporarily_unavailable" | "unsupported_link";
+  };
 };
 
 export type PreproductionNode = {
@@ -190,9 +204,10 @@ export function saveCanvasLayout(projectId: string, layout: CanvasLayout): Promi
   }, "无法保存画布布局，请重新读取后重试。");
 }
 
-export function uploadPreproductionAsset(projectId: string, role: AssetRole, file: File): Promise<PreproductionWorkspace> {
+export function uploadPreproductionAsset(projectId: string, role: AssetRole, file: File, _ignored?: unknown, rightsConfirmed = false): Promise<PreproductionWorkspace> {
   const data = new FormData();
   data.append("file", file);
+  if (rightsConfirmed) data.append("rightsConfirmed", "true");
   return request(`${baseUrl(projectId)}/assets?role=${encodeURIComponent(role)}`, { method: "POST", body: data }, "无法上传素材，请重试。");
 }
 
@@ -233,9 +248,10 @@ export async function downloadPreproductionPackage(projectId: string, revision: 
   URL.revokeObjectURL(url);
 }
 
-export function uploadShotResult(projectId: string, shotId: string, revision: number, file: File): Promise<PreproductionWorkspace> {
+export function uploadShotResult(projectId: string, shotId: string, revision: number, file: File, rightsConfirmed = false): Promise<PreproductionWorkspace> {
   const data = new FormData();
   data.append("file", file);
+  if (rightsConfirmed) data.append("rightsConfirmed", "true");
   return request(`${baseUrl(projectId)}/assets?role=motion&resultForShot=${encodeURIComponent(shotId)}&revision=${revision}`, { method: "POST", body: data }, "无法上传镜头结果，请检查视频并重新读取方案。");
 }
 

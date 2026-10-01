@@ -489,7 +489,7 @@ def test_upload_validates_real_media_and_serves_only_owned_asset(tmp_path):
     corrupted[marker + 4:box_start + box_size] = b"\xff" * (box_size - 8)
     unreadable = client.post(BASE + "/assets?role=motion", files={"file": ("broken.mp4", bytes(corrupted), "video/mp4")})
     assert unreadable.status_code == 422
-    uploaded = client.post(BASE + "/assets?role=motion", files={"file": ("motion.mp4", valid.read_bytes(), "video/mp4")})
+    uploaded = client.post(BASE + "/assets?role=motion", data={"rightsConfirmed": "true"}, files={"file": ("motion.mp4", valid.read_bytes(), "video/mp4")})
     assert uploaded.status_code == 200, uploaded.text
     asset = uploaded.json()["assets"][0]
     assert asset["url"] == BASE + f"/assets/{asset['id']}/file"
@@ -501,7 +501,7 @@ def test_asset_metadata_and_delete_map_workspace_cas_conflicts_to_409(tmp_path, 
     client, _, _ = setup(tmp_path)
     media = tmp_path / "asset.mp4"
     make_video(media)
-    uploaded = client.post(BASE + "/assets?role=motion", files={"file": ("asset.mp4", media.read_bytes(), "video/mp4")})
+    uploaded = client.post(BASE + "/assets?role=motion", data={"rightsConfirmed": "true"}, files={"file": ("asset.mp4", media.read_bytes(), "video/mp4")})
     assert uploaded.status_code == 200, uploaded.text
     asset = uploaded.json()["assets"][0]
     revision = uploaded.json()["revision"]
@@ -773,12 +773,17 @@ def test_input_kind_and_shot_result_upload_are_persisted_and_versioned(tmp_path,
     unchanged = client.get(BASE).json()
     assert unchanged["revision"] == state["revision"] and unchanged["assets"] == state["assets"]
     source = tmp_path / f"project-files/{PROJECT_ID}/reference-media/ref-001.mp4"
-    result = client.post(BASE + f"/assets?role=motion&resultForShot=shot-result&revision={state['revision']}", files={"file": ("result.mp4", source.read_bytes(), "video/mp4")})
+    unconfirmed = client.post(BASE + f"/assets?role=motion&resultForShot=shot-result&revision={state['revision']}", files={"file": ("result.mp4", source.read_bytes(), "video/mp4")})
+    assert unconfirmed.status_code == 422
+    assert unconfirmed.json()["detail"]["code"] == "local_video_rights_required"
+    result = client.post(BASE + f"/assets?role=motion&resultForShot=shot-result&revision={state['revision']}", data={"rightsConfirmed": "true"}, files={"file": ("result.mp4", source.read_bytes(), "video/mp4")})
     assert result.status_code == 200, result.text
     final = result.json()
     assert final["shots"][0]["resultAssetId"] == final["assets"][-1]["id"]
+    assert final["assets"][-1]["assetVersionId"] == final["assets"][-1]["id"] + "-v1"
+    assert final["assets"][-1]["videoSource"]["sourceType"] == "local"
     assert project.referenceMedia.id == "ref-001"
-    assert client.post(BASE + f"/assets?role=motion&resultForShot=shot-result&revision={state['revision']}", files={"file": ("result.mp4", source.read_bytes(), "video/mp4")}).status_code == 409
+    assert client.post(BASE + f"/assets?role=motion&resultForShot=shot-result&revision={state['revision']}", data={"rightsConfirmed": "true"}, files={"file": ("result.mp4", source.read_bytes(), "video/mp4")}).status_code == 409
     invalid = {"revision": final["revision"], "brief": final["brief"], "shots": [{**final["shots"][0], "resultAssetId": "foreign-asset"}]}
     assert client.put(BASE, json=invalid).status_code == 422
     assert client.put(BASE, json={**invalid, "brief": {**final["brief"], "inputKind": "arbitrary"}}).status_code == 422
@@ -800,7 +805,7 @@ def test_result_versions_preserve_candidates_and_invalidate_review_on_plan_chang
         {"id": "versions", "duration": 1, "title": "镜头", "prompt": "原提示", "nodes": [], "assetIds": []}]}).json()
     media = (tmp_path / f"project-files/{PROJECT_ID}/reference-media/ref-001.mp4").read_bytes()
     for name in ('first.mp4', 'second.mp4'):
-        uploaded = client.post(BASE + f"/assets?role=motion&resultForShot=versions&revision={state['revision']}", files={"file": (name, media, "video/mp4")})
+        uploaded = client.post(BASE + f"/assets?role=motion&resultForShot=versions&revision={state['revision']}", data={"rightsConfirmed": "true"}, files={"file": (name, media, "video/mp4")})
         assert uploaded.status_code == 200, uploaded.text
         state = uploaded.json()
     versions = state['shots'][0]['resultVersions']
@@ -872,7 +877,7 @@ def test_candidate_external_note_is_owned_by_candidate_and_does_not_change_assoc
         {'id': 'shot-a', 'duration': 1, 'prompt': '雨景', 'assetIds': [], 'nodes': []}]}).json()
     media = (tmp_path / f'project-files/{PROJECT_ID}/reference-media/ref-001.mp4').read_bytes()
     state = client.post(BASE + f"/assets?role=motion&resultForShot=shot-a&revision={state['revision']}",
-                        files={'file': ('candidate.mp4', media, 'video/mp4')}).json()
+                        data={"rightsConfirmed": "true"}, files={'file': ('candidate.mp4', media, 'video/mp4')}).json()
     version = state['shots'][0]['resultVersions'][0]
     route = BASE + f"/shots/shot-a/results/{version['assetId']}/note"
     changed = client.put(route, json={'revision': state['revision'], 'note': '外部工具制作，参数未核实'})
@@ -891,7 +896,7 @@ def test_candidate_adoption_reason_stays_with_candidate_when_selection_changes(t
     media = (tmp_path / f'project-files/{PROJECT_ID}/reference-media/ref-001.mp4').read_bytes()
     for name in ('a.mp4', 'b.mp4'):
         state = client.post(BASE + f"/assets?role=motion&resultForShot=shot-a&revision={state['revision']}",
-                            files={'file': (name, media, 'video/mp4')}).json()
+                            data={"rightsConfirmed": "true"}, files={'file': (name, media, 'video/mp4')}).json()
     first, second = [version['assetId'] for version in state['shots'][0]['resultVersions']]
     route = BASE + f'/shots/shot-a/results/{first}/adoption-reason'
     saved = client.put(route, json={'revision': state['revision'], 'reason': '动作更自然'})
@@ -923,7 +928,7 @@ def test_candidate_historical_asset_remains_named_when_file_unavailable(tmp_path
         {'id': 'shot-a', 'duration': 1, 'prompt': '旧提示', 'assetIds': [asset['id']], 'nodes': []}]}).json()
     media = (tmp_path / f'project-files/{PROJECT_ID}/reference-media/ref-001.mp4').read_bytes()
     state = client.post(BASE + f"/assets?role=motion&resultForShot=shot-a&revision={state['revision']}",
-                        files={'file': ('candidate.mp4', media, 'video/mp4')}).json()
+                        data={"rightsConfirmed": "true"}, files={'file': ('candidate.mp4', media, 'video/mp4')}).json()
     association = state['shots'][0]['resultVersions'][0]['association']
     assert association['assets'][0]['name'] == asset['name']
     raw = json.loads((tmp_path / f'project-files/{PROJECT_ID}/preproduction/state.json').read_text())

@@ -25,6 +25,10 @@ function resultProvenance(asset: PreproductionAsset): ResultProvenance | null {
   };
 }
 
+function videoSource(asset: PreproductionAsset) {
+  return asset.videoSource?.sourceType === "local" ? asset.videoSource : null;
+}
+
 export function AssetManager({ projectId, asset, revision, blocked, onChanged, onBusy }: Props) {
   const [name, setName] = useState(asset.name);
   const [notes, setNotes] = useState(asset.notes ?? "");
@@ -36,6 +40,7 @@ export function AssetManager({ projectId, asset, revision, blocked, onChanged, o
   const [message, setMessage] = useState("");
   const live = useRef(true);
   const provenance = resultProvenance(asset);
+  const source = videoSource(asset);
   useEffect(() => { live.current = true; return () => { live.current = false; }; }, []);
   useEffect(() => {
     let active = true;
@@ -89,6 +94,13 @@ export function AssetManager({ projectId, asset, revision, blocked, onChanged, o
       {provenance.sha256 && <p>内容哈希 · {provenance.sha256}</p>}
       {provenance.inputFingerprint && <p>输入指纹 · {provenance.inputFingerprint}</p>}
       {provenance.inputSnapshot !== undefined && <details><summary>冻结输入快照</summary><pre>{JSON.stringify(provenance.inputSnapshot, null, 2)}</pre></details>}
+    </section>}
+    {source && <section aria-label="视频来源">
+      <h4>视频来源</h4>
+      <p>本地文件 · {source.originalReference} · {source.status === "available" ? "可用" : source.status}</p>
+      <p>适配器 · {source.adapter.id} {source.adapter.version} · 验证于 {source.verifiedAt}</p>
+      <p>内容哈希 · {source.contentHash}</p>
+      {source.rightsConfirmation && <p>使用权确认于 {source.rightsConfirmation.confirmedAt}</p>}
     </section>}
     <label>素材名称<input value={name} maxLength={255} disabled={busy} onChange={(event) => setName(event.target.value)} /></label>
     <label>素材备注<textarea value={notes} maxLength={4000} disabled={busy} onChange={(event) => setNotes(event.target.value)} /></label>

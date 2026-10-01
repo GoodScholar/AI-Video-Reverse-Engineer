@@ -5,6 +5,8 @@ import os
 import shutil
 import stat
 import hashlib
+import json
+import tempfile
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from pathlib import Path
@@ -15,6 +17,7 @@ from uuid import uuid4
 from .durable_runs import freeze_run_input
 from .preproduction import PreproductionStore
 from .reference_video import validate_storage_id
+from .video_sources import local_video_source
 
 
 ReferenceFacts = Callable[[str, str], list[dict[str, str]]]
@@ -42,6 +45,26 @@ class AssetStateConflict(Exception):
 
 class ResultInstallationConflict(ValueError):
     """A run/result identity already names different immutable media."""
+
+
+class LocalVideoInstallationConflict(ValueError):
+    """The same local-video identity names inconsistent stored media."""
+
+
+def _write_local_video_marker(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        descriptor, raw = tempfile.mkstemp(dir=path.parent, prefix=".local-video-", suffix=".part")
+        temporary = Path(raw)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as target:
+            json.dump(value, target, separators=(",", ":"))
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 class ProjectAssets:
@@ -239,6 +262,116 @@ class ProjectAssets:
                 state["revision"] += 1
                 self._store.save(project_id, state)
             return state
+
+    def install_local_video(
+        self,
+        project_id: str,
+        *,
+        source: Path,
+        staging_root: Path,
+        original_name: str,
+        role: str,
+        metadata: Mapping[str, Any],
+        confirmed_at: str,
+        apply: Callable[[dict[str, Any], dict[str, Any]], None] | None = None,
+        deduplicate: bool = True,
+    ) -> dict[str, Any]:
+        """Install an authorized local video once, keyed by immutable content."""
+        source = Path(source)
+        try:
+            if source.parent.resolve(strict=True) != Path(staging_root).resolve(strict=True) or not source.name.startswith(".preproduction-"):
+                raise OSError("本地视频必须来自受管上传暂存区")
+        except OSError:
+            raise OSError("本地视频必须来自受管上传暂存区") from None
+        _regular_file(source)
+        content_hash = _sha256(source)
+        provenance = local_video_source(
+            original_name=original_name,
+            metadata=metadata,
+            content_hash=content_hash,
+            confirmed_at=confirmed_at,
+        )
+        with _result_install_lock(self._store.root):
+            state = self._store.load(project_id)
+            matches = [asset for asset in self.records_from(state)
+                       if isinstance(asset.get("videoSource"), dict)
+                       and asset["videoSource"].get("sourceType") == "local"
+                       and asset["videoSource"].get("contentHash") == content_hash]
+            if deduplicate and len(matches) > 1:
+                raise LocalVideoInstallationConflict("同一内容哈希对应多个本地视频素材")
+            if deduplicate and matches:
+                existing = matches[0]
+                try:
+                    stored_hash = _sha256(self.file(project_id, existing))
+                except (OSError, ValueError, KeyError):
+                    raise LocalVideoInstallationConflict("已导入的本地视频文件不可用") from None
+                if existing.get("sha256") != content_hash or stored_hash != content_hash:
+                    raise LocalVideoInstallationConflict("已导入的本地视频内容不一致")
+                if apply is not None:
+                    apply(state, existing)
+                    self._store.save(project_id, state)
+                return existing
+            asset_id = self.new_id("local-video")
+            suffix = Path(original_name).suffix.lower()
+            filename = asset_id + (suffix if suffix and suffix[1:].isalnum() else ".mp4")
+            record = {
+                "id": asset_id,
+                "assetVersionId": asset_id + "-v1",
+                "name": provenance["originalReference"],
+                "kind": "video",
+                "role": role,
+                "file": filename,
+                "sha256": content_hash,
+                "duration": metadata["duration"],
+                "width": metadata["width"],
+                "height": metadata["height"],
+                "videoSource": provenance,
+            }
+            marker = self._local_video_marker(project_id, asset_id)
+            _write_local_video_marker(marker, {"version": 1, "assetId": asset_id, "file": filename})
+            try:
+                with self.install(project_id, state, source, record, move=True):
+                    if _sha256(self._store.path(project_id, "assets", filename)) != content_hash:
+                        raise LocalVideoInstallationConflict("本地视频安装后内容校验失败")
+                    if apply is None:
+                        state["revision"] += 1
+                    else:
+                        apply(state, record)
+                    self._store.save(project_id, state)
+            finally:
+                marker.unlink(missing_ok=True)
+            return record
+
+    def recover_local_video_installations(self, project_id: str) -> None:
+        """Finish or discard an interrupted local-video installation before serving state."""
+        assets_dir = self._store.path(project_id, "assets")
+        if not assets_dir.exists():
+            return
+        if assets_dir.is_symlink() or not assets_dir.is_dir():
+            raise OSError("项目素材目录无效")
+        state = self._store.load(project_id)
+        records = self.index_from(state)
+        for marker in assets_dir.glob("local-video-*.pending.json"):
+            if marker.is_symlink() or not marker.is_file():
+                raise OSError("本地视频安装记录无效")
+            try:
+                data = json.loads(marker.read_text(encoding="utf-8"))
+                if set(data) != {"version", "assetId", "file"} or data["version"] != 1:
+                    raise ValueError
+                asset_id = validate_storage_id(data["assetId"])
+                filename = validate_storage_id(data["file"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise OSError("本地视频安装记录无效") from error
+            target = self._store.path(project_id, "assets", filename)
+            asset = records.get(asset_id)
+            if asset is None or asset.get("file") != filename:
+                if target.exists():
+                    _regular_file(target)
+                    target.unlink()
+            marker.unlink()
+
+    def _local_video_marker(self, project_id: str, asset_id: str) -> Path:
+        return self._store.path(project_id, "assets", f"local-video-{asset_id}.pending.json")
 
     def install_run_result(
         self,
