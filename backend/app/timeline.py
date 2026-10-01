@@ -5,9 +5,11 @@ import json
 import math
 import os
 import tempfile
+from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Tuple
 
+from .durable_runs import freeze_run_input
 from .preproduction import safe_child
 from .reference_video import validate_storage_id
 
@@ -16,11 +18,16 @@ DEFAULT_SETTINGS = {"width": 1280, "height": 720, "fps": 30}
 MAX_DURATION = 300.0
 MAX_TRACKS = 8
 MAX_CLIPS = 80
+RUN_CONTRACT_VERSION = 1
 
 
 class TimelineStore:
-    def __init__(self, data_dir: Path):
+    def __init__(self, data_dir: Path, *, replace: Callable[[str, str], None] | None = None):
         self.root = Path(data_dir)
+        self._replace = replace
+
+    def _replace_file(self, source: str, destination: str) -> None:
+        (self._replace or os.replace)(source, destination)
 
     def path(self, project_id: str, *parts: str) -> Path:
         return safe_child(self.root, "project-files", project_id, "timeline", *parts)
@@ -32,11 +39,12 @@ class TimelineStore:
         if path.is_symlink() or not path.is_file():
             raise OSError("时间线状态文件无效")
         try:
-            state = json.loads(path.read_text(encoding="utf-8"))
+            raw = path.read_bytes()
+            state = json.loads(raw.decode("utf-8"))
         except (OSError, ValueError, json.JSONDecodeError) as error:
             raise OSError("时间线状态无法读取") from error
         validate_state(state)
-        return state
+        return self._migrate_run_contract(project_id, path, raw, state)
 
     def save(self, project_id: str, state: Dict[str, Any]) -> None:
         validate_state(state)
@@ -50,14 +58,55 @@ class TimelineStore:
                 json.dump(state, stream, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(str(temporary), str(path))
+            self._replace_file(str(temporary), str(path))
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def _migrate_run_contract(self, project_id: str, path: Path, raw: bytes, state: Dict[str, Any]) -> Dict[str, Any]:
+        if state.get("runContractVersion") == RUN_CONTRACT_VERSION:
+            return state
+        if state.get("runContractVersion") is not None:
+            raise OSError("时间线运行契约版本无效")
+        migrated = deepcopy(state)
+        migrated["runContractVersion"] = RUN_CONTRACT_VERSION
+        for run in migrated["runs"]:
+            if not isinstance(run, dict) or not isinstance(run.get("id"), str):
+                raise OSError("时间线运行记录无效")
+            snapshot = run.get("snapshot")
+            fingerprint = freeze_run_input(snapshot).fingerprint if snapshot is not None else None
+            run.setdefault("commonRunId", "timeline:" + run["id"])
+            run.setdefault("domainKind", "timeline.render")
+            run.setdefault("inputSnapshot", deepcopy(snapshot))
+            run.setdefault("inputFingerprint", fingerprint)
+            run.setdefault("idempotencyKey", None)
+            run.setdefault("retryOf", None)
+            run.setdefault("attempt", 1)
+            run.setdefault("logs", [])
+        backup = self.path(project_id, "state.json.run-contract-v1.bak")
+        if not backup.exists():
+            self._atomic_bytes(backup, raw)
+        self.save(project_id, migrated)
+        return migrated
+
+    def _atomic_bytes(self, path: Path, raw: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            descriptor, temporary_path = tempfile.mkstemp(dir=str(path.parent), prefix=".timeline-", suffix=".part")
+            temporary = Path(temporary_path)
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            self._replace_file(str(temporary), str(path))
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
 
 
 def default_workspace() -> Dict[str, Any]:
-    return {"schemaVersion": 1, "revision": 0, "settings": dict(DEFAULT_SETTINGS), "tracks": [], "runs": []}
+    return {"schemaVersion": 1, "runContractVersion": RUN_CONTRACT_VERSION, "revision": 0, "settings": dict(DEFAULT_SETTINGS), "tracks": [], "runs": []}
 
 
 def validate_state(state: Any) -> None:

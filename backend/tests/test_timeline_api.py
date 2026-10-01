@@ -1,11 +1,14 @@
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.timeline_api import create_timeline_router
+from app.timeline import TimelineStore
 
 
 PROJECT_ID = "p1"
@@ -73,6 +76,75 @@ def test_workspace_reads_preproduction_assets_and_uses_revision_cas(tmp_path):
     assert client.put(BASE, json=_workspace()).status_code == 409
 
 
+def test_legacy_timeline_run_is_upgraded_once_with_recoverable_backup(tmp_path):
+    store = TimelineStore(tmp_path)
+    path = store.path(PROJECT_ID, "state.json")
+    path.parent.mkdir(parents=True)
+    legacy = {
+        "schemaVersion": 1,
+        "revision": 1,
+        "settings": {"width": 1280, "height": 720, "fps": 30},
+        "tracks": [],
+        "runs": [{
+            "id": "legacy-run",
+            "revision": 1,
+            "format": "preview",
+            "status": "completed",
+            "error": None,
+            "snapshot": {"settings": {"width": 1280, "height": 720, "fps": 30}, "tracks": []},
+            "sources": {},
+            "output": "legacy-run.mp4",
+        }],
+    }
+    original = json.dumps(legacy, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    path.write_bytes(original)
+
+    migrated = store.load(PROJECT_ID)
+
+    run = migrated["runs"][0]
+    assert migrated["runContractVersion"] == 1
+    assert run["commonRunId"] == "timeline:legacy-run"
+    assert run["domainKind"] == "timeline.render"
+    assert run["inputSnapshot"] == legacy["runs"][0]["snapshot"]
+    assert len(run["inputFingerprint"]) == 64
+    assert run["idempotencyKey"] is None
+    assert run["retryOf"] is None
+    assert run["attempt"] == 1
+    assert run["logs"] == []
+    backup = store.path(PROJECT_ID, "state.json.run-contract-v1.bak")
+    assert backup.read_bytes() == original
+    persisted = path.read_bytes()
+    assert store.load(PROJECT_ID) == migrated
+    assert path.read_bytes() == persisted
+
+
+def test_legacy_run_migration_keeps_original_state_when_atomic_replacement_fails(tmp_path):
+    initial_store = TimelineStore(tmp_path)
+    path = initial_store.path(PROJECT_ID, "state.json")
+    path.parent.mkdir(parents=True)
+    legacy = {
+        "schemaVersion": 1, "revision": 0,
+        "settings": {"width": 1280, "height": 720, "fps": 30}, "tracks": [],
+        "runs": [{"id": "legacy-run", "revision": 0, "format": "preview", "status": "queued", "error": None,
+                  "snapshot": {"settings": {"width": 1280, "height": 720, "fps": 30}, "tracks": []}, "sources": {}}],
+    }
+    original = json.dumps(legacy, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    path.write_bytes(original)
+
+    def fail_state_replacement(source, destination):
+        if destination == str(path):
+            raise OSError("simulated replacement failure")
+        os.replace(source, destination)
+
+    with pytest.raises(OSError, match="simulated replacement failure"):
+        TimelineStore(tmp_path, replace=fail_state_replacement).load(PROJECT_ID)
+
+    backup = initial_store.path(PROJECT_ID, "state.json.run-contract-v1.bak")
+    assert path.read_bytes() == original
+    assert backup.read_bytes() == original
+    assert TimelineStore(tmp_path).load(PROJECT_ID)["runs"][0]["commonRunId"] == "timeline:legacy-run"
+
+
 def test_rejects_overlapping_video_clips_and_wrong_asset_track_kind(tmp_path):
     client, _ = setup(tmp_path)
     overlapping = _workspace(tracks=[{
@@ -114,6 +186,50 @@ def test_run_uses_saved_snapshot_and_publishes_only_completed_output(tmp_path):
     assert client.get(BASE + "/runs/" + run_id + "/output").content == b"rendered"
 
 
+def test_run_contract_exposes_common_identity_and_reuses_matching_idempotency_key(tmp_path):
+    client, queue = setup(tmp_path, lambda *_args, **_kwargs: None)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+
+    first = client.post(BASE + "/runs", json={"revision": 1, "format": "preview", "idempotencyKey": "preview-v1"})
+    assert first.status_code == 202, first.text
+    run = first.json()["runs"][0]
+    assert run["commonRunId"]
+    assert run["domainKind"] == "timeline.render"
+    assert run["inputSnapshot"]["tracks"][0]["id"] == "v1"
+    assert len(run["inputFingerprint"]) == 64
+    assert run["idempotencyKey"] == "preview-v1"
+    assert run["retryOf"] is None
+    assert client.get(BASE + "/runs/" + run["id"]).json()["commonRunId"] == run["commonRunId"]
+
+    repeated = client.post(BASE + "/runs", json={"revision": 1, "format": "preview", "idempotencyKey": "preview-v1"})
+    assert repeated.status_code == 202
+    assert [item["id"] for item in repeated.json()["runs"]] == [run["id"]]
+    assert len(queue.jobs) == 1
+    conflict = client.post(BASE + "/runs", json={"revision": 1, "format": "mp4", "idempotencyKey": "preview-v1"})
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "timeline_idempotency_conflict"
+
+
+def test_retry_creates_linked_domain_run_and_is_idempotent(tmp_path):
+    client, queue = setup(tmp_path, lambda *_args, **_kwargs: None)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    original = client.post(BASE + "/runs", json={"revision": 1, "format": "preview"}).json()["runs"][0]
+    assert client.post(BASE + "/runs/" + original["id"] + "/cancel", json={}).status_code == 200
+
+    retried = client.post(BASE + "/runs/" + original["id"] + "/retry", json={"idempotencyKey": "retry-original-1"})
+    assert retried.status_code == 202, retried.text
+    retry = retried.json()["runs"][-1]
+    assert retry["id"] != original["id"]
+    assert retry["commonRunId"] != original["commonRunId"]
+    assert retry["retryOf"] == original["id"]
+    assert retry["inputFingerprint"] == original["inputFingerprint"]
+    assert retry["idempotencyKey"] == "retry-original-1"
+    repeated = client.post(BASE + "/runs/" + original["id"] + "/retry", json={"idempotencyKey": "retry-original-1"})
+    assert repeated.status_code == 202
+    assert [item["id"] for item in repeated.json()["runs"]] == [original["id"], retry["id"]]
+    assert len(queue.jobs) == 2
+
+
 def test_cancelled_or_failed_run_never_publishes_partial_output(tmp_path):
     def broken(timeline, sources, output, **kwargs):
         output.write_bytes(b"partial")
@@ -134,6 +250,48 @@ def test_cancelled_or_failed_run_never_publishes_partial_output(tmp_path):
     assert "/private" not in failed["error"]
     assert client.get(BASE + "/runs/" + run_id + "/output").status_code == 409
 
+
+def test_running_cancel_is_acknowledged_by_worker_and_retains_late_output_privately(tmp_path):
+    client = None
+
+    def renderer(_timeline, _sources, output, **_kwargs):
+        cancelled = client.post(BASE + "/runs/" + run_id + "/cancel", json={})
+        assert cancelled.status_code == 200
+        assert cancelled.json()["runs"][0]["status"] == "cancel_requested"
+        output.write_bytes(b"late-output")
+
+    client, queue = setup(tmp_path, renderer)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    run_id = client.post(BASE + "/runs", json={"revision": 1, "format": "preview"}).json()["runs"][0]["id"]
+    queue.run()
+
+    run = client.get(BASE + "/runs/" + run_id).json()
+    assert run["status"] == "cancelled"
+    assert run["logs"][-1]["event"] == "retained_not_adopted"
+    assert client.get(BASE + "/runs/" + run_id + "/output").status_code == 409
+    assert (tmp_path / "project-files" / PROJECT_ID / "timeline" / "runs" / run_id / "attempt-1.mp4").read_bytes() == b"late-output"
+
+
+def test_running_cancel_retains_partial_output_under_attempt_name_when_renderer_raises(tmp_path):
+    client = None
+
+    def renderer(_timeline, _sources, output, **_kwargs):
+        cancelled = client.post(BASE + "/runs/" + run_id + "/cancel", json={})
+        assert cancelled.status_code == 200
+        output.write_bytes(b"partial-late-output")
+        raise RuntimeError("renderer acknowledged cancellation")
+
+    client, queue = setup(tmp_path, renderer)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    run_id = client.post(BASE + "/runs", json={"revision": 1, "format": "preview"}).json()["runs"][0]["id"]
+    queue.run()
+
+    run = client.get(BASE + "/runs/" + run_id).json()
+    assert run["status"] == "cancelled"
+    assert run["logs"][-1] == {"event": "retained_not_adopted", "attempt": 1, "reason": "cancelled"}
+    retained = tmp_path / "project-files" / PROJECT_ID / "timeline" / "runs" / run_id / "attempt-1.mp4"
+    assert retained.read_bytes() == b"partial-late-output"
+    assert not (retained.parent / "output.mp4").exists()
 
 def test_missing_frozen_source_keeps_the_existing_safe_render_error(tmp_path):
     client, queue = setup(tmp_path, lambda *_args, **_kwargs: None)
@@ -176,13 +334,19 @@ def test_rejects_symlinked_preproduction_source_and_allows_audible_audio_only_wa
     assert client.post(BASE + "/runs", json={"revision": 3, "format": "wav"}).status_code == 422
 
 
-def test_restart_marks_unfinished_run_failed(tmp_path):
+def test_restart_resumes_unfinished_run_with_same_identity_and_new_attempt(tmp_path):
     client, _, = setup(tmp_path)
     client.put(BASE, json=_workspace())
     run_id = client.post(BASE + "/runs", json={"revision": 1, "format": "mp4"}).json()["runs"][-1]["id"]
-    restarted, _ = setup(tmp_path)
+    original = client.get(BASE + "/runs/" + run_id).json()
+    restarted, recovery_queue = setup(tmp_path)
     run = restarted.get(BASE).json()["runs"][0]
-    assert run["id"] == run_id and run["status"] == "failed"
+    assert run["id"] == run_id and run["commonRunId"] == original["commonRunId"]
+    assert run["status"] == "queued"
+    assert run["attempt"] == 2
+    assert run["recovery"]["reason"] == "restart_resumed"
+    assert run["logs"][-1] == {"event": "recovered", "attempt": 2, "reason": "restart_resumed"}
+    assert len(recovery_queue.jobs) == 1
 
 
 def test_adjacent_decimal_clips_are_accepted_but_real_overlap_is_rejected(tmp_path):

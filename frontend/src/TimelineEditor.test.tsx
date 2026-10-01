@@ -3,16 +3,17 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TimelineEditor } from "./TimelineEditor";
-import { preflightTimeline, startTimelineRun, cancelTimelineRun, getTimeline, importShotResults, saveTimeline, validateTimelineDraft, type TimelineWorkspace } from "./timelineApi";
+import { preflightTimeline, startTimelineRun, cancelTimelineRun, retryTimelineRun, getTimeline, importShotResults, saveTimeline, validateTimelineDraft, type TimelineWorkspace } from "./timelineApi";
 
 vi.mock("./timelineApi", () => ({
-  preflightTimeline: vi.fn(), validateTimelineDraft: vi.fn(), importShotResults: vi.fn(), getTimeline: vi.fn(), saveTimeline: vi.fn(), startTimelineRun: vi.fn(), cancelTimelineRun: vi.fn(), uploadTimelineAudio: vi.fn(),
+  preflightTimeline: vi.fn(), validateTimelineDraft: vi.fn(), importShotResults: vi.fn(), getTimeline: vi.fn(), saveTimeline: vi.fn(), startTimelineRun: vi.fn(), cancelTimelineRun: vi.fn(), retryTimelineRun: vi.fn(), uploadTimelineAudio: vi.fn(),
   timelineOutputUrl: (projectId: string, runId: string) => `/api/projects/${projectId}/timeline/runs/${runId}/output`,
 }));
 
 const mockedGet = vi.mocked(getTimeline);
 const mockedSave = vi.mocked(saveTimeline);
 const mockedCancel = vi.mocked(cancelTimelineRun);
+const mockedRetry = vi.mocked(retryTimelineRun);
 
 function workspace(revision = 2): TimelineWorkspace {
   return {
@@ -34,7 +35,7 @@ function deferred<T>() {
 
 describe("TimelineEditor", () => {
   afterEach(() => vi.useRealTimers());
-  beforeEach(() => { sessionStorage.clear(); localStorage.clear(); mockedGet.mockReset(); mockedSave.mockReset(); mockedCancel.mockReset(); });
+  beforeEach(() => { sessionStorage.clear(); localStorage.clear(); mockedGet.mockReset(); mockedSave.mockReset(); mockedCancel.mockReset(); mockedRetry.mockReset(); });
 
   it("从候选引用定位已保存时间线片段", async () => {
     mockedGet.mockResolvedValue(workspace());
@@ -77,7 +78,7 @@ describe("TimelineEditor", () => {
     render(<TimelineEditor projectId="preflight-ok" />);
     await userEvent.click(await screen.findByRole("button", { name: "导出 MP4" }));
     expect(await screen.findByText("视频将为静音")).toBeVisible();
-    expect(startTimelineRun).toHaveBeenCalledWith("preflight-ok", 2, "mp4");
+    expect(startTimelineRun).toHaveBeenCalledWith("preflight-ok", 2, "mp4", "timeline:preflight-ok:2:mp4");
   });
 
   it("素材版本在预检期间变化时不使用晚到的成功结果导出", async () => {
@@ -446,6 +447,44 @@ describe("TimelineEditor", () => {
     await act(async () => { pending.resolve(workspace()); });
 
     expect(screen.getByLabelText("时间线起点")).toHaveValue(2.5);
+  });
+
+  it("显示公共运行身份、领域详情和未采用的迟到结果", async () => {
+    const observableStatuses = ["queued", "running", "cancel_requested", "failed", "unknown", "partial_success", "completed"] as const;
+    mockedGet.mockResolvedValue({
+      ...workspace(),
+      runs: [{
+        id: "run-1", commonRunId: "timeline:run-1", domainKind: "timeline.render", revision: 2, format: "preview",
+        status: "cancelled", error: null, inputFingerprint: "a".repeat(64), idempotencyKey: "retry-1", retryOf: "old-run",
+        attempt: 2, logs: [{ event: "retained_not_adopted", attempt: 1, reason: "superseded_attempt" }],
+      }, ...observableStatuses.map((status, index) => ({
+        id: `run-status-${index}`, commonRunId: `timeline:run-status-${index}`, domainKind: "timeline.render",
+        revision: 2, format: "mp4" as const, status, error: null,
+      }))],
+    } as TimelineWorkspace);
+
+    render(<TimelineEditor projectId="run-contract" />);
+
+    expect(await screen.findByText(/公共运行 ID：timeline:run-1/)).toBeVisible();
+    expect(screen.getByText(/领域：时间线渲染 · 尝试 2/)).toBeVisible();
+    for (const label of ["排队中", "渲染中", "取消中", "已取消", "失败", "状态未知", "部分成功", "已完成"]) {
+      expect(screen.getByText(label)).toBeVisible();
+    }
+    expect(screen.getByText("迟到结果已保留，未采用。" )).toBeVisible();
+  });
+
+  it("重试使用可在刷新后复用的稳定幂等键", async () => {
+    const failed = {
+      ...workspace(),
+      runs: [{ id: "failed-run", commonRunId: "timeline:failed-run", domainKind: "timeline.render", revision: 2, format: "preview", status: "failed", error: "渲染失败" }],
+    } as TimelineWorkspace;
+    mockedGet.mockResolvedValue(failed);
+    mockedRetry.mockResolvedValue(failed);
+    render(<TimelineEditor projectId="retry-contract" />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "重试" }));
+
+    expect(mockedRetry).toHaveBeenCalledWith("retry-contract", "failed-run", "timeline-retry:failed-run");
   });
 
   it("保存期间继续编辑时保留新草稿，并使用保存返回的新版本", async () => {

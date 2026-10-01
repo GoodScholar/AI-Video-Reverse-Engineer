@@ -87,6 +87,25 @@ class RenderInputPreparation:
                 shutil.rmtree(destination, ignore_errors=True)
             raise RenderInputError() from error
 
+    def clone_frozen(self, destination: Path, frozen_directory: Path, frozen_sources: dict[str, str]) -> dict[str, str]:
+        destination = Path(destination)
+        created = False
+        try:
+            source_directory = _create_destination(destination)
+            created = True
+            frozen_source_directory = _source_directory(Path(frozen_directory))
+            sources = {}
+            for asset_id, filename in frozen_sources.items():
+                validate_storage_id(asset_id)
+                validate_storage_id(filename)
+                _copy_regular(frozen_source_directory / filename, source_directory / filename)
+                sources[asset_id] = filename
+            return sources
+        except (OSError, TypeError, ValueError) as error:
+            if created:
+                shutil.rmtree(destination, ignore_errors=True)
+            raise RenderInputError() from error
+
 
 def _used_asset_ids(tracks):
     return {clip["assetId"] for track in tracks for clip in track["clips"]}

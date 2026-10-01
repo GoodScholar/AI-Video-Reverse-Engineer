@@ -16,12 +16,13 @@ from typing import Any, Callable, Literal, Mapping, Optional, cast
 
 RunExecution = Literal["local", "external"]
 RunStatus = Literal[
-    "submitting", "queued", "running", "completed", "failed", "cancelled", "unknown"
+    "submitting", "queued", "running", "cancel_requested", "completed", "failed", "cancelled", "unknown", "partial_success"
 ]
 
-SHARED_RUN_STATUSES = frozenset({"queued", "running", "completed", "failed", "cancelled"})
-LOCAL_RUN_STATUSES = SHARED_RUN_STATUSES
-EXTERNAL_RUN_STATUSES = SHARED_RUN_STATUSES | {"submitting", "unknown"}
+PUBLIC_RUN_STATUSES = frozenset({"queued", "running", "cancel_requested", "cancelled", "failed", "unknown", "partial_success", "completed"})
+SHARED_RUN_STATUSES = PUBLIC_RUN_STATUSES
+LOCAL_RUN_STATUSES = frozenset({"queued", "running", "cancel_requested", "completed", "failed", "cancelled"})
+EXTERNAL_RUN_STATUSES = PUBLIC_RUN_STATUSES | {"submitting"}
 BUSINESS_DECISION_FIELDS = frozenset({"approved", "adopted", "delivered", "reviewDecision"})
 
 
@@ -125,6 +126,8 @@ class RunPolicy:
         result: Mapping[str, Any],
     ) -> RunCompletion:
         self.validate(status)
+        if status == "cancel_requested":
+            raise RunConflict("取消请求尚未由工作进程确认。")
         if status not in {"queued", "running"}:
             raise RunConflict("运行状态不允许完成。")
         if not frozen_input.matches(current_input):
@@ -148,6 +151,20 @@ class RunPolicy:
             raise RunConflict("运行状态不允许取消。")
         return "cancelled"
 
+    def request_cancel(self, status: str) -> Literal["cancel_requested", "cancelled"]:
+        self.validate(status)
+        if not self.cancellable:
+            raise RunConflict("此执行适配器不支持取消。")
+        if status not in self.active_statuses:
+            raise RunConflict("运行状态不允许取消。")
+        return "cancelled" if status == "queued" else "cancel_requested"
+
+    def acknowledge_cancel(self, status: str) -> Literal["cancelled"]:
+        self.validate(status)
+        if status != "cancel_requested":
+            raise RunConflict("运行状态没有待确认的取消请求。")
+        return "cancelled"
+
     def mark_outcome_unknown(self, status: str) -> Literal["unknown"]:
         self.validate(status)
         if self.execution != "external" or status not in self.active_statuses:
@@ -156,6 +173,8 @@ class RunPolicy:
 
     def recover_after_restart(self, status: str) -> RunRecovery:
         value = self.validate(status)
+        if self.execution == "local" and value == "cancel_requested":
+            return RunRecovery(status="cancelled", reason="interrupted")
         if self.execution == "local" and value in {"queued", "running"}:
             return RunRecovery(status="failed", reason="interrupted")
         if self.execution == "external" and value == "submitting":
@@ -167,14 +186,14 @@ LOCAL_RUN_POLICY = RunPolicy(
     execution="local",
     initial_status="queued",
     allowed_statuses=LOCAL_RUN_STATUSES,
-    active_statuses=frozenset({"queued", "running"}),
+    active_statuses=frozenset({"queued", "running", "cancel_requested"}),
     cancellable=True,
 )
 EXTERNAL_RUN_POLICY = RunPolicy(
     execution="external",
     initial_status="submitting",
     allowed_statuses=EXTERNAL_RUN_STATUSES,
-    active_statuses=frozenset({"submitting", "queued", "running", "unknown"}),
+    active_statuses=frozenset({"submitting", "queued", "running", "cancel_requested", "unknown"}),
     cancellable=False,
 )
 
