@@ -287,6 +287,11 @@ def validate_packaging(value: Any, cues: list[dict[str, Any]], tracks: list[dict
         start, end = _number(raw["start"], "包装起点"), _number(raw["end"], "包装终点")
         if end <= start:
             raise PackagingError("包装元素时序无效。")
+        duration_centiseconds = _ass_centiseconds(end) - _ass_centiseconds(start)
+        if duration_centiseconds <= 0:
+            raise PackagingError("包装元素短于 ASS 时间精度。")
+        if kind == "title" and duration_centiseconds < 10:
+            raise PackagingError("动态标题时长至少需要 0.10 秒。")
         text = _validate_text(raw["text"])
         elements.append({"id": element_id, "kind": kind, "enabled": raw["enabled"], "start": start, "end": end,
                          "text": text, "position": raw["position"], "style": raw["style"]})
@@ -313,8 +318,12 @@ def escape_ass_text(text: str) -> str:
     return "".join(chunks)
 
 
+def _ass_centiseconds(seconds: float) -> int:
+    return int(round(seconds * 100))
+
+
 def _ass_time(seconds: float) -> str:
-    centiseconds = int(round(seconds * 100))
+    centiseconds = _ass_centiseconds(seconds)
     return "%d:%02d:%02d.%02d" % (centiseconds // 360000, centiseconds // 6000 % 60, centiseconds // 100 % 60, centiseconds % 100)
 
 
@@ -582,10 +591,13 @@ def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width
                     if float(sample["timeSeconds"]) == 0:
                         append_sweep(sample, sample, 0, 0)
             else:
+                frame_duration = float(reframe["frameDurationSeconds"])
                 for sample in usable:
                     sample_time = float(sample["timeSeconds"])
-                    if source_start <= sample_time < source_end:
-                        append_sweep(sample, sample, sample_time, sample_time)
+                    segment_start = max(source_start, sample_time)
+                    segment_end = min(source_end, sample_time + frame_duration)
+                    if segment_start < segment_end:
+                        append_sweep(sample, sample, segment_start, segment_end)
             continue
         if _asset_media_kind(clip, asset_media_kinds) == "image":
             if len(usable) != 1 or float(usable[0]["timeSeconds"]) != 0:
@@ -658,6 +670,13 @@ def _element_events(packaging: dict[str, Any], cues: list[dict[str, Any]], width
         text, start, end = item["text"], item["start"], item["end"]
         events.append({**item, "text": text, "start": start, "end": end})
     for item in events:
+        duration_centiseconds = _ass_centiseconds(item["end"]) - _ass_centiseconds(item["start"])
+        if duration_centiseconds <= 0:
+            raise PackagingError("包装元素短于 ASS 时间精度。")
+        if item["kind"] == "title":
+            if duration_centiseconds < 10:
+                raise PackagingError("动态标题时长至少需要 0.10 秒。")
+            item["fadeMilliseconds"] = min(180, duration_centiseconds * 10 // 3)
         # This includes implicit/default batch cues, before any libass call.
         _glyphs(item["text"])
         size = {"title": 56, "cta": 48, "selling-point": 42, "keyword": 44, "subtitle": 38}[item["kind"]]
@@ -783,7 +802,7 @@ def compile_ass(packaging: dict[str, Any], cues: list[dict[str, Any]], tracks: l
         y, box = selected
         occupied.append((item["start"], item["end"], *box))
         # \\an5 with explicit centre is invariant for preview and export dimensions.
-        fade = "\\fad(180,180)" if item["kind"] == "title" else ""
+        fade = "\\fad(%d,%d)" % ((item["fadeMilliseconds"],) * 2) if item["kind"] == "title" else ""
         lines.append("Dialogue: %d,%s,%s,%s,,0,0,0,,{\\an5\\pos(%d,%d)%s}%s" % (
             index, _ass_time(item["start"]), _ass_time(item["end"]), "G" + str(index), round(x), round(y), fade,
             escape_ass_text(item["text"])))

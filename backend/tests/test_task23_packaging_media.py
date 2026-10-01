@@ -153,7 +153,7 @@ def _package() -> dict:
     # carries real newline plus literal ASS controls; the compiler must show
     # them as text, never execute them.
     package["elements"] = [
-        {"id": "title", "kind": "title", "enabled": True, "start": .20, "end": .85,
+        {"id": "title", "kind": "title", "enabled": True, "start": .20, "end": .32,
          "text": "新品\\N{安全}\n真换行", "position": "top", "style": "emphasis"},
         {"id": "selling", "kind": "selling-point", "enabled": True, "start": 1.10, "end": 1.75,
          "text": "中文卖点", "position": "middle", "style": "banner"},
@@ -273,7 +273,7 @@ def test_real_five_element_layout_uses_actual_subject_facts_at_each_event_pts():
     render_timeline(timeline, {"shot": source}, preview_control, format="preview", ffmpeg_path=str(FFMPEG), ffprobe_path=str(FFPROBE))
     render_timeline(timeline, {"shot": source}, export_control, format="mp4", ffmpeg_path=str(FFMPEG), ffprobe_path=str(FFPROBE))
 
-    samples = {"title": (.50, "top"), "selling-point": (1.40, "middle"), "keyword": (2.30, "top"),
+    samples = {"title": (.25, "top"), "selling-point": (1.40, "middle"), "keyword": (2.30, "top"),
                "cta": (3.20, "bottom"), "subtitle": (4.10, "bottom")}
     matrix: dict[str, object] = {"thresholds": {"bboxNormalizedDelta": .015, "safeArea": [.05, .95],
         "pixelDifference": 12, "subjectRule": "each event PTS has actual red source pixels disjoint from ASS pixels"},
@@ -306,7 +306,7 @@ def test_real_five_element_layout_uses_actual_subject_facts_at_each_event_pts():
     # The fixed title fade is verified at its early, opaque-middle and late
     # intervals in both render targets.  This observes pixels, not ASS text.
     title_effects = {}
-    for label, second in (("early", .24), ("middle", .52), ("late", .79)):
+    for label, second in (("early", .21), ("middle", .25), ("late", .28)):
         preview_frame = _frame(preview, second, directory / f"preview-title-{label}.png")
         export_frame = _frame(exported, second, directory / f"export-title-{label}.png")
         preview_control_frame = _frame(preview_control, second, directory / f"preview-control-title-{label}.png")
@@ -318,6 +318,10 @@ def test_real_five_element_layout_uses_actual_subject_facts_at_each_event_pts():
     assert title_effects["late"]["preview"]["normalizedArea"] < title_effects["middle"]["preview"]["normalizedArea"]
     assert title_effects["early"]["export"]["normalizedArea"] < title_effects["middle"]["export"]["normalizedArea"]
     assert title_effects["late"]["export"]["normalizedArea"] < title_effects["middle"]["export"]["normalizedArea"]
+    assert title_effects["early"]["preview"]["meanRgbDelta"] < title_effects["middle"]["preview"]["meanRgbDelta"]
+    assert title_effects["late"]["preview"]["meanRgbDelta"] < title_effects["middle"]["preview"]["meanRgbDelta"]
+    assert title_effects["early"]["export"]["meanRgbDelta"] < title_effects["middle"]["export"]["meanRgbDelta"]
+    assert title_effects["late"]["export"]["meanRgbDelta"] < title_effects["middle"]["export"]["meanRgbDelta"]
     matrix["titleFade"] = title_effects
     for second in (.05, .95, 1.90, 2.80, 3.70, 4.65):
         packaged, baseline = _frame(exported, second, directory / f"outside-{second}.png"), _frame(export_control, second, directory / f"control-outside-{second}.png")
@@ -375,13 +379,16 @@ def test_real_moving_subject_reframe_and_transition_keep_actual_text_pixels_clea
                     for colour in subjects}
         for subject in fidelity.values():
             # Near the end of a dissolve, a faint subject can cross the colour
-            # classifier threshold after a one-level codec change.  Retention
-            # and RGB delta are evaluated on every unmasked control-subject
-            # pixel; stable masks additionally keep IoU/count limits.
-            assert subject["retainedRatio"] > .96 and subject["referenceMeanRgbDelta"] < 14
+            # classifier threshold after a one-level codec change.  RGB delta
+            # is evaluated on every unmasked control-subject pixel; stable
+            # masks additionally keep retention, IoU, and count limits.
+            assert subject["referenceMeanRgbDelta"] < 14
             if subject["controlPixels"] >= 5_000:
-                assert (subject["iou"] > .96
+                assert (subject["retainedRatio"] > .96
+                        and subject["iou"] > .96
                         and subject["pixelDelta"] <= subject["controlPixels"] * .04)
+            else:
+                assert subject["referenceMeanRgbDelta"] < 3
         matrix["times"][str(second)] = {"text": text, "subjects": subjects, "subjectFidelity": fidelity}
     # The same production entry rejects full-frame occupancy before it can run ffmpeg.
     blocked_tracks = json.loads(json.dumps(tracks))
@@ -494,7 +501,7 @@ def test_real_api_lifecycle_renders_downloads_stales_and_regenerates():
         api_matrix = {"thresholds": {"eventOutside": "null", "previewExportBBoxDelta": .02, "pixelDifference": 12,
             "normalizedAreaDelta": .012, "maskGridIoU": .45, "meanRgbDelta": 35, "histogramL1": .50,
             "safeArea": [.05, .95], "subjectRule": "actual red source pixels disjoint from ASS pixels"}, "elements": {}}
-        for kind, second in {"title": .5, "selling-point": 1.4, "keyword": 2.3, "cta": 3.2, "subtitle": 4.1}.items():
+        for kind, second in {"title": .25, "selling-point": 1.4, "keyword": 2.3, "cta": 3.2, "subtitle": 4.1}.items():
             pframe, eframe = _frame(api_preview, second, directory / f"api-preview-{kind}.png"), _frame(api_export, second, directory / f"api-export-{kind}.png")
             pcontrol, econtrol = _frame(preview_control, second, directory / f"api-preview-control-{kind}.png"), _frame(export_control, second, directory / f"api-export-control-{kind}.png")
             preview_subject, export_subject = _colour_bbox(pcontrol, "red"), _colour_bbox(econtrol, "red")

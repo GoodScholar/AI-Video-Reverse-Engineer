@@ -182,6 +182,32 @@ def test_review_required_video_requires_real_frame_coverage_without_gaps_or_tail
     assert _subject_boxes([track], .04, .12, 720, 1280, asset_media_kinds=context)
 
 
+def test_review_required_mid_frame_event_projects_the_intersecting_frame_subject():
+    """Coverage and occupancy must use the same half-open real-frame interval."""
+    from app.montage_packaging import PackagingError, _subject_boxes, compile_ass, private_font_path
+
+    track = _reframed_track()[0]
+    clip = track["clips"][0]
+    clip.update(inPoint=2, speed=.5)
+    reframe = clip["reframe"]
+    sample = reframe["samples"][0]
+    sample.update(timeSeconds=2, boxes=[{
+        "x": .2, "y": 0, "width": .6, "height": .25,
+        "label": "person", "confidence": .99,
+    }])
+    reframe.update(status="review_required", samples=[sample], frameDurationSeconds=.04,
+                   override={"mode": "center", "keyframes": []})
+    context = {"asset": "video"}
+
+    # Timeline .05-.075 maps to source 2.025-2.0375: wholly inside the
+    # decoded frame [2.0, 2.04), while its PTS itself is outside the event.
+    subjects = _subject_boxes([track], .05, .075, 720, 1280, asset_media_kinds=context)
+    assert subjects and subjects[0][1] == 0
+    package = _packaging([_element("keyword", start=.05, end=.075, position="top", text="帧内主体")])
+    with pytest.raises(PackagingError, match="无可用安全区"):
+        compile_ass(package, [], [track], 720, 1280, private_font_path(), asset_media_kinds=context)
+
+
 def test_only_titles_receive_the_fixed_template_fade():
     from app.montage_packaging import compile_ass, private_font_path
 
@@ -191,6 +217,22 @@ def test_only_titles_receive_the_fixed_template_fade():
     keyword_line = next(line for line in ass.splitlines() if line.endswith("关键词"))
     assert "\\fad(180,180)" in title_line
     assert "\\fad(" not in keyword_line
+
+
+def test_short_title_scales_fade_to_leave_a_visible_middle_and_rejects_sub_precision_events():
+    from app.montage_packaging import PackagingError, compile_ass, private_font_path, validate_packaging
+
+    short = _packaging([_element("title", start=.2, end=.32, text="短标题")])
+    ass = compile_ass(short, [], [], 720, 1280, private_font_path())
+    assert "\\fad(40,40)" in ass
+
+    too_short = _packaging([_element("title", start=.2, end=.28, text="不可见标题")])
+    with pytest.raises(PackagingError, match="动态标题时长"):
+        validate_packaging(too_short, [], [])
+
+    sub_precision = _packaging([_element("keyword", start=.2, end=.204, text="零时长")])
+    with pytest.raises(PackagingError, match="ASS 时间精度"):
+        validate_packaging(sub_precision, [], [])
 
 
 @pytest.mark.parametrize("mode", ["center", "manual", "replace"])
