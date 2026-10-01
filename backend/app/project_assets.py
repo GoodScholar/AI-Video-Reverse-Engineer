@@ -58,6 +58,14 @@ class ProjectAssets:
         validate_storage_id(prefix)
         return f"{prefix}-{uuid4().hex}"
 
+    @staticmethod
+    def version_id(asset: Mapping[str, Any]) -> str:
+        """Return the immutable first-version identity used by legacy and current assets."""
+        version_id = asset.get("assetVersionId")
+        if isinstance(version_id, str) and version_id:
+            return version_id
+        return validate_storage_id(asset.get("id")) + "-v1"
+
     def records(self, project_id: str) -> list[dict[str, Any]]:
         return self.records_from(self._store.load(project_id))
 

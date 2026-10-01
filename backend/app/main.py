@@ -1177,9 +1177,11 @@ def create_app(
             return True
         return (
             request.method in ("POST", "PUT")
-            and bool(re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|preparation|preproduction|source-segments|segment-searches|timeline|batch-edits|upscale|character-motion|toolkit|backup)(?:/.*)?", path))
+            and bool(re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|preparation|preproduction|image-generation|source-segments|segment-searches|timeline|batch-edits|upscale|character-motion|toolkit|backup)(?:/.*)?", path))
         ) or (
             request.method == "PUT" and bool(re.fullmatch(r"/api/analysis-providers/[^/]+/configuration", path))
+        ) or (
+            request.method == "PUT" and path == "/api/image-generation/configuration"
         ) or (
             request.method == "POST" and (
                 bool(re.fullmatch(r"/api/analysis-providers/[^/]+/(?:test-connection|connection-test)", path))
@@ -2499,6 +2501,13 @@ def create_app(
         data_dir, ensure_project_exists, compute_jobs,
         ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, source_lock=project_write_lock,
     ))
+    from .image_generation import ImageGenerationConfigurations, ImageGenerationService, ImageGenerationSettings
+    from .image_generation_api import create_image_generation_router
+    image_generation_configurations = ImageGenerationConfigurations(
+        ImageGenerationSettings(data_dir / "image-generation.json"),
+    )
+    image_generation_service = ImageGenerationService(image_generation_configurations)
+    app.include_router(create_image_generation_router(image_generation_configurations))
     from .source_segment_index import create_source_segment_router
     app.include_router(create_source_segment_router(
         data_dir, ensure_project_exists, compute_jobs,
@@ -2580,7 +2589,15 @@ def create_app(
         "analysis-structured-text", "analysis-v1", "text", run_aigc_generation, aigc_capabilities,
         result_validator=lambda text: _CandidateResponse.model_validate_json(text),
     ))
+    from .image_generation_adapter import ConfiguredImageGenerationAdapter
+    configured_image_adapter = ConfiguredImageGenerationAdapter(
+        data_dir, image_generation_configurations, image_generation_service,
+    )
+    aigc_generation_registry.register(configured_image_adapter.as_generation_adapter())
     aigc_generation_service = GenerationService(data_dir, registry=aigc_generation_registry, queue=compute_jobs)
+
+    from .image_generation_run_api import create_image_generation_run_router
+    app.include_router(create_image_generation_run_router(aigc_generation_service, ensure_project_exists))
 
     app.include_router(create_aigc_content_router(data_dir, ensure_project_exists,
                                                    script_generator=generate_marketing_candidates,

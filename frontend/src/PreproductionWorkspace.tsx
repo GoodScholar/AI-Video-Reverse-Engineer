@@ -31,6 +31,7 @@ import { TimelineEditor } from "./TimelineEditor";
 import { BatchEditor } from "./BatchEditor";
 import { ShotWorkspaceLayout } from "./ShotWorkspaceLayout";
 import { createPreproductionWorkspaceStore, selectWorkspaceDirty, selectWorkspaceSnapshot } from "./preproductionWorkspaceStore";
+import { ImageGenerationPanel } from "./ImageGenerationPanel";
 
 type Props = { project: Project; tools: ReactNode; onDraftChange?: (projectId: string, dirty: boolean) => void;
   importedWorkspace?: {projectId:string;workspace:Workspace}; sectionOverride?: Section; studioMode?: boolean; onAssetsChanged?: (assets: Workspace["assets"]) => void };
@@ -136,6 +137,8 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
   const selectedShotIds = useStore(workspaceStore, (state) => state.selection.selectedShotIds);
   const primaryEntity = useStore(workspaceStore, (state) => state.selection.primaryEntity);
   const [managedAssetId, setManagedAssetId] = useState<string | null>(null);
+  const [imageGenerationOpen, setImageGenerationOpen] = useState(false);
+  useEffect(() => { setImageGenerationOpen(false); }, [project.id]);
   const [roleFilter, setRoleFilter] = useState<AssetRole | "all">("all");
   const [uploadRole, setUploadRole] = useState<AssetRole>("reference");
   const [loading, setLoading] = useState(true);
@@ -416,7 +419,18 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
         </section>}
 
         {section === "assets" && <section className="preproduction-panel preproduction-native-form" aria-labelledby="preproduction-assets-title">
-          <div className="preproduction-panel-heading"><div><h3 id="preproduction-assets-title">素材库</h3><p>上传后按用途标记，镜头可以绑定多份素材。</p></div><div className="preproduction-import-actions"><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("reference")}>导入参考素材</button><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("shots")}>导入已有分镜</button><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("toolkit")}>导入工具产物</button></div></div>
+          <div className="preproduction-panel-heading"><div><h3 id="preproduction-assets-title">素材库</h3><p>上传后按用途标记，镜头可以绑定多份素材。</p></div><div className="preproduction-import-actions"><button type="button" className="secondary-action" onClick={() => setImageGenerationOpen((open) => !open)}>{imageGenerationOpen ? "收起图片生成" : "图片生成"}</button><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("reference")}>导入参考素材</button><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("shots")}>导入已有分镜</button><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("toolkit")}>导入工具产物</button></div></div>
+          {imageGenerationOpen && <ImageGenerationPanel
+            projectId={project.id}
+            imageAssets={workspace.assets.filter((asset) => asset.kind === "image").map((asset) => ({
+              id: asset.id,
+              assetVersionId: (asset as typeof asset & { assetVersionId?: string }).assetVersionId ?? `${asset.id}-v1`,
+              name: asset.name,
+              kind: "image",
+              url: asset.url,
+            }))}
+            onInstalled={() => void reloadSavedWorkspace()}
+          />}
           <div className="preproduction-upload"><label>标记为<select value={uploadRole} onChange={(event) => setUploadRole(event.target.value as AssetRole)}>{Object.entries(roleLabels).map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label><button type="button" className="secondary-action" disabled={Boolean(busy) || dirty} onClick={() => uploadInputRef.current?.click()}><Upload size={16} aria-hidden="true" />{busy === "upload" ? "正在上传…" : "上传素材"}</button><input ref={uploadInputRef} aria-label="上传素材文件" hidden type="file" accept="image/*,video/*,audio/*" disabled={Boolean(busy) || dirty} onChange={upload} /></div>
           <div className="preproduction-filters" role="group" aria-label="素材标签筛选"><button type="button" aria-pressed={roleFilter === "all"} className={roleFilter === "all" ? "is-active" : ""} onClick={() => setRoleFilter("all")}>全部</button>{(Object.entries(roleLabels) as Array<[AssetRole, string]>).map(([role, label]) => <button type="button" key={role} aria-pressed={roleFilter === role} className={roleFilter === role ? "is-active" : ""} onClick={() => setRoleFilter(role)}>{label}</button>)}</div>
           {visibleAssets.length ? <ul className="preproduction-assets">{visibleAssets.map((asset) => <li key={asset.id}><span className="preproduction-asset-kind">{asset.kind}</span><div className="preproduction-asset-info"><strong>{asset.name}</strong>{asset.notes && <p>{asset.notes}</p>}<button type="button" className="secondary-action" aria-label={`管理素材 ${asset.name}`} onClick={() => setManagedAssetId(asset.id)}>管理素材</button><span className="preproduction-asset-role">{roleLabels[asset.role]}</span>{asset.width && asset.height ? <small>{asset.width}×{asset.height}</small> : null}<a className="preproduction-asset-download" href={asset.url} download>下载{asset.name}</a><details className={`preproduction-asset-preview ${studioMode ? "studio-asset-preview" : ""}`} open={studioMode || undefined}><summary>预览</summary>{asset.kind === "image" ? <img src={asset.url} alt={`${asset.name} 预览`} /> : asset.kind === "video" ? <video controls preload="metadata" aria-label={`${asset.name} 预览`} src={asset.url} /> : <audio controls preload="metadata" aria-label={`${asset.name} 预览`} src={asset.url} />}</details></div></li>)}</ul> : <p className="preproduction-empty">还没有匹配的素材。上传素材，或从已有参考和工具结果导入。</p>}
