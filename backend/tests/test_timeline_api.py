@@ -29,6 +29,17 @@ class Queue:
         handler(project_id)
 
 
+class TrackingLock:
+    def __init__(self):
+        self.entries = 0
+
+    def __enter__(self):
+        self.entries += 1
+
+    def __exit__(self, *_args):
+        return False
+
+
 def _asset_root(tmp_path):
     root = tmp_path / "project-files" / PROJECT_ID / "preproduction"
     (root / "assets").mkdir(parents=True, exist_ok=True)
@@ -56,11 +67,11 @@ def _workspace(revision=0, tracks=None):
     }
 
 
-def setup(tmp_path, renderer=None):
+def setup(tmp_path, renderer=None, source_lock=None):
     _asset_root(tmp_path)
     queue = Queue()
     app = FastAPI()
-    app.include_router(create_timeline_router(tmp_path, lambda project_id: SimpleNamespace(id=project_id) if project_id == PROJECT_ID else None, queue, renderer=renderer))
+    app.include_router(create_timeline_router(tmp_path, lambda project_id: SimpleNamespace(id=project_id) if project_id == PROJECT_ID else None, queue, renderer=renderer, source_lock=source_lock))
     return TestClient(app), queue
 
 
@@ -238,6 +249,40 @@ def test_retry_creates_linked_domain_run_and_is_idempotent(tmp_path):
     assert blocked.status_code == 409
     assert blocked.json()["detail"]["code"] == "timeline_run_active"
     assert len(queue.jobs) == 2
+
+
+def test_retry_holds_the_project_source_lock_while_copying_and_queueing(tmp_path):
+    source_lock = TrackingLock()
+    client, _ = setup(tmp_path, lambda *_args, **_kwargs: None, source_lock)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    original = client.post(BASE + "/runs", json={"revision": 1, "format": "preview"}).json()["runs"][0]
+    assert client.post(BASE + "/runs/" + original["id"] + "/cancel", json={}).status_code == 200
+    source_lock.entries = 0
+
+    retried = client.post(BASE + "/runs/" + original["id"] + "/retry", json={"idempotencyKey": "retry-with-lock"})
+
+    assert retried.status_code == 202
+    assert source_lock.entries == 1
+
+
+def test_common_run_id_cleanup_removes_files_and_the_domain_record(tmp_path):
+    def renderer(_timeline, _sources, output, **_kwargs):
+        output.write_bytes(b"rendered")
+
+    client, queue = setup(tmp_path, renderer)
+    state = client.put(BASE, json=_workspace()).json()
+    run = client.post(BASE + "/runs", json={"revision": state["revision"], "format": "preview"}).json()["runs"][0]
+    queue.run()
+    completed = client.get(BASE + "/runs/" + run["commonRunId"]).json()
+    assert completed["status"] == "completed"
+    assert client.get(BASE + "/runs/" + run["commonRunId"] + "/cleanup-preview").status_code == 200
+
+    cleaned = client.post(BASE + "/runs/" + run["commonRunId"] + "/delete", json={"revision": state["revision"]})
+
+    assert cleaned.status_code == 200
+    assert cleaned.json()["runs"] == []
+    assert not (tmp_path / "project-files" / PROJECT_ID / "timeline" / "runs" / run["id"]).exists()
+    assert not (tmp_path / "project-files" / PROJECT_ID / "timeline" / "outputs" / (run["id"] + ".mp4")).exists()
 
 
 def test_cancelled_or_failed_run_never_publishes_partial_output(tmp_path):

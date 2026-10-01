@@ -435,7 +435,7 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
         project_for(project_id)
         if not isinstance(body, dict) or set(body) != {"idempotencyKey"} or not isinstance(body.get("idempotencyKey"), str) or not body["idempotencyKey"] or len(body["idempotencyKey"]) > 200:
             fail("timeline_invalid", "重试请求无效。", 422)
-        with lock:
+        with source_lock or nullcontext(), lock:
             state = state_for(project_id)
             original = find_run(state, run_id)
             if original["status"] not in TERMINAL_STATUSES:
@@ -518,8 +518,9 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             if body["revision"] != state["revision"]:
                 fail("timeline_conflict", "时间线已更新，请重新预览清理范围。")
             try:
-                paths = cleanup_paths(project_id, state, run_id)
-                state["runs"] = [item for item in state["runs"] if item["id"] != run_id]
+                domain_run_id = find_run(state, run_id)["id"]
+                paths = cleanup_paths(project_id, state, domain_run_id)
+                state["runs"] = [item for item in state["runs"] if item["id"] != domain_run_id]
                 state["revision"] += 1
                 warning = remove_history_files(paths, store.path(project_id), lambda: save(project_id, state))
             except (OSError, ValueError):

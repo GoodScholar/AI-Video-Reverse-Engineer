@@ -4,7 +4,7 @@
 
 **Blocked by:** 01: 冻结五张验收矩阵与三条金标接缝
 
-**Status:** resolved
+**Status:** claimed
 
 ## Scope
 
@@ -50,6 +50,7 @@
 - 前端 `timelineApi`、`TimelineEditor` 增加八态中文、公共运行 ID、领域、attempt、关联重试与“迟到结果已保留，未采用”提示；重试按钮调用专用 endpoint，不再用无关联创建请求。
 - 源码复用/适配：仅复用项目内 `backend/app/durable_runs.py`、`timeline.py`、`timeline_api.py`、`render_inputs.py`、`frontend/src/timelineApi.ts`、`TimelineEditor.tsx` 的既有队列、持久化、冻结输入、路由与轮询结构；未引入外部任务系统，因此无新增第三方源码或许可证项。适配范围限于公共运行字段、兼容迁移、两阶段取消/恢复与 UI 可观察性。
 - TDD 红灯已实际确认：旧运行迁移缺少契约版本；带幂等键创建返回 422；运行中取消停在错误状态；专用 retry 返回 404；重启将运行标为 failed；前端缺少公共运行详情。收口时又以失败用例确认前端重试键随点击变化会破坏刷新后的幂等、取消后渲染器抛错会把迟到文件留在通用 staging 名称；随后均以稳定重试键与 attempt 私有文件转绿。
-- 绿灯证据：相关后端合同、真实 FFmpeg 与备份迁移测试 → `81 passed`；前端 Timeline 合同测试 → `35 passed`；`npm run build` 通过，保留既有大 bundle 提示。完整回归最终结果为后端 `1585 passed, 8 skipped`、前端 `64 files / 639 passed`。完整后端首次运行曾由本票的 `os.replace` 过早绑定暴露 1 个既有原子保存兼容回归；修复为默认运行时解析、保留显式失败注入后，既有原子保存测试和后续全量回归均通过。
+- 绿灯证据：当前工作区相关后端合同、真实 FFmpeg、备份迁移、公共 ID 清理与共享锁测试 → `83 passed`；前端 Timeline 合同测试 → `35 passed`；`npm run build` 通过，保留既有大 bundle 提示。独立审查在精确 `f4c9b41` 快照复现后端 `1442 passed, 10 skipped`、前端 `47 files / 471 passed` 与生产构建通过；此前记录的 `1585 / 639` 来自包含其他未提交工作的脏工作区，已撤回为提交证据。
 - 双轴首次审查发现并以回归测试闭合：公共 `commonRunId` 现在可直接查询、取消和重试，同时保留旧领域 ID；每个 attempt 从渲染开始使用独立 staging，旧 attempt 的失败或迟到文件不能覆盖/失败化新 attempt；重试端点恢复同项目活动任务限制；迁移前若原文变化会原子刷新可恢复备份，项目备份在冻结 inventory 前完成迁移；浏览器为每次明确操作生成幂等键，未收到持久化响应时跨刷新复用，确认后才清除并允许下一次明确运行。
+- 最终复核继续闭合公共 ID 清理留下悬空运行记录、以及重试复制/保存/入队未与项目备份共享 `source_lock` 两项问题；两项均先红后绿。票据自身六项验收已实现，但精确提交快照运行 Ticket 01 验收合同仍为 `5 failed / 10 passed`，原因是其覆盖表引用的 Ticket 03–33 文件不在提交树。受“只提交票据 02 直接文件”约束，本票不夹带这些前置票据文件，因此保持 `claimed`，不将 Ticket 03 宣称为已解锁。
 - 该票据仅完成 A07–A11、A14 的 Timeline 合同切片自动化证据；五张矩阵、真实 Provider/媒体金标和整个产品仍保持阻塞，未在验收资产中改写为通过。
