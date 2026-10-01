@@ -7,8 +7,8 @@ import type { AnalysisProviderConfiguration } from "./models";
 import type { TimelineAsset } from "./timelineApi";
 import { AspectRatioPicker } from "./AspectRatioPicker";
 import { resolveProductAspect, type AspectResolution } from "./videoAspect";
-import { confirmAigcCandidate, discloseAigcRequest, generateAigcCandidates, getAigcWorkspace, handoffAigcGeneration, saveAigcBrief, saveAigcCandidate,
-  type AigcBrief, type AigcCandidate, type AigcDisclosure, type AigcAsset } from "./aigcContentApi";
+import { adoptAigcGenerationResult, cancelAigcGenerationRun, clearPendingAigcGenerationKey, confirmAigcCandidate, discloseAigcRequest, getAigcGenerationCapabilities, getAigcGenerationRun, getAigcWorkspace, handoffAigcGeneration, pendingAigcGenerationKey, saveAigcBrief, saveAigcCandidate, submitAigcGeneration,
+  type AigcBrief, type AigcCandidate, type AigcDisclosure, type AigcAsset, type AigcGenerationRun } from "./aigcContentApi";
 
 function lines(value: string): string[] { return value.split("\n").map((item) => item.trim()).filter(Boolean); }
 function message(reason: unknown): string { return reason instanceof Error ? reason.message : "操作失败，请重试。"; }
@@ -34,6 +34,9 @@ export function AigcCreator({ projectId, onDraftChange, onPersistedChange, onBat
   const [forbiddenText, setForbiddenText] = useState("");
   const [assets, setAssets] = useState<AigcAsset[]>([]);
   const [candidates, setCandidates] = useState<AigcCandidate[]>([]);
+  const [generationRuns, setGenerationRuns] = useState<AigcGenerationRun[]>([]);
+  const [generationPollAttempt, setGenerationPollAttempt] = useState(0);
+  const [capabilities, setCapabilities] = useState<Record<string, boolean | string> | null>(null);
   const [candidateDrafts, setCandidateDrafts] = useState<Record<string, AigcCandidate>>({});
   const [providers, setProviders] = useState<AnalysisProviderConfiguration[]>([]);
   const [providerId, setProviderId] = useState("");
@@ -67,20 +70,33 @@ export function AigcCreator({ projectId, onDraftChange, onPersistedChange, onBat
   useEffect(() => {
     let active = true;
     searchRequestRef.current += 1; setImageSearch(null); setImageIds([]); setFailedImages([]); setImagesAccepted(false); setContinueAfterImages(false); setImageOperation(null);
-    setLoading(true); setBusy(false); setBrief(null); setSavedBrief(null); setCandidateDrafts({}); setDisclosure(null); setAccepted(false); setError(""); setHandoffTaskId(""); setHandoffSkipped(0);
+    setLoading(true); setBusy(false); setBrief(null); setSavedBrief(null); setCandidateDrafts({}); setGenerationRuns([]); setGenerationPollAttempt(0); setCapabilities(null); setDisclosure(null); setAccepted(false); setError(""); setHandoffTaskId(""); setHandoffSkipped(0);
     void Promise.all([getAigcWorkspace(projectId), listAnalysisProviders()]).then(([workspace, available]) => {
       if (!active) return;
       setBrief(workspace.brief); setSavedBrief(workspace.brief); setAssets(workspace.assets);
       setFactsText(workspace.brief.facts.map((item) => item.text).join("\n"));
       setSellingPointsText(workspace.brief.sellingPoints.join("\n"));
       setForbiddenText(workspace.brief.forbiddenPhrases.join("\n"));
-      setCandidates(workspace.candidates); setProviders(available);
+      setCandidates(workspace.candidates); setGenerationRuns(workspace.generationRuns ?? []); setProviders(available);
       setProviderId(available.find((item) => item.provider === item.selectedProvider && item.model && item.verificationState === "available")?.provider
         ?? available.find((item) => item.model && item.verificationState === "available")?.provider ?? "");
     }).catch((reason) => { if (active) setError(message(reason)); })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [projectId]);
+  useEffect(() => {
+    const active = generationRuns.find((run) => run.status === "queued" || run.status === "running");
+    if (!active) return;
+    const timer = window.setTimeout(() => { void getAigcGenerationRun(projectId, active.id).then((run) => {
+      if (projectRef.current === projectId) setGenerationRuns((runs) => runs.map((item) => item.id === run.id ? run : item));
+    }).catch((reason) => {
+      if (projectRef.current === projectId) {
+        setError(message(reason));
+        setGenerationPollAttempt((attempt) => attempt + 1);
+      }
+    }); }, 750);
+    return () => window.clearTimeout(timer);
+  }, [generationRuns, generationPollAttempt, projectId]);
   useEffect(() => { onDraftChange?.(dirty || candidateDirty); }, [dirty, candidateDirty, onDraftChange]);
 
   function change(update: Partial<AigcBrief>) {
@@ -90,11 +106,11 @@ export function AigcCreator({ projectId, onDraftChange, onPersistedChange, onBat
       update = {...update,facts:[]}; setFactsText("");
     }
     setBrief((current) => current ? { ...current, ...update } : current);
-    setDisclosure(null); setAccepted(false);
+    setDisclosure(null); setCapabilities(null); setAccepted(false);
   }
 
   async function reloadProviders() {
-    setBusy(true); setError(""); setDisclosure(null); setAccepted(false);
+    setBusy(true); setError(""); setDisclosure(null); setCapabilities(null); setAccepted(false);
     try {
       const available = await listAnalysisProviders();
       if (projectRef.current !== projectId) return;
@@ -112,7 +128,7 @@ export function AigcCreator({ projectId, onDraftChange, onPersistedChange, onBat
     try {
       const result = await saveAigcBrief(projectId, { ...brief, revision: savedBrief.revision });
       if (projectRef.current !== projectId) return;
-      setBrief(result.brief); setSavedBrief(result.brief); setDisclosure(null); setAccepted(false);
+      setBrief(result.brief); setSavedBrief(result.brief); setDisclosure(null); setCapabilities(null); setAccepted(false);
       setFactsText(result.brief.facts.map((item) => item.text).join("\n"));
       setSellingPointsText(result.brief.sellingPoints.join("\n"));
       setForbiddenText(result.brief.forbiddenPhrases.join("\n"));
@@ -124,11 +140,18 @@ export function AigcCreator({ projectId, onDraftChange, onPersistedChange, onBat
   async function preview() {
     const provider = providers.find((item) => item.provider === providerId);
     if (!provider?.model || provider.verificationState !== "available") return;
-    setBusy(true); setError("");
+    setBusy(true); setError(""); setCapabilities(null);
     try {
       const result = await discloseAigcRequest(projectId, providerId, provider.model);
       if (projectRef.current !== projectId) return;
-      setDisclosure(result); setAccepted(false);
+      let supported: { capabilities: Record<string, boolean | string> } | null = null;
+      try {
+        supported = await getAigcGenerationCapabilities(projectId, result.provider, result.model);
+      } catch {
+        // A disclosure may remain visible, but unknown capabilities cannot submit.
+      }
+      if (projectRef.current !== projectId) return;
+      setDisclosure(result); setCapabilities(supported?.capabilities ?? null); setAccepted(false);
     } catch (reason) { if (projectRef.current === projectId) setError(message(reason)); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
@@ -152,7 +175,7 @@ export function AigcCreator({ projectId, onDraftChange, onPersistedChange, onBat
     if (ids.length < 2) { change({assetIds:ids}); await findImages(true); return; }
     const prepared = { ...input, assetIds: ids, audience: input.audience,
       facts: input.facts.length ? input.facts : [{ id: "product-name", text: `商品名称：${input.productName.trim()}。仅描述所选画面可核对的信息，不推断功效、价格或市场表现。` }] };
-    setBusy(true); setError(""); setDisclosure(null); setAccepted(false);
+    setBusy(true); setError(""); setDisclosure(null); setCapabilities(null); setAccepted(false);
     try {
       if (JSON.stringify(prepared) !== JSON.stringify(savedBrief)) {
         const result = await saveAigcBrief(projectId, { ...prepared, revision: savedBrief.revision });
@@ -161,7 +184,13 @@ export function AigcCreator({ projectId, onDraftChange, onPersistedChange, onBat
         onPersistedChange?.();
       }
       const result = await discloseAigcRequest(projectId, providerId, provider.model);
-      if (projectRef.current === projectId) setDisclosure(result);
+      let supported: { capabilities: Record<string, boolean | string> } | null = null;
+      try {
+        supported = await getAigcGenerationCapabilities(projectId, result.provider, result.model);
+      } catch {
+        // The user can review the disclosure, but cannot submit without a catalog.
+      }
+      if (projectRef.current === projectId) { setDisclosure(result); setCapabilities(supported?.capabilities ?? null); }
     } catch (reason) { if (projectRef.current === projectId) setError(message(reason)); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
@@ -183,16 +212,40 @@ export function AigcCreator({ projectId, onDraftChange, onPersistedChange, onBat
   }
 
   async function generate() {
-    if (!disclosure || !accepted || candidateDirty) return;
+    if (!disclosure || !capabilities || !accepted || candidateDirty) return;
     setBusy(true); setError("");
     try {
-      const result = await generateAigcCandidates(projectId, disclosure);
+      const idempotencyKey = pendingAigcGenerationKey(projectId, disclosure);
+      const result = await submitAigcGeneration(projectId, disclosure, idempotencyKey);
       if (projectRef.current !== projectId) return;
-      setCandidates((current) => [...current, ...result.candidates]);
-      setSelectedCandidate(0); onStepChange?.(1);
+      setGenerationRuns((runs) => [result.run, ...runs.filter((run) => run.id !== result.run.id)]);
+      clearPendingAigcGenerationKey(projectId, disclosure);
       setDisclosure(null); setAccepted(false);
-      onPersistedChange?.();
     } catch (reason) { if (projectRef.current === projectId) setError(message(reason)); }
+    finally { if (projectRef.current === projectId) setBusy(false); }
+  }
+
+  async function adopt(run: AigcGenerationRun) {
+    const result = run.outputItems.find((item) => item.status === "completed");
+    if (!result) return;
+    setBusy(true); setError("");
+    try {
+      const adopted = await adoptAigcGenerationResult(projectId, run.id, result.resultId);
+      if (projectRef.current !== projectId) return;
+      setCandidates((current) => [...current, ...adopted.candidates.filter((candidate) => !current.some((item) => item.id === candidate.id))]);
+      setSelectedCandidate(0); onStepChange?.(1); onPersistedChange?.();
+    } catch (reason) { if (projectRef.current === projectId) setError(message(reason)); }
+    finally { if (projectRef.current === projectId) setBusy(false); }
+  }
+
+  async function refreshRun(run: AigcGenerationRun) {
+    try { const next = await getAigcGenerationRun(projectId, run.id); if (projectRef.current === projectId) setGenerationRuns((runs) => runs.map((item) => item.id === next.id ? next : item)); }
+    catch (reason) { if (projectRef.current === projectId) setError(message(reason)); }
+  }
+  async function cancelRun(run: AigcGenerationRun) {
+    setBusy(true); setError("");
+    try { const next = await cancelAigcGenerationRun(projectId, run.id); if (projectRef.current === projectId) setGenerationRuns((runs) => runs.map((item) => item.id === next.run.id ? next.run : item)); }
+    catch (reason) { if (projectRef.current === projectId) setError(message(reason)); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
 
@@ -325,7 +378,7 @@ export function AigcCreator({ projectId, onDraftChange, onPersistedChange, onBat
       {guided && onOpenAssets && <button type="button" className="secondary-action" onClick={onOpenAssets}>上传或管理项目素材</button>}
       <button type="button" className={guided ? "secondary-action" : "primary-action"} disabled={busy || !dirty} onClick={() => void save()}>{guided ? "保存资料" : "保存创作简报"}</button>
       <div className={`studio-script-controls${disclosure ? " is-confirming" : ""}`}>
-        <label>脚本生成服务<select value={providerId} onChange={(event) => { setProviderId(event.target.value); setDisclosure(null); setAccepted(false); }}>
+        <label>脚本生成服务<select value={providerId} onChange={(event) => { setProviderId(event.target.value); setDisclosure(null); setCapabilities(null); setAccepted(false); }}>
           <option value="">请选择已验证服务</option>{providers.filter((item) => item.model && item.verificationState === "available").map((item) =>
             <option key={item.provider} value={item.provider}>{item.label} · {item.model}</option>)}</select></label>
         <div className="studio-script-actions">
@@ -341,11 +394,25 @@ export function AigcCreator({ projectId, onDraftChange, onPersistedChange, onBat
       {disclosure && <div className="batch-editor-disclosure" role="region" aria-label="发送前核对">
         <div className="studio-disclosure-heading"><div><h5>发送前核对</h5><p>{providers.find((item) => item.provider === disclosure.provider)?.label ?? disclosure.provider} · {disclosure.model}</p></div><span>简报版本 {disclosure.briefRevision}</span></div>
         <div className="studio-disclosure-summary"><p>将发送 {brief.facts.length} 条商品事实和 {brief.assetIds.length} 项素材引用</p><p>不会发送原始图片、视频或本地文件。</p></div>
+        {capabilities && <p>结构化 schema：{capabilities.structuredSchema ? "支持" : "不支持"}；流式：{capabilities.streaming ? "支持" : "不支持"}；引用：{capabilities.references ? "支持" : "不支持"}；输出预算：{capabilities.outputBudget ? "支持" : "不支持"}；取消：{capabilities.cancel ? "支持" : "不支持"}；超时：{capabilities.timeout ? "支持" : "不支持"}。</p>}
         <details className="studio-disclosure-details"><summary>查看完整发送文字</summary><pre tabIndex={0}>{disclosure.prompt}</pre></details>
         <div className="studio-disclosure-actions"><label><input type="checkbox" checked={accepted} onChange={(event) => setAccepted(event.target.checked)} />我已核对本次发送内容</label>
-        <button type="button" className="primary-action" disabled={busy || !accepted || candidateDirty}
+        <button type="button" className="primary-action" disabled={busy || !capabilities || !accepted || candidateDirty}
           onClick={() => void generate()}>确认发送并生成 5 条候选</button></div>
       </div>}
+      {generationRuns.map((run) => {
+        const result = run.outputItems.find((item) => item.status === "completed");
+        return <section key={run.id} className="batch-editor-disclosure" aria-label={`脚本生成运行 ${run.id}`}>
+          <h5>脚本生成结果</h5><p>{run.provider} · {run.model}</p><p role="status">状态：{run.status}；结果：{run.outcome ?? "处理中"}{run.billingUnknown ? "（计费结果未知）" : ""}</p>
+          <p>结构化 schema：{run.capabilitySnapshot.structuredSchema ? "支持" : "不支持"}；流式：{run.capabilitySnapshot.streaming ? "支持" : "不支持"}；引用：{run.capabilitySnapshot.references ? "支持" : "不支持"}；输出预算：{run.capabilitySnapshot.outputBudget ? "支持" : "不支持"}；取消：{run.capabilitySnapshot.cancel ? "支持" : "不支持"}；超时：{run.capabilitySnapshot.timeout ? "支持" : "不支持"}。</p>
+          {run.disclosure?.prompt && <details open><summary>查看完整外发文字</summary><pre tabIndex={0}>{run.disclosure.prompt}</pre></details>}
+          {run.outputItems.map((item) => item.text && <details key={item.resultId} open><summary>查看已收文本（{item.status}）</summary><pre tabIndex={0}>{item.text}</pre></details>)}
+          {result && <button type="button" className="primary-action" disabled={busy} onClick={() => void adopt(run)}>采用这次生成的 5 条脚本</button>}
+          <button type="button" className="secondary-action" disabled={busy} onClick={() => void refreshRun(run)}>刷新生成状态</button>
+          {run.status === "queued" && <button type="button" className="secondary-action" disabled={busy} onClick={() => void cancelRun(run)}>取消排队</button>}
+          {run.status === "running" && run.capabilitySnapshot.cancel && <button type="button" className="secondary-action" disabled={busy} onClick={() => void cancelRun(run)}>请求远端取消</button>}
+        </section>;
+      })}
       </div>
       {guided && guidedStep === 1 && candidates.length === 0 && <div className="sp-empty"><p>这个项目尚无脚本候选。请先准备资料并生成脚本；已有制作任务可在选声制作或成片与审片中继续。</p><button type="button" className="secondary-action" onClick={() => onStepChange?.(0)}>返回准备资料</button></div>}
       {candidates.length > 0 && <div hidden={guided && guidedStep !== 1} className="studio-candidates"><h5>脚本候选</h5>

@@ -16,6 +16,7 @@ from .preproduction import safe_child
 from .project_assets import ProjectAssets
 from .prompt_generation import _redact_value
 from .provider_models import PROVIDER_IDS
+from .generation_service import GenerationAdapter, GenerationAdapterRegistry, GenerationError, GenerationService
 from .video_aspect import valid_aspect_mode
 
 
@@ -188,11 +189,40 @@ def load_confirmed_handoff(data_dir, project_id, generation_id):
     return brief, candidates
 
 
-def create_aigc_content_router(data_dir, get_project, script_generator=None, source_lock=None):
+def create_aigc_content_router(data_dir, get_project, script_generator=None, source_lock=None,
+                               generation_service=None, compute_queue=None, capability_catalog=None):
     root = Path(data_dir)
     project_assets = ProjectAssets(root)
     router = APIRouter(prefix="/api/projects/{project_id}/aigc-content")
     lock = RLock()
+
+    def run_adapter(run):
+        if script_generator is None:
+            raise GenerationError("provider_unconfigured")
+        return script_generator(run["provider"], run["model"], run["input"]["prompt"], run["input"]["textParams"].get("structuredSchema"))
+
+    if generation_service is None:
+        registry = GenerationAdapterRegistry()
+        registry.register(GenerationAdapter("aigc-script-text", "compat-1", "text", run_adapter,
+            capability_catalog or GenerationService._default, result_validator=lambda text: _CandidateResponse.model_validate_json(text)))
+        service = GenerationService(root, registry=registry, queue=compute_queue)
+    else:
+        service = generation_service
+
+    def generation_error(error):
+        if error.code in {"generation_adapter_missing", "generation_adapter_resolution_failed"}:
+            error = GenerationError("provider_unconfigured")
+        messages = {
+            "generation_run_missing": (404, "生成运行不存在。"),
+            "generation_idempotency_conflict": (409, "同一幂等键已用于不同输入，不能重复提交。"),
+            "generation_capability_unavailable": (422, "所选服务未声明本次结构化文本生成能力。"),
+            "generation_cancel_unsupported": (422, "所选服务未声明远端取消能力。"),
+            "generation_timeout_unsupported": (422, "所选服务未声明超时控制能力。"),
+            "provider_unconfigured": (422, "请先配置并验证所选 AI 服务。"),
+            "generation_adapter_missing": (422, "请先配置并验证所选 AI 服务。"),
+        }
+        status, message = messages.get(error.code, (422, "文本生成请求无效。"))
+        raise HTTPException(status, detail={"code": error.code, "message": message}) from None
 
     @router.get("")
     def workspace(project_id: str):
@@ -203,7 +233,8 @@ def create_aigc_content_router(data_dir, get_project, script_generator=None, sou
                 project_id, kinds=("image", "video"), include_url=False,
                 include_source_reference=True,
             )
-        return {"brief": state["brief"], "candidates": state["candidates"], "assets": assets}
+        return {"brief": state["brief"], "candidates": state["candidates"], "assets": assets,
+                "generationRuns": service.list_runs(project_id)}
 
     @router.put("/brief")
     def save_brief(project_id: str, body: dict):
@@ -228,35 +259,82 @@ def create_aigc_content_router(data_dir, get_project, script_generator=None, sou
             state = load_aigc_content_state(root, project_id)
             return _disclosure(root, project_id, state["brief"], body["provider"], body["model"])
 
-    @router.post("/candidates", status_code=201)
+    @router.post("/candidates")
     def generate_candidates(project_id: str, body: dict):
         get_project(project_id)
-        if not isinstance(body, dict) or body.get("disclosureAccepted") is not True:
-            raise HTTPException(422, detail={"code": "aigc_disclosure_required", "message": "请先核对并确认本次发送内容。"})
-        if (set(body) != {"briefRevision", "provider", "model", "digest", "disclosureAccepted"}
-                or type(body["briefRevision"]) is not int or not isinstance(body["digest"], str)):
-            raise HTTPException(422, detail={"code": "aigc_disclosure_invalid", "message": "发送确认无效，请重新预览。"})
+        raise HTTPException(410, detail={"code": "aigc_generation_run_required", "message": "请先创建生成运行，再显式采用结果。"})
+
+    @router.post("/generation-runs", status_code=202)
+    def submit_generation_run(project_id: str, body: dict):
+        get_project(project_id)
+        expected = {"briefRevision", "provider", "model", "digest", "disclosureAccepted", "idempotencyKey"}
+        if not isinstance(body, dict) or set(body) != expected or body.get("disclosureAccepted") is not True or type(body.get("briefRevision")) is not int or not isinstance(body.get("digest"), str) or not isinstance(body.get("idempotencyKey"), str) or not body["idempotencyKey"]:
+            raise HTTPException(422, detail={"code": "generation_request_invalid", "message": "文本生成提交无效，请重新核对发送内容。"})
         with source_lock or nullcontext(), lock:
             state = load_aigc_content_state(root, project_id)
             disclosure = _disclosure(root, project_id, state["brief"], body["provider"], body["model"])
             if body["briefRevision"] != state["brief"]["revision"] or body["digest"] != disclosure["digest"]:
                 raise HTTPException(409, detail={"code": "aigc_disclosure_stale", "message": "创作简报或素材信息已更新，请重新核对发送内容。"})
-        if script_generator is None:
-            raise HTTPException(503, detail={"code": "aigc_provider_unavailable", "message": "脚本生成服务尚未连接。"})
-        raw = script_generator(disclosure["provider"], disclosure["model"], disclosure["prompt"], _CandidateResponse.model_json_schema())
-        candidates = _validate_candidates(raw, state["brief"])
-        generation_id = uuid4().hex
-        saved = [{**candidate.model_dump(), "id": uuid4().hex, "generationId": generation_id, "revision": 0,
-                  "briefRevision": disclosure["briefRevision"], "confirmedRevision": None, "provider": disclosure["provider"],
-                  "model": disclosure["model"], "promptDigest": disclosure["digest"]} for candidate in candidates]
+            frozen_disclosure = {key: disclosure[key] for key in ("provider", "model", "prompt", "digest", "briefRevision")}
+            frozen_disclosure["accepted"] = True
+            try:
+                run = service.submit(project_id, disclosure=frozen_disclosure, text_params={"structuredSchema": _CandidateResponse.model_json_schema()}, idempotency_key=body["idempotencyKey"], caller="aigc-script-candidates")
+            except GenerationError as error:
+                generation_error(error)
+        return {"run": run}
+
+    @router.get("/generation-capabilities")
+    def generation_capabilities(project_id: str, provider: str, model: str):
+        get_project(project_id)
+        try:
+            return service.capabilities(provider, model)
+        except GenerationError as error:
+            generation_error(error)
+
+    @router.get("/generation-runs/{run_id}")
+    def get_generation_run(project_id: str, run_id: str):
+        get_project(project_id)
+        try:
+            return service.get_run(project_id, run_id)
+        except GenerationError as error:
+            generation_error(error)
+
+    @router.post("/generation-runs/{run_id}/cancel")
+    def cancel_generation_run(project_id: str, run_id: str):
+        get_project(project_id)
+        try:
+            return {"run": service.cancel(project_id, run_id)}
+        except GenerationError as error:
+            generation_error(error)
+
+    @router.post("/generation-runs/{run_id}/outputs/{result_id}/adopt")
+    def adopt_generation_result(project_id: str, run_id: str, result_id: str):
+        get_project(project_id)
         with source_lock or nullcontext(), lock:
-            current = load_aigc_content_state(root, project_id)
-            fresh = _disclosure(root, project_id, current["brief"], body["provider"], body["model"])
-            if current["brief"] != state["brief"] or fresh["digest"] != disclosure["digest"]:
-                raise HTTPException(409, detail={"code": "aigc_disclosure_stale", "message": "创作简报已更新，请重新核对发送内容。"})
-            current["candidates"].extend(saved)
-            _save(root, project_id, current)
-        return {"candidates": saved}
+            try:
+                run = service.get_run(project_id, run_id)
+            except GenerationError as error:
+                generation_error(error)
+            item = next((value for value in run.get("outputItems", []) if value.get("resultId") == result_id and value.get("status") == "completed"), None)
+            if item is None or not isinstance(item.get("text"), str):
+                raise HTTPException(409, detail={"code": "generation_result_unavailable", "message": "文本结果尚不可采用。"})
+            state = load_aigc_content_state(root, project_id)
+            current_disclosure = _disclosure(root, project_id, state["brief"], run["provider"], run["model"])
+            if (run["disclosure"].get("briefRevision") != state["brief"]["revision"]
+                    or run["disclosure"].get("digest") != current_disclosure["digest"]):
+                raise HTTPException(409, detail={"code": "aigc_disclosure_stale", "message": "创作简报或素材信息已更新，请重新生成后采用。"})
+            existing = [candidate for candidate in state["candidates"] if candidate.get("sourceRunId") == run_id and candidate.get("sourceResultId") == result_id]
+            if existing:
+                return {"candidates": existing}
+            candidates = _validate_candidates(item["text"], state["brief"])
+            generation_id = uuid4().hex
+            saved = [{**candidate.model_dump(), "id": uuid4().hex, "generationId": generation_id, "revision": 0,
+                      "briefRevision": state["brief"]["revision"], "confirmedRevision": None,
+                      "provider": run["provider"], "model": run["model"], "promptDigest": run["disclosure"]["digest"],
+                      "sourceRunId": run_id, "sourceResultId": result_id} for candidate in candidates]
+            state["candidates"].extend(saved)
+            _save(root, project_id, state)
+            return {"candidates": saved}
 
     def candidate_for(state, candidate_id):
         candidate = next((item for item in state["candidates"] if item["id"] == candidate_id), None)

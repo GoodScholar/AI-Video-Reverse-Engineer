@@ -2533,9 +2533,10 @@ def create_app(
         segment_reranker=resolved_segment_reranker,
         segment_vectorizer_version=resolved_segment_vectorizer.version,
     ))
-    from .aigc_content_api import create_aigc_content_router
+    from .aigc_content_api import _CandidateResponse, create_aigc_content_router
+    from .generation_service import GenerationAdapter, GenerationAdapterRegistry, GenerationService, TEXT_CAPABILITIES
 
-    def generate_marketing_candidates(provider_id, model, prompt, schema):
+    def generate_marketing_candidates(provider_id, model, prompt, schema, *, configuration_version=None):
         if not analysis_model_is_supported(provider_id, model):
             raise HTTPException(422, detail={"code": "provider_unconfigured", "message": "请先配置并验证所选 AI 服务。"})
         try:
@@ -2543,6 +2544,7 @@ def create_app(
                 provider=provider_id,
                 model=model,
                 require_verified=True,
+                expected_configuration_revision=configuration_version,
                 operation=lambda provider, configured_model: provider.analyze(ProviderRequest(
                     task="prompt_generation", prompt=prompt, model=configured_model,
                     responseSchema=schema,
@@ -2553,9 +2555,37 @@ def create_app(
         except ProviderAnalysisError as error:
             raise HTTPException(422, detail={"code": error.failure.code, "message": error.failure.message}) from None
 
+    def aigc_capabilities(provider_id, model):
+        try:
+            configuration = analysis_provider_configurations.require_configured(
+                provider_id, model, require_verified=True,
+            )
+        except AnalysisProviderUnconfiguredError:
+            raise GenerationError("provider_unconfigured") from None
+        return {
+            "provider": provider_id,
+            "model": configuration.model,
+            "configurationVersion": configuration.configurationRevision,
+            "capabilities": dict(TEXT_CAPABILITIES),
+        }
+
+    def run_aigc_generation(run):
+        return generate_marketing_candidates(
+            run["provider"], run["model"], run["input"]["prompt"], run["input"]["textParams"].get("structuredSchema"),
+            configuration_version=run["configurationVersion"],
+        )
+
+    aigc_generation_registry = GenerationAdapterRegistry()
+    aigc_generation_registry.register(GenerationAdapter(
+        "analysis-structured-text", "analysis-v1", "text", run_aigc_generation, aigc_capabilities,
+        result_validator=lambda text: _CandidateResponse.model_validate_json(text),
+    ))
+    aigc_generation_service = GenerationService(data_dir, registry=aigc_generation_registry, queue=compute_jobs)
+
     app.include_router(create_aigc_content_router(data_dir, ensure_project_exists,
                                                    script_generator=generate_marketing_candidates,
-                                                   source_lock=project_write_lock))
+                                                   source_lock=project_write_lock,
+                                                   generation_service=aigc_generation_service))
     from .content_workflow_api import create_content_workflow_router
     app.include_router(create_content_workflow_router(
         data_dir, ensure_project_exists, source_lock=project_write_lock,

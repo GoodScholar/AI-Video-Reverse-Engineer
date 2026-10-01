@@ -67,7 +67,7 @@ it("四步制作的生成按钮先保存新资料并展示发送内容，未经�
   expect(screen.getByText("已保存新资料：通勤者")).toHaveAttribute("tabindex", "0");
   expect(screen.getByRole("button", { name: "确认发送并生成 5 条候选" })).toBeDisabled();
   expect(vi.mocked(fetch).mock.calls.map(([url]) => String(url))).toEqual([
-    "/api/projects/p1/aigc-content", "/api/analysis-providers", "/api/projects/p1/aigc-content/brief", "/api/projects/p1/aigc-content/disclosure",
+    "/api/projects/p1/aigc-content", "/api/analysis-providers", "/api/projects/p1/aigc-content/brief", "/api/projects/p1/aigc-content/disclosure", "/api/projects/p1/aigc-content/generation-capabilities?provider=local_openai_compatible&model=local-model",
   ]);
 });
 
@@ -97,6 +97,85 @@ it("尚未通过连接测试的 AI 服务不能用于脚本生成", async () => 
   expect(await screen.findByRole("button", { name: "预览发送内容" })).toBeDisabled();
 });
 
+it("生成运行卡显示完整能力、外发内容并允许手动刷新", async () => {
+  const brief = { ...emptyBrief, revision: 1, productName: "晴雨杯", assetIds: ["front", "use"] };
+  const run = { id: "run-1", provider: provider.provider, model: provider.model, status: "partial_success", outcome: "incomplete", billingUnknown: true,
+    disclosure: { prompt: "完整外发文字" }, capabilitySnapshot: { structuredSchema: true, streaming: false, references: false, outputBudget: false, cancel: false, timeout: false },
+    outputItems: [{ resultId: "result-1", status: "incomplete", chunks: [{ sequence: 0, text: "已收片段" }], text: "已收片段" }] };
+  vi.mocked(fetch).mockResolvedValueOnce(response({ brief, candidates: [], assets, generationRuns: [run] }))
+    .mockResolvedValueOnce(response([provider]));
+  render(<AigcCreator projectId="p1" />);
+
+  expect(await screen.findByText("完整外发文字")).toBeVisible();
+  expect(screen.getByText(/结构化 schema：/)).toHaveTextContent("支持");
+  expect(screen.getByRole("button", { name: "刷新生成状态" })).toBeVisible();
+});
+
+it("生成状态自动轮询首个请求失败后会继续轮询并恢复", async () => {
+  const brief = { ...emptyBrief, revision: 1, productName: "晴雨杯", assetIds: ["front", "use"] };
+  const running = { id: "poll-run", provider: provider.provider, model: provider.model, status: "running",
+    billingUnknown: false, capabilitySnapshot: { structuredSchema: true, streaming: false, references: false,
+      outputBudget: false, cancel: false, timeout: false }, outputItems: [] };
+  const completed = { ...running, status: "completed", outcome: "completed" };
+  vi.mocked(fetch).mockResolvedValueOnce(response({ brief, candidates: [], assets, generationRuns: [running] }))
+    .mockResolvedValueOnce(response([provider]))
+    .mockRejectedValueOnce(new Error("temporary network"))
+    .mockResolvedValueOnce(response(completed));
+  render(<AigcCreator projectId="poll-recovery" />);
+
+  expect(await screen.findByText(/状态：running/)).toBeVisible();
+  expect(await screen.findByRole("alert", {}, { timeout: 1_500 })).toHaveTextContent("无法连接本地服务");
+  expect(await screen.findByText(/状态：completed/, {}, { timeout: 1_500 })).toBeVisible();
+  const polls = vi.mocked(fetch).mock.calls.filter(([url]) => String(url).includes("/generation-runs/poll-run"));
+  expect(polls).toHaveLength(2);
+});
+
+it("发送前先读取并展示能力，尚未确认时不会提交生成运行", async () => {
+  const brief = { ...emptyBrief, revision: 1, productName: "晴雨杯", assetIds: ["front", "use"] };
+  vi.mocked(fetch).mockResolvedValueOnce(response({ brief, candidates: [], assets }))
+    .mockResolvedValueOnce(response([provider]))
+    .mockResolvedValueOnce(response({ briefRevision: 1, provider: provider.provider, model: provider.model,
+      prompt: "完整发送文字", digest: "capability-digest" }))
+    .mockResolvedValueOnce(response({ capabilities: { structuredSchema: true, streaming: true, references: false,
+      outputBudget: false, cancel: true, timeout: true } }));
+  render(<AigcCreator projectId="capabilities-before-submit" />);
+
+  await userEvent.click(await screen.findByRole("button", { name: "预览发送内容" }));
+
+  expect(await screen.findByText(/结构化 schema：支持；流式：支持/)).toBeVisible();
+  expect(vi.mocked(fetch).mock.calls.map(([url]) => String(url))).not.toContain(
+    "/api/projects/capabilities-before-submit/aigc-content/generation-runs",
+  );
+});
+
+it("提交失败会复用幂等键，成功后清除待提交键", async () => {
+  const brief = { ...emptyBrief, revision: 1, productName: "晴雨杯", assetIds: ["front", "use"] };
+  const disclosure = { briefRevision: 1, provider: provider.provider, model: provider.model,
+    prompt: "完整发送文字", digest: "retry-digest" };
+  vi.mocked(fetch).mockResolvedValueOnce(response({ brief, candidates: [], assets }))
+    .mockResolvedValueOnce(response([provider]))
+    .mockResolvedValueOnce(response(disclosure))
+    .mockResolvedValueOnce(response({ capabilities: { structuredSchema: true, streaming: false, references: false,
+      outputBudget: false, cancel: false, timeout: false } }))
+    .mockRejectedValueOnce(new Error("network"))
+    .mockResolvedValueOnce(response({ run: { id: "retry-run", provider: provider.provider, model: provider.model,
+      status: "completed", billingUnknown: false, capabilitySnapshot: { structuredSchema: true, streaming: false,
+      references: false, outputBudget: false, cancel: false, timeout: false }, outputItems: [] } }));
+  render(<AigcCreator projectId="retry-key" />);
+
+  await userEvent.click(await screen.findByRole("button", { name: "预览发送内容" }));
+  await userEvent.click(screen.getByLabelText("我已核对本次发送内容"));
+  const submit = screen.getByRole("button", { name: "确认发送并生成 5 条候选" });
+  await userEvent.click(submit);
+  expect(await screen.findByRole("alert")).toHaveTextContent("无法连接本地服务");
+  await userEvent.click(submit);
+
+  const first = JSON.parse(vi.mocked(fetch).mock.calls[4][1]?.body as string);
+  const second = JSON.parse(vi.mocked(fetch).mock.calls[5][1]?.body as string);
+  expect(first.idempotencyKey).toBe(second.idempotencyKey);
+  expect(sessionStorage.getItem("aigc-generation:retry-key:retry-digest:1:local_openai_compatible:local-model")).toBeNull();
+});
+
 it("保存简报后逐次展示发送文字并由交付人员确认生成五条候选", async () => {
   const savedBrief = { ...emptyBrief, revision: 1, productName: "晴雨杯", facts: [{ id: "fact-1", text: "杯盖防泼溅" },
     { id: "fact-2", text: "杯身可重复使用" }],
@@ -112,6 +191,10 @@ it("保存简报后逐次展示发送文字并由交付人员确认生成五条�
     .mockResolvedValueOnce(response([provider]))
     .mockResolvedValueOnce(response({ brief: savedBrief }))
     .mockResolvedValueOnce(response(disclosure))
+    .mockResolvedValueOnce(response({ capabilities: { structuredSchema: true, streaming: false, references: false, outputBudget: false, cancel: false, timeout: false } }))
+    .mockResolvedValueOnce(response({ run: { id: "run-1", status: "completed", billingUnknown: false,
+      capabilitySnapshot: { streaming: false, cancel: false, outputBudget: false },
+      outputItems: [{ resultId: "result-1", status: "completed", chunks: [{ sequence: 0, text: "不可变脚本结果" }], text: "不可变脚本结果" }] } }))
     .mockResolvedValueOnce(response({ candidates }));
   render(<AigcCreator projectId="p1" />);
 
@@ -128,16 +211,20 @@ it("保存简报后逐次展示发送文字并由交付人员确认生成五条�
   await userEvent.click(await screen.findByRole("button", { name: "预览发送内容" }));
   await userEvent.click(await screen.findByText("查看完整发送文字"));
   expect(await screen.findByText(disclosure.prompt)).toBeVisible();
-  expect(vi.mocked(fetch)).toHaveBeenCalledTimes(4);
+  expect(vi.mocked(fetch)).toHaveBeenCalledTimes(5);
   expect(screen.getByRole("button", { name: "确认发送并生成 5 条候选" })).toBeDisabled();
   await userEvent.click(screen.getByLabelText("我已核对本次发送内容"));
   await userEvent.click(screen.getByRole("button", { name: "确认发送并生成 5 条候选" }));
 
+  expect(await screen.findByText("不可变脚本结果")).toBeVisible();
+  expect(screen.queryByText("卖点 5")).not.toBeInTheDocument();
+  const request = vi.mocked(fetch).mock.calls[5];
+  expect(request[0]).toContain("/api/projects/p1/aigc-content/generation-runs");
+  expect(JSON.parse(request[1]?.body as string)).toMatchObject({ briefRevision: 1, provider: "local_openai_compatible",
+    model: "local-model", digest: "digest-1", disclosureAccepted: true, idempotencyKey: expect.any(String) });
+  await userEvent.click(screen.getByRole("button", { name: "采用这次生成的 5 条脚本" }));
   expect(await screen.findByText("卖点 5")).toBeVisible();
-  const request = vi.mocked(fetch).mock.calls[4];
-  expect(request[0]).toContain("/api/projects/p1/aigc-content/candidates");
-  expect(JSON.parse(request[1]?.body as string)).toEqual({ briefRevision: 1, provider: "local_openai_compatible",
-    model: "local-model", digest: "digest-1", disclosureAccepted: true });
+  expect(vi.mocked(fetch).mock.calls[6][0]).toContain("/generation-runs/run-1/outputs/result-1/adopt");
   expect(JSON.parse(vi.mocked(fetch).mock.calls[2][1]?.body as string).brief.facts).toEqual(savedBrief.facts);
 });
 

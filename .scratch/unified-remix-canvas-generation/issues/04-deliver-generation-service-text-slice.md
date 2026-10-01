@@ -4,7 +4,7 @@
 
 **Blocked by:** 03: 统一项目素材结果安装与版本失效传播
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 ## Scope
 
@@ -20,12 +20,12 @@
 
 ## Acceptance criteria
 
-- [ ] 用户能从至少一个现有入口提交文本请求并看到 Provider、模型、外发文字和能力限制。
-- [ ] 普通流式结果按顺序持久化，刷新后可继续查看，断流明确标记不完整。
-- [ ] 结构化 Schema 和输出预算只在适配器声明支持时可用，非法组合在服务端拒绝。
-- [ ] 取消、超时、失败和未知状态不会静默切换 Provider 或自动重提。
-- [ ] 文本结果保持不可变，明确采用后才成为画布文本、脚本版本或 `RemixPlan` 输入。
-- [ ] Provider 凭据不进入前端、项目数据、日志或错误回显。
+- [x] 用户能从至少一个现有入口提交文本请求并看到 Provider、模型、外发文字和能力限制。
+- [x] 普通流式结果按顺序持久化，刷新后可继续查看，断流明确标记不完整。
+- [x] 结构化 Schema 和输出预算只在适配器声明支持时可用，非法组合在服务端拒绝。
+- [x] 取消、超时、失败和未知状态不会静默切换 Provider 或自动重提。
+- [x] 文本结果保持不可变，明确采用后才成为画布文本、脚本版本或 `RemixPlan` 输入。
+- [x] Provider 凭据不进入前端、项目数据、日志或错误回显。
 
 ## Verification evidence
 
@@ -37,3 +37,18 @@
 
 - 图片、视频和 ComfyUI 适配器。
 - 自动把生成文本写入任何领域对象。
+
+## Comments
+
+### 2026-10-01 第二轮复审修复与证据
+
+- 按复审意见重建为受控 `GenerationAdapterRegistry`：注册项冻结 adapter id/version、模态、execute、能力解析器，并可选取消与结果校验；生产 `main.py` 显式注册 analysis 结构化文本 adapter。运行保存公共 `commonRunId`、`domainKind`、`inputSnapshot`、`inputFingerprint`、幂等键、attempt、logs 和共享公共状态；生成结论放入 `outcome/reason`。重启中的运行转可备份终态 `failed + outcome=unknown`，不自动重提。
+- disclosure 仅允许 Provider、模型、完整外发 prompt、digest、briefRevision、accepted；schema 移入受控 `textParams`。结构化 schema、references、outputBudget、timeoutSeconds、stream 均逐项按版本化能力拒绝；canary 密钥字段不能进入项目记录或错误。首个 analysis adapter 仅声明 schema，其余能力为 false。
+- fake generator 验证每个 sequence chunk 在下次 yield 前已原子写入固定 resultId；仅明确 done 才完成，缺口/中断保留已收文本并标记 incomplete/unknown。同步字符串只是单 chunk 非流响应。adapter 边界用 `_CandidateResponse` 校验结构化 AIGC 输出，非法结果不可采用。
+- queued cancel 在 worker 调用 adapter 前终止；running cancel 使用 cancel_requested 后确认，迟到 chunk/完成不会覆盖终态。timeoutSeconds 由内部 deadline timer 自动进入 timed_out；网络/Provider 异常默认 billingUnknown=true。
+- AIGC UI 确认提交前查询 capability catalog，展示完整外发文字与 schema/streaming/references/outputBudget/cancel/timeout；运行卡刷新后展示 Provider、模型、外发、outcome、计费未知和 partial chunks，支持手动刷新、自动轮询与已声明的取消。sessionStorage 加内存 pending key 保证未知响应重试复用同一幂等键。
+- TDD 红灯：`PYTHONPATH=. .venv/bin/pytest -q tests/test_generation_service_review.py` 初始因不存在 registry 类型收集失败；运行卡 Vitest 初始找不到外发文字/能力/刷新按钮。修复后后端定向、前端定向、构建与 acceptance 校验通过。正式矩阵未写入通过；真实 Provider E3/E4 仍为票据 08。
+
+### 2026-10-01 最终复审修复
+
+- 协议未知与远端取消失败统一收敛为可备份的 `failed + outcome=unknown + billingUnknown=true`，不再把顶层 `unknown` 留作活动任务；重启恢复同步把 pending/running 输出项标为 failed，避免运行与结果状态分叉或被备份活动任务检查误判。AIGC 自动轮询一次读取失败后保留错误提示并按原间隔继续读取，后续成功即可恢复状态显示。
