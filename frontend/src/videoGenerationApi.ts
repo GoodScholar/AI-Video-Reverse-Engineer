@@ -1,4 +1,5 @@
 import { readApiError } from "./referenceMediaApi";
+import type { GenerationExecutionSemantics, GenerationRoute, GenerationRouteAttempt, GenerationRoutingPolicyRef } from "./generationRoutingApi";
 
 
 export type VideoReferenceType = "first-frame" | "last-frame" | "reference";
@@ -30,7 +31,7 @@ export type VideoGenerationRun = {
   provider: string; model: string; lastConfirmedRemoteStatus?: string | null;
   localDisposition: "active" | "stopped"; remoteCancelResult?: "cancelled" | "unsupported" | "unknown" | null;
   billingUnknown: boolean; capabilitySnapshot: VideoGenerationCapabilities; outputItems: VideoGenerationOutput[];
-  retryOf?: string;
+  retryOf?: string; actualRoute?: GenerationRoute; routeAttempts?: GenerationRouteAttempt[]; executionSemantics?: GenerationExecutionSemantics;
 };
 
 const endpoint = (projectId: string) => `/api/projects/${encodeURIComponent(projectId)}/video-generation`;
@@ -66,7 +67,7 @@ export function submitVideoGeneration(projectId: string, input: {
     profileId: string; mode: "text-to-video" | "image-to-video"; references: VideoGenerationReference[];
     durationSeconds: number; aspectRatio: string; resolution: string; audio: boolean; resultCount: number;
   };
-  idempotencyKey: string; caller: string;
+  idempotencyKey: string; caller: string; routingPolicyRef?: GenerationRoutingPolicyRef;
 }) {
   return request<{ run: VideoGenerationRun }>(`${endpoint(projectId)}/runs`, mutation(input), "无法提交视频生成。");
 }

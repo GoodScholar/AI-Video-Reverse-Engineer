@@ -22,6 +22,7 @@ from uuid import uuid4
 from PIL import Image, UnidentifiedImageError
 
 from .durable_runs import EXTERNAL_RUN_POLICY, freeze_run_input
+from .generation_routing import GenerationRoutingConflict, GenerationRoutingPolicyError, GenerationRoutingPolicyStore
 from .project_assets import ProjectAssets, ResultInstallationConflict
 from .video_media import probe_video
 
@@ -119,10 +120,11 @@ class _BoundedVideoWriter:
 class GenerationError(RuntimeError):
     """An API-safe failure with an outcome and conservative billing state."""
 
-    def __init__(self, code: str, *, outcome: str = "failed", billing_unknown: bool = False):
+    def __init__(self, code: str, *, outcome: str = "failed", billing_unknown: bool = False, safe_to_fallback: bool = False):
         self.code = code
         self.outcome = outcome
         self.billing_unknown = billing_unknown
+        self.safe_to_fallback = safe_to_fallback
         super().__init__(code)
 
 
@@ -188,7 +190,7 @@ class GenerationAdapterRegistry:
             except Exception as error:
                 raise GenerationError(
                     "generation_adapter_resolution_failed",
-                    billing_unknown=True,
+                    billing_unknown=False,
                 ) from error
             if catalog is None:
                 continue
@@ -264,6 +266,7 @@ class GenerationService:
         ffmpeg_path: str = "ffmpeg",
         ffprobe_path: str = "ffprobe",
         max_video_result_bytes: int = _DEFAULT_MAX_VIDEO_RESULT_BYTES,
+        routing_policies: Optional[GenerationRoutingPolicyStore] = None,
     ) -> None:
         self.store = GenerationRunStore(root)
         self.assets = ProjectAssets(root)
@@ -272,6 +275,7 @@ class GenerationService:
         self.video_operation_locks: dict[tuple[str, str], Lock] = {}
         self.recovered_projects: set[str] = set()
         self.registry = registry or GenerationAdapterRegistry()
+        self.routing_policies = routing_policies or GenerationRoutingPolicyStore(Path(root) / "generation-routing.json")
         self.ffmpeg_path = ffmpeg_path
         self.ffprobe_path = ffprobe_path
         if type(max_video_result_bytes) is not int or max_video_result_bytes <= 0:
@@ -338,6 +342,74 @@ class GenerationService:
             "model": catalog.get("model", model),
             "configurationVersion": configuration_version,
             "capabilities": normalized,
+        }
+
+    def routing_policy(self, policy_id: str, revision: int) -> dict[str, Any]:
+        """Resolve a saved policy without exposing any provider configuration."""
+        try:
+            return self.routing_policies.get(policy_id, revision=revision)
+        except GenerationRoutingConflict as error:
+            raise GenerationError("generation_routing_policy_revision_conflict") from error
+        except GenerationRoutingPolicyError as error:
+            raise GenerationError(str(error)) from error
+
+    def _routing_plan(
+        self,
+        modality: str,
+        disclosure: dict[str, Any],
+        routing_policy_ref: Optional[dict[str, Any]],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        explicit = {"provider": disclosure["provider"], "model": disclosure["model"]}
+        if routing_policy_ref is None:
+            return ({"mode": "explicit", "fallback": False}, [explicit])
+        if (
+            not isinstance(routing_policy_ref, dict) or set(routing_policy_ref) != {"id", "revision"}
+            or not isinstance(routing_policy_ref.get("id"), str)
+            or type(routing_policy_ref.get("revision")) is not int
+        ):
+            raise GenerationError("generation_routing_policy_invalid")
+        policy = self.routing_policy(routing_policy_ref["id"], routing_policy_ref["revision"])
+        if policy["modality"] != modality or policy["routes"][0] != explicit:
+            raise GenerationError("generation_routing_policy_invalid")
+        candidates = [dict(route) for route in policy["routes"]]
+        return (
+            {"mode": "saved", "fallback": True, "id": policy["id"], "revision": policy["revision"]},
+            candidates,
+        )
+
+    def _routing_snapshot(self, modality: str, policy: dict[str, Any], candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        if policy["mode"] == "explicit":
+            return {"mode": "explicit", "fallback": False, "candidates": candidates}
+        return {"id": policy["id"], "revision": policy["revision"], "modality": modality, "candidates": candidates}
+
+    @staticmethod
+    def _route_attempt(catalog: dict[str, Any], route: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "provider": route["provider"], "model": route["model"],
+            "adapterId": catalog["adapterId"], "adapterVersion": catalog["adapterVersion"],
+            "configurationVersion": catalog["configurationVersion"],
+            "capabilityVersion": catalog["capabilities"]["version"],
+            "status": "selected", "failureCode": None, "fallbackDecision": "selected",
+        }
+
+    def _freeze_route_candidates(self, modality: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Resolve every saved candidate once at submission; never re-read catalog for an old run."""
+        frozen = []
+        for route in candidates:
+            catalog = self.capabilities(route["provider"], route["model"], modality=modality)
+            frozen.append({
+                "provider": route["provider"], "model": route["model"],
+                "adapterId": catalog["adapterId"], "adapterVersion": catalog["adapterVersion"],
+                "configurationVersion": catalog["configurationVersion"], "capabilitySnapshot": catalog["capabilities"],
+            })
+        return frozen
+
+    @staticmethod
+    def _catalog_from_frozen(candidate: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "provider": candidate["provider"], "model": candidate["model"],
+            "adapterId": candidate["adapterId"], "adapterVersion": candidate["adapterVersion"],
+            "configurationVersion": candidate["configurationVersion"], "capabilities": candidate["capabilitySnapshot"],
         }
 
     def _normalize_text_capabilities(self, raw: dict[str, Any]) -> dict[str, Any]:
@@ -560,6 +632,9 @@ class GenerationService:
                         billingUnknown=True,
                         updatedAt=self._now(),
                     )
+                    attempts = run.get("routeAttempts")
+                    if isinstance(attempts, list) and attempts and attempts[-1].get("status") == "selected":
+                        attempts[-1].update(status="failed", failureCode="generation_recovery_unknown", fallbackDecision="fallback_blocked_unknown_outcome")
                     changed = True
                     continue
                 for output in run.get("outputItems", []):
@@ -573,6 +648,10 @@ class GenerationService:
                 else:
                     run.update(status="failed", outcome="unknown")
                 run.update(reason="generation_recovery_unknown", billingUnknown=True, updatedAt=self._now())
+                attempts = run.get("routeAttempts")
+                if isinstance(attempts, list) and attempts and attempts[-1].get("status") == "selected":
+                    attempts[-1].update(status="partial" if run["status"] == "partial_success" else "failed",
+                        failureCode="generation_recovery_unknown", fallbackDecision="fallback_blocked_unknown_outcome")
                 changed = True
             if changed:
                 self.store.save(project_id, runs)
@@ -587,6 +666,52 @@ class GenerationService:
         if run is None:
             raise GenerationError("generation_run_missing")
         return run
+
+    @staticmethod
+    def public_run(run: dict[str, Any]) -> dict[str, Any]:
+        """Safe lifecycle projection shared by text, image and video HTTP routes."""
+        keys = {
+            "id", "commonRunId", "domainKind", "attempt", "modality", "status", "outcome", "reason",
+            "createdAt", "updatedAt", "provider", "model", "configurationVersion", "capabilitySnapshot",
+            "adapterId", "adapterVersion", "billingUnknown", "retryOf", "actualRoute", "routeAttempts",
+            "routingPolicySnapshot", "localDisposition", "remoteCancelResult", "localCancelResult", "lastConfirmedRemoteStatus",
+        }
+        result = {key: run[key] for key in keys if key in run}
+        outputs = []
+        output_keys = {
+            "index", "resultId", "status", "reason", "billingUnknown", "assetId", "assetVersionId", "url",
+            "name", "width", "height", "duration", "text", "chunks",
+        }
+        for item in run.get("outputItems", []):
+            if isinstance(item, dict):
+                outputs.append({key: item[key] for key in output_keys if key in item})
+        result["outputItems"] = outputs
+        cancel_result = run.get("localCancelResult") or run.get("remoteCancelResult")
+        if cancel_result in {"cancelled", "unknown", "unsupported"}:
+            cancel = cancel_result
+        elif run.get("status") == "cancel_requested":
+            cancel = "requested"
+        elif run.get("status") == "queued" and run.get("modality") in {"text", "image"}:
+            cancel = "supported"
+        elif run.get("capabilitySnapshot", {}).get("cancel"):
+            cancel = "supported"
+        else:
+            cancel = "unsupported"
+        cancel_support = "supported" if run.get("localCancelResult") == "cancelled" or (
+            run.get("status") == "queued" and run.get("modality") in {"text", "image"}
+        ) or run.get("capabilitySnapshot", {}).get("cancel") else "unsupported"
+        result["executionSemantics"] = {
+            "cancel": cancel,
+            "cancelSupport": cancel_support,
+            "cancelResult": cancel if cancel in {"cancelled", "unknown", "unsupported", "requested"} else None,
+            "stateConfidence": "unknown" if run.get("status") == "unknown" or run.get("outcome") == "unknown"
+            or run.get("lastConfirmedRemoteStatus") == "unknown" or str(run.get("reason") or "").endswith("_unknown") else "known",
+            "late": run.get("outcome") == "late_success" or bool(run.get("lateResult")),
+            "partial": run.get("status") == "partial_success" or run.get("outcome") in {"partial_success", "incomplete"},
+            "billing": "unknown" if run.get("billingUnknown") else "known",
+            "actualRoute": result.get("actualRoute", {"provider": run.get("provider"), "model": run.get("model")}),
+        }
+        return result
 
     @staticmethod
     def _validate_disclosure(disclosure: dict[str, Any]) -> None:
@@ -720,6 +845,7 @@ class GenerationService:
         text_params: Optional[dict[str, Any]] = None,
         idempotency_key: str,
         caller: str,
+        routing_policy_ref: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         self._validate_disclosure(disclosure)
         if not isinstance(text_params, (dict, type(None))):
@@ -730,18 +856,26 @@ class GenerationService:
         if not isinstance(caller, str) or not 1 <= len(caller) <= 120:
             raise GenerationError("generation_request_invalid")
 
-        catalog = self.capabilities(disclosure["provider"], disclosure["model"])
+        policy, candidates = self._routing_plan("text", disclosure, routing_policy_ref)
+        frozen_candidates = self._freeze_route_candidates("text", candidates)
+        catalog = self._catalog_from_frozen(frozen_candidates[0])
         self._validate_text_params(params, catalog["capabilities"])
+        for candidate in frozen_candidates[1:]:
+            self._validate_text_params(params, candidate["capabilitySnapshot"])
         snapshot = {
             "modality": "text",
-            "provider": disclosure["provider"],
-            "model": disclosure["model"],
+            "provider": candidates[0]["provider"],
+            "model": candidates[0]["model"],
             "configurationVersion": catalog["configurationVersion"],
             "input": {"prompt": disclosure["prompt"], "textParams": params},
             "disclosure": dict(disclosure),
             "idempotencyKey": idempotency_key,
             "caller": caller,
-            "routingPolicy": {"mode": "explicit", "fallback": False},
+            "routingPolicy": policy,
+            "routingPolicySnapshot": self._routing_snapshot("text", policy, candidates),
+            "routingCandidateSnapshots": frozen_candidates,
+            "actualRoute": dict(candidates[0]),
+            "routeAttempts": [self._route_attempt(catalog, candidates[0])],
             "capabilitySnapshot": catalog["capabilities"],
             "adapterId": catalog["adapterId"],
             "adapterVersion": catalog["adapterVersion"],
@@ -805,6 +939,7 @@ class GenerationService:
         image_params: dict[str, Any],
         idempotency_key: str,
         caller: str,
+        routing_policy_ref: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         self._validate_disclosure(disclosure)
         if not isinstance(image_params, dict):
@@ -813,19 +948,27 @@ class GenerationService:
             raise GenerationError("generation_request_invalid")
         if not isinstance(caller, str) or not 1 <= len(caller) <= 120:
             raise GenerationError("generation_request_invalid")
-        catalog = self.capabilities(disclosure["provider"], disclosure["model"], modality="image")
+        policy, candidates = self._routing_plan("image", disclosure, routing_policy_ref)
+        frozen_candidates = self._freeze_route_candidates("image", candidates)
+        catalog = self._catalog_from_frozen(frozen_candidates[0])
         params = json.loads(json.dumps(image_params, ensure_ascii=False, allow_nan=False))
         self._validate_image_params(project_id, params, catalog["capabilities"])
+        for candidate in frozen_candidates[1:]:
+            self._validate_image_params(project_id, params, candidate["capabilitySnapshot"])
         snapshot = {
             "modality": "image",
-            "provider": disclosure["provider"],
-            "model": disclosure["model"],
+            "provider": candidates[0]["provider"],
+            "model": candidates[0]["model"],
             "configurationVersion": catalog["configurationVersion"],
             "input": {"prompt": disclosure["prompt"], "imageParams": params},
             "disclosure": dict(disclosure),
             "idempotencyKey": idempotency_key,
             "caller": caller,
-            "routingPolicy": {"mode": "explicit", "fallback": False},
+            "routingPolicy": policy,
+            "routingPolicySnapshot": self._routing_snapshot("image", policy, candidates),
+            "routingCandidateSnapshots": frozen_candidates,
+            "actualRoute": dict(candidates[0]),
+            "routeAttempts": [self._route_attempt(catalog, candidates[0])],
             "capabilitySnapshot": catalog["capabilities"],
             "adapterId": catalog["adapterId"],
             "adapterVersion": catalog["adapterVersion"],
@@ -936,11 +1079,28 @@ class GenerationService:
             key: value for key, value in previous.items()
             if key in {
                 "modality", "provider", "model", "configurationVersion", "input", "disclosure",
-                "caller", "routingPolicy", "capabilitySnapshot", "adapterId", "adapterVersion",
+                "caller", "routingPolicy", "routingPolicySnapshot", "routingCandidateSnapshots", "actualRoute", "routeAttempts",
+                "capabilitySnapshot", "adapterId", "adapterVersion",
             }
         }
+        snapshot["routeAttempts"] = self._fresh_retry_route_attempt(previous)
         snapshot["idempotencyKey"] = idempotency_key
         return self._create_image_run(project_id, snapshot, retry_of=previous)
+
+    def _fresh_retry_route_attempt(self, previous: dict[str, Any]) -> list[dict[str, Any]]:
+        """Keep the frozen route contract, but never copy a prior run's audit trail."""
+        candidates = previous.get("routingCandidateSnapshots")
+        actual = previous.get("actualRoute")
+        if isinstance(candidates, list) and isinstance(actual, dict):
+            candidate = next((item for item in candidates if isinstance(item, dict) and {
+                "provider": item.get("provider"), "model": item.get("model"),
+            } == actual), None)
+            if isinstance(candidate, dict):
+                return [self._route_attempt(self._catalog_from_frozen(candidate), candidate)]
+        return [self._route_attempt({
+            "adapterId": previous["adapterId"], "adapterVersion": previous["adapterVersion"],
+            "configurationVersion": previous["configurationVersion"], "capabilities": previous["capabilitySnapshot"],
+        }, {"provider": previous["provider"], "model": previous["model"]})]
 
     def _validate_video_params(
         self,
@@ -1003,6 +1163,7 @@ class GenerationService:
         video_params: dict[str, Any],
         idempotency_key: str,
         caller: str,
+        routing_policy_ref: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         self._validate_disclosure(disclosure)
         if not isinstance(video_params, dict):
@@ -1011,19 +1172,27 @@ class GenerationService:
             raise GenerationError("generation_request_invalid")
         if not isinstance(caller, str) or not 1 <= len(caller) <= 120:
             raise GenerationError("generation_request_invalid")
-        catalog = self.capabilities(disclosure["provider"], disclosure["model"], modality="video")
+        policy, candidates = self._routing_plan("video", disclosure, routing_policy_ref)
+        frozen_candidates = self._freeze_route_candidates("video", candidates)
+        catalog = self._catalog_from_frozen(frozen_candidates[0])
         params = json.loads(json.dumps(video_params, ensure_ascii=False, allow_nan=False))
         self._validate_video_params(project_id, params, catalog["capabilities"])
+        for candidate in frozen_candidates[1:]:
+            self._validate_video_params(project_id, params, candidate["capabilitySnapshot"])
         snapshot = {
             "modality": "video",
-            "provider": disclosure["provider"],
-            "model": disclosure["model"],
+            "provider": candidates[0]["provider"],
+            "model": candidates[0]["model"],
             "configurationVersion": catalog["configurationVersion"],
             "input": {"prompt": disclosure["prompt"], "videoParams": params},
             "disclosure": dict(disclosure),
             "idempotencyKey": idempotency_key,
             "caller": caller,
-            "routingPolicy": {"mode": "explicit", "fallback": False},
+            "routingPolicy": policy,
+            "routingPolicySnapshot": self._routing_snapshot("video", policy, candidates),
+            "routingCandidateSnapshots": frozen_candidates,
+            "actualRoute": dict(candidates[0]),
+            "routeAttempts": [self._route_attempt(catalog, candidates[0])],
             "capabilitySnapshot": catalog["capabilities"],
             "adapterId": catalog["adapterId"],
             "adapterVersion": catalog["adapterVersion"],
@@ -1069,16 +1238,39 @@ class GenerationService:
             }
             runs.append(run)
             self.store.save(project_id, runs)
-        adapter = self.registry.resolve_by_id(catalog["adapterId"])
+        self._submit_video_remote(project_id, run_id)
+        return self.get_run(project_id, run_id)
+
+    def _submit_video_remote(self, project_id: str, run_id: str) -> None:
+        run = self.get_run(project_id, run_id)
+        try:
+            adapter = self.registry.resolve_by_id(run["adapterId"])
+            if getattr(adapter, "version", None) != run.get("adapterVersion"):
+                raise GenerationError("generation_adapter_version_unavailable", safe_to_fallback=True)
+        except GenerationError as error:
+            error.safe_to_fallback = True
+            if self._start_safe_fallback(project_id, run_id, error):
+                return
+            self._finish_video_terminal(project_id, run_id, "unknown" if error.outcome == "unknown" else "failed", error.outcome, error.code, error.billing_unknown)
+            return
         if not isinstance(adapter, VideoGenerationAdapter):
-            self._finish_video_terminal(project_id, run_id, "failed", "unknown", "generation_adapter_missing", True)
-            return self.get_run(project_id, run_id)
+            error = GenerationError("generation_adapter_missing", safe_to_fallback=True)
+            if self._start_safe_fallback(project_id, run_id, error):
+                return
+            self._finish_video_terminal(project_id, run_id, "failed", "failed", error.code, False)
+            return
         try:
             remote = adapter.submit({**run, "_projectId": project_id})
             self._validate_video_submit_result(remote)
+        except GenerationError as error:
+            if self._start_safe_fallback(project_id, run_id, error):
+                return
+            self._finish_video_terminal(project_id, run_id, "unknown" if error.outcome == "unknown" else "failed", error.outcome, error.code, error.billing_unknown)
+            return
         except Exception:
+            self._mark_route_failure(project_id, run_id, "generation_submit_unknown", "fallback_blocked_unknown_outcome")
             self._finish_video_terminal(project_id, run_id, "unknown", "unknown", "generation_submit_unknown", True)
-            return self.get_run(project_id, run_id)
+            return
 
         def accepted(current: dict[str, Any]) -> None:
             if current.get("status") != "submitting":
@@ -1093,7 +1285,6 @@ class GenerationService:
             current["logs"].append({"event": "video_remote_submitted", "remoteStatus": remote["status"]})
 
         self._mutate(project_id, run_id, accepted)
-        return self.get_run(project_id, run_id)
 
     @staticmethod
     def _validate_video_submit_result(value: Any) -> None:
@@ -1155,7 +1346,7 @@ class GenerationService:
         status = event["status"]
         if status in {"queued", "running", "unknown"}:
             def progress(current: dict[str, Any]) -> None:
-                if current.get("status") in _TERMINAL_STATUSES:
+                if current.get("status") in _TERMINAL_STATUSES or current.get("status") == "cancel_requested":
                     return
                 current.update(
                     status="running",
@@ -1385,16 +1576,22 @@ class GenerationService:
             successes = [item for item in run["outputItems"] if item.get("status") in _VIDEO_SUCCESS_STATUSES]
             failures = [item for item in run["outputItems"] if item.get("status") not in _VIDEO_SUCCESS_STATUSES]
             if successes and not failures:
+                if run.get("routeAttempts") and run["routeAttempts"][-1].get("status") == "selected":
+                    run["routeAttempts"][-1].update(status="completed", failureCode=None, fallbackDecision="completed")
                 run.update(
                     status="completed", outcome="late_success" if run.get("localDisposition") == "stopped" else "completed",
                     reason=None, billingUnknown=bool(run.get("billingUnknown")),
                 )
             elif successes:
+                if run.get("routeAttempts") and run["routeAttempts"][-1].get("status") == "selected":
+                    run["routeAttempts"][-1].update(status="partial", failureCode="generation_results_partial", fallbackDecision="fallback_blocked_remote_identity")
                 run.update(
                     status="partial_success", outcome="partial_success", reason="generation_results_partial",
                     billingUnknown=bool(run.get("billingUnknown")) or any(item.get("billingUnknown") for item in failures),
                 )
             else:
+                if run.get("routeAttempts") and run["routeAttempts"][-1].get("status") == "selected":
+                    run["routeAttempts"][-1].update(status="failed", failureCode="generation_results_failed", fallbackDecision="fallback_blocked_remote_identity")
                 run.update(
                     status="failed", outcome="failed", reason="generation_results_failed",
                     billingUnknown=bool(run.get("billingUnknown")) or any(item.get("billingUnknown") for item in failures),
@@ -1421,6 +1618,12 @@ class GenerationService:
             for item in run["outputItems"]:
                 if item.get("status") == "pending":
                     item.update(status=item_status, reason=reason, billingUnknown=billing_unknown)
+            if run.get("routeAttempts") and run["routeAttempts"][-1].get("status") == "selected":
+                run["routeAttempts"][-1].update(
+                    status="cancelled" if status == "cancelled" else "failed", failureCode=reason,
+                    fallbackDecision="fallback_not_requested_cancelled" if status == "cancelled"
+                    else "fallback_blocked_remote_identity" if run.get("remoteTaskId") else "fallback_not_allowed",
+                )
             run.update(status=status, outcome=outcome, reason=reason, billingUnknown=billing_unknown)
             if remote_status is not None:
                 run["lastConfirmedRemoteStatus"] = remote_status
@@ -1470,6 +1673,9 @@ class GenerationService:
             if result.get("pollCursor") is not None:
                 current["pollCursor"] = result["pollCursor"]
             if result["status"] == "cancelled":
+                attempts = current.get("routeAttempts")
+                if isinstance(attempts, list) and attempts and attempts[-1].get("status") == "selected":
+                    attempts[-1].update(status="cancelled", failureCode="generation_remote_cancelled", fallbackDecision="fallback_not_requested_cancelled")
                 current.update(
                     status="cancelled", outcome="cancelled", reason="generation_remote_cancelled",
                     lastConfirmedRemoteStatus="cancelled",
@@ -1520,9 +1726,11 @@ class GenerationService:
             snapshot = {
                 key: previous[key] for key in (
                     "modality", "provider", "model", "configurationVersion", "input", "disclosure", "caller",
-                    "routingPolicy", "capabilitySnapshot", "adapterId", "adapterVersion",
+                    "routingPolicy", "routingPolicySnapshot", "routingCandidateSnapshots", "actualRoute",
+                    "capabilitySnapshot", "adapterId", "adapterVersion",
                 )
             }
+            snapshot["routeAttempts"] = self._fresh_retry_route_attempt(previous)
             snapshot["idempotencyKey"] = idempotency_key
             frozen = freeze_run_input(snapshot)
             now = self._now()
@@ -1590,7 +1798,19 @@ class GenerationService:
         try:
             adapter = self.registry.resolve_by_id(run["adapterId"])
         except GenerationError:
-            self._final(project_id, run_id, "failed", "failed", "adapter_missing", True)
+            error = GenerationError("generation_adapter_version_unavailable", safe_to_fallback=True)
+            if self._start_safe_fallback(project_id, run_id, error):
+                return
+            self._final(project_id, run_id, "failed", "failed", error.code, True)
+            return
+        if adapter.version != run.get("adapterVersion"):
+            # A persisted snapshot is an executable contract: never silently
+            # switch an old queued run to the adapter now registered under the
+            # same id.
+            error = GenerationError("generation_adapter_version_unavailable", safe_to_fallback=True)
+            if self._start_safe_fallback(project_id, run_id, error):
+                return
+            self._final(project_id, run_id, "failed", "failed", error.code, True)
             return
 
         timer: Optional[Timer] = None
@@ -1611,6 +1831,8 @@ class GenerationService:
                 self._consume_adapter_result(project_id, run_id, adapter, run)
         except GenerationError as error:
             if run.get("modality") == "image":
+                if self._start_safe_fallback(project_id, run_id, error):
+                    return
                 self._finish_image_terminal(
                     project_id, run_id, outcome=error.outcome, reason=error.code,
                     billing_unknown=error.billing_unknown,
@@ -1618,10 +1840,11 @@ class GenerationService:
             else:
                 self._record_generation_error(project_id, run_id, error)
         except Exception:
+            self._mark_route_failure(project_id, run_id, "generation_provider_failed", "fallback_blocked_unknown_outcome")
             if run.get("modality") == "image":
                 self._finish_image_terminal(
                     project_id, run_id, outcome="failed", reason="generation_provider_failed",
-                    billing_unknown=True,
+                    billing_unknown=False,
                 )
             else:
                 self._final(project_id, run_id, "failed", "failed", "generation_provider_failed", True)
@@ -1631,6 +1854,7 @@ class GenerationService:
 
     def _timeout(self, project_id: str, run_id: str) -> None:
         run = self.get_run(project_id, run_id)
+        self._mark_route_failure(project_id, run_id, "generation_timed_out", "fallback_blocked_unknown_outcome")
         if run.get("modality") == "image":
             self._finish_image_terminal(
                 project_id, run_id, outcome="timed_out", reason="generation_timed_out",
@@ -1653,6 +1877,8 @@ class GenerationService:
         for event in value:
             current = self.get_run(project_id, run_id)
             if current.get("status") != "running":
+                if current.get("status") in _TERMINAL_STATUSES | {"cancel_requested"}:
+                    self._consume_late_image_events(project_id, run_id, adapter, [event, *list(value)])
                 return
             if not isinstance(event, dict) or not isinstance(event.get("type"), str):
                 raise GenerationError("generation_protocol_invalid", outcome="unknown", billing_unknown=True)
@@ -1684,6 +1910,34 @@ class GenerationService:
         if not done:
             raise GenerationError("generation_protocol_invalid", outcome="unknown", billing_unknown=True)
         self._finish_image_run(project_id, run_id)
+
+    def _consume_late_image_events(self, project_id: str, run_id: str, adapter: GenerationAdapter, events: list[Any]) -> None:
+        done = False
+        for event in events:
+            if not isinstance(event, dict) or not isinstance(event.get("type"), str): return
+            if event["type"] == "done":
+                done = set(event) == {"type"}; break
+            if type(event.get("index")) is not int: return
+            if event["type"] == "result" and set(event) == {"type", "index", "content", "name"}:
+                self._install_image_result(project_id, run_id, adapter, event)
+            elif event["type"] == "error" and set(event) == {"type", "index", "code", "billingUnknown"} and isinstance(event["code"], str) and type(event["billingUnknown"]) is bool:
+                def failed(run: dict[str, Any]) -> None:
+                    item = next((item for item in run["outputItems"] if item.get("index") == event["index"]), None)
+                    if item is not None: item.update(status="failed", reason=event["code"], billingUnknown=event["billingUnknown"])
+                self._mutate(project_id, run_id, failed)
+            else: return
+        if not done: return
+        def finish(run: dict[str, Any]) -> None:
+            successes = [item for item in run["outputItems"] if item.get("status") in _IMAGE_SUCCESS_STATUSES]
+            failures = [item for item in run["outputItems"] if item.get("status") not in _IMAGE_SUCCESS_STATUSES]
+            run["lateResult"] = True
+            if successes and not failures:
+                if run.get("routeAttempts") and run["routeAttempts"][-1].get("status") == "selected": run["routeAttempts"][-1].update(status="completed", failureCode=None, fallbackDecision="completed")
+                run.update(status="completed", outcome="late_success", reason=None, billingUnknown=bool(run.get("billingUnknown")))
+            elif successes:
+                if run.get("routeAttempts") and run["routeAttempts"][-1].get("status") == "selected": run["routeAttempts"][-1].update(status="partial", failureCode="generation_results_partial", fallbackDecision="fallback_blocked_partial_result")
+                run.update(status="partial_success", outcome="partial_success", reason="generation_results_partial", billingUnknown=bool(run.get("billingUnknown")) or any(item.get("billingUnknown") for item in failures))
+        self._mutate(project_id, run_id, finish)
 
     @staticmethod
     def _normalize_image_content(content: Any) -> tuple[bytes, int, int]:
@@ -1723,10 +1977,11 @@ class GenerationService:
                 os.fsync(output.fileno())
             with self.lock:
                 run = self.get_run(project_id, run_id)
-                if run.get("status") != "running":
+                late = run.get("status") in _TERMINAL_STATUSES or run.get("status") == "cancel_requested"
+                if run.get("status") != "running" and not late:
                     return
                 item = next((item for item in run["outputItems"] if item.get("index") == event["index"]), None)
-                if item is None or item.get("status") != "pending":
+                if item is None or (item.get("status") != "pending" and not late):
                     raise GenerationError("generation_protocol_invalid", outcome="unknown", billing_unknown=True)
                 try:
                     asset = self.assets.install_run_result(
@@ -1756,6 +2011,8 @@ class GenerationService:
                     height=asset.get("height"),
                     billingUnknown=False,
                 )
+                if late:
+                    run["lateResult"] = True
                 run["logs"].append({"event": "image_result", "index": event["index"], "resultId": item["resultId"]})
                 run["updatedAt"] = self._now()
                 runs = self.store.load(project_id)
@@ -1797,13 +2054,19 @@ class GenerationService:
             successes = [item for item in run["outputItems"] if item.get("status") in _IMAGE_SUCCESS_STATUSES]
             failures = [item for item in run["outputItems"] if item.get("status") not in _IMAGE_SUCCESS_STATUSES]
             if successes and not failures:
+                if run.get("routeAttempts"):
+                    run["routeAttempts"][-1].update(status="completed", failureCode=None, fallbackDecision="completed")
                 run.update(status="completed", outcome="completed", reason=None, billingUnknown=False)
             elif successes:
+                if run.get("routeAttempts"):
+                    run["routeAttempts"][-1].update(status="partial", failureCode="generation_results_partial", fallbackDecision="fallback_blocked_partial_result")
                 run.update(
                     status="partial_success", outcome="partial_success", reason="generation_results_partial",
                     billingUnknown=any(item.get("billingUnknown") for item in failures),
                 )
             else:
+                if run.get("routeAttempts"):
+                    run["routeAttempts"][-1].update(status="failed", failureCode="generation_results_failed", fallbackDecision="fallback_blocked_unknown_outcome")
                 run.update(
                     status="failed", outcome="failed", reason="generation_results_failed",
                     billingUnknown=any(item.get("billingUnknown") for item in failures),
@@ -1828,6 +2091,11 @@ class GenerationService:
                 if item.get("status") == "pending":
                     item.update(status=item_status, reason=reason, billingUnknown=billing_unknown)
             successes = [item for item in run["outputItems"] if item.get("status") in _IMAGE_SUCCESS_STATUSES]
+            if run.get("routeAttempts") and run["routeAttempts"][-1].get("status") == "selected":
+                run["routeAttempts"][-1].update(
+                    status="cancelled" if outcome == "cancelled" else "partial" if successes else "failed", failureCode=reason,
+                    fallbackDecision="fallback_not_requested_cancelled" if outcome == "cancelled" else "fallback_blocked_partial_result" if successes else "fallback_blocked_unknown_outcome",
+                )
             run.update(
                 status="partial_success" if successes else ("cancelled" if outcome == "cancelled" else "failed"),
                 outcome=outcome,
@@ -1846,6 +2114,9 @@ class GenerationService:
     ) -> None:
         value = adapter.execute(run)
         if isinstance(value, str):
+            if self.get_run(project_id, run_id).get("status") in _TERMINAL_STATUSES | {"cancel_requested"}:
+                self._record_late_text_result(project_id, run_id, [{"sequence": 0, "text": value}], adapter)
+                return
             self._append(project_id, run_id, 0, value)
             self._complete(project_id, run_id, adapter)
             return
@@ -1861,6 +2132,22 @@ class GenerationService:
         for event in value:
             current = self.get_run(project_id, run_id)
             if current["status"] != "running":
+                if current.get("status") in _TERMINAL_STATUSES | {"cancel_requested"}:
+                    chunks = list(current["outputItems"][0].get("chunks", []))
+                    sequence = len(chunks)
+                    complete = False
+                    for late in [event, *list(value)]:
+                        if not isinstance(late, dict):
+                            return
+                        if late.get("type") == "done":
+                            complete = late.get("outcome", "completed") == "completed"
+                            break
+                        if type(late.get("sequence")) is not int or not isinstance(late.get("text"), str) or late["sequence"] != sequence:
+                            return
+                        chunks.append({"sequence": sequence, "text": late["text"]})
+                        sequence += 1
+                    if complete:
+                        self._record_late_text_result(project_id, run_id, chunks, adapter)
                 return
             if not isinstance(event, dict):
                 raise GenerationError(
@@ -1917,10 +2204,97 @@ class GenerationService:
         run_id: str,
         error: GenerationError,
     ) -> None:
+        if self._start_safe_fallback(project_id, run_id, error):
+            return
         status = "failed"
         if error.outcome in {"incomplete", "partial_success"}:
             status = "partial_success"
-        self._final(project_id, run_id, status, error.outcome, error.code, True)
+        self._final(project_id, run_id, status, error.outcome, error.code, error.billing_unknown)
+
+    def _start_safe_fallback(self, project_id: str, run_id: str, error: GenerationError) -> bool:
+        """Move only a definitely non-billable, pre-remote failure to a frozen route."""
+        if not error.safe_to_fallback or error.billing_unknown or error.outcome != "failed":
+            decision = "fallback_blocked_unknown_outcome"
+        else:
+            decision = "fallback"
+        run = self.get_run(project_id, run_id)
+        snapshot = run.get("routingPolicySnapshot")
+        attempts = run.get("routeAttempts")
+        if not isinstance(snapshot, dict):
+            return False
+        if snapshot.get("mode") == "explicit":
+            self._mark_route_failure(project_id, run_id, error.code, "fallback_not_allowed")
+            return False
+        if not isinstance(attempts, list) or not attempts:
+            return False
+        current = attempts[-1]
+        if not isinstance(current, dict):
+            return False
+        candidates = run.get("routingCandidateSnapshots", [])
+        if not isinstance(candidates, list):
+            return False
+        if run.get("modality") == "video" and run.get("remoteTaskId"):
+            decision = "fallback_blocked_remote_identity"
+        if run.get("modality") == "text" and run.get("outputItems", [{}])[0].get("chunks"):
+            decision = "fallback_blocked_partial_result"
+        if run.get("modality") == "image" and any(item.get("status") != "pending" for item in run.get("outputItems", [])):
+            decision = "fallback_blocked_partial_result"
+        actual = run.get("actualRoute")
+        current_index = next((index for index, candidate in enumerate(candidates)
+            if isinstance(candidate, dict) and isinstance(actual, dict)
+            and candidate.get("provider") == actual.get("provider") and candidate.get("model") == actual.get("model")), -1)
+        if current_index < 0:
+            self._mark_route_failure(project_id, run_id, error.code, "fallback_blocked_capability_unavailable")
+            return False
+        next_index = current_index + 1
+        if decision != "fallback" or next_index >= len(candidates):
+            self._mark_route_failure(project_id, run_id, error.code, decision if decision != "fallback" else "fallback_exhausted")
+            return False
+        next_route = candidates[next_index]
+        try:
+            catalog = self._catalog_from_frozen(next_route)
+            adapter = self.registry.resolve_by_id(catalog["adapterId"])
+            if adapter.version != catalog["adapterVersion"] or adapter.modality != run.get("modality"):
+                raise GenerationError("generation_adapter_version_unavailable")
+        except GenerationError as resolution_error:
+            def unavailable(value: dict[str, Any]) -> None:
+                if value.get("routeAttempts"):
+                    value["routeAttempts"][-1].update(
+                        status="failed", failureCode=error.code,
+                        fallbackDecision="fallback_blocked_capability_unavailable",
+                    )
+                value["reason"] = resolution_error.code
+            self._mutate(project_id, run_id, unavailable)
+            error.code = resolution_error.code
+            return False
+
+        def switch(value: dict[str, Any]) -> None:
+            if value.get("status") not in {"running", "submitting"} or value.get("actualRoute") != actual:
+                return
+            value["routeAttempts"][-1].update(status="failed", failureCode=error.code, fallbackDecision="fallback")
+            value.update(
+                provider=next_route["provider"], model=next_route["model"],
+                configurationVersion=catalog["configurationVersion"], capabilitySnapshot=catalog["capabilities"],
+                adapterId=catalog["adapterId"], adapterVersion=catalog["adapterVersion"],
+                actualRoute={"provider": next_route["provider"], "model": next_route["model"]},
+            )
+            value["routeAttempts"].append(self._route_attempt(catalog, next_route))
+            value["logs"].append({"event": "generation_route_fallback", "reason": error.code})
+        changed = self._mutate(project_id, run_id, switch)
+        if changed is None or changed.get("actualRoute") != {"provider": next_route["provider"], "model": next_route["model"]}:
+            return False
+        if changed.get("modality") == "video":
+            self._submit_video_remote(project_id, run_id)
+        else:
+            self._execute(project_id, run_id)
+        return True
+
+    def _mark_route_failure(self, project_id: str, run_id: str, code: str, decision: str) -> None:
+        def mark(value: dict[str, Any]) -> None:
+            attempts = value.get("routeAttempts")
+            if isinstance(attempts, list) and attempts:
+                attempts[-1].update(status="failed", failureCode=code, fallbackDecision=decision)
+        self._mutate(project_id, run_id, mark)
 
     def _append(self, project_id: str, run_id: str, sequence: int, text: str) -> None:
         def append(run: dict[str, Any]) -> None:
@@ -1941,7 +2315,15 @@ class GenerationService:
         except Exception:
             self._final(project_id, run_id, "failed", "failed", "generation_result_invalid", True)
             return
+        self._mark_route_completed(project_id, run_id)
         self._final(project_id, run_id, "completed", "completed", None, False)
+
+    def _mark_route_completed(self, project_id: str, run_id: str) -> None:
+        def mark(value: dict[str, Any]) -> None:
+            attempts = value.get("routeAttempts")
+            if isinstance(attempts, list) and attempts:
+                attempts[-1].update(status="completed", failureCode=None, fallbackDecision="completed")
+        self._mutate(project_id, run_id, mark)
 
     def _final(
         self,
@@ -1955,6 +2337,14 @@ class GenerationService:
         def finish(run: dict[str, Any]) -> None:
             if run["status"] in _TERMINAL_STATUSES:
                 return
+            attempts = run.get("routeAttempts")
+            if status != "completed" and isinstance(attempts, list) and attempts and attempts[-1].get("status") == "selected":
+                attempts[-1].update(
+                    status="cancelled" if status == "cancelled" else "partial" if status == "partial_success" else "failed",
+                    failureCode=reason or "generation_result_incomplete",
+                    fallbackDecision="fallback_not_requested_cancelled" if status == "cancelled"
+                    else "fallback_blocked_partial_result" if status == "partial_success" else "fallback_blocked_unknown_outcome",
+                )
             run.update(
                 status=status,
                 outcome=outcome,
@@ -1966,6 +2356,23 @@ class GenerationService:
 
         self._mutate(project_id, run_id, finish)
 
+    def _record_late_text_result(self, project_id: str, run_id: str, chunks: list[dict[str, Any]], adapter: GenerationAdapter) -> None:
+        text = "".join(item["text"] for item in chunks)
+        try:
+            if adapter.result_validator is not None:
+                adapter.result_validator(text)
+        except Exception:
+            return
+        def finish(run: dict[str, Any]) -> None:
+            if run.get("status") not in _TERMINAL_STATUSES and run.get("status") != "cancel_requested":
+                return
+            item = run["outputItems"][0]
+            item.update(status="completed", text=text, chunks=chunks)
+            if run.get("routeAttempts") and run["routeAttempts"][-1].get("status") == "selected":
+                run["routeAttempts"][-1].update(status="completed", failureCode=None, fallbackDecision="completed")
+            run.update(status="completed", outcome="late_success", reason=None, billingUnknown=bool(run.get("billingUnknown")))
+        self._mutate(project_id, run_id, finish)
+
     def cancel(self, project_id: str, run_id: str) -> dict[str, Any]:
         run = self.get_run(project_id, run_id)
         if run["status"] == "queued":
@@ -1975,7 +2382,8 @@ class GenerationService:
                     billing_unknown=False,
                 )
             else:
-                self._final(project_id, run_id, "cancelled", "cancelled", "generation_cancelled", True)
+                self._final(project_id, run_id, "cancelled", "cancelled", "generation_cancelled", False)
+            self._mutate(project_id, run_id, lambda value: value.update(localCancelResult="cancelled"))
             return self.get_run(project_id, run_id)
         if run["status"] in _TERMINAL_STATUSES:
             raise GenerationError("generation_cancel_invalid")
@@ -2007,6 +2415,7 @@ class GenerationService:
         try:
             adapter.cancel(claimed)
         except Exception:
+            self._mutate(project_id, run_id, lambda value: value.update(localCancelResult="unknown"))
             if run.get("modality") == "image":
                 self._finish_image_terminal(
                     project_id, run_id, outcome="unknown", reason="generation_cancel_unknown",
@@ -2015,10 +2424,11 @@ class GenerationService:
             else:
                 self._final(project_id, run_id, "failed", "unknown", "generation_cancel_unknown", True)
         else:
+            self._mutate(project_id, run_id, lambda value: value.update(localCancelResult="cancelled"))
             if run.get("modality") == "image":
                 self._finish_image_terminal(
                     project_id, run_id, outcome="cancelled", reason="generation_cancelled",
-                    billing_unknown=False,
+                    billing_unknown=True,
                 )
             else:
                 self._final(project_id, run_id, "cancelled", "cancelled", "generation_cancelled", True)

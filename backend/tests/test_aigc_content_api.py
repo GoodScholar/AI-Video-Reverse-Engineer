@@ -214,7 +214,7 @@ def test_generation_run_persists_structured_result_without_automatically_creatin
         run = submitted.json()["run"]
         assert run["status"] == "completed"
         assert run["modality"] == "text"
-        assert run["disclosure"]["prompt"] == disclosure["prompt"]
+        assert "disclosure" not in run
         assert "apiKey" not in json.dumps(run)
         assert client.get(base).json()["candidates"] == []
         reread = client.get(base + f"/generation-runs/{run['id']}")

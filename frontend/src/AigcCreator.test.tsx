@@ -13,7 +13,8 @@ const assets = [
 ];
 const provider = { provider: "local_openai_compatible", label: "本地 AI 服务", models: [], model: "local-model",
   baseUrl: "http://127.0.0.1:8188", credentialState: "unconfigured", selectedProvider: "local_openai_compatible",
-  configurationRevision: 1, catalogVersion: 1, verificationState: "available", verifiedAt: "2026-09-25T00:00:00Z" };
+  configurationRevision: 1, catalogVersion: 1, verificationState: "available", verifiedAt: "2026-09-25T00:00:00Z",
+  textGenerationCapabilityState: "verified" as const, textGenerationCapabilityVersion: "text-compatibility-1" };
 
 beforeEach(() => vi.stubGlobal("fetch", vi.fn()));
 
@@ -48,6 +49,58 @@ it("准备资料将已选素材与其他素材分组并按需展开授权说明"
   expect(screen.getByText("防泼溅")).not.toBeVisible();
   await userEvent.click(within(selected).getByText("来源与使用说明"));
   expect(screen.getByText("防泼溅")).toBeVisible();
+});
+
+it("连接可用但文本能力目录未验证的服务不会出现在生成下拉", async () => {
+  const connectionOnly = { ...provider, provider: "openai" as const, label: "连接成功但能力未知", model: "gpt-test",
+    textGenerationCapabilityState: "unverified" as const };
+  vi.mocked(fetch).mockResolvedValueOnce(response({ brief: emptyBrief, candidates: [], assets }))
+    .mockResolvedValueOnce(response([provider, connectionOnly]));
+
+  render(<AigcCreator projectId="p1" />);
+
+  expect(await screen.findByRole("option", { name: /本地 AI 服务/ })).toBeVisible();
+  expect(screen.queryByRole("option", { name: /连接成功但能力未知/ })).toBeNull();
+});
+
+it("两个已验证文本路由可保存备用策略并随实际提交引用", async () => {
+  const primary = { ...provider, textGenerationCapabilityState: "verified" as const, textGenerationCapabilityVersion: "text-compatibility-1" };
+  const fallback = { ...provider, provider: "bailian" as const, label: "百炼文本服务", model: "qwen-plus",
+    textGenerationCapabilityState: "verified" as const, textGenerationCapabilityVersion: "text-compatibility-1" };
+  const brief = { ...emptyBrief, revision: 1, productName: "晴雨杯", assetIds: ["front", "use"] };
+  const disclosure = { briefRevision: 1, provider: primary.provider, model: primary.model, prompt: "完整发送文字", digest: "routing-digest" };
+  const capabilities = { structuredSchema: true, streaming: false, references: false, outputBudget: false, cancel: false, timeout: false };
+  let submitted: Record<string, unknown> | undefined;
+  vi.mocked(fetch).mockImplementation(async (input, init) => {
+    const url = String(input); const method = init?.method ?? "GET";
+    if (url === "/api/projects/routing-text/aigc-content") return response({ brief, candidates: [], assets });
+    if (url === "/api/analysis-providers") return response([primary, fallback]);
+    if (url.includes("/disclosure")) return response(disclosure);
+    if (url.includes("/generation-capabilities")) return response({ capabilities });
+    if (url === "/api/generation-routing-policies?modality=text") return response({ revision: 0, policies: [] });
+    if (url === "/api/generation-routing-policies/text-routing-policy" && method === "PUT") {
+      return response({ policy: { id: "text-routing-policy", name: "文本备用", modality: "text", revision: 1,
+        routes: [{ provider: primary.provider, model: primary.model }, { provider: fallback.provider, model: fallback.model }] } });
+    }
+    if (url.endsWith("/generation-runs") && method === "POST") {
+      submitted = JSON.parse(String(init?.body));
+      return response({ run: { id: "routing-run", provider: primary.provider, model: primary.model, status: "completed", outcome: "completed",
+        billingUnknown: false, capabilitySnapshot: capabilities, outputItems: [] } });
+    }
+    throw new Error(`未覆盖请求：${method} ${url}`);
+  });
+
+  render(<AigcCreator projectId="routing-text" />);
+  await userEvent.click(await screen.findByRole("button", { name: "预览发送内容" }));
+  const backup = await screen.findByLabelText("备用路由（可选）");
+  expect(within(backup).getByRole("option", { name: "bailian · qwen-plus" })).toBeVisible();
+  await userEvent.click(screen.getByRole("button", { name: "读取已保存策略" }));
+  await userEvent.selectOptions(backup, "bailian\u0000qwen-plus");
+  await userEvent.click(screen.getByRole("button", { name: "保存当前顺序" }));
+  await userEvent.click(screen.getByLabelText("我已核对本次发送内容"));
+  await userEvent.click(screen.getByRole("button", { name: "确认发送并生成 5 条候选" }));
+
+  expect(submitted).toMatchObject({ routingPolicyRef: { id: "text-routing-policy", revision: 1 } });
 });
 
 it("四步制作的生成按钮先保存新资料并展示发送内容，未经确认不生成", async () => {
@@ -106,7 +159,8 @@ it("生成运行卡显示完整能力、外发内容并允许手动刷新", asyn
     .mockResolvedValueOnce(response([provider]));
   render(<AigcCreator projectId="p1" />);
 
-  expect(await screen.findByText("完整外发文字")).toBeVisible();
+  expect(await screen.findByText("实际路由：", { exact: false })).toBeVisible();
+  expect(screen.queryByText("完整外发文字")).not.toBeInTheDocument();
   expect(screen.getByText(/结构化 schema：/)).toHaveTextContent("支持");
   expect(screen.getByRole("button", { name: "刷新生成状态" })).toBeVisible();
 });

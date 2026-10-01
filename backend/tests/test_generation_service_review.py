@@ -100,7 +100,7 @@ def test_registry_does_not_fallback_after_selected_provider_error(tmp_path):
     else: raise AssertionError("resolver 异常不得静默换 adapter")
 
 
-def test_timeout_marks_billing_unknown_and_late_result_cannot_overwrite(tmp_path):
+def test_timeout_preserves_late_text_as_run_output_without_auto_adoption(tmp_path):
     started = Event()
     release = Event()
 
@@ -126,14 +126,17 @@ def test_timeout_marks_billing_unknown_and_late_result_cannot_overwrite(tmp_path
         caller="test",
     )
 
-    assert queued["status"] == "failed"
+    assert queued["status"] == "completed"
     assert queued["billingUnknown"] is True
-    assert queued["outcome"] == "timed_out"
+    assert queued["outcome"] == "late_success"
+    assert queued["outputItems"][0]["text"] == "late provider text"
+    assert service.public_run(queued)["executionSemantics"]["late"] is True
+    assert not (tmp_path / "project-files/timeout/aigc-content/state.json").exists()
     assert started.is_set()
     release.set()
 
 
-def test_running_cancel_calls_remote_once_and_terminal_cancel_is_rejected(tmp_path):
+def test_running_cancel_preserves_late_text_without_auto_adoption(tmp_path):
     started = Event()
     release = Event()
     cancelled: list[str] = []
@@ -182,10 +185,14 @@ def test_running_cancel_calls_remote_once_and_terminal_cancel_is_rejected(tmp_pa
 
     release.set()
     worker.join(1)
-    assert service.get_run("cancel", queued["id"])["status"] == "cancelled"
+    late = service.get_run("cancel", queued["id"])
+    assert late["status"] == "completed" and late["outcome"] == "late_success"
+    assert late["outputItems"][0]["text"] == "late text"
+    assert service.public_run(late)["executionSemantics"]["late"] is True
+    assert not (tmp_path / "project-files/cancel/aigc-content/state.json").exists()
 
 
-def test_remote_cancel_failure_is_failed_with_unknown_outcome(tmp_path):
+def test_remote_cancel_failure_preserves_late_text_without_auto_adoption(tmp_path):
     started = Event()
     release = Event()
 
@@ -230,7 +237,11 @@ def test_remote_cancel_failure_is_failed_with_unknown_outcome(tmp_path):
 
     release.set()
     worker.join(1)
-    assert service.get_run("cancel-failure", queued["id"])["status"] == "failed"
+    late = service.get_run("cancel-failure", queued["id"])
+    assert late["status"] == "completed" and late["outcome"] == "late_success"
+    assert late["outputItems"][0]["text"] == "late text"
+    assert service.public_run(late)["executionSemantics"]["late"] is True
+    assert not (tmp_path / "project-files/cancel-failure/aigc-content/state.json").exists()
 
 
 def test_provider_and_result_validation_failures_leave_billing_unknown(tmp_path):

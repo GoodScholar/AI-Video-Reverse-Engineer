@@ -234,7 +234,7 @@ def create_aigc_content_router(data_dir, get_project, script_generator=None, sou
                 include_source_reference=True,
             )
         return {"brief": state["brief"], "candidates": state["candidates"], "assets": assets,
-                "generationRuns": service.list_runs(project_id)}
+                "generationRuns": [service.public_run(run) for run in service.list_runs(project_id) if run.get("modality") == "text"]}
 
     @router.put("/brief")
     def save_brief(project_id: str, body: dict):
@@ -268,7 +268,26 @@ def create_aigc_content_router(data_dir, get_project, script_generator=None, sou
     def submit_generation_run(project_id: str, body: dict):
         get_project(project_id)
         expected = {"briefRevision", "provider", "model", "digest", "disclosureAccepted", "idempotencyKey"}
-        if not isinstance(body, dict) or set(body) != expected or body.get("disclosureAccepted") is not True or type(body.get("briefRevision")) is not int or not isinstance(body.get("digest"), str) or not isinstance(body.get("idempotencyKey"), str) or not body["idempotencyKey"]:
+        has_policy = isinstance(body, dict) and "routingPolicyRef" in body
+        valid_policy = (
+            isinstance(body, dict)
+            and isinstance(body.get("routingPolicyRef"), dict)
+            and set(body["routingPolicyRef"]) == {"id", "revision"}
+            and isinstance(body["routingPolicyRef"].get("id"), str)
+            and type(body["routingPolicyRef"].get("revision")) is int
+            and body["routingPolicyRef"]["revision"] > 0
+        )
+        invalid_body = (
+            not isinstance(body, dict)
+            or set(body) != expected | ({"routingPolicyRef"} if has_policy else set())
+            or (has_policy and not valid_policy)
+            or body.get("disclosureAccepted") is not True
+            or type(body.get("briefRevision")) is not int
+            or not isinstance(body.get("digest"), str)
+            or not isinstance(body.get("idempotencyKey"), str)
+            or not body["idempotencyKey"]
+        )
+        if invalid_body:
             raise HTTPException(422, detail={"code": "generation_request_invalid", "message": "文本生成提交无效，请重新核对发送内容。"})
         with source_lock or nullcontext(), lock:
             state = load_aigc_content_state(root, project_id)
@@ -278,10 +297,10 @@ def create_aigc_content_router(data_dir, get_project, script_generator=None, sou
             frozen_disclosure = {key: disclosure[key] for key in ("provider", "model", "prompt", "digest", "briefRevision")}
             frozen_disclosure["accepted"] = True
             try:
-                run = service.submit(project_id, disclosure=frozen_disclosure, text_params={"structuredSchema": _CandidateResponse.model_json_schema()}, idempotency_key=body["idempotencyKey"], caller="aigc-script-candidates")
+                run = service.submit(project_id, disclosure=frozen_disclosure, text_params={"structuredSchema": _CandidateResponse.model_json_schema()}, idempotency_key=body["idempotencyKey"], caller="aigc-script-candidates", routing_policy_ref=body.get("routingPolicyRef"))
             except GenerationError as error:
                 generation_error(error)
-        return {"run": run}
+        return {"run": service.public_run(run)}
 
     @router.get("/generation-capabilities")
     def generation_capabilities(project_id: str, provider: str, model: str):
@@ -295,7 +314,7 @@ def create_aigc_content_router(data_dir, get_project, script_generator=None, sou
     def get_generation_run(project_id: str, run_id: str):
         get_project(project_id)
         try:
-            return service.get_run(project_id, run_id)
+            return service.public_run(service.get_run(project_id, run_id))
         except GenerationError as error:
             generation_error(error)
 
@@ -303,7 +322,7 @@ def create_aigc_content_router(data_dir, get_project, script_generator=None, sou
     def cancel_generation_run(project_id: str, run_id: str):
         get_project(project_id)
         try:
-            return {"run": service.cancel(project_id, run_id)}
+            return {"run": service.public_run(service.cancel(project_id, run_id))}
         except GenerationError as error:
             generation_error(error)
 
@@ -319,7 +338,11 @@ def create_aigc_content_router(data_dir, get_project, script_generator=None, sou
             if item is None or not isinstance(item.get("text"), str):
                 raise HTTPException(409, detail={"code": "generation_result_unavailable", "message": "文本结果尚不可采用。"})
             state = load_aigc_content_state(root, project_id)
-            current_disclosure = _disclosure(root, project_id, state["brief"], run["provider"], run["model"])
+            # Disclosure proves the initial user-authorized route.  A saved
+            # policy may later select its recorded fallback; it must not alter
+            # the original disclosure digest used for stale-input protection.
+            original = run.get("disclosure", {})
+            current_disclosure = _disclosure(root, project_id, state["brief"], original.get("provider"), original.get("model"))
             if (run["disclosure"].get("briefRevision") != state["brief"]["revision"]
                     or run["disclosure"].get("digest") != current_disclosure["digest"]):
                 raise HTTPException(409, detail={"code": "aigc_disclosure_stale", "message": "创作简报或素材信息已更新，请重新生成后采用。"})

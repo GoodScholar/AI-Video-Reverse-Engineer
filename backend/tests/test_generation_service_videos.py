@@ -551,6 +551,9 @@ def test_video_cancel_unsupported_and_remote_cancelled_are_not_local_stop(tmp_pa
     assert result["outcome"] == "cancelled"
     assert result["remoteCancelResult"] == "cancelled"
     assert result["localDisposition"] == "active"
+    assert result["routeAttempts"][-1]["status"] == "cancelled"
+    assert result["routeAttempts"][-1]["failureCode"] == "generation_remote_cancelled"
+    assert result["routeAttempts"][-1]["fallbackDecision"] == "fallback_not_requested_cancelled"
 
 
 def test_video_success_downloads_probes_installs_and_is_timeline_referenceable(tmp_path):

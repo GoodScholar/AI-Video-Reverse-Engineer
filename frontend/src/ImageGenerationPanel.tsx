@@ -11,6 +11,9 @@ import {
   type ImageGenerationModelCatalogEntry,
   type ImageGenerationRun,
 } from "./imageGenerationApi";
+import { GenerationRoutingPolicyControl } from "./GenerationRoutingPolicyControl";
+import { GenerationRouteAudit } from "./GenerationRouteAudit";
+import type { GenerationRoutingPolicyRef } from "./generationRoutingApi";
 
 type ImageAsset = {
   id: string;
@@ -103,6 +106,7 @@ export function ImageGenerationPanel({ projectId, imageAssets, onInstalled }: Pr
   const [models, setModels] = useState<ImageGenerationModelCatalogEntry[]>();
   const [modelKey, setModelKey] = useState("");
   const [catalog, setCatalog] = useState<ImageCapabilityCatalog>();
+  const [routingCatalogs, setRoutingCatalogs] = useState<Record<string, ImageCapabilityCatalog>>({});
   const [runs, setRuns] = useState<ImageGenerationRun[]>([]);
   const [prompt, setPrompt] = useState("");
   const [operation, setOperation] = useState<Operation>("generate");
@@ -113,6 +117,7 @@ export function ImageGenerationPanel({ projectId, imageAssets, onInstalled }: Pr
   const [accepted, setAccepted] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [routingPolicyRef, setRoutingPolicyRef] = useState<GenerationRoutingPolicyRef>();
 
   useEffect(() => {
     let active = true;
@@ -126,6 +131,9 @@ export function ImageGenerationPanel({ projectId, imageAssets, onInstalled }: Pr
           entry.mediaType === "image" && entry.configured && entry.capabilitySource === "verified",
         );
         setModels(verified);
+        void Promise.all(verified.map(async (entry) => [modelValue(entry), await getVerifiedImageCapabilities(projectId, entry.providerId, entry.modelId)] as const))
+          .then((items) => { if (active) setRoutingCatalogs(Object.fromEntries(items)); })
+          .catch(() => { if (active) setRoutingCatalogs({}); });
         setRuns(runList.runs);
         setModelKey(verified[0] ? modelValue(verified[0]) : "");
       })
@@ -156,6 +164,15 @@ export function ImageGenerationPanel({ projectId, imageAssets, onInstalled }: Pr
   }, [projectId, selectedModel]);
 
   const capabilities = catalog?.capabilities;
+  const routingCandidates = useMemo(() => (models ?? []).filter((entry) => {
+    const candidate = routingCatalogs[modelValue(entry)]?.capabilities;
+    return Boolean(candidate
+      && (operation === "generate" || operation === "edit" && candidate.imageEditing || operation === "super-resolution" && candidate.superResolution)
+      && selectedAssetIds.length >= candidate.minReferences && selectedAssetIds.length <= candidate.maxReferences
+      && (selectedAssetIds.length === 0 ? operation === "generate" : candidate.referenceTypes.includes(referenceType(operation)))
+      && candidate.aspectRatios.includes(aspectRatio) && candidate.resolutions.includes(resolution)
+      && resultCount >= candidate.minResults && resultCount <= candidate.maxResults);
+  }).map((entry) => ({ provider: entry.providerId, model: entry.modelId })), [models, routingCatalogs, operation, selectedAssetIds.length, aspectRatio, resolution, resultCount]);
   const activeReferenceType = referenceType(operation);
   const selectionValid = Boolean(capabilities)
     && selectedAssetIds.length >= (capabilities?.minReferences ?? 0)
@@ -199,7 +216,7 @@ export function ImageGenerationPanel({ projectId, imageAssets, onInstalled }: Pr
         caller: "asset-library",
       };
       const pending = pendingKey(`${projectId}:submit`, requestFingerprint(input));
-      const response = await submitImageGeneration(projectId, { ...input, idempotencyKey: pending.key });
+      const response = await submitImageGeneration(projectId, { ...input, idempotencyKey: pending.key, routingPolicyRef });
       clearPendingKey(`${projectId}:submit`, pending);
       setRuns((current) => [response.run, ...current.filter((run) => run.id !== response.run.id)]);
       if (response.run.outputItems.some((item) => item.status === "completed")) onInstalled?.();
@@ -283,6 +300,7 @@ export function ImageGenerationPanel({ projectId, imageAssets, onInstalled }: Pr
           <label>分辨率<select value={resolution} onChange={(event) => setResolution(event.target.value)}>{capabilities.resolutions.map((value) => <option key={value}>{value}</option>)}</select></label>
           <label>结果数量<input aria-label="结果数量" type="number" min={capabilities.minResults} max={capabilities.maxResults} value={resultCount} onChange={(event) => setResultCount(Number(event.target.value))} /></label>
           <label><input type="checkbox" checked={accepted} onChange={(event) => setAccepted(event.target.checked)} />确认发送提示词和所选图片</label>
+          {selectedModel && <GenerationRoutingPolicyControl modality="image" currentRoute={{ provider: selectedModel.providerId, model: selectedModel.modelId }} verifiedRoutes={routingCandidates} value={routingPolicyRef} onChange={setRoutingPolicyRef} />}
           <button type="button" className="primary-action" disabled={!canSubmit || busy} onClick={() => void submit()}>{busy ? "正在处理…" : "提交图片生成"}</button>
           {!selectionValid && <p role="status">当前参考图片数量或类型不符合所选模型能力。</p>}
         </>}
@@ -292,13 +310,19 @@ export function ImageGenerationPanel({ projectId, imageAssets, onInstalled }: Pr
       <div><h5>生成历史</h5><button type="button" disabled={busy} onClick={() => void refreshRuns()}>刷新运行</button></div>
       {runs.map((run) => <article key={run.id}>
         <strong>{statusLabels[run.status] ?? run.status}</strong>
+        <p>实际路由：{run.actualRoute?.provider ?? run.provider} · {run.actualRoute?.model ?? run.model}</p>
+        <GenerationRouteAudit attempts={run.routeAttempts} />
+        {run.executionSemantics?.stateConfidence === "unknown" && <p>运行状态未知，未自动切换 Provider。</p>}
+        {run.executionSemantics?.cancelResult === "cancelled" && <p>已取消本地排队任务，未发起 Provider 调用。</p>}
+        {(run.billingUnknown || run.executionSemantics?.billing === "unknown") && <p>计费状态未知</p>}
         {run.outputItems.map((item) => <div key={item.resultId}>
           {(item.status === "completed" || item.status === "reused") && item.url
             ? <><a href={item.url} target="_blank" rel="noreferrer" aria-label={`预览${item.name ?? `结果 ${item.index + 1}`}`}>预览 {item.name ?? `结果 ${item.index + 1}`}</a> <a href={item.url} download>下载</a></>
             : item.status === "failed" ? <span>失败 · {item.reason ?? "generation_failed"}</span>
               : <span>{statusLabels[item.status] ?? item.status}</span>}
         </div>)}
-        {(run.status === "queued" || run.status === "running") && capabilities?.cancel && <button type="button" disabled={busy} onClick={() => void cancel(run.id)}>取消</button>}
+        {(run.status === "queued" || run.status === "running") && (run.executionSemantics?.cancel === "supported" || (!run.executionSemantics && run.capabilitySnapshot?.cancel)) && <button type="button" disabled={busy} onClick={() => void cancel(run.id)}>取消</button>}
+        {(run.status === "queued" || run.status === "running") && (run.executionSemantics?.cancel === "unsupported" || (!run.executionSemantics && run.capabilitySnapshot && !run.capabilitySnapshot.cancel)) && <p>该运行的冻结能力不支持取消。</p>}
         {["failed", "partial_success", "cancelled", "timed_out"].includes(run.status) && <button type="button" disabled={busy} onClick={() => void retry(run.id)}>重试失败结果</button>}
       </article>)}
     </section>}

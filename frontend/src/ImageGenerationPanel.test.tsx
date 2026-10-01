@@ -20,6 +20,8 @@ const configuration = {
     { providerId: "unknown-provider", modelId: "unknown-model", mediaType: "image", label: "未验证模型", configured: true, capabilitySource: "unknown", capabilityVersion: "cfg", capabilities: {} },
   ],
 };
+const routingModel = { providerId: "backup-provider", modelId: "backup-model", mediaType: "image", label: "备用已验证图片模型", configured: true,
+  capabilitySource: "verified", capabilityVersion: "probe", capabilities: capabilities.capabilities };
 
 const assets = [
   { id: "asset-1", assetVersionId: "asset-1-v1", name: "商品正面.png", kind: "image" as const, url: "/asset-1" },
@@ -31,9 +33,14 @@ afterEach(() => vi.unstubAllGlobals());
 it("只显示已验证能力，区分模型编辑、模型超分与普通本地处理，并按能力提交多参考多结果", async () => {
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
-    if (url === "/api/image-generation/configuration") return new Response(JSON.stringify(configuration));
+    if (url === "/api/image-generation/configuration") return new Response(JSON.stringify({ ...configuration, modelCatalog: [configuration.modelCatalog[0], routingModel, configuration.modelCatalog[1]] }));
     if (url.endsWith("/runs") && (!init?.method || init.method === "GET")) return new Response(JSON.stringify({ runs: [] }));
     if (url.includes("/capabilities?")) return new Response(JSON.stringify(capabilities));
+    if (url === "/api/generation-routing-policies?modality=image") return new Response(JSON.stringify({ revision: 0, policies: [] }));
+    if (url === "/api/generation-routing-policies/image-routing-policy" && init?.method === "PUT") return new Response(JSON.stringify({ policy: {
+      id: "image-routing-policy", name: "图片备用", modality: "image", revision: 1,
+      routes: [{ provider: "backup-provider", model: "backup-model" }, { provider: "verified-provider", model: "verified-model" }],
+    } }));
     if (url.endsWith("/runs") && init?.method === "POST") return new Response(JSON.stringify({ run: {
       id: "run-1", status: "partial_success", outcome: "partial_success", provider: "verified-provider", model: "verified-model",
       outputItems: [
@@ -48,6 +55,8 @@ it("只显示已验证能力，区分模型编辑、模型超分与普通本地�
   render(<ImageGenerationPanel projectId="project-1" imageAssets={assets} onInstalled={installed} />);
 
   expect(await screen.findByRole("option", { name: "已验证图片模型" })).toBeVisible();
+  await userEvent.selectOptions(screen.getByLabelText("图片模型"), JSON.stringify(["backup-provider", "backup-model"]));
+  await screen.findByText("参考图片：0–2 张；结果：1–3 张。比例 1:1、16:9；分辨率 1024x1024、1536x864。");
   expect(screen.queryByRole("option", { name: "未验证模型" })).not.toBeInTheDocument();
   expect(await screen.findByText("参考图片：0–2 张；结果：1–3 张。比例 1:1、16:9；分辨率 1024x1024、1536x864。")).toBeVisible();
   expect(screen.getByRole("option", { name: "模型图片编辑" })).toBeVisible();
@@ -61,6 +70,9 @@ it("只显示已验证能力，区分模型编辑、模型超分与普通本地�
   await user.clear(screen.getByLabelText("结果数量"));
   await user.type(screen.getByLabelText("结果数量"), "2");
   await user.click(screen.getByRole("checkbox", { name: "确认发送提示词和所选图片" }));
+  await user.click(screen.getByRole("button", { name: "读取已保存策略" }));
+  await user.selectOptions(screen.getByLabelText("备用路由（可选）"), "verified-provider\u0000verified-model");
+  await user.click(screen.getByRole("button", { name: "保存当前顺序" }));
   await user.click(screen.getByRole("button", { name: "提交图片生成" }));
 
   await screen.findByText("部分成功");
@@ -70,7 +82,7 @@ it("只显示已验证能力，区分模型编辑、模型超分与普通本地�
   const request = fetchMock.mock.calls.find(call => String(call[0]).endsWith("/runs") && call[1]?.method === "POST");
   const body = JSON.parse(String(request?.[1]?.body));
   expect(body).toMatchObject({
-    disclosure: { provider: "verified-provider", model: "verified-model", prompt: "为商品制作干净主图", accepted: true },
+    disclosure: { provider: "backup-provider", model: "backup-model", prompt: "为商品制作干净主图", accepted: true },
     imageParams: {
       operation: "generate", aspectRatio: "1:1", resolution: "1024x1024", resultCount: 2,
       references: [
@@ -78,6 +90,7 @@ it("只显示已验证能力，区分模型编辑、模型超分与普通本地�
         { assetId: "asset-2", assetVersionId: "asset-2-v1", referenceType: "reference" },
       ],
     },
+    routingPolicyRef: { id: "image-routing-policy", revision: 1 },
   });
   expect(JSON.stringify(body)).not.toContain("apiKey");
 });

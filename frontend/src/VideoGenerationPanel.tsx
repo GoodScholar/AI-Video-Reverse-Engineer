@@ -13,6 +13,9 @@ import {
   type VideoGenerationRun,
   type VideoReferenceType,
 } from "./videoGenerationApi";
+import { GenerationRoutingPolicyControl } from "./GenerationRoutingPolicyControl";
+import { GenerationRouteAudit } from "./GenerationRouteAudit";
+import type { GenerationRoutingPolicyRef } from "./generationRoutingApi";
 
 
 type ImageAsset = { id: string; assetVersionId: string; name: string; kind: "image"; url: string };
@@ -113,6 +116,7 @@ export function VideoGenerationPanel({ projectId, imageAssets, onInstalled }: Pr
   const refreshesRef = useRef(new Map<string, Promise<{ run: VideoGenerationRun }>>());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [routingPolicyRef, setRoutingPolicyRef] = useState<GenerationRoutingPolicyRef>();
 
   useEffect(() => { runsRef.current = runs; }, [runs]);
 
@@ -195,6 +199,13 @@ export function VideoGenerationPanel({ projectId, imageAssets, onInstalled }: Pr
     selectedModel && profile && combination && prompt.trim() && accepted && referenceSelectionValid
     && resultCount >= profile.minResults && resultCount <= profile.maxResults,
   );
+  const routingCandidates = useMemo(() => (models ?? []).filter((entry) => {
+    const candidate = entry.capabilities.profiles.find((item) => item.id === profileId && item.mode === profile?.mode);
+    return Boolean(candidate
+      && candidate.referencePatterns.some((item) => JSON.stringify(item) === JSON.stringify(pattern))
+      && candidate.combinations.some((item) => combination && combinationKey(item) === combinationKey(combination))
+      && resultCount >= candidate.minResults && resultCount <= candidate.maxResults);
+  }).map((entry) => ({ provider: entry.provider, model: entry.model })), [models, profileId, profile?.mode, patternKey, combinationValue, resultCount]);
 
   async function submit() {
     if (!selectedModel || !profile || !combination || !canSubmit || busy) return;
@@ -216,7 +227,7 @@ export function VideoGenerationPanel({ projectId, imageAssets, onInstalled }: Pr
     const pending = pendingKey(scope, input);
     setBusy(true); setError("");
     try {
-      const response = await submitVideoGeneration(projectId, { ...input, idempotencyKey: pending.key });
+      const response = await submitVideoGeneration(projectId, { ...input, idempotencyKey: pending.key, routingPolicyRef });
       clearPendingKey(scope, pending);
       setRuns((current) => replaceRun(current, response.run));
     } catch (reason) { setError(errorMessage(reason, "无法提交视频生成。")); }
@@ -278,6 +289,7 @@ export function VideoGenerationPanel({ projectId, imageAssets, onInstalled }: Pr
           <label>视频提示词<textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
           <label>结果数量<input aria-label="视频结果数量" type="number" min={profile.minResults} max={profile.maxResults} value={resultCount} onChange={(event) => setResultCount(Number(event.target.value))} /></label>
           <label><input type="checkbox" checked={accepted} onChange={(event) => setAccepted(event.target.checked)} />确认发送提示词和所选图片</label>
+          {selectedModel && <GenerationRoutingPolicyControl modality="video" currentRoute={{ provider: selectedModel.provider, model: selectedModel.model }} verifiedRoutes={routingCandidates} value={routingPolicyRef} onChange={setRoutingPolicyRef} />}
           {!referenceSelectionValid && <p role="status">当前参考图片未满足所选的精确角色组合。</p>}
           <button type="button" className="primary-action" disabled={!canSubmit || busy} onClick={() => void submit()}>{busy ? "正在处理…" : "提交视频生成"}</button>
         </>}
@@ -287,6 +299,9 @@ export function VideoGenerationPanel({ projectId, imageAssets, onInstalled }: Pr
       <div><h5>生成历史</h5><button type="button" disabled={busy} onClick={() => void refreshActive(runs)}>刷新远端状态</button></div>
       {runs.map((run) => <article key={run.id}>
         <strong>{run.outcome === "late_success" ? "迟到成功（未自动采用）" : run.localDisposition === "stopped" ? statusLabels[run.status] ?? run.status : run.lastConfirmedRemoteStatus === "unknown" ? "远端状态未知" : run.lastConfirmedRemoteStatus === "queued" ? "远端等待中" : statusLabels[run.status] ?? run.status}</strong>
+        <p>实际路由：{run.actualRoute?.provider ?? run.provider} · {run.actualRoute?.model ?? run.model}</p>
+        <GenerationRouteAudit attempts={run.routeAttempts} />
+        {run.executionSemantics?.stateConfidence === "unknown" && <p>运行状态未知，未自动切换 Provider。</p>}
         {run.localDisposition === "stopped" && run.outcome !== "late_success" && <p>本地已停止轮询，远端任务未被视为已取消</p>}
         {run.remoteCancelResult === "unsupported" && <p>远端取消不受支持</p>}
         {run.remoteCancelResult === "unknown" && <p>远端取消结果未知</p>}

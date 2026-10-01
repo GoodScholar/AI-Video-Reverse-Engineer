@@ -43,6 +43,14 @@ class _Submit(BaseModel):
     imageParams: _ImageParams
     idempotencyKey: str = Field(min_length=1, max_length=200)
     caller: str = Field(min_length=1, max_length=120)
+    routingPolicyRef: "_RoutingPolicyRef | None" = None
+
+
+class _RoutingPolicyRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=120)
+    revision: int = Field(ge=1)
 
 
 class _Retry(BaseModel):
@@ -68,6 +76,9 @@ _ERRORS = {
     "generation_resolution_unsupported": (422, "图片分辨率不在模型已验证范围内。"),
     "generation_result_count_unsupported": (422, "结果数量不在模型已验证范围内。"),
     "generation_cancel_unsupported": (422, "所选图片模型未验证远端取消能力。"),
+    "generation_routing_policy_revision_conflict": (409, "路由策略已更新，请重新确认后提交。"),
+    "generation_routing_policy_missing": (422, "所选路由策略不存在。"),
+    "generation_routing_policy_invalid": (422, "路由策略与图片生成请求不匹配。"),
 }
 
 
@@ -97,7 +108,7 @@ def create_image_generation_run_router(
     @router.get("/runs")
     def list_runs(project_id: str):
         require_project(project_id)
-        return {"runs": [run for run in service.list_runs(project_id) if run.get("modality") == "image"]}
+        return {"runs": [service.public_run(run) for run in service.list_runs(project_id) if run.get("modality") == "image"]}
 
     @router.post("/runs", status_code=202)
     async def submit_run(project_id: str, request: Request):
@@ -115,8 +126,9 @@ def create_image_generation_run_router(
                 image_params=body.imageParams.model_dump(exclude_none=True),
                 idempotency_key=body.idempotencyKey,
                 caller=body.caller,
+                routing_policy_ref=body.routingPolicyRef.model_dump() if body.routingPolicyRef else None,
             )
-            return {"run": run}
+            return {"run": service.public_run(run)}
         except GenerationError as error:
             _fail(error)
 
@@ -127,7 +139,7 @@ def create_image_generation_run_router(
             run = service.get_run(project_id, run_id)
             if run.get("modality") != "image":
                 raise GenerationError("generation_run_missing")
-            return {"run": run}
+            return {"run": service.public_run(run)}
         except GenerationError as error:
             _fail(error)
 
@@ -138,7 +150,7 @@ def create_image_generation_run_router(
             run = service.get_run(project_id, run_id)
             if run.get("modality") != "image":
                 raise GenerationError("generation_run_missing")
-            return {"run": service.cancel(project_id, run_id)}
+            return {"run": service.public_run(service.cancel(project_id, run_id))}
         except GenerationError as error:
             _fail(error)
 
@@ -146,7 +158,7 @@ def create_image_generation_run_router(
     def retry_run(project_id: str, run_id: str, body: _Retry):
         require_project(project_id)
         try:
-            return {"run": service.retry_image(project_id, run_id, idempotency_key=body.idempotencyKey)}
+            return {"run": service.public_run(service.retry_image(project_id, run_id, idempotency_key=body.idempotencyKey))}
         except GenerationError as error:
             _fail(error)
 

@@ -87,6 +87,7 @@ def test_declared_cancel_and_timeout_are_terminal_and_late_provider_result_is_ig
     service._execute("project-1", run["id"])
     assert cancelled["status"] == "cancelled"
     assert service.get_run("project-1", run["id"])["status"] == "cancelled"
+    assert service.get_run("project-1", run["id"])["routeAttempts"][-1]["fallbackDecision"] == "fallback_not_requested_cancelled"
     assert adapter.cancelled == []
     assert adapter.calls == 0
 

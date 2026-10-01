@@ -112,7 +112,7 @@ from app.analysis_settings import (
     AnalysisSettingsConflictError,
 )
 from app.credential_store import CredentialStore
-from app.provider_models import PROVIDER_IDS, model_is_allowed
+from app.provider_models import CATALOG_VERSION, PROVIDER_IDS, model_is_allowed, provider_for
 from app.analysis_providers.bailian import BailianAnalysisProvider
 from app.analysis_providers.base import ProviderAnalysisError, ProviderFailure, ProviderRequest
 from app.analysis_providers.claude import ClaudeAnalysisProvider
@@ -1182,6 +1182,8 @@ def create_app(
             request.method == "PUT" and bool(re.fullmatch(r"/api/analysis-providers/[^/]+/configuration", path))
         ) or (
             request.method == "PUT" and path == "/api/image-generation/configuration"
+        ) or (
+            request.method == "PUT" and bool(re.fullmatch(r"/api/generation-routing-policies/[^/]+", path))
         ) or (
             request.method == "POST" and (
                 bool(re.fullmatch(r"/api/analysis-providers/[^/]+/(?:test-connection|connection-test)", path))
@@ -2561,10 +2563,24 @@ def create_app(
             )
         except AnalysisProviderUnconfiguredError:
             raise HTTPException(422, detail={"code": "provider_unconfigured", "message": "请先配置并验证所选 AI 服务。"}) from None
+        except AnalysisProviderConfigurationChangedError:
+            raise HTTPException(409, detail={"code": "provider_configuration_changed", "message": "Provider 配置已变化，请重新确认本次生成。"}) from None
         except ProviderAnalysisError as error:
             raise HTTPException(422, detail={"code": error.failure.code, "message": error.failure.message}) from None
 
     def aigc_capabilities(provider_id, model):
+        # A successful credential probe only proves connectivity.  Production
+        # text generation also requires this separately maintained, versioned
+        # compatibility catalog entry for the exact provider/model.
+        try:
+            compatibility = provider_for(provider_id)
+        except ValueError:
+            raise GenerationError("generation_capability_unavailable") from None
+        if (
+            compatibility.compatibilityAvailability != "verified"
+            or not any(candidate.id == model for candidate in compatibility.models)
+        ):
+            raise GenerationError("generation_capability_unavailable")
         try:
             configuration = analysis_provider_configurations.require_configured(
                 provider_id, model, require_verified=True,
@@ -2575,14 +2591,21 @@ def create_app(
             "provider": provider_id,
             "model": configuration.model,
             "configurationVersion": configuration.configurationRevision,
-            "capabilities": dict(TEXT_CAPABILITIES),
+            "capabilities": dict(TEXT_CAPABILITIES) | {"version": f"text-compatibility-{CATALOG_VERSION}"},
         }
 
     def run_aigc_generation(run):
-        return generate_marketing_candidates(
-            run["provider"], run["model"], run["input"]["prompt"], run["input"]["textParams"].get("structuredSchema"),
-            configuration_version=run["configurationVersion"],
-        )
+        try:
+            return generate_marketing_candidates(
+                run["provider"], run["model"], run["input"]["prompt"], run["input"]["textParams"].get("structuredSchema"),
+                configuration_version=run["configurationVersion"],
+            )
+        except HTTPException as error:
+            # These failures happen while resolving the frozen local
+            # configuration, before an operation is handed to a provider.
+            if isinstance(error.detail, dict) and error.detail.get("code") in {"provider_unconfigured", "provider_configuration_changed"}:
+                raise GenerationError("generation_configuration_unavailable", safe_to_fallback=True) from None
+            raise GenerationError("generation_provider_outcome_unknown", outcome="unknown", billing_unknown=True) from None
 
     aigc_generation_registry = GenerationAdapterRegistry()
     aigc_generation_registry.register(GenerationAdapter(
@@ -2603,6 +2626,8 @@ def create_app(
     app.include_router(create_image_generation_run_router(aigc_generation_service, ensure_project_exists))
     from .video_generation_run_api import create_video_generation_run_router
     app.include_router(create_video_generation_run_router(aigc_generation_service, ensure_project_exists))
+    from .generation_routing_api import create_generation_routing_router
+    app.include_router(create_generation_routing_router(aigc_generation_service))
 
     app.include_router(create_aigc_content_router(data_dir, ensure_project_exists,
                                                    script_generator=generate_marketing_candidates,

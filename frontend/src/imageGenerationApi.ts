@@ -1,4 +1,5 @@
 import { readApiError } from "./referenceMediaApi";
+import type { GenerationExecutionSemantics, GenerationRoute, GenerationRouteAttempt, GenerationRoutingPolicyRef } from "./generationRoutingApi";
 
 export type ImageGenerationProvider = "openai-compatible" | "volcengine-ark";
 export type ImageGenerationCapabilities = { imageSizes?: string[]; imageRatios?: string[]; maxReferences?: number };
@@ -57,7 +58,8 @@ export type ImageGenerationOutput = {
 };
 export type ImageGenerationRun = {
   id: string; status: string; outcome?: string | null; reason?: string | null; provider: string; model: string;
-  outputItems: ImageGenerationOutput[]; retryOf?: string;
+  outputItems: ImageGenerationOutput[]; retryOf?: string; billingUnknown?: boolean; capabilitySnapshot?: VerifiedImageCapabilities;
+  actualRoute?: GenerationRoute; routeAttempts?: GenerationRouteAttempt[]; executionSemantics?: GenerationExecutionSemantics;
 };
 
 const projectEndpoint = (projectId: string) => `/api/projects/${encodeURIComponent(projectId)}/image-generation`;
@@ -81,7 +83,7 @@ export function listImageGenerationRuns(projectId: string) {
 export function submitImageGeneration(projectId: string, input: {
   disclosure: { provider: string; model: string; prompt: string; accepted: true };
   imageParams: { operation: "generate" | "edit" | "super-resolution"; references: ImageGenerationReference[]; aspectRatio: string; resolution: string; resultCount: number; timeoutSeconds?: number };
-  idempotencyKey: string; caller: string;
+  idempotencyKey: string; caller: string; routingPolicyRef?: GenerationRoutingPolicyRef;
 }) {
   return projectRequest<{ run: ImageGenerationRun }>(`${projectEndpoint(projectId)}/runs`, {
     method: "POST", headers: { "Content-Type": "application/json", "x-aivre-intent": "semantic-analysis" }, body: JSON.stringify(input),

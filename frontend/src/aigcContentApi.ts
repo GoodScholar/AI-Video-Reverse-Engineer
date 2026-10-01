@@ -1,4 +1,5 @@
 import { readApiError } from "./referenceMediaApi";
+import type { GenerationExecutionSemantics, GenerationRoute, GenerationRouteAttempt, GenerationRoutingPolicyRef } from "./generationRoutingApi";
 import type { AspectMode } from "./videoAspect";
 
 export type AigcBrief = { revision: number; productName: string; facts: Array<{ id: string; text: string }>;
@@ -8,8 +9,8 @@ export type AigcBeat = { text: string; factIds: string[]; assetId: string };
 export type AigcCandidate = { id: string; generationId: string; revision: number; briefRevision: number;
   confirmedRevision: number | null; sellingPoint: string; beats: AigcBeat[] };
 export type AigcGenerationOutput = { resultId: string; status: string; chunks: Array<{ sequence: number; text: string }>; text: string };
-export type AigcGenerationRun = { id: string; provider: string; model: string; status: string; outcome?: string | null; billingUnknown: boolean; disclosure?: { prompt: string }; capabilitySnapshot: Record<string, boolean | string>;
-  outputItems: AigcGenerationOutput[] };
+export type AigcGenerationRun = { id: string; provider: string; model: string; status: string; outcome?: string | null; billingUnknown: boolean; capabilitySnapshot: Record<string, boolean | string>;
+  outputItems: AigcGenerationOutput[]; actualRoute?: GenerationRoute; routeAttempts?: GenerationRouteAttempt[]; executionSemantics?: GenerationExecutionSemantics };
 export type AigcWorkspace = { brief: AigcBrief; assets: AigcAsset[]; candidates: AigcCandidate[]; generationRuns?: AigcGenerationRun[] };
 export type AigcDisclosure = { briefRevision: number; provider: string; model: string; prompt: string; digest: string };
 
@@ -55,10 +56,10 @@ export function discloseAigcRequest(projectId: string, provider: string, model: 
   return request(`${base(projectId)}/disclosure`, { method: "POST", headers, body: JSON.stringify({ provider, model }) }, "无法预览发送内容。");
 }
 
-export function submitAigcGeneration(projectId: string, disclosure: AigcDisclosure, idempotencyKey: string): Promise<{ run: AigcGenerationRun }> {
+export function submitAigcGeneration(projectId: string, disclosure: AigcDisclosure, idempotencyKey: string, routingPolicyRef?: GenerationRoutingPolicyRef): Promise<{ run: AigcGenerationRun }> {
   return request(`${base(projectId)}/generation-runs`, { method: "POST", headers,
     body: JSON.stringify({ briefRevision: disclosure.briefRevision, provider: disclosure.provider, model: disclosure.model,
-      digest: disclosure.digest, disclosureAccepted: true, idempotencyKey }) }, "无法提交脚本生成。");
+      digest: disclosure.digest, disclosureAccepted: true, idempotencyKey, ...(routingPolicyRef ? { routingPolicyRef } : {}) }) }, "无法提交脚本生成。");
 }
 
 export function getAigcGenerationRun(projectId: string, runId: string): Promise<AigcGenerationRun> {

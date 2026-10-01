@@ -47,6 +47,13 @@ class _VideoParams(BaseModel):
     resultCount: int = Field(ge=1, le=VIDEO_MAX_RESULTS)
 
 
+class _RoutingPolicyRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=120)
+    revision: int = Field(ge=1)
+
+
 class _Submit(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -54,6 +61,7 @@ class _Submit(BaseModel):
     videoParams: _VideoParams
     idempotencyKey: str = Field(min_length=1, max_length=200)
     caller: str = Field(min_length=1, max_length=120)
+    routingPolicyRef: _RoutingPolicyRef | None = None
 
 
 class _Retry(BaseModel):
@@ -78,6 +86,9 @@ _ERRORS = {
     "generation_combination_unsupported": (422, "时长、比例、分辨率与音频组合不在模型已验证范围内。"),
     "generation_result_count_unsupported": (422, "结果数量不在模型已验证范围内。"),
     "generation_protocol_invalid": (502, "视频 Provider 返回了无效协议数据。"),
+    "generation_routing_policy_revision_conflict": (409, "路由策略已更新，请重新确认后提交。"),
+    "generation_routing_policy_missing": (422, "所选路由策略不存在。"),
+    "generation_routing_policy_invalid": (422, "路由策略与视频生成请求不匹配。"),
 }
 
 
@@ -97,12 +108,13 @@ _PUBLIC_OUTPUT_KEYS = (
 
 
 def _public_run(run: dict) -> dict:
+    shared = GenerationService.public_run(run)
     outputs = []
     for item in run.get("outputItems", []):
         public_item = {key: item[key] for key in _PUBLIC_OUTPUT_KEYS if key in item}
         public_item["retryable"] = item.get("status") == "failed" and isinstance(item.get("remoteResultId"), str)
         outputs.append(public_item)
-    return {key: run[key] for key in _PUBLIC_RUN_KEYS if key in run} | {"outputItems": outputs}
+    return shared | {key: run[key] for key in _PUBLIC_RUN_KEYS if key in run} | {"outputItems": outputs}
 
 
 def create_video_generation_run_router(
@@ -156,6 +168,7 @@ def create_video_generation_run_router(
                 video_params=body.videoParams.model_dump(),
                 idempotency_key=body.idempotencyKey,
                 caller=body.caller,
+                routing_policy_ref=body.routingPolicyRef.model_dump() if body.routingPolicyRef else None,
             )
             return {"run": _public_run(run)}
         except GenerationError as error:

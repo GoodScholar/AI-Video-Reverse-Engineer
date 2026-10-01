@@ -152,6 +152,26 @@ def test_configuration_module_uses_one_authoritative_snapshot_for_verification_a
     ]
 
 
+def test_public_configuration_derives_text_generation_capability_from_catalog_not_connection(tmp_path):
+    credentials = InMemoryCredentials()
+    configurations = configuration_module(
+        AnalysisSettings(tmp_path / "analysis-providers.json"), credentials, lambda **_: object(),
+    )
+
+    verified_catalog = configurations.save(
+        provider="bailian", model="qwen3.7-flash", base_url=None, api_key="stored-secret",
+    )
+    connection_only_catalog = configurations.save(
+        provider="openai", model="gpt-5.6-luna", base_url=None, api_key="stored-secret",
+    )
+
+    assert verified_catalog.verificationState == "unverified"
+    assert verified_catalog.textGenerationCapabilityState == "verified"
+    assert verified_catalog.textGenerationCapabilityVersion == f"text-compatibility-{CATALOG_VERSION}"
+    assert connection_only_catalog.textGenerationCapabilityState == "unverified"
+    assert connection_only_catalog.textGenerationCapabilityVersion is None
+
+
 def test_configuration_module_rejects_use_when_disclosed_revision_changed(tmp_path):
     credentials = InMemoryCredentials()
     created = []

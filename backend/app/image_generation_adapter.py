@@ -31,7 +31,9 @@ class ConfiguredImageGenerationAdapter:
         try:
             configuration = self._configurations.snapshot()
         except Exception as error:
-            raise GenerationError("generation_adapter_resolution_failed") from error
+            # The local configuration could not be read before a provider call,
+            # so a user-saved frozen backup may safely be considered.
+            raise GenerationError("generation_configuration_unavailable", safe_to_fallback=True) from error
         if not isinstance(configuration, dict):
             raise GenerationError("generation_capability_unavailable")
         entries = configuration.get("providers")
@@ -83,12 +85,12 @@ class ConfiguredImageGenerationAdapter:
     def execute(self, run: dict[str, Any]) -> Iterable[dict[str, Any]]:
         catalog = self.capability_catalog(run.get("provider"), run.get("model"))
         if catalog is None or catalog["configurationVersion"] != run.get("configurationVersion"):
-            raise GenerationError("generation_configuration_changed")
+            raise GenerationError("generation_configuration_changed", safe_to_fallback=True)
         configuration = self._configurations.snapshot()
-        provider_entry = next(
-            item for item in configuration["providers"]
-            if item.get("providerId") == run["provider"]
-        )
+        try:
+            provider_entry = next(item for item in configuration["providers"] if item.get("providerId") == run["provider"])
+        except StopIteration:
+            raise GenerationError("generation_configuration_changed", safe_to_fallback=True) from None
         pending = [item for item in run.get("outputItems", []) if item.get("status") == "pending"]
         if len(pending) != 1:
             raise GenerationError("generation_capability_unavailable")

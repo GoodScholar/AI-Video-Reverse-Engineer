@@ -234,7 +234,7 @@ class HeldQueue:
         return True
 
 
-def test_cancel_after_one_result_keeps_installed_asset_and_marks_partial_success(tmp_path):
+def test_cancel_after_one_result_preserves_late_asset_as_late_success(tmp_path):
     first_written = Event()
     release = Event()
     cancelled = Event()
@@ -255,15 +255,18 @@ def test_cancel_after_one_result_keeps_installed_asset_and_marks_partial_success
 
     cancelled_run = service.cancel(PROJECT_ID, queued["id"])
     worker.join(2)
+    late_run = service.get_run(PROJECT_ID, queued["id"])
 
     assert cancelled.is_set()
     assert cancelled_run["status"] == "partial_success"
     assert cancelled_run["outcome"] == "cancelled"
-    assert [item["status"] for item in cancelled_run["outputItems"]] == ["completed", "cancelled"]
-    assert len(ProjectAssets(tmp_path).records(PROJECT_ID)) == 1
+    assert late_run["status"] == "completed"
+    assert late_run["outcome"] == "late_success"
+    assert [item["status"] for item in late_run["outputItems"]] == ["completed", "completed"]
+    assert len(ProjectAssets(tmp_path).records(PROJECT_ID)) == 2
 
 
-def test_timeout_after_one_result_keeps_installed_asset_and_does_not_install_late_result(tmp_path):
+def test_timeout_after_one_result_preserves_late_asset_as_late_success(tmp_path):
     first_written = Event()
     release = Event()
 
@@ -285,10 +288,53 @@ def test_timeout_after_one_result_keeps_installed_asset_and_does_not_install_lat
     worker.join(2)
 
     timed_out = service.get_run(PROJECT_ID, queued["id"])
-    assert timed_out["status"] == "partial_success"
-    assert timed_out["outcome"] == "timed_out"
-    assert [item["status"] for item in timed_out["outputItems"]] == ["completed", "timed_out"]
-    assert len(ProjectAssets(tmp_path).records(PROJECT_ID)) == 1
+    assert timed_out["status"] == "completed"
+    assert timed_out["outcome"] == "late_success"
+    # A timeout was already indeterminate; later successful output does not
+    # supply retrospective billing proof.
+    assert timed_out["billingUnknown"] is True
+    assert [item["status"] for item in timed_out["outputItems"]] == ["completed", "completed"]
+    assert len(ProjectAssets(tmp_path).records(PROJECT_ID)) == 2
+
+
+def test_cancelled_run_preserves_two_late_images_only_after_done(tmp_path):
+    started, release = Event(), Event()
+    def execute(_run):
+        started.set(); release.wait(2)
+        yield {"type": "result", "index": 0, "content": png_bytes("red"), "name": "一.png"}
+        yield {"type": "result", "index": 1, "content": png_bytes("green"), "name": "二.png"}
+        yield {"type": "done"}
+    queue = HeldQueue()
+    service = image_service(tmp_path, execute, cancel=lambda _run: release.set(), queue=queue)
+    queued = submit(service, resultCount=2)
+    worker = Thread(target=lambda: queue.job(PROJECT_ID)); worker.start(); assert started.wait(2)
+    service.cancel(PROJECT_ID, queued["id"]); worker.join(2)
+    run = service.get_run(PROJECT_ID, queued["id"])
+    assert run["status"] == "completed" and run["outcome"] == "late_success"
+    assert [item["status"] for item in run["outputItems"]] == ["completed", "completed"]
+    assert run["routeAttempts"][-1]["status"] == "cancelled"
+    assert run["routeAttempts"][-1]["failureCode"] == "generation_cancelled"
+
+
+def test_cancelled_run_late_image_and_error_is_partial_and_late(tmp_path):
+    started, release = Event(), Event()
+    def execute(_run):
+        started.set(); release.wait(2)
+        yield {"type": "result", "index": 0, "content": png_bytes("red"), "name": "一.png"}
+        yield {"type": "error", "index": 1, "code": "late_failed", "billingUnknown": False}
+        yield {"type": "done"}
+    queue = HeldQueue()
+    service = image_service(tmp_path, execute, cancel=lambda _run: release.set(), queue=queue)
+    queued = submit(service, resultCount=2)
+    worker = Thread(target=lambda: queue.job(PROJECT_ID)); worker.start(); assert started.wait(2)
+    service.cancel(PROJECT_ID, queued["id"]); worker.join(2)
+    run = service.get_run(PROJECT_ID, queued["id"])
+    assert run["status"] == "partial_success" and run["outputItems"][1]["reason"] == "late_failed"
+    assert run["billingUnknown"] is True
+    assert run["routeAttempts"][-1]["status"] == "cancelled"
+    assert run["routeAttempts"][-1]["failureCode"] == "generation_cancelled"
+    assert run["routeAttempts"][-1]["fallbackDecision"] == "fallback_not_requested_cancelled"
+    assert service.public_run(run)["executionSemantics"]["late"] is True
 
 
 def test_retry_creates_new_run_reuses_successful_asset_and_is_idempotent(tmp_path):
@@ -375,7 +421,8 @@ def test_image_generation_api_exposes_capabilities_runs_asset_download_and_stabl
         "idempotencyKey": "api-image-2", "caller": "asset-library",
     })
     assert downstream.status_code == 202, downstream.text
-    assert downstream.json()["run"]["input"]["imageParams"]["references"][0]["assetId"] == output["assetId"]
+    assert downstream.json()["run"]["actualRoute"] == {"provider": "fake-provider", "model": "fake-model"}
+    assert "input" not in downstream.json()["run"]
     assert client.get(base + f"/runs/{run['id']}").json()["run"]["id"] == run["id"]
 
 
