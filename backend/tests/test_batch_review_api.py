@@ -1,4 +1,5 @@
 """Review decisions are bound to a completed preview of one saved variant version."""
+import hashlib
 import json
 
 from fastapi import FastAPI
@@ -114,3 +115,49 @@ def test_review_lifecycle_and_version_isolation(tmp_path):
         final_run = preview(reopened, first["id"], 3)
         assert review(reopened, first["id"], final_run, "approved", "输出已确认").status_code == 200
         assert status(reopened, first["id"])["reviewStatus"] == "approved"
+
+
+def test_dependencies_endpoint_uses_cas_and_validates_result_provenance(tmp_path):
+    root = tmp_path / "project-files" / "p1" / "preproduction"
+    (root / "assets").mkdir(parents=True)
+    (root / "assets" / "shot.mp4").write_bytes(b"video")
+    digest = hashlib.sha256(b"video").hexdigest()
+    (root / "state.json").write_text(json.dumps({"schemaVersion": 1, "revision": 0, "brief": {}, "shots": [], "assets": [{
+        "id": "shot", "name": "镜头", "kind": "video", "role": "reference", "file": "shot.mp4",
+        "assetVersionId": "shot-v1", "sha256": digest, "sourceRunId": "run-1", "sourceResultId": "result-1",
+    }]}), encoding="utf-8")
+    app = FastAPI()
+    app.include_router(create_batch_editing_router(tmp_path, lambda _: object(), type("Queue", (), {"submit": lambda *_: True})()))
+    base = "/api/projects/p1/batch-edits"
+    with TestClient(app) as api:
+        task = api.post(base, json={"sellingPoint": "省时", "script": "操作演示"}).json()["task"]
+        body = {"revision": 0, "dependencies": {
+            "source": {"assetId": "shot", "assetVersionId": "shot-v1", "sha256": digest},
+            "generated_result": {"runId": "run-1", "resultId": "result-1", "assetId": "shot"},
+            "current_output": {"runId": "run-1", "resultId": "result-1"},
+        }}
+        saved = api.put(f"{base}/{task['id']}/dependencies", json=body)
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["task"]["productionDependencyRevision"] == 1
+        assert api.put(f"{base}/{task['id']}/dependencies", json=body).status_code == 409
+        invalids = [
+            {"revision": 1, "dependencies": {"source": {"assetId": "shot", "assetVersionId": "shot-v1", "sha256": digest},
+                "generated_result": {"runId": "fake-run", "resultId": "result-1", "assetId": "shot"},
+                "current_output": {"runId": "fake-run", "resultId": "result-1"}}},
+            {"revision": 1, "dependencies": {"source": {"assetId": "shot", "assetVersionId": "shot-v1", "sha256": digest},
+                "generated_result": {"runId": "run-1", "resultId": "result-1", "assetId": "shot"},
+                "current_output": {"runId": "run-1", "resultId": "other-result"}}},
+            {"revision": 1, "dependencies": {"source": {"assetId": "shot"},
+                "generated_result": {"runId": "run-1", "resultId": "result-1", "assetId": "shot"},
+                "current_output": {"runId": "run-1", "resultId": "result-1"}}},
+            {"revision": 1, "dependencies": {"source": {"assetId": "shot", "assetVersionId": "wrong", "sha256": "b" * 64},
+                "generated_result": {"runId": "run-1", "resultId": "result-1", "assetId": "shot"},
+                "current_output": {"runId": "run-1", "resultId": "result-1"}}},
+            {"revision": 1, "dependencies": {"source": {"assetId": "shot", "assetVersionId": "shot-v1", "sha256": digest},
+                "generated_result": {"runId": "run-1", "resultId": "result-1"},
+                "current_output": {"runId": "run-1", "resultId": "result-1"}}},
+            {"revision": 1, "dependencies": {"current_output": {"runId": "run-1", "resultId": "result-1"}}},
+            {"revision": 1, "dependencies": {"generated_result": {"runId": "run-1", "resultId": "result-1", "assetId": "shot"}}},
+        ]
+        for invalid in invalids:
+            assert api.put(f"{base}/{task['id']}/dependencies", json=invalid).status_code == 422

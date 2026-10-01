@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from app.preproduction import PreproductionStore
 from app.preproduction_api import create_preproduction_router
+from app.project_assets import AssetStateConflict, ProjectAssets
 from app.canvas_layout import CanvasLayoutStore
 from app.timeline import TimelineStore
 
@@ -494,6 +495,29 @@ def test_upload_validates_real_media_and_serves_only_owned_asset(tmp_path):
     assert asset["url"] == BASE + f"/assets/{asset['id']}/file"
     assert client.get(BASE + f"/assets/{asset['id']}/file").status_code == 200
     assert client.get(BASE + "/assets/../state/file").status_code == 404
+
+
+def test_asset_metadata_and_delete_map_workspace_cas_conflicts_to_409(tmp_path, monkeypatch):
+    client, _, _ = setup(tmp_path)
+    media = tmp_path / "asset.mp4"
+    make_video(media)
+    uploaded = client.post(BASE + "/assets?role=motion", files={"file": ("asset.mp4", media.read_bytes(), "video/mp4")})
+    assert uploaded.status_code == 200, uploaded.text
+    asset = uploaded.json()["assets"][0]
+    revision = uploaded.json()["revision"]
+
+    def conflict(*_args, **_kwargs):
+        raise AssetStateConflict("项目素材已更新")
+
+    monkeypatch.setattr(ProjectAssets, "update_metadata", conflict)
+    metadata = client.put(BASE + f"/assets/{asset['id']}", json={"revision": revision, "name": "新名称", "notes": ""})
+    assert metadata.status_code == 409
+    assert metadata.json()["detail"]["code"] == "preproduction_conflict"
+
+    monkeypatch.setattr(ProjectAssets, "delete", conflict)
+    deleted = client.post(BASE + f"/assets/{asset['id']}/delete", json={"revision": revision})
+    assert deleted.status_code == 409
+    assert deleted.json()["detail"]["code"] == "preproduction_conflict"
 
 
 def test_result_upload_validates_its_target_before_reading_invalid_media(tmp_path):

@@ -8,6 +8,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.batch_editing_api import create_batch_editing_router
+from app.preproduction import PreproductionStore
+from app.project_assets import ProjectAssets
 
 
 def test_batch_export_gate_isolation_retry_and_history(tmp_path):
@@ -172,15 +174,32 @@ def test_batch_export_gate_isolation_retry_and_history(tmp_path):
 
 @pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="需要 FFmpeg")
 def test_export_uses_real_horizontal_mp4_with_saved_subtitles(tmp_path):
-    root = tmp_path / "project-files" / "p1" / "preproduction"
-    (root / "assets").mkdir(parents=True)
-    source = root / "assets" / "black.mp4"
+    source = tmp_path / "local-render-1.mp4"
     subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "lavfi",
                     "-i", "color=c=black:s=128x96:r=24:d=2", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)], check=True)
-    shutil.copyfile(source, root / "assets" / "backup.mp4")
-    (root / "state.json").write_text(json.dumps({"schemaVersion": 1, "revision": 0, "brief": {}, "shots": [],
-        "assets": [{"id": "black", "name": "黑色素材", "kind": "video", "file": "black.mp4", "duration": 2},
-                   {"id": "backup", "name": "备用素材", "kind": "video", "file": "backup.mp4", "duration": 2}]}), encoding="utf-8")
+    second_source = tmp_path / "local-render-2.mp4"
+    subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "lavfi",
+                    "-i", "color=c=red:s=128x96:r=24:d=2", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(second_source)], check=True)
+    project_assets = ProjectAssets(tmp_path)
+    generated = project_assets.install_run_result(
+        "p1", source=source, run_id="local-render-1", result_id="result-1", kind="video", name="本地生成黑色视频",
+        provider="local-renderer", processing_method="ffmpeg", input_snapshot={"color": "black"},
+        domain_kind="local-video", domain_run_id="local-render-1",
+        media={"duration": 2, "width": 128, "height": 96},
+    )
+    generated_second = project_assets.install_run_result(
+        "p1", source=second_source, run_id="local-render-2", result_id="result-2", kind="video", name="本地生成红色视频",
+        provider="local-renderer", processing_method="ffmpeg", input_snapshot={"color": "red"},
+        domain_kind="local-video", domain_run_id="local-render-2",
+        media={"duration": 2, "width": 128, "height": 96},
+    )
+    root = tmp_path / "project-files" / "p1" / "preproduction"
+    backup = root / "assets" / "backup.mp4"
+    shutil.copyfile(project_assets.file("p1", generated), backup)
+    workspace = PreproductionStore(tmp_path).load("p1")
+    workspace["assets"].append({"id": "backup", "name": "备用素材", "kind": "video", "file": "backup.mp4", "duration": 2})
+    workspace["revision"] += 1
+    PreproductionStore(tmp_path).save("p1", workspace)
     jobs = []
 
     class Queue:
@@ -194,14 +213,20 @@ def test_export_uses_real_horizontal_mp4_with_saved_subtitles(tmp_path):
         base = "/api/projects/p1/batch-edits"
         parent = api.post(base, json={"sellingPoint": "批量", "script": "初稿"}).json()["task"]
         created = api.post(f"{base}/{parent['id']}/variants/bulk", json={"items": [
-            {"sellingPoint": f"卖点{i}", "script": f"脚本{i}"} for i in range(5)], "assetIds": ["black", "backup"]})
+            {"sellingPoint": f"卖点{i}", "script": f"脚本{i}"} for i in range(5)], "assetIds": [generated["id"], "backup"]})
         assert created.status_code == 201, created.text
         child = created.json()["tasks"][0]
         tracks = child["variant"]["tracks"]
-        tracks[0]["clips"] = [{"id": "shot", "assetId": "black", "start": 0, "inPoint": 0, "duration": 2,
+        tracks[0]["clips"] = [{"id": "shot", "assetId": generated["id"], "start": 0, "inPoint": 0, "duration": 2,
                                "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0}]
         assert api.put(f"{base}/{child['id']}/variant", json={"revision": 0, "tracks": tracks,
             "aspectMode": "16:9", "settings": {"width": 1280, "height": 720, "fps": 30}}).status_code == 200
+        dependencies = {
+            "source": {"assetId": generated["id"], "assetVersionId": generated["assetVersionId"], "sha256": generated["sha256"]},
+            "generated_result": {"runId": "local-render-1", "resultId": "result-1", "assetId": generated["id"]},
+            "current_output": {"runId": "local-render-1", "resultId": "result-1"},
+        }
+        assert api.put(f"{base}/{child['id']}/dependencies", json={"revision": 0, "dependencies": dependencies}).status_code == 200
         cues = [{"id": "caption", "start": 0.2, "end": 1.5, "text": "人工确认字幕"}]
         assert api.put(f"{base}/{child['id']}/subtitles", json={"revision": 0, "timelineRevision": 1, "cues": cues}).status_code == 200
         assert api.post(f"{base}/{child['id']}/variant/previews", json={"revision": 1}).status_code == 202
@@ -209,8 +234,29 @@ def test_export_uses_real_horizontal_mp4_with_saved_subtitles(tmp_path):
         handler(project_id)
         preview = next(task for task in api.get(base).json()["tasks"] if task["id"] == child["id"])["variant"]["runs"][-1]
         assert preview["status"] == "completed", preview
+        old_preview_id = preview["id"]
         assert api.post(f"{base}/{child['id']}/reviews", json={"runId": preview["id"],
             "decision": "approved", "reason": "字幕确认"}).status_code == 200
+        switched = {
+            "source": {"assetId": generated_second["id"], "assetVersionId": generated_second["assetVersionId"], "sha256": generated_second["sha256"]},
+            "generated_result": {"runId": "local-render-2", "resultId": "result-2", "assetId": generated_second["id"]},
+            "current_output": {"runId": "local-render-2", "resultId": "result-2"},
+        }
+        assert api.put(f"{base}/{child['id']}/dependencies", json={"revision": 1, "dependencies": switched}).status_code == 200
+        stale = next(task for task in api.get(base).json()["tasks"] if task["id"] == child["id"])
+        assert stale["reviewStatus"] == "stale"
+        assert stale["variant"]["runs"][-1]["id"] == old_preview_id
+        assert api.post(f"{base}/{parent['id']}/exports", json={"taskIds": [child["id"]]}).status_code == 409
+        tracks[0]["clips"][0]["assetId"] = generated_second["id"]
+        assert api.put(f"{base}/{child['id']}/variant", json={"revision": 1, "tracks": tracks,
+            "aspectMode": "16:9", "settings": {"width": 1280, "height": 720, "fps": 30}}).status_code == 200
+        assert api.post(f"{base}/{child['id']}/variant/previews", json={"revision": 2}).status_code == 202
+        project_id, handler = jobs.pop()
+        handler(project_id)
+        preview = next(task for task in api.get(base).json()["tasks"] if task["id"] == child["id"])["variant"]["runs"][-1]
+        assert preview["id"] != old_preview_id and preview["status"] == "completed"
+        assert api.post(f"{base}/{child['id']}/reviews", json={"runId": preview["id"],
+            "decision": "approved", "reason": "切换结果后已确认"}).status_code == 200
         queued = api.post(f"{base}/{parent['id']}/exports", json={"taskIds": [child["id"]]})
         assert queued.status_code == 202, queued.text
         project_id, handler = jobs.pop()
@@ -220,6 +266,7 @@ def test_export_uses_real_horizontal_mp4_with_saved_subtitles(tmp_path):
         assert delivery["media"]["width"] == 1280 and delivery["media"]["height"] == 720
         assert delivery["media"]["fps"] == 30.0
         assert delivery["subtitles"] == cues
+        assert delivery["assets"] == [{"id": generated_second["id"], "name": "本地生成红色视频", "kind": "video"}]
         subtitle_file = tmp_path / "project-files" / "p1" / "batch-edits" / "exports" / delivery["id"] / "subtitles.srt"
         assert "人工确认字幕" in subtitle_file.read_text(encoding="utf-8")
         output = tmp_path / "delivered.mp4"

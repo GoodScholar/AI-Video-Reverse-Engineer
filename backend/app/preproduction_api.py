@@ -40,6 +40,7 @@ from .project_assets import (
     AssetFileUnavailableError,
     AssetInUseError,
     AssetReferencesUnavailableError,
+    AssetStateConflict,
     ProjectAssets,
 )
 from .preproduction_handoff import render_handoff
@@ -491,10 +492,13 @@ def create_preproduction_router(
         with source_lock or nullcontext(), lock:
             state = editable_assets(project_id, body.revision)
             managed_asset(state, asset_id)
-            project_assets.update_metadata(
-                state, asset_id, name=body.name, notes=body.notes,
-                save=lambda value: save(project_id, value),
-            )
+            try:
+                project_assets.update_metadata(
+                    project_id, state, asset_id, name=body.name, notes=body.notes,
+                    save=lambda value: save(project_id, value),
+                )
+            except AssetStateConflict:
+                fail("preproduction_conflict", "前置工作台已被更新，请刷新后重试。")
             return response(project_id, state)
 
     @router.post("/assets/{asset_id}/delete")
@@ -505,6 +509,8 @@ def create_preproduction_router(
             managed_asset(state, asset_id)
             try:
                 project_assets.delete(project_id, state, asset_id, save=lambda value: save(project_id, value))
+            except AssetStateConflict:
+                fail("preproduction_conflict", "前置工作台已被更新，请刷新后重试。")
             except AssetInUseError as error:
                 raise HTTPException(status_code=409, detail={
                     "code": "asset_in_use",

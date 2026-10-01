@@ -14,6 +14,7 @@ from app.batch_production import (
     review_current_version,
     review_status,
     save_content,
+    save_production_dependencies,
     save_subtitles,
     save_variant,
     start_voiceover,
@@ -188,6 +189,85 @@ def test_review_and_export_reject_a_preview_after_the_edit_version_changes():
     with pytest.raises(BatchProductionError) as error:
         export_approved_version(task, assets=assets, snapshot_sources=lambda *_: {}, id_factory=ids("delivery"))
     assert error.value.code == "batch_export_not_approved"
+
+
+def test_preview_review_and_export_stale_when_frozen_cross_engine_dependency_changes():
+    """Removing the dependency fingerprint comparison must make stale approval exportable."""
+    task = create_batch("省时", "操作演示", id_factory=ids("task", "variant"))
+    assets = {"shot": {"id": "shot", "name": "镜头", "kind": "video", "duration": 4}}
+    task["productionDependencies"] = {
+        "source": {"assetId": "shot", "versionId": "source-v1"},
+        "generated_result": {"runId": "generation-1", "resultId": "result-1", "assetId": "shot"},
+        "current_output": {"runId": "generation-1", "resultId": "result-1"},
+        "remix_plan": {"versionId": "plan-1"},
+        "edit_sequence": {"versionId": "sequence-1"},
+        "crop": {"versionId": "crop-1"},
+        "packaging": {"versionId": "package-1"},
+        "subtitles": {"versionId": "subtitle-1"},
+        "audio": {"assetId": "audio-1"},
+        "model": {"id": "model-a"},
+        "configuration": {"revision": "config-1"},
+    }
+    save_variant(task, expected_revision=0, tracks=video_tracks(), settings={"width": 720, "height": 1280, "fps": 30},
+                 aspect_mode="9:16", assets=assets)
+    preview = submit_preview(task, expected_revision=1, assets=assets,
+                             snapshot_sources=lambda *_: {"shot": "shot.mp4"}, id_factory=ids("preview"))
+    preview.update(status="completed", output="preview.mp4")
+    review_current_version(task, run_id="preview", decision="approved", reason="确认",
+                           preview_available=lambda run: True, id_factory=ids("review"))
+
+    assert preview["dependencySnapshot"] == {"script": "操作演示", **task["productionDependencies"]}
+    task["productionDependencies"]["current_output"] = {"runId": "generation-1", "resultId": "result-2"}
+
+    assert production.inspect_variant(task).preview.status == "stale"
+    assert review_status(task) == "stale"
+    with pytest.raises(BatchProductionError) as error:
+        export_approved_version(task, assets=assets, snapshot_sources=lambda *_: {}, id_factory=ids("delivery"))
+    assert error.value.code == "batch_export_not_approved"
+
+
+def test_legacy_preview_without_dependency_fingerprint_stales_when_task_gains_dependencies():
+    """Treating a missing run fingerprint as universally current would export an old approval."""
+    task = create_batch("省时", "操作演示", id_factory=ids("task", "variant"))
+    task["variant"].update(revision=1, tracks=video_tracks())
+    preview = completed_preview(task)
+    task["variant"]["runs"].append(preview)
+    task["reviews"].append(approved_review(task, preview))
+    task["productionDependencies"] = {"current_output": {"runId": "run-2", "resultId": "result-2"}}
+
+    assert production.inspect_variant(task).preview.status == "stale"
+    assert review_status(task) == "stale"
+
+
+def test_dependency_cas_revision_prevents_an_aba_current_output_from_reviving_a_queued_preview():
+    """Comparing only a fingerprint would incorrectly revive A after A→B→A."""
+    task = create_batch("省时", "操作演示", id_factory=ids("task", "variant"))
+    assets = {"shot": {"id": "shot", "name": "镜头", "kind": "video", "duration": 4}}
+    save_variant(task, expected_revision=0, tracks=video_tracks(), settings={"width": 720, "height": 1280, "fps": 30},
+                 aspect_mode="9:16", assets=assets)
+    assert save_production_dependencies(task, expected_revision=0, dependencies={
+        "current_output": {"runId": "run-a", "resultId": "result-a"},
+    }) is True
+    preview = submit_preview(task, expected_revision=1, assets=assets,
+                             snapshot_sources=lambda *_: {"shot": "shot.mp4"}, id_factory=ids("preview"))
+    assert preview["productionDependencyRevision"] == 1
+    assert production.inspect_variant(task).preview.status == "active"
+    assert production.reusable_preview(task) is preview
+
+    assert save_production_dependencies(task, expected_revision=1, dependencies={
+        "current_output": {"runId": "run-b", "resultId": "result-b"},
+    }) is True
+    assert production.inspect_variant(task).preview.status == "stale"
+    assert production.reusable_preview(task) is None
+    replacement = submit_preview(task, expected_revision=1, assets=assets,
+                                 snapshot_sources=lambda *_: {"shot": "shot.mp4"}, id_factory=ids("preview-2"))
+    assert replacement["id"] == "preview-2" and replacement["status"] == "queued"
+    assert save_production_dependencies(task, expected_revision=2, dependencies={
+        "current_output": {"runId": "run-a", "resultId": "result-a"},
+    }) is True
+
+    assert task["productionDependencyRevision"] == 3
+    assert production.inspect_variant(task).preview.status == "stale"
 
 
 def test_saving_changed_content_advances_its_version_and_invalidates_the_review():

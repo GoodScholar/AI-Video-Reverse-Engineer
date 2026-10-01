@@ -31,6 +31,7 @@ from .batch_production import (
     reusable_preview,
     queue_voiceover,
     save_content as save_batch_content,
+    save_production_dependencies,
     save_subtitles as save_batch_subtitles,
     save_variant as save_batch_variant,
     submit_preview as submit_batch_preview,
@@ -384,6 +385,46 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             return project_assets.index(project_id)
         except (OSError, ValueError):
             raise HTTPException(503, detail={"code": "batch_assets_unavailable", "message": "项目素材无法读取。"}) from None
+
+    def validate_dependencies(dependencies: Any, assets: dict[str, dict[str, Any]]) -> None:
+        allowed = {"source", "generated_result", "current_output", "remix_plan", "edit_sequence", "crop", "packaging",
+                   "subtitles", "audio", "model", "configuration"}
+        if not isinstance(dependencies, dict) or set(dependencies) - allowed:
+            raise HTTPException(422, detail={"code": "batch_dependency_invalid", "message": "成片依赖无效。"})
+        source = dependencies.get("source")
+        if source is not None:
+            if not isinstance(source, dict) or not _valid_id(source.get("assetId")) or source["assetId"] not in assets:
+                raise HTTPException(422, detail={"code": "batch_dependency_source_invalid", "message": "来源素材不存在。"})
+            asset = assets[source["assetId"]]
+            for key in ("assetVersionId", "sha256"):
+                if asset.get(key) is not None and source.get(key) != asset[key]:
+                    raise HTTPException(422, detail={"code": "batch_dependency_source_invalid", "message": "来源素材版本已变化。"})
+                if key in source and source[key] != asset.get(key):
+                    raise HTTPException(422, detail={"code": "batch_dependency_source_invalid", "message": "来源素材版本已变化。"})
+        for key in ("generated_result", "current_output"):
+            value = dependencies.get(key)
+            if value is None:
+                continue
+            if (not isinstance(value, dict) or not _valid_id(value.get("runId"))
+                    or not _valid_id(value.get("resultId"))):
+                raise HTTPException(422, detail={"code": "batch_dependency_result_invalid", "message": "生成结果身份无效。"})
+        generated = dependencies.get("generated_result")
+        current = dependencies.get("current_output")
+        has_generated = "generated_result" in dependencies
+        has_current = "current_output" in dependencies
+        if has_generated != has_current or (has_generated and (not isinstance(generated, dict) or not isinstance(current, dict))):
+            raise HTTPException(422, detail={"code": "batch_dependency_result_invalid", "message": "生成结果和当前输出必须同时指定。"})
+        if has_generated:
+            if not _valid_id(generated.get("assetId")) or generated["assetId"] not in assets:
+                raise HTTPException(422, detail={"code": "batch_dependency_result_invalid", "message": "生成结果素材不存在。"})
+            asset = assets[generated["assetId"]]
+            if (asset.get("sourceResultId") != generated["resultId"]
+                    or generated["runId"] not in {asset.get("sourceRunId"), asset.get("sourceCommonRunId")}):
+                raise HTTPException(422, detail={"code": "batch_dependency_result_invalid", "message": "生成结果与素材来源不一致。"})
+            if generated["runId"] != current["runId"] or generated["resultId"] != current["resultId"]:
+                raise HTTPException(422, detail={"code": "batch_dependency_result_invalid", "message": "当前输出与生成结果不一致。"})
+            if isinstance(source, dict) and source["assetId"] != generated["assetId"]:
+                raise HTTPException(422, detail={"code": "batch_dependency_source_invalid", "message": "来源素材与生成结果素材不一致。"})
 
     def public_task(project_id: str, task: dict[str, Any]):
         result = {**task, "contentRevision": task.get("contentRevision", 0), "reviews": task.get("reviews", []),
@@ -845,6 +886,21 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             )
             save(project_id, state)
             return {"variant": public_task(project_id, task)["variant"]}
+
+    @router.put("/{task_id}/dependencies")
+    def save_dependencies(project_id: str, task_id: str, body: dict[str, Any]):
+        project_for(project_id)
+        if (not isinstance(body, dict) or set(body) != {"revision", "dependencies"}
+                or type(body["revision"]) is not int):
+            raise HTTPException(422, detail={"code": "batch_dependency_invalid", "message": "成片依赖请求无效。"})
+        with source_lock or nullcontext(), lock:
+            state = state_for(project_id)
+            task = task_for(state, task_id)
+            dependencies = body["dependencies"]
+            validate_dependencies(dependencies, assets_for(project_id))
+            production_call(save_production_dependencies, task, expected_revision=body["revision"], dependencies=dependencies)
+            save(project_id, state)
+            return {"task": public_task(project_id, task)}
 
     @router.post("/{task_id}/recommendations")
     def create_recommendation(project_id: str, task_id: str, body: dict[str, Any]):
