@@ -511,7 +511,7 @@ def test_reframe_moves_a_full_bleed_crop_in_source_time_without_black_padding(tm
             "samples": [
                 {"timeSeconds": point, "boxes": [{"x": .15 + .6 * point / 2.958333, "y": .1, "width": .1, "height": .8, "label": "person", "confidence": .9}],
                  "center": {"x": .2 + .6 * point / 2.958333, "y": .5}, "confidence": .9}
-                for point in (0, .5, 1, 1.5, 2, 2.5, 2.958333)
+                for point in (index / 24 for index in range(72))
             ], "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []},
     }
     output = tmp_path / "reframe.mp4"
