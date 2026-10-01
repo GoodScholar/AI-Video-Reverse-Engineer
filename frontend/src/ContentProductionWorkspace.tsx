@@ -5,6 +5,7 @@ import { AigcCreator } from "./AigcCreator";
 import { BatchEditor } from "./BatchEditor";
 import { PreproductionWorkspace } from "./PreproductionWorkspace";
 import { SourceSegmentIndexPanel } from "./SourceSegmentIndexPanel";
+import { TranscriptionPanel } from "./TranscriptionPanel";
 import { StudioSteps } from "./StudioPrototypePrimitives";
 import { getContentWorkflow, type ContentWorkflowProjection } from "./contentWorkflowApi";
 import type { AspectResolution } from "./videoAspect";
@@ -79,5 +80,6 @@ export function ContentProductionWorkspace({ project, page, tools, onNavigate, o
       sectionOverride={page === "assets" ? "assets" : page === "tools" ? "tools" : "shots"}
       importedWorkspace={importedWorkspace} onDraftChange={onPreproductionDirty} onAssetsChanged={setAssets} />
       {page === "assets" && <SourceSegmentIndexPanel projectId={project.id} assets={assets} />}</div>
+      {page === "assets" && <TranscriptionPanel projectId={project.id} assets={assets} />}
   </>;
 }
