@@ -76,6 +76,20 @@ from .bilibili_import import (
     public_bilibili_import_run,
     resolve_bilibili_short_url,
 )
+from .douyin_import import (
+    DOUYIN_ADAPTER,
+    MAX_DOUYIN_SOURCE_DURATION_SECONDS,
+    DouyinImportError,
+    DouyinImportRuns,
+    SystemDouyinCookieStore,
+    YtDlpDouyinAdapter,
+    douyin_video_source,
+    extract_douyin_share_url,
+    normalize_douyin_url,
+    probe_downloaded_douyin_video,
+    public_douyin_import_run,
+    resolve_douyin_short_url,
+)
 from .shot_production import MAX_RESULT_VERSIONS, NODE_KINDS, ShotProduction, ShotProductionError, StepSource, public_result_versions
 from .shot_organization import ShotOrganization, ShotOrganizationError
 from .preproduction_transaction import WorkspaceTransaction, WorkspaceTransactionError
@@ -105,6 +119,16 @@ def bilibili_external_request() -> dict[str, Any]:
         "purpose": "读取公开视频与分P元数据；确认权利并明确选择分P后下载到本项目受管暂存区。",
         "sessionPolicy": "默认不读取或发送会话；仅在你明确勾选后，才读取系统安全存储中的合法会话并仅发送给 B站。",
         "shortLinkPolicy": "b23.tv 短链只会经无代理、最多三次的 HTTPS 跳转解析，最终必须是标准 BV 视频页。",
+    }
+
+
+def douyin_external_request() -> dict[str, Any]:
+    return {
+        "probeHosts": ["www.douyin.com"],
+        "downloadHosts": ["抖音授权媒体 CDN"],
+        "purpose": "读取公开视频元数据；确认权利后下载到本项目受管暂存区。",
+        "sessionPolicy": "默认不读取或发送会话；仅在你明确勾选后，才读取系统安全存储中的合法会话并仅发送给抖音。",
+        "shortLinkPolicy": "v.douyin.com 短链只会经无代理、最多三次、DNS 固定的 HTTPS 跳转解析，最终必须是标准抖音视频页。",
     }
 
 
@@ -222,6 +246,10 @@ class BilibiliImportRequest(YoutubeImportRequest):
     part: int | None = Field(default=None, ge=1, le=9999)
 
 
+class DouyinImportRequest(YoutubeImportRequest):
+    pass
+
+
 class CanvasLayoutUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     layoutRevision: int = Field(ge=0)
@@ -243,6 +271,9 @@ def create_preproduction_router(
     bilibili_adapter: Any = None,
     bilibili_session_store: Any = None,
     bilibili_short_link_resolver: Any = None,
+    douyin_adapter: Any = None,
+    douyin_session_store: Any = None,
+    douyin_short_link_resolver: Any = None,
 ) -> APIRouter:
     """Create the router; ``runner`` is a test seam and defaults to execute_node."""
     root = Path(data_dir)
@@ -266,6 +297,10 @@ def create_preproduction_router(
     bilibili_short_link_resolver = bilibili_short_link_resolver or resolve_bilibili_short_url
     bilibili_runs = BilibiliImportRuns(root)
     bilibili_cancel_events: dict[str, Event] = {}
+    douyin_adapter = douyin_adapter or YtDlpDouyinAdapter(ffmpeg_path=ffmpeg_path)
+    douyin_short_link_resolver = douyin_short_link_resolver or resolve_douyin_short_url
+    douyin_runs = DouyinImportRuns(root)
+    douyin_cancel_events: dict[str, Event] = {}
     router = APIRouter(prefix="/api/projects/{project_id}/preproduction")
 
     def reconcile_youtube_imports(project_id: str) -> None:
@@ -307,6 +342,23 @@ def create_preproduction_router(
                 continue
             bilibili_runs.transition(project_id, run["id"], status="completed", error=None, uploadedAssetId=asset["id"])
 
+    def reconcile_douyin_imports(project_id: str) -> None:
+        assets = project_assets.index(project_id)
+        for run in douyin_runs.list(project_id):
+            if run["status"] not in {"failed", "cancelled"} or run.get("uploadedAssetId"):
+                continue
+            canonical = normalize_douyin_url(str(run.get("input", {}).get("url", "")))
+            video_id = (canonical or "").rsplit("/", 1)[-1]
+            asset = next((item for item in assets.values() if isinstance(item.get("videoSource"), dict)
+                          and item["videoSource"].get("sourceId") == "source-douyin-" + video_id), None)
+            if asset is None:
+                continue
+            try:
+                project_assets.file(project_id, asset)
+            except (OSError, ValueError, KeyError):
+                continue
+            douyin_runs.transition(project_id, run["id"], status="completed", error=None, uploadedAssetId=asset["id"])
+
     if runner is None:
         from .preproduction_nodes import execute_node
         runner = execute_node
@@ -326,8 +378,10 @@ def create_preproduction_router(
             project_assets.recover_local_video_installations(project_id)
             project_assets.recover_youtube_video_installations(project_id)
             project_assets.recover_bilibili_video_installations(project_id)
+            project_assets.recover_douyin_video_installations(project_id)
             reconcile_youtube_imports(project_id)
             reconcile_bilibili_imports(project_id)
+            reconcile_douyin_imports(project_id)
             return store.load(project_id)
         except (OSError, ValueError):
             fail("preproduction_storage_invalid", "前置工作台状态无法读取。", 503)
@@ -441,6 +495,7 @@ def create_preproduction_router(
                 project_assets.recover_local_video_installations(project_id)
                 project_assets.recover_youtube_video_installations(project_id)
                 project_assets.recover_bilibili_video_installations(project_id)
+                project_assets.recover_douyin_video_installations(project_id)
                 state = store.load(project_id)
                 changed = False
                 for shot in state["shots"]:
@@ -467,6 +522,14 @@ def create_preproduction_router(
                     project_id = path.parents[2].name
                     bilibili_runs.recover(project_id)
                     reconcile_bilibili_imports(project_id)
+            except (OSError, ValueError):
+                continue
+        for path in base.glob("*/preproduction/douyin-import/runs.json"):
+            try:
+                if not path.is_symlink():
+                    project_id = path.parents[2].name
+                    douyin_runs.recover(project_id)
+                    reconcile_douyin_imports(project_id)
             except (OSError, ValueError):
                 continue
 
@@ -1017,6 +1080,189 @@ def create_preproduction_router(
             if temporary is not None: temporary.unlink(missing_ok=True)
             shutil.rmtree(staging, ignore_errors=True)
             bilibili_cancel_events.pop(run_id, None)
+
+    def douyin_error(error: DouyinImportError) -> None:
+        messages = {
+            "requires_login": "该抖音内容需要已授权会话；系统不会自动登录、读取浏览器 Cookie 或绕过访问限制。",
+            "temporarily_unavailable": "抖音暂时不可用或站点适配已变化，请稍后重试。",
+            "unsupported_link": "该链接或内容受私密、地区、DRM 或其他不支持的访问限制，不能导入。",
+        }
+        statuses = {"requires_login": 409, "temporarily_unavailable": 503, "unsupported_link": 422}
+        fail(f"douyin_{error.status}", messages[error.status], statuses[error.status])
+
+    def douyin_cookie(required: bool) -> str | None:
+        if not required:
+            return None
+        try:
+            cookie = (douyin_session_store or SystemDouyinCookieStore()).get()
+        except Exception:
+            cookie = None
+        if not cookie:
+            raise DouyinImportError("requires_login")
+        return cookie
+
+    def douyin_probe(body: DouyinImportRequest, *, cancelled=None, redirect_facts: list[dict[str, Any]] | None = None):
+        raw_url = extract_douyin_share_url(body.url)
+        if raw_url is None:
+            raise DouyinImportError("unsupported_link")
+        canonical = normalize_douyin_url(raw_url)
+        if canonical is None:
+            canonical = douyin_short_link_resolver(raw_url, facts=redirect_facts) if redirect_facts is not None else douyin_short_link_resolver(raw_url)
+        if canonical is None:
+            raise DouyinImportError("unsupported_link")
+        try:
+            probe = douyin_adapter.probe
+            kwargs = {"cookie": douyin_cookie(body.useSession)}
+            if cancelled is not None and "cancelled" in inspect.signature(probe).parameters:
+                kwargs["cancelled"] = cancelled
+            result = probe(canonical, **kwargs)
+        except (DouyinImportError, YoutubeImportCancelled):
+            raise
+        except Exception:
+            raise DouyinImportError("temporarily_unavailable") from None
+        if result.status != "available" or result.canonical_url != canonical:
+            raise DouyinImportError("temporarily_unavailable")
+        if result.duration is not None and result.duration > MAX_DOUYIN_SOURCE_DURATION_SECONDS:
+            raise DouyinImportError("unsupported_link")
+        return result
+
+    @router.get("/douyin/disclosure")
+    def douyin_disclosure(project_id: str):
+        project_for(project_id)
+        return douyin_external_request()
+
+    @router.post("/douyin/probe")
+    def probe_douyin(project_id: str, body: DouyinImportRequest):
+        project_for(project_id)
+        if not body.externalRequestAccepted:
+            fail("douyin_external_request_confirmation_required", "请先确认将向抖音发起元数据请求。", 422)
+        try:
+            probe = douyin_probe(body, redirect_facts=[])
+        except DouyinImportError as error:
+            douyin_error(error)
+        return {
+            "canonicalUrl": probe.canonical_url, "videoId": probe.video_id, "title": probe.title,
+            "durationSeconds": probe.duration, "uploader": probe.uploader, "status": "available",
+            "adapter": {"id": "yt-dlp", "version": str(getattr(douyin_adapter, "version", DOUYIN_ADAPTER["version"]))},
+            "externalRequest": douyin_external_request(), "lastRealVerificationAt": None,
+        }
+
+    @router.post("/douyin/import")
+    def import_douyin(project_id: str, body: DouyinImportRequest):
+        project_for(project_id)
+        if not body.rightsConfirmed:
+            fail("douyin_video_rights_required", "请先确认你拥有该抖音视频的使用权，再导入项目。", 422)
+        if not body.externalRequestAccepted:
+            fail("douyin_external_request_confirmation_required", "请先确认将向抖音发起下载请求。", 422)
+        redirect_facts: list[dict[str, Any]] = []
+        try:
+            probe = douyin_probe(body, redirect_facts=redirect_facts)
+        except DouyinImportError as error:
+            douyin_error(error)
+        snapshot = {"url": probe.canonical_url, "role": body.role, "useSession": body.useSession,
+                    "adapter": dict(DOUYIN_ADAPTER), "redirectFacts": redirect_facts}
+        key = body.idempotencyKey.strip() or freeze_run_input(snapshot).fingerprint
+        try:
+            run, created = douyin_runs.create_or_reuse(project_id, snapshot, key)
+        except OSError:
+            fail("douyin_run_storage_failed", "抖音导入运行无法保存。", 503)
+        if created:
+            douyin_cancel_events[run["id"]] = Event()
+            if not compute_queue.submit("douyin-import", run["id"], lambda run_id: execute_douyin_import(project_id, run_id), project_id=project_id):
+                douyin_runs.transition(project_id, run["id"], status="failed", error="queue_unavailable")
+                fail("douyin_queue_unavailable", "抖音导入队列不可用，请稍后重试。", 503)
+        return JSONResponse(status_code=202, content={"run": public_douyin_import_run(run)})
+
+    @router.get("/douyin/imports/{run_id}")
+    def get_douyin_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try:
+            return {"run": public_douyin_import_run(douyin_runs.get(project_id, run_id))}
+        except (KeyError, ValueError):
+            fail("douyin_import_not_found", "抖音导入运行不存在。", 404)
+        except OSError:
+            fail("douyin_run_storage_failed", "抖音导入运行无法读取。", 503)
+
+    @router.post("/douyin/imports/{run_id}/cancel")
+    def cancel_douyin_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try:
+            with source_lock or nullcontext(), lock:
+                run = douyin_runs.request_cancel(project_id, run_id)
+        except KeyError:
+            fail("douyin_import_not_found", "抖音导入运行不存在。", 404)
+        except ValueError:
+            fail("douyin_import_not_cancellable", "该抖音导入运行当前不能取消。", 409)
+        if (event := douyin_cancel_events.get(run_id)) is not None:
+            event.set()
+        if run["status"] == "cancelled":
+            shutil.rmtree(douyin_runs.staging_dir(project_id, run_id), ignore_errors=True)
+        return JSONResponse(status_code=202, content={"run": public_douyin_import_run(run)})
+
+    @router.post("/douyin/imports/{run_id}/retry")
+    def retry_douyin_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try:
+            run, created = douyin_runs.retry(project_id, run_id)
+        except KeyError:
+            fail("douyin_import_not_found", "抖音导入运行不存在。", 404)
+        except ValueError:
+            fail("douyin_import_not_retryable", "该抖音导入运行当前不能重试。", 409)
+        except OSError:
+            fail("douyin_run_storage_failed", "抖音导入运行无法保存。", 503)
+        if created:
+            douyin_cancel_events[run["id"]] = Event()
+            if not compute_queue.submit("douyin-import", run["id"], lambda candidate: execute_douyin_import(project_id, candidate), project_id=project_id):
+                douyin_runs.transition(project_id, run["id"], status="failed", error="queue_unavailable")
+                fail("douyin_queue_unavailable", "抖音导入队列不可用，请稍后重试。", 503)
+        return JSONResponse(status_code=202, content={"run": public_douyin_import_run(run)})
+
+    def execute_douyin_import(project_id: str, run_id: str) -> None:
+        temporary: Path | None = None
+        staging = douyin_runs.staging_dir(project_id, run_id)
+        event = douyin_cancel_events.setdefault(run_id, Event())
+        try:
+            run = douyin_runs.get(project_id, run_id)
+            if run["status"] == "cancelled" or event.is_set():
+                douyin_runs.transition(project_id, run_id, status="cancelled", error="cancelled"); return
+            if run["status"] != "queued": return
+            douyin_runs.transition(project_id, run_id, status="running", error=None)
+            body = DouyinImportRequest(url=run["input"]["url"], role=run["input"]["role"], rightsConfirmed=True,
+                                       externalRequestAccepted=True, useSession=bool(run["input"].get("useSession", False)))
+            probe = douyin_probe(body, cancelled=event.is_set)
+            if event.is_set(): raise YoutubeImportCancelled()
+            staging.mkdir(parents=True, exist_ok=True)
+            descriptor, name = tempfile.mkstemp(dir=staging, prefix=".douyin-", suffix=".mp4"); os.close(descriptor); temporary = Path(name)
+            download = douyin_adapter.download
+            kwargs = {"cookie": douyin_cookie(body.useSession)}
+            if "cancelled" in inspect.signature(download).parameters: kwargs["cancelled"] = event.is_set
+            downloaded = Path(download(probe, temporary, **kwargs))
+            if event.is_set(): raise YoutubeImportCancelled()
+            if downloaded.parent.resolve(strict=True) != staging.resolve(strict=True) or not downloaded.name.startswith(".douyin-"):
+                raise OSError("unmanaged Douyin staging output")
+            if downloaded != temporary: temporary.unlink(missing_ok=True); temporary = downloaded
+            metadata = probe_downloaded_douyin_video(temporary, ffprobe_path=ffprobe_path, ffmpeg_path=ffmpeg_path)
+            if event.is_set(): raise YoutubeImportCancelled()
+            provenance = douyin_video_source(probe=probe, metadata=metadata, content_hash=hashlib.sha256(temporary.read_bytes()).hexdigest(),
+                                              confirmed_at=utc_timestamp(), redirect_facts=run["input"].get("redirectFacts"))
+            with source_lock or nullcontext(), lock:
+                if event.is_set(): raise YoutubeImportCancelled()
+                installed = project_assets.install_platform_video(project_id, source=temporary, staging_root=staging, platform="douyin", probe=probe,
+                                                                    role=run["input"]["role"], metadata=metadata, confirmed_at=utc_timestamp(), provenance=provenance)
+                douyin_runs.transition(project_id, run_id, status="completed", error=None, uploadedAssetId=installed["id"])
+                temporary = None
+        except YoutubeImportCancelled:
+            douyin_runs.transition(project_id, run_id, status="cancelled", error="cancelled")
+        except DouyinImportError as error:
+            douyin_runs.transition(project_id, run_id, status="failed", error="douyin_" + error.status)
+        except ValueError:
+            douyin_runs.transition(project_id, run_id, status="failed", error="douyin_download_invalid")
+        except Exception:
+            douyin_runs.transition(project_id, run_id, status="failed", error="douyin_temporarily_unavailable")
+        finally:
+            if temporary is not None: temporary.unlink(missing_ok=True)
+            shutil.rmtree(staging, ignore_errors=True)
+            douyin_cancel_events.pop(run_id, None)
 
     @router.post("/assets")
     async def upload_asset(project_id: str, role: Literal["character", "scene", "motion", "audio", "reference"] = Query(...), file: UploadFile = File(...), resultForShot: Optional[str] = Query(None), revision: Optional[int] = Query(None), derivation: Optional[str] = Form(None), rightsConfirmed: bool = Form(False)):

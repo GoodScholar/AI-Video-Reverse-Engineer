@@ -190,7 +190,14 @@ export type BilibiliImportRun = {
   uploadedAssetId: string | null;
 };
 
+export type DouyinProbe = YoutubeProbe & {
+  externalRequest: { probeHosts: string[]; downloadHosts: string[]; purpose: string; sessionPolicy: string; shortLinkPolicy: string };
+};
+export type DouyinImportRequest = YoutubeImportRequest;
+export type DouyinImportRun = YoutubeImportRun;
+
 export type PreproductionWorkspace = {
+  uploadedAssetId?: string;
   schemaVersion: 2;
   revision: number;
   brief: PreproductionBrief;
@@ -325,6 +332,28 @@ export function cancelBilibiliImportRun(projectId: string, runId: string): Promi
 
 export function retryBilibiliImportRun(projectId: string, runId: string): Promise<{ run: BilibiliImportRun }> {
   return request(`${baseUrl(projectId)}/bilibili/imports/${encodeURIComponent(runId)}/retry`, { method: "POST", headers: jsonHeaders }, "无法重试 B站导入，请重试。");
+}
+
+export function probeDouyinVideo(projectId: string, url: string, useSession = false): Promise<DouyinProbe> {
+  return request(`${baseUrl(projectId)}/douyin/probe`, {
+    method: "POST", headers: jsonHeaders, body: JSON.stringify({ url, externalRequestAccepted: true, useSession }),
+  }, "无法读取抖音视频信息，请检查链接或稍后重试。");
+}
+
+export function importDouyinVideo(projectId: string, body: DouyinImportRequest): Promise<{ run: DouyinImportRun }> {
+  return request(`${baseUrl(projectId)}/douyin/import`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }, "无法导入抖音视频，请检查授权、链接和网络状态。");
+}
+
+export function getDouyinImportRun(projectId: string, runId: string): Promise<{ run: DouyinImportRun }> {
+  return request(`${baseUrl(projectId)}/douyin/imports/${encodeURIComponent(runId)}`, {}, "无法读取抖音导入状态，请重试。");
+}
+
+export function cancelDouyinImportRun(projectId: string, runId: string): Promise<{ run: DouyinImportRun }> {
+  return request(`${baseUrl(projectId)}/douyin/imports/${encodeURIComponent(runId)}/cancel`, { method: "POST", headers: jsonHeaders }, "无法取消抖音导入，请重试。");
+}
+
+export function retryDouyinImportRun(projectId: string, runId: string): Promise<{ run: DouyinImportRun }> {
+  return request(`${baseUrl(projectId)}/douyin/imports/${encodeURIComponent(runId)}/retry`, { method: "POST", headers: jsonHeaders }, "无法重试抖音导入，请重试。");
 }
 
 export function importReferenceAssets(projectId: string, revision: number): Promise<PreproductionWorkspace> {

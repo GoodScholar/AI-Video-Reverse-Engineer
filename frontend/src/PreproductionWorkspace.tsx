@@ -20,6 +20,11 @@ import {
   cancelBilibiliImportRun,
   retryBilibiliImportRun,
   probeBilibiliVideo,
+  importDouyinVideo,
+  getDouyinImportRun,
+  cancelDouyinImportRun,
+  retryDouyinImportRun,
+  probeDouyinVideo,
   runPreproductionNode,
   savePreproductionWorkspace,
   uploadPreproductionAsset,
@@ -35,6 +40,8 @@ import {
   type YoutubeImportRun,
   type BilibiliProbe,
   type BilibiliImportRun,
+  type DouyinProbe,
+  type DouyinImportRun,
 } from "./preproductionApi";
 import "./preproduction.css";
 import { ReproductionFlow } from "./ReproductionFlow";
@@ -188,6 +195,11 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
   const [bilibiliRun, setBilibiliRun] = useState<BilibiliImportRun | null>(null);
   const [bilibiliDisclosureAccepted, setBilibiliDisclosureAccepted] = useState(false);
   const [bilibiliUseSession, setBilibiliUseSession] = useState(false);
+  const [douyinUrl, setDouyinUrl] = useState("");
+  const [douyinProbe, setDouyinProbe] = useState<DouyinProbe | null>(null);
+  const [douyinRun, setDouyinRun] = useState<DouyinImportRun | null>(null);
+  const [douyinDisclosureAccepted, setDouyinDisclosureAccepted] = useState(false);
+  const [douyinUseSession, setDouyinUseSession] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState("");
@@ -277,6 +289,14 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
     void getYoutubeImportRun(project.id, runId).then(result => setYoutubeRun(result.run)).catch(() => {
       window.sessionStorage.removeItem(`aivre:youtube-import:${project.id}`);
       setYoutubeRun(null);
+    });
+  }, [project.id]);
+
+  useEffect(() => {
+    const runId = window.sessionStorage.getItem(`aivre:douyin-import:${project.id}`);
+    if (!runId) { setDouyinRun(null); return; }
+    void getDouyinImportRun(project.id, runId).then(result => setDouyinRun(result.run)).catch(() => {
+      window.sessionStorage.removeItem(`aivre:douyin-import:${project.id}`); setDouyinRun(null);
     });
   }, [project.id]);
 
@@ -464,6 +484,43 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
     finally { if (mounted.current) setBusy(null); }
   }
 
+  async function probeDouyin() {
+    if (!douyinUrl.trim() || busy || dirty) return;
+    setBusy("douyin-probe"); setError("");
+    try { setDouyinProbe(await probeDouyinVideo(project.id, douyinUrl.trim(), douyinUseSession)); }
+    catch (reason) { setDouyinProbe(null); setError(errorMessage(reason, "无法读取抖音视频信息。")); }
+    finally { setBusy(null); }
+  }
+
+  async function importDouyin() {
+    if (!douyinProbe || busy || dirty) return;
+    if (!window.confirm(`即将向 ${douyinProbe.externalRequest.downloadHosts.join("、")} 发起下载请求：${douyinProbe.externalRequest.purpose}`)) return;
+    setBusy("douyin-import"); setError("");
+    try {
+      const started = await importDouyinVideo(project.id, { url: douyinUrl.trim(), role: uploadRole, rightsConfirmed: true, externalRequestAccepted: true, useSession: douyinUseSession });
+      setDouyinRun(started.run); window.sessionStorage.setItem(`aivre:douyin-import:${project.id}`, started.run.id);
+    } catch (reason) { setError(errorMessage(reason, "无法导入抖音视频。")); }
+    finally { setBusy(null); }
+  }
+
+  async function refreshDouyinRun() {
+    if (!douyinRun || busy) return;
+    setBusy("douyin-status"); setError("");
+    try {
+      const next = await getDouyinImportRun(project.id, douyinRun.id); setDouyinRun(next.run);
+      if (["completed", "failed", "cancelled"].includes(next.run.status)) window.sessionStorage.removeItem(`aivre:douyin-import:${project.id}`);
+    } catch (reason) { setError(errorMessage(reason, "无法读取抖音导入状态。")); }
+    finally { setBusy(null); }
+  }
+
+  async function changeDouyinRun(action: "cancel" | "retry") {
+    if (!douyinRun || busy) return;
+    setBusy(`douyin-${action}`); setError("");
+    try { setDouyinRun((await (action === "cancel" ? cancelDouyinImportRun(project.id, douyinRun.id) : retryDouyinImportRun(project.id, douyinRun.id))).run); }
+    catch (reason) { setError(errorMessage(reason, "无法更新抖音导入运行。")); }
+    finally { setBusy(null); }
+  }
+
   async function refreshBilibiliRun() {
     if (!bilibiliRun || busy) return;
     setBusy("bilibili-status"); setError("");
@@ -612,6 +669,15 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
             <button type="button" className="secondary-action" disabled={Boolean(busy) || dirty || !bilibiliUrl.trim() || !bilibiliDisclosureAccepted} onClick={() => void probeBilibili()}>{busy === "bilibili-probe" ? "正在读取…" : "读取链接与分P"}</button>
             {bilibiliProbe && <div role="status"><strong>{bilibiliProbe.title}</strong><small>适配器：{bilibiliProbe.adapter.id} {bilibiliProbe.adapter.version} · 状态：{bilibiliProbe.status} · 最近真实验证：{bilibiliProbe.lastRealVerificationAt ?? "尚无真实验证（受控测试不计入）"}</small><p>{bilibiliProbe.parts.length > 1 ? "该视频有多个分P，请明确选择一个后再下载。" : "单分P视频已可选择。"}</p><label>选择分P<select aria-label="选择 B站分P" value={bilibiliPart ?? ""} onChange={(event) => setBilibiliPart(Number(event.target.value) || null)}><option value="">请选择</option>{bilibiliProbe.parts.map(part => <option key={part.number} value={part.number}>P{part.number} · {part.title} · {part.durationSeconds ?? "未知"}秒</option>)}</select></label><button type="button" className="primary-action" disabled={Boolean(busy) || dirty || bilibiliPart === null} onClick={() => void importBilibili()}>{busy === "bilibili-import" ? "正在创建导入…" : "确认权利并下载所选分P"}</button></div>}
             {bilibiliRun && <div role="status"><strong>导入运行：{bilibiliRun.status}</strong><small>{bilibiliRun.error ? `诊断：${bilibiliRun.error}` : `运行标识：${bilibiliRun.id}`}</small><button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void refreshBilibiliRun()}>刷新导入状态</button>{["queued", "running", "cancel_requested"].includes(bilibiliRun.status) && <button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void changeBilibiliRun("cancel")}>取消导入</button>}{["failed", "cancelled"].includes(bilibiliRun.status) && <button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void changeBilibiliRun("retry")}>重试导入</button>}</div>}
+          </div>
+          <div className="preproduction-upload" aria-label="导入抖音视频">
+            <label>抖音链接或分享文本<input aria-label="抖音链接或分享文本" value={douyinUrl} placeholder="https://www.douyin.com/video/... 或 https://v.douyin.com/..." onChange={(event) => { setDouyinUrl(event.target.value); setDouyinProbe(null); }} /></label>
+            <p>读取分享文本只接受唯一抖音链接；v.douyin.com 仅做有限、无代理且 DNS 固定的 HTTPS 跳转解析。系统不会绕过验证码、风控、地区或私密限制。</p>
+            <label><input type="checkbox" checked={douyinDisclosureAccepted} onChange={(event) => setDouyinDisclosureAccepted(event.target.checked)} />我已阅读并同意上述外发范围</label>
+            <label><input type="checkbox" checked={douyinUseSession} onChange={(event) => setDouyinUseSession(event.target.checked)} />仅在此链接需要时使用系统安全存储中的合法抖音会话</label>
+            <button type="button" className="secondary-action" disabled={Boolean(busy) || dirty || !douyinUrl.trim() || !douyinDisclosureAccepted} onClick={() => void probeDouyin()}>{busy === "douyin-probe" ? "正在读取…" : "读取链接"}</button>
+            {douyinProbe && <div role="status"><strong>{douyinProbe.title}</strong><small>适配器：{douyinProbe.adapter.id} {douyinProbe.adapter.version} · 状态：{douyinProbe.status} · 最近真实验证：{douyinProbe.lastRealVerificationAt ?? "尚无真实验证（受控测试不计入）"}</small><p>{douyinProbe.externalRequest.purpose}</p><button type="button" className="primary-action" disabled={Boolean(busy) || dirty} onClick={() => void importDouyin()}>{busy === "douyin-import" ? "正在创建导入…" : "确认权利并下载"}</button></div>}
+            {douyinRun && <div role="status"><strong>导入运行：{douyinRun.status}</strong><small>{douyinRun.error ? `诊断：${douyinRun.error}` : `运行标识：${douyinRun.id}`}</small><button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void refreshDouyinRun()}>刷新导入状态</button>{["queued", "running", "cancel_requested"].includes(douyinRun.status) && <button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void changeDouyinRun("cancel")}>取消导入</button>}{["failed", "cancelled"].includes(douyinRun.status) && <button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void changeDouyinRun("retry")}>重试导入</button>}</div>}
           </div>
           <div className="preproduction-filters" role="group" aria-label="素材标签筛选"><button type="button" aria-pressed={roleFilter === "all"} className={roleFilter === "all" ? "is-active" : ""} onClick={() => setRoleFilter("all")}>全部</button>{(Object.entries(roleLabels) as Array<[AssetRole, string]>).map(([role, label]) => <button type="button" key={role} aria-pressed={roleFilter === role} className={roleFilter === role ? "is-active" : ""} onClick={() => setRoleFilter(role)}>{label}</button>)}</div>
           {visibleAssets.length ? <ul className="preproduction-assets">{visibleAssets.map((asset) => <li key={asset.id}><span className="preproduction-asset-kind">{asset.kind}</span><div className="preproduction-asset-info"><strong>{asset.name}</strong>{asset.notes && <p>{asset.notes}</p>}<button type="button" className="secondary-action" aria-label={`管理素材 ${asset.name}`} onClick={() => setManagedAssetId(asset.id)}>管理素材</button><span className="preproduction-asset-role">{roleLabels[asset.role]}</span>{asset.width && asset.height ? <small>{asset.width}×{asset.height}</small> : null}<a className="preproduction-asset-download" href={asset.url} download>下载{asset.name}</a><details className={`preproduction-asset-preview ${studioMode ? "studio-asset-preview" : ""}`} open={studioMode || undefined}><summary>预览</summary>{asset.kind === "image" ? <img src={asset.url} alt={`${asset.name} 预览`} /> : asset.kind === "video" ? <video controls preload="metadata" aria-label={`${asset.name} 预览`} src={asset.url} /> : asset.kind === "text" ? <TextAssetPreview url={asset.url} name={asset.name} /> : <audio controls preload="metadata" aria-label={`${asset.name} 预览`} src={asset.url} />}</details></div></li>)}</ul> : <p className="preproduction-empty">还没有匹配的素材。上传素材，或从已有参考和工具结果导入。</p>}

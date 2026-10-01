@@ -9,6 +9,8 @@ import {
   importYoutubeVideo,
   importBilibiliVideo,
   probeBilibiliVideo,
+  importDouyinVideo,
+  probeDouyinVideo,
   runPreproductionNode,
   savePreproductionWorkspace,
   saveCanvasLayout,
@@ -167,6 +169,17 @@ describe("preproductionApi", () => {
 
     expect(fetch).toHaveBeenNthCalledWith(1, "/api/projects/project-001/preproduction/bilibili/probe", expect.objectContaining({ method: "POST", body: JSON.stringify({ url: "https://b23.tv/abc123", externalRequestAccepted: true, useSession: false }) }));
     expect(fetch).toHaveBeenNthCalledWith(2, "/api/projects/project-001/preproduction/bilibili/import", expect.objectContaining({ method: "POST", body: JSON.stringify({ url: "https://b23.tv/abc123", part: 1, role: "reference", rightsConfirmed: true, externalRequestAccepted: true }) }));
+  });
+
+  it("抖音分享文本探测与确认导入保留外发及权利确认字段", async () => {
+    const probe = { canonicalUrl: "https://www.douyin.com/video/7420000000000000001", videoId: "7420000000000000001", title: "授权样片", durationSeconds: 1, uploader: "owner", status: "available" as const, adapter: { id: "yt-dlp" as const, version: "2026.08.19" }, externalRequest: { probeHosts: ["www.douyin.com"], downloadHosts: ["抖音授权媒体 CDN"], purpose: "读取", sessionPolicy: "默认不读取", shortLinkPolicy: "v.douyin.com 受限解析" }, lastRealVerificationAt: null };
+    vi.mocked(fetch).mockResolvedValueOnce(response(probe)).mockResolvedValueOnce(response({ run: { id: "douyin-import-1", status: "queued", error: null, createdAt: "2026-10-02T00:00:00Z", inputFingerprint: "hash", idempotencyKey: "key", retryOf: null, uploadedAssetId: null } }));
+
+    await expect(probeDouyinVideo("project-001", "分享 https://v.douyin.com/AbC123/", true)).resolves.toEqual(probe);
+    await importDouyinVideo("project-001", { url: "分享 https://v.douyin.com/AbC123/", role: "reference", rightsConfirmed: true, externalRequestAccepted: true, useSession: true });
+
+    expect(fetch).toHaveBeenNthCalledWith(1, "/api/projects/project-001/preproduction/douyin/probe", expect.objectContaining({ method: "POST", body: JSON.stringify({ url: "分享 https://v.douyin.com/AbC123/", externalRequestAccepted: true, useSession: true }) }));
+    expect(fetch).toHaveBeenNthCalledWith(2, "/api/projects/project-001/preproduction/douyin/import", expect.objectContaining({ method: "POST", body: JSON.stringify({ url: "分享 https://v.douyin.com/AbC123/", role: "reference", rightsConfirmed: true, externalRequestAccepted: true, useSession: true }) }));
   });
 
   it("打包失败时读取后端检查错误而不下载旧结果", async () => {
