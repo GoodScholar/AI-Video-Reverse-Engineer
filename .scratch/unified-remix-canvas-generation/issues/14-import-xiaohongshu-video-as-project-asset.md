@@ -4,7 +4,7 @@
 
 **Blocked by:** 10: 建立统一视频来源合同并贯通本地导入
 
-**Status:** ready-for-agent
+**Status:** blocked（E3/E4 需要用户明确授权的小红书金标 URL）
 
 ## Scope
 
@@ -31,6 +31,13 @@
 - E2 覆盖 URL/短链、重定向、登录要求、错误分类、取消和脱敏。
 - E3 使用一份授权小红书金标 URL 完成真实导入、哈希、来源登记和预览。
 - 人工核对真实媒体和来源元数据一致。
+
+## 实施记录（2026-10-02）
+
+- 复用固定 `yt-dlp==2026.08.19` 的 `yt_dlp/extractor/xiaohongshu.py::XiaoHongShuIE`；实际版本和唯一专用 extractor 已由 E2 加载检查验证。该源码只支持标准 `explore` / `discovery/item` 页面，`xhslink.com` 由本项目受限短链解析后再交给专用 extractor；未启用 Generic extractor。wheel 许可证为 Unlicense。
+- 复用 Ticket 10–13 的 `PlatformVideoImportRuns`、受管暂存、原子 `install_platform_video`、安全会话、取消/重试/崩溃恢复和前端状态模式，仅为小红书的页面识别、短链 host、脱敏来源事实和专用会话增加必要适配。
+- E2：覆盖标准页、分享文本、短链/DNS 约束、外发与权利前置、四态脱敏、会话、取消/恢复、真实 FFprobe/FFmpeg、哈希、来源登记与素材身份。受控测试不构成 E3，接口和 UI 的 `lastRealVerificationAt` 固定为 `null`。
+- E3/E4：尚未提供用户明确授权的小红书金标 URL；未发起真实第三方请求，故真实导入、人工媒体/元数据核对及 Ticket 30 仍为 blocked。
 
 ## Out of scope
 

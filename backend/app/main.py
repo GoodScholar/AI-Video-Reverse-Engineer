@@ -2508,6 +2508,8 @@ def create_app(
     app.include_router(create_bilibili_session_router())
     from .douyin_session_api import create_douyin_session_router
     app.include_router(create_douyin_session_router())
+    from .xiaohongshu_session_api import create_xiaohongshu_session_router
+    app.include_router(create_xiaohongshu_session_router())
     from .image_generation import ImageGenerationConfigurations, ImageGenerationService, ImageGenerationSettings
     from .image_generation_api import create_image_generation_router
     image_generation_configurations = ImageGenerationConfigurations(

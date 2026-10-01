@@ -385,7 +385,7 @@ class ProjectAssets:
         provenance: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Atomically install one checked platform download by its immutable identity."""
-        if platform not in {"youtube", "bilibili", "douyin"}:
+        if platform not in {"youtube", "bilibili", "douyin", "xiaohongshu"}:
             raise ValueError("不支持的视频平台")
         source = Path(source)
         try:
@@ -454,7 +454,7 @@ class ProjectAssets:
 
     def recover_platform_video_installations(self, project_id: str, platform: str) -> None:
         """Remove unregistered platform-download files after a process restart."""
-        if platform not in {"youtube", "bilibili", "douyin"}:
+        if platform not in {"youtube", "bilibili", "douyin", "xiaohongshu"}:
             raise ValueError("不支持的视频平台")
         assets_dir = self._store.path(project_id, "assets")
         if not assets_dir.exists():
@@ -488,6 +488,9 @@ class ProjectAssets:
 
     def recover_douyin_video_installations(self, project_id: str) -> None:
         self.recover_platform_video_installations(project_id, "douyin")
+
+    def recover_xiaohongshu_video_installations(self, project_id: str) -> None:
+        self.recover_platform_video_installations(project_id, "xiaohongshu")
 
     def _local_video_marker(self, project_id: str, asset_id: str) -> Path:
         return self._store.path(project_id, "assets", f"local-video-{asset_id}.pending.json")

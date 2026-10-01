@@ -432,3 +432,28 @@ export function deletePreproductionAsset(projectId: string, assetId: string, rev
     method: "POST", headers: jsonHeaders, body: JSON.stringify({ revision }),
   }, "无法删除素材。");
 }
+export type XiaohongshuProbe = DouyinProbe;
+export type XiaohongshuImportRequest = YoutubeImportRequest;
+export type XiaohongshuImportRun = YoutubeImportRun;
+
+export function probeXiaohongshuVideo(projectId: string, url: string, rightsConfirmed: boolean, useSession = false): Promise<XiaohongshuProbe> {
+  return request(`${baseUrl(projectId)}/xiaohongshu/probe`, {
+    method: "POST", headers: jsonHeaders, body: JSON.stringify({ url, rightsConfirmed, externalRequestAccepted: true, useSession }),
+  }, "无法读取小红书视频信息，请检查链接、权利确认或稍后重试。");
+}
+
+export function importXiaohongshuVideo(projectId: string, body: XiaohongshuImportRequest): Promise<{ run: XiaohongshuImportRun }> {
+  return request(`${baseUrl(projectId)}/xiaohongshu/import`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }, "无法导入小红书视频，请检查授权、链接和网络状态。");
+}
+
+export function getXiaohongshuImportRun(projectId: string, runId: string): Promise<{ run: XiaohongshuImportRun }> {
+  return request(`${baseUrl(projectId)}/xiaohongshu/imports/${encodeURIComponent(runId)}`, {}, "无法读取小红书导入状态，请重试。");
+}
+
+export function cancelXiaohongshuImportRun(projectId: string, runId: string): Promise<{ run: XiaohongshuImportRun }> {
+  return request(`${baseUrl(projectId)}/xiaohongshu/imports/${encodeURIComponent(runId)}/cancel`, { method: "POST", headers: jsonHeaders }, "无法取消小红书导入，请重试。");
+}
+
+export function retryXiaohongshuImportRun(projectId: string, runId: string): Promise<{ run: XiaohongshuImportRun }> {
+  return request(`${baseUrl(projectId)}/xiaohongshu/imports/${encodeURIComponent(runId)}/retry`, { method: "POST", headers: jsonHeaders }, "无法重试小红书导入，请重试。");
+}

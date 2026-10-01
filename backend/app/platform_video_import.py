@@ -20,14 +20,16 @@ class PlatformVideoImportRuns:
     _ACTIVE = frozenset({"queued", "running", "cancel_requested"})
 
     def __init__(self, root: Path, platform: str):
-        if platform not in {"youtube", "bilibili", "douyin"}:
+        if platform not in {"youtube", "bilibili", "douyin", "xiaohongshu"}:
             raise ValueError("不支持的视频平台")
         self._root = Path(root)
         self._platform = platform
         self._lock = RLock()
 
     def create_or_reuse(self, project_id: str, snapshot: dict[str, Any], idempotency_key: str) -> tuple[dict[str, Any], bool]:
-        frozen = freeze_run_input(snapshot)
+        # Rights confirmation is an auditable event timestamp, not a new media
+        # request identity. Re-submission therefore remains idempotent.
+        frozen = freeze_run_input({key: value for key, value in snapshot.items() if key != "rightsConfirmedAt"})
         with self._lock:
             state = self._load(project_id)
             existing = next((run for run in state["runs"] if run["idempotencyKey"] == idempotency_key
@@ -50,7 +52,7 @@ class PlatformVideoImportRuns:
                              and run.get("status") in self._ACTIVE | {"completed"}), None)
             if existing is not None:
                 return dict(existing), False
-            frozen = freeze_run_input(previous["input"])
+            frozen = freeze_run_input({key: value for key, value in previous["input"].items() if key != "rightsConfirmedAt"})
             run = self._new(previous["input"], frozen.fingerprint, uuid4().hex, retry_of=run_id)
             state["runs"].append(run); self._save(project_id, state)
             return dict(run), True
