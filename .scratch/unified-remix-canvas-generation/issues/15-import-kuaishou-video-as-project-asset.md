@@ -4,7 +4,7 @@
 
 **Blocked by:** 10: 建立统一视频来源合同并贯通本地导入
 
-**Status:** ready-for-agent
+**Status:** blocked（E3 需要用户明确授权的快手金标 URL）
 
 ## Scope
 
@@ -31,6 +31,12 @@
 - E1 固定实现、提交、许可证和适配范围记录。
 - E2 覆盖 URL、短链、会话、错误分类、取消、幂等和回滚。
 - E3 使用一份授权快手金标 URL 完成真实导入、哈希、来源登记和预览。
+
+## 实施记录（2026-10-02）
+
+- E1：核对固定 `yt-dlp==2026.08.19`，无 Kuaishou/Kwai 专用 extractor，禁止 Generic；`JoeanAmier/KS-Downloader@7c493d1c9f6aab1ee37885909f0f5450e01f2462` 为 GPL-3.0 且依赖浏览器伪装/代理，不能集成；`wwwzhouhui/video-parser@e81f669863daa315fc5423765196ae2479837904` 虽为 MIT，但快手下载器硬编码 Cookie、缺少安全重定向与会话边界，不能复用。采用项目最小自研 `KuaishouSourceAdapter 1.0.0`，只读取公开页面 JSON，不签名、不登录、不扫码、不绕过风控或访问限制。
+- E2：离线测试覆盖唯一 URL/分享文本、三跳 HTTPS 短链、DNS 公网地址钉扎、无代理重定向、公开 JSON 字段解析、会话系统安全存储、四态错误映射、取消后重试、原子入库/哈希/幂等及安装后状态写入中断恢复。适配器的页面/媒体请求使用 DNS 钉扎、无代理、禁自动跳转并限制媒体字节；登录、验证码、风控、私密、DRM 不会触发绕过。
+- E3/E4：尚未提供用户明确授权的快手金标 URL；未发起真实第三方请求，`lastRealVerificationAt` 必须为 `null`，R22/R23-R25 和 Ticket 30 保持 blocked。
 
 ## Out of scope
 

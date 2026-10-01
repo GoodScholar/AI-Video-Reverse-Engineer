@@ -196,6 +196,17 @@ export type DouyinProbe = YoutubeProbe & {
 export type DouyinImportRequest = YoutubeImportRequest;
 export type DouyinImportRun = YoutubeImportRun;
 
+export type KuaishouProbe = Omit<DouyinProbe, "adapter"> & { adapter: { id: "kuaishou-public-page"; version: string } };
+export type KuaishouImportRequest = YoutubeImportRequest;
+export type KuaishouImportRun = YoutubeImportRun;
+export type KuaishouDisclosure = {
+  probeHosts: string[];
+  downloadHosts: string[];
+  purpose: string;
+  sessionPolicy: string;
+  shortLinkPolicy: string;
+};
+
 export type PreproductionWorkspace = {
   uploadedAssetId?: string;
   schemaVersion: 2;
@@ -355,6 +366,19 @@ export function cancelDouyinImportRun(projectId: string, runId: string): Promise
 export function retryDouyinImportRun(projectId: string, runId: string): Promise<{ run: DouyinImportRun }> {
   return request(`${baseUrl(projectId)}/douyin/imports/${encodeURIComponent(runId)}/retry`, { method: "POST", headers: jsonHeaders }, "无法重试抖音导入，请重试。");
 }
+
+export function probeKuaishouVideo(projectId: string, url: string, rightsConfirmed: boolean, useSession = false): Promise<KuaishouProbe> {
+  return request(`${baseUrl(projectId)}/kuaishou/probe`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ url, rightsConfirmed, externalRequestAccepted: true, useSession }) }, "无法读取快手视频信息，请检查链接或稍后重试。");
+}
+export function getKuaishouDisclosure(projectId: string): Promise<KuaishouDisclosure> {
+  return request(`${baseUrl(projectId)}/kuaishou/disclosure`, {}, "无法读取快手外发说明，请稍后重试。");
+}
+export function importKuaishouVideo(projectId: string, body: KuaishouImportRequest): Promise<{ run: KuaishouImportRun }> {
+  return request(`${baseUrl(projectId)}/kuaishou/import`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }, "无法导入快手视频，请检查授权、链接和网络状态。");
+}
+export function getKuaishouImportRun(projectId: string, runId: string): Promise<{ run: KuaishouImportRun }> { return request(`${baseUrl(projectId)}/kuaishou/imports/${encodeURIComponent(runId)}`, {}, "无法读取快手导入状态，请重试。"); }
+export function cancelKuaishouImportRun(projectId: string, runId: string): Promise<{ run: KuaishouImportRun }> { return request(`${baseUrl(projectId)}/kuaishou/imports/${encodeURIComponent(runId)}/cancel`, { method: "POST", headers: jsonHeaders }, "无法取消快手导入，请重试。"); }
+export function retryKuaishouImportRun(projectId: string, runId: string): Promise<{ run: KuaishouImportRun }> { return request(`${baseUrl(projectId)}/kuaishou/imports/${encodeURIComponent(runId)}/retry`, { method: "POST", headers: jsonHeaders }, "无法重试快手导入，请重试。"); }
 
 export function importReferenceAssets(projectId: string, revision: number): Promise<PreproductionWorkspace> {
   return request(`${baseUrl(projectId)}/import-reference`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ revision }) }, "无法导入现有参考素材，请重试。");

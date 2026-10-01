@@ -8,6 +8,7 @@ import { AnalysisProviderSettings } from "./AnalysisProviderSettings";
 import { BilibiliSessionSettings } from "./BilibiliSessionSettings";
 import { DouyinSessionSettings } from "./DouyinSessionSettings";
 import { ImageGenerationSettings } from "./ImageGenerationSettings";
+import { KuaishouSessionSettings } from "./KuaishouSessionSettings";
 import { ContentProductionWorkspace, type StudioProjectPage } from "./ContentProductionWorkspace";
 import { ProjectBackup } from "./ProjectBackup";
 import { ReferenceMediaPanel } from "./ReferenceMediaPanel";
@@ -112,7 +113,7 @@ export function ContentStudioApp(){
         {project&&<div hidden={page==="projects"||page==="settings"}><ContentProductionWorkspace key={project.id} project={project} tools={tools} active={page!=="projects"&&page!=="settings"} page={page==="projects"||page==="settings"?"create":page} onNavigate={navigate} onOpenSettings={()=>{setSettingsTab("services");navigate("settings");}} onDirtyChange={onDirty}/></div>}
         {page==="tools"&&!project&&<div className="sp-empty"><Clapperboard size={32}/><h2>先选择需要处理的项目</h2><p>工具使用项目里的素材，并把结果保存回该项目。</p><button type="button" className="sp-button sp-primary" onClick={()=>navigate("projects")}>选择项目<ArrowRight size={16}/></button></div>}
         {page==="settings"&&<><div className="sp-work-heading"><div><h2>为制作准备好环境</h2><p>服务连接、声音与备份集中在这里。</p></div></div><div className="sp-settings-layout"><nav aria-label="设置分类">{[["services","AI 服务连接"],["local","声音与渲染说明"],["files","文件与备份"]].map(([id,label])=><button type="button" key={id} aria-pressed={settingsTab===id} onClick={()=>setSettingsTab(id)}>{label}<ArrowRight size={15}/></button>)}</nav><section className="sp-settings-panel">
-          {settingsTab==="services"&&<><AnalysisProviderSettings providers={providers} onProvidersChanged={setProviders}/><ImageGenerationSettings /><TextGenerationSettings /><BilibiliSessionSettings /><DouyinSessionSettings /></>}
+          {settingsTab==="services"&&<><AnalysisProviderSettings providers={providers} onProvidersChanged={setProviders}/><ImageGenerationSettings /><TextGenerationSettings /><BilibiliSessionSettings /><DouyinSessionSettings /><KuaishouSessionSettings /></>}
           {settingsTab==="local"&&<><h3>本地声音与视频制作</h3><p>选声制作步骤会读取真实音色目录与运行环境，支持描述、适用场景及试听。</p><p>配音使用已准备的本机 Qwen3-TTS；视频使用现有 FFmpeg。缺失环境会显示原因，不自动下载。</p><button type="button" className="sp-button sp-primary" onClick={()=>navigate(project?"create":"projects")}>前往制作<ArrowRight size={16}/></button></>}
           {settingsTab==="files"&&<ProjectBackup projectId={project?.id} hasUnsavedDraft={dirty} onRestored={restored=>{setProjects(current=>[restored,...current]);setProject(restored);setPage("create");}}/>}
         </section></div></>}

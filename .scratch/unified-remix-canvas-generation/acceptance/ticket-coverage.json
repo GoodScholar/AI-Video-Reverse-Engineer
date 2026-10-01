@@ -14,7 +14,7 @@
     {"ticket": "12", "issue": "../issues/12-import-bilibili-video-as-project-asset.md", "primaryRanges": ["R19"], "supportRanges": ["R23-R25", "X02"]},
     {"ticket": "13", "issue": "../issues/13-import-douyin-video-as-project-asset.md", "primaryRanges": ["R20"], "supportRanges": ["R23-R25", "X02"]},
     {"ticket": "14", "issue": "../issues/14-import-xiaohongshu-video-as-project-asset.md", "primaryRanges": ["R21"], "supportRanges": ["R23-R25", "X02"]},
-    {"ticket": "15", "issue": "../issues/15-import-kuaishou-video-as-project-asset.md", "primaryRanges": ["R22"], "supportRanges": ["R23-R26", "X02"]},
+    {"ticket": "15", "issue": "../issues/15-import-kuaishou-video-as-project-asset.md", "primaryRanges": ["R22"], "supportRanges": ["R23-R25", "X02"]},
     {"ticket": "16", "issue": "../issues/16-deliver-faster-whisper-long-video-transcription.md", "primaryRanges": ["R27-R28"], "supportRanges": ["A08-A10", "R30", "X03", "X16"]},
     {"ticket": "17", "issue": "../issues/17-deliver-highlight-candidates-dedup-and-top-n.md", "primaryRanges": ["R26", "R29-R31"], "supportRanges": ["R28", "R32", "R38", "X03"]},
     {"ticket": "18", "issue": "../issues/18-deliver-subject-aware-vertical-reframe.md", "primaryRanges": ["R34-R35"], "supportRanges": ["R13-R15", "X04"]},

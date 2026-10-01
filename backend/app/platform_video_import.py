@@ -20,7 +20,7 @@ class PlatformVideoImportRuns:
     _ACTIVE = frozenset({"queued", "running", "cancel_requested"})
 
     def __init__(self, root: Path, platform: str):
-        if platform not in {"youtube", "bilibili", "douyin", "xiaohongshu"}:
+        if platform not in {"youtube", "bilibili", "douyin", "xiaohongshu", "kuaishou"}:
             raise ValueError("不支持的视频平台")
         self._root = Path(root)
         self._platform = platform

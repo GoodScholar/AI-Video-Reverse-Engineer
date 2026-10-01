@@ -6,6 +6,8 @@ import type { Project } from "./models";
 import { PreproductionWorkspace } from "./PreproductionWorkspace";
 import type { PreproductionWorkspace as Workspace } from "./preproductionApi";
 
+vi.mock("./KuaishouImportPanel", () => ({ KuaishouImportPanel: () => null }));
+
 const project: Project = {
   id: "project-001", name: "雨夜人像", createdAt: "2026-09-10T10:00:00Z", updatedAt: "2026-09-10T10:00:00Z",
   referenceMedia: null, localPreprocessing: null,
