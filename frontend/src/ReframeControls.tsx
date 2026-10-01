@@ -75,7 +75,7 @@ export function ReframeControls({ clipId, assetUrl, mediaKind = "video", sourceS
   const samples = reframe?.samples ?? [];
   const samplePoints = useMemo(() => samples.map((sample) => ({ timeSeconds: sample.timeSeconds, x: sample.center?.x ?? .5, y: sample.center?.y ?? .5 })), [samples]);
   const sampleButtons = useMemo(() => visibleSamples(samples), [samples]);
-  const maximumSourceTime = isVideo ? sourceEnd ?? Math.max(sourceStart, samples.at(-1)?.timeSeconds ?? sourceStart) : 0;
+  const maximumSourceTime = isVideo ? sourceEnd ?? Math.max(sourceStart, samples[samples.length - 1]?.timeSeconds ?? sourceStart) : 0;
   const currentTime = isVideo ? Math.min(maximumSourceTime, Math.max(sourceStart, selectedTime ?? reframe?.samples[0]?.timeSeconds ?? sourceStart)) : 0;
   const override = reframe?.override ?? { mode: "auto" as const, keyframes: [] };
   const active = { timeSeconds: currentTime, ...(override.mode === "center" ? { x: .5, y: .5 } : interpolate(override.mode === "manual" || override.mode === "replace" ? override.keyframes : samplePoints, currentTime)) };

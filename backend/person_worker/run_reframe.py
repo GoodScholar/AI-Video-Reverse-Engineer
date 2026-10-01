@@ -82,6 +82,21 @@ def select_sample_indices(frames: list[dict], start: float, end: float, _sample_
     return intersecting
 
 
+def packaging_boxes(boxes: list[dict], subject: dict) -> list[dict]:
+    """Keep the subject plus one conservative envelope for every other object."""
+    obstacles = [box for box in boxes if box.get("label", "").lower() != "person"]
+    if not obstacles:
+        return [subject]
+    left = min(box["x"] for box in obstacles)
+    top = min(box["y"] for box in obstacles)
+    right = max(box["x"] + box["width"] for box in obstacles)
+    bottom = max(box["y"] + box["height"] for box in obstacles)
+    envelope = {"x": round(left, 6), "y": round(top, 6), "width": round(right - left, 6),
+                "height": round(bottom - top, 6), "label": "detected-obstacle",
+                "confidence": max(box["confidence"] for box in obstacles)}
+    return [subject, envelope]
+
+
 def load_timing(path: str | None) -> tuple[list[dict], str | None]:
     if not path:
         return [], "服务端未提供可信逐帧时间"
@@ -196,10 +211,9 @@ def analyze(source: Path, model: Path, start: float, end: float, target_width: i
                     detected_reasons.append("主体框大于目标满幅裁剪窗，可能持续被裁切")
                 if any(box["label"].lower() != "person" for box in boxes):
                     detected_reasons.append("检测到可能商品或遮挡物，无法确认满幅裁剪不会遮挡商品")
-                # Persist only the unique person used by crop/packaging.  Other
-                # detections have already made the result review-required and
-                # retaining them would multiply every durable preview snapshot.
-                detected_samples.append({"timeSeconds": round(actual_time, 6), "boxes": [subject],
+                # Preserve every non-person occupancy conservatively without
+                # multiplying durable preview snapshots by detector max_results.
+                detected_samples.append({"timeSeconds": round(actual_time, 6), "boxes": packaging_boxes(boxes, subject),
                                          "center": {"x": round(subject["x"] + subject["width"] / 2, 6),
                                                     "y": round(subject["y"] + subject["height"] / 2, 6)},
                                          "confidence": round(subject["confidence"], 6)})

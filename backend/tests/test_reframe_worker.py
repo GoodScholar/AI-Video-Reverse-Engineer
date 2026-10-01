@@ -81,3 +81,19 @@ def test_worker_keeps_every_real_frame_needed_for_manual_packaging_coverage():
     ]
     complete = module.select_sample_indices(long_frames, 0, 1_200, 2.0)
     assert len(complete) == 72_000 == module.MAX_VIDEO_SAMPLES
+
+
+def test_worker_retains_a_conservative_obstacle_envelope_for_packaging():
+    worker = Path(__file__).parents[1] / "person_worker" / "run_reframe.py"
+    spec = importlib.util.spec_from_file_location("reframe_worker_obstacles", worker)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    person = {"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}
+    product = {"x": .05, "y": .4, "width": .2, "height": .2, "label": "bottle", "confidence": .8}
+    overlay = {"x": .75, "y": .3, "width": .2, "height": .4, "label": "screen", "confidence": .7}
+
+    retained = module.packaging_boxes([person, product, overlay], person)
+
+    assert retained[0] == person
+    assert retained[1] == {"x": .05, "y": .3, "width": .9, "height": .4,
+                           "label": "detected-obstacle", "confidence": .8}
