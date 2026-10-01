@@ -20,6 +20,7 @@ import type { GenerationRoutingPolicyRef } from "./generationRoutingApi";
 
 type ImageAsset = { id: string; assetVersionId: string; name: string; kind: "image"; url: string };
 type Props = { projectId: string; imageAssets: ImageAsset[]; onInstalled?: () => void };
+type ComfyStatus = { state: string; workflowVerified: boolean };
 
 const referenceLabels: Record<VideoReferenceType, string> = {
   "first-frame": "首帧",
@@ -117,8 +118,18 @@ export function VideoGenerationPanel({ projectId, imageAssets, onInstalled }: Pr
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [routingPolicyRef, setRoutingPolicyRef] = useState<GenerationRoutingPolicyRef>();
+  const [comfyStatus, setComfyStatus] = useState<ComfyStatus>();
 
   useEffect(() => { runsRef.current = runs; }, [runs]);
+
+  useEffect(() => {
+    let alive = true;
+    void fetch("/api/comfyui-adapter/status").then(async (response) => {
+      if (!response.ok) throw new Error("optional adapter unavailable");
+      return response.json() as Promise<ComfyStatus>;
+    }).then((value) => { if (alive) setComfyStatus(value); }).catch(() => { /* Older servers have no optional adapter endpoint. */ });
+    return () => { alive = false; };
+  }, []);
 
   function refreshOne(runId: string) {
     const existing = refreshesRef.current.get(runId);
@@ -294,6 +305,9 @@ export function VideoGenerationPanel({ projectId, imageAssets, onInstalled }: Pr
           <button type="button" className="primary-action" disabled={!canSubmit || busy} onClick={() => void submit()}>{busy ? "正在处理…" : "提交视频生成"}</button>
         </>}
       </>}
+    {comfyStatus?.workflowVerified === false && <p role="status">{comfyStatus.state === "unconfigured"
+      ? "ComfyUI 为可选本地适配器：尚未配置，未纳入已支持视频模型。"
+      : "ComfyUI 已保存配置但工作流尚未完成真实验证，未纳入已支持视频模型。"}</p>}
 
     {runs.length > 0 && <section aria-label="视频生成历史">
       <div><h5>生成历史</h5><button type="button" disabled={busy} onClick={() => void refreshActive(runs)}>刷新远端状态</button></div>

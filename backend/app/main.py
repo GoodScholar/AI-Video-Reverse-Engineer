@@ -2631,6 +2631,11 @@ def create_app(
         data_dir, image_generation_configurations, image_generation_service,
     )
     aigc_generation_registry.register(configured_image_adapter.as_generation_adapter())
+    from .comfyui_adapter import ComfyUIAdapter, ComfyUIConfigurationStore, create_comfyui_adapter_router
+    comfyui_adapter_settings = ComfyUIConfigurationStore(data_dir)
+    # Registration is harmless while unconfigured: its catalog is empty until a
+    # separately evidenced workflow verification exists.
+    aigc_generation_registry.register(ComfyUIAdapter(data_dir, comfyui_adapter_settings).as_generation_adapter())
     aigc_generation_service = GenerationService(
         data_dir, registry=aigc_generation_registry, queue=compute_jobs,
         ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
@@ -2642,6 +2647,7 @@ def create_app(
     app.include_router(create_video_generation_run_router(aigc_generation_service, ensure_project_exists))
     from .generation_routing_api import create_generation_routing_router
     app.include_router(create_generation_routing_router(aigc_generation_service))
+    app.include_router(create_comfyui_adapter_router(comfyui_adapter_settings))
 
     app.include_router(create_aigc_content_router(data_dir, ensure_project_exists,
                                                    script_generator=generate_marketing_candidates,

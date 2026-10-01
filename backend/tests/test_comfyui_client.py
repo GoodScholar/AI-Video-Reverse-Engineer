@@ -97,6 +97,29 @@ def test_submit_marks_network_or_server_failures_unknown_but_not_explicit_reject
     assert uncertain.value.outcome_unknown is True
 
 
+def test_cancel_targets_only_the_known_prompt_and_never_treats_interrupt_ack_as_completion():
+    from app.comfyui_client import ComfyUIClientError
+
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, request.content))
+        if request.url.path == "/queue":
+            return httpx.Response(200, json={"queue_pending": [[1, "prompt-123"]], "queue_running": []})
+        assert request.url.path == "/queue"
+        return httpx.Response(200)
+
+    assert _client(handler).cancel("prompt-123") == "unknown"
+    assert seen == [
+        ("GET", "/queue", b""),
+        ("POST", "/queue", b'{"delete":["prompt-123"]}'),
+    ]
+
+    with pytest.raises(ComfyUIClientError) as uncertain:
+        _client(lambda request: (_ for _ in ()).throw(httpx.ConnectError("offline"))).cancel("prompt-123")
+    assert uncertain.value.outcome_unknown is True
+
+
 def test_poll_reports_queue_running_completed_and_safe_outputs():
     def queued(request):
         if request.url.path == "/history/prompt-123":

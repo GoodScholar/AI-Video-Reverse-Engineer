@@ -179,6 +179,22 @@ class ComfyUIClient:
             return {"status": "queued", "outputs": [], "error": None}
         return _unknown_poll_result("ComfyUI 尚未报告此执行状态。")
 
+    def cancel(self, prompt_id: str) -> str:
+        """Best-effort, prompt-scoped cancellation; never sends a global interrupt."""
+
+        _validate_prompt_id(prompt_id)
+        try:
+            queue = self._get_json("/queue")
+            if _queue_contains(queue, "queue_pending", prompt_id):
+                self._request("POST", "/queue", json={"delete": [prompt_id]}).close()
+                return "unknown"
+            if _queue_contains(queue, "queue_running", prompt_id):
+                self._request("POST", "/interrupt", json={"prompt_id": prompt_id}).close()
+                return "unknown"
+            return "unknown"
+        except ComfyUIClientError as error:
+            raise ComfyUIClientError("无法确认 ComfyUI 是否已取消工作流。", outcome_unknown=True) from error
+
     def fetch_output(self, output: Mapping[str, str]) -> bytes:
         filename, subfolder, output_type = _validate_output(output)
         params = {"filename": filename, "subfolder": subfolder, "type": output_type}

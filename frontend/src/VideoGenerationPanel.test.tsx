@@ -53,6 +53,21 @@ it("没有服务端验证的视频模型时不显示未知组合或提交入口"
   expect(screen.queryByRole("button", { name: "提交视频生成" })).not.toBeInTheDocument();
 });
 
+it("未配置的 ComfyUI 只显示为可选待验证，不显示为已支持模型", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/models")) return new Response(JSON.stringify({ models: [] }));
+    if (url.endsWith("/runs")) return new Response(JSON.stringify({ runs: [] }));
+    if (url === "/api/comfyui-adapter/status") return new Response(JSON.stringify({ state: "unconfigured", workflowVerified: false }));
+    throw new Error(`unexpected ${url}`);
+  }));
+
+  render(<VideoGenerationPanel projectId="project-1" imageAssets={assets} />);
+
+  expect(await screen.findByText("ComfyUI 为可选本地适配器：尚未配置，未纳入已支持视频模型。")).toBeVisible();
+  expect(screen.queryByRole("option", { name: /ComfyUI/ })).not.toBeInTheDocument();
+});
+
 it("只用目录中的图生视频首尾帧与精确参数组合提交", async () => {
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);

@@ -4,7 +4,7 @@
 
 **Blocked by:** 07: 收口 Provider 路由、取消、恢复与支持声明
 
-**Status:** ready-for-agent
+**Status:** blocked
 
 ## Scope
 
@@ -37,3 +37,9 @@
 
 - 把 ComfyUI 设为首期强制依赖。
 - 分发模型权重或自动安装未知自定义节点。
+
+## Comments
+
+- 2026-10-02：源码核查固定到 `Comfy-Org/ComfyUI` `77c0f39e343aa83597d67cd95811df9e4fbfef2e`（GPL-3.0）。读取 `server.py` 的 `/prompt`、`/queue`、`/history/{prompt_id}`、`/interrupt` 和 `/ws`，以及官方 `script_examples/websockets_api_example.py`。本项目仅以 HTTP 调用独立、用户运行的 ComfyUI 服务；没有复制、导入或分发其 GPL 核心、模型或自定义节点。恢复以持久的 `history/queue` 轮询为准，WebSocket 仅可作即时观察，不能替代重启恢复。
+- 2026-10-02：复用仓内 `workflow_templates.py` 的固定 `wan22_i2v`（上游 workflow-template commit `aaac56dd5cc5497533d92cbe50edc35ea660e587`）及 `GenerationService` 视频异步、取消、迟到结果和不可变项目素材安装链。新增可选 `ComfyUIAdapter`：未配置或未有真实工作流验证记录时其统一目录为空，UI 只显示“可选/未配置或待验证”，不会静默路由到 ComfyUI。保存地址、连接/依赖检查和真实工作流验证保持分离；服务端只接受固定 I2V 档位、单首帧与固定参数映射，拒绝未知输入。
+- 2026-10-02：E2 覆盖配置缺失、固定输入映射、队列/history 轮询、取消的本地/远端边界及已有持久恢复、迟到结果、素材安装合同。当前工作区没有经过确认的本地 ComfyUI、模型和工作流；未启动服务、下载模型或安装节点，因此 E3 无真实运行、取消或媒体证据。本票保持 blocked，ComfyUI 不构成文本/图片/视频其他 Provider 的强制依赖，也没有被标为已支持。
