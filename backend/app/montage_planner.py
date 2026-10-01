@@ -250,7 +250,7 @@ def plan_montage(
         "proposalGeneration": proposal_generation,
     }
     digest = hashlib.sha256(json.dumps(input_snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    proposal_id = f"montage-proposal-{digest[:24]}"
+    proposal_id = f"remix-plan-{digest[:24]}"
     planned_segments = []
     clips = []
     unmet = []
@@ -284,6 +284,13 @@ def plan_montage(
                 })
             planned_segments.append({
                 "id": segment["id"], "text": segment["text"], "status": "gap",
+                "input": {
+                    "searchId": segment["searchId"], "indexVersion": segment["indexVersion"],
+                    "retrievalVersion": segment.get("retrievalVersion"), "vectorizerVersion": segment.get("vectorizerVersion"),
+                    "rerankId": segment.get("rerankId"), "narrationSource": segment.get("narrationSource", "provided"),
+                    "wordBoundariesSeconds": deepcopy(segment["wordBoundariesSeconds"]),
+                    "candidateIds": [item["candidateId"] for item in segment["candidates"]],
+                },
                 "suggestion": None, "selectedClip": None, "alternatives": alternatives,
                 "timing": timing, "reasons": reasons, "unmet": [message],
             })
@@ -339,6 +346,13 @@ def plan_montage(
         }
         planned_segments.append({
             "id": segment["id"], "text": segment["text"], "status": "gap" if segment_unmet else "planned",
+            "input": {
+                "searchId": segment["searchId"], "indexVersion": segment["indexVersion"],
+                "retrievalVersion": segment.get("retrievalVersion"), "vectorizerVersion": segment.get("vectorizerVersion"),
+                "rerankId": segment.get("rerankId"), "narrationSource": segment.get("narrationSource", "provided"),
+                "wordBoundariesSeconds": deepcopy(segment["wordBoundariesSeconds"]),
+                "candidateIds": [item["candidateId"] for item in segment["candidates"]],
+            },
             "suggestion": suggestion, "suggestionClip": deepcopy(selected_clip), "selectedClip": selected_clip,
             "alternatives": alternatives, "timing": timing, "reasons": reasons,
             "unmet": segment_unmet,
@@ -354,8 +368,10 @@ def plan_montage(
         timeline_start = _round(timeline_start + requested_duration)
 
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "id": proposal_id,
+        "engine": "RemixEngine",
+        "entrypoint": "script",
         "plannerVersion": PLANNER_VERSION,
         "baseRevision": variant_revision,
         "inputSnapshot": input_snapshot,
