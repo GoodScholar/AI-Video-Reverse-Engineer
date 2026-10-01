@@ -1,0 +1,170 @@
+{
+  "version": 1,
+  "recordContract": {
+    "purpose": "只保存可追溯身份、快照引用、证据引用、人工结论和未闭合差异；项目、素材、运行、审核与交付状态仍由既有真相源拥有。",
+    "recordStatuses": ["模板", "执行中", "已封存"],
+    "requiredIncidentSlots": ["failure", "cancellation", "recovery", "unknownState", "lateResult", "retry", "restart"]
+  },
+  "records": [
+    {
+      "id": "GL01",
+      "name": "长视频拆短真实金标闭环",
+      "recordStatus": "模板",
+      "matrixItems": ["X01", "X02", "X03", "X04", "X05", "X06", "X16", "X17", "X18"],
+      "identityRefs": {
+        "acceptanceRunId": null,
+        "commonRunId": null,
+        "projectId": null,
+        "inputSnapshotRef": null,
+        "capabilitySnapshotRef": null
+      },
+      "realInputs": [
+        {"role": "local-or-platform-video", "assetId": null, "assetVersionId": null, "sha256": null, "sourceRecordId": null, "rightsEvidenceRef": null},
+        {"role": "over-30-minute-video", "assetId": null, "assetVersionId": null, "sha256": null, "sourceRecordId": null, "rightsEvidenceRef": null},
+        {"role": "six-scenario-golden-manifest", "manifestRef": null, "annotationEvidenceRef": null}
+      ],
+      "runRefs": [
+        {"domain": "source-import", "runId": null},
+        {"domain": "transcription", "runId": null},
+        {"domain": "highlight", "runId": null},
+        {"domain": "reframe", "runId": null},
+        {"domain": "remix", "runId": null},
+        {"domain": "render", "runId": null}
+      ],
+      "truthSourceRefs": {"timelineId": null, "previewRunIds": [], "reviewIds": [], "deliveryIds": []},
+      "realMediaRefs": [
+        {"role": "source", "assetId": null, "assetVersionId": null, "sha256": null, "evidenceRef": null},
+        {"role": "vertical-variants", "assetIds": [], "sha256": [], "evidenceRefs": []}
+      ],
+      "checkpoints": [
+        {"id": "source-installed", "requiredEvidence": ["E3", "E4"], "evidenceRefs": []},
+        {"id": "absolute-time-transcript", "requiredEvidence": ["E3", "E4"], "evidenceRefs": []},
+        {"id": "highlight-top-n", "requiredEvidence": ["E3", "E4"], "evidenceRefs": []},
+        {"id": "subject-aware-vertical-media", "requiredEvidence": ["E3", "E4"], "evidenceRefs": []},
+        {"id": "remix-plan-and-variants", "requiredEvidence": ["E3", "E4"], "evidenceRefs": []},
+        {"id": "preview-review-approved-delivery", "requiredEvidence": ["E3", "E4"], "evidenceRefs": []}
+      ],
+      "manualAcceptance": [
+        {"criterion": "高光召回、采用与未采用原因", "reviewer": null, "decidedAt": null, "decision": null, "evidenceRefs": []},
+        {"criterion": "无黑边、主体或字幕安全区、音画同步", "reviewer": null, "decidedAt": null, "decision": null, "evidenceRefs": []},
+        {"criterion": "权利、审核与批准交付关系", "reviewer": null, "decidedAt": null, "decision": null, "evidenceRefs": []}
+      ],
+      "incidentEvidence": {
+        "failure": {"evidenceRefs": [], "notes": null},
+        "cancellation": {"evidenceRefs": [], "notes": null},
+        "recovery": {"evidenceRefs": [], "notes": null},
+        "unknownState": {"evidenceRefs": [], "notes": null},
+        "lateResult": {"evidenceRefs": [], "notes": null},
+        "retry": {"evidenceRefs": [], "notes": null},
+        "restart": {"evidenceRefs": [], "notes": null}
+      },
+      "zeroToleranceObservations": [],
+      "openGaps": ["模板待票据 30 使用真实授权输入填写；不得把模板本身作为通过证据。"]
+    },
+    {
+      "id": "GL02",
+      "name": "脚本混剪与缺失生成真实金标闭环",
+      "recordStatus": "模板",
+      "matrixItems": ["X07", "X08", "X09", "X10", "X16", "X17", "X18"],
+      "identityRefs": {
+        "acceptanceRunId": null,
+        "commonRunId": null,
+        "projectId": null,
+        "inputSnapshotRef": null,
+        "capabilitySnapshotRef": null
+      },
+      "realInputs": [
+        {"role": "confirmed-script", "scriptVersionId": null, "contentHash": null, "approvalEvidenceRef": null},
+        {"role": "project-assets", "assetIds": [], "assetVersionIds": [], "sha256": [], "rightsEvidenceRefs": []},
+        {"role": "missing-generation-requirements", "requestRefs": [], "disclosureEvidenceRefs": [], "feeConfirmationEvidenceRefs": []}
+      ],
+      "runRefs": [
+        {"domain": "remix", "runId": null},
+        {"domain": "generation", "runIds": []},
+        {"domain": "render", "runIds": []}
+      ],
+      "truthSourceRefs": {"timelineIds": [], "previewRunIds": [], "reviewIds": [], "deliveryIds": []},
+      "realMediaRefs": [
+        {"role": "generated-project-assets", "assetIds": [], "assetVersionIds": [], "sha256": [], "evidenceRefs": []},
+        {"role": "delivered-variants", "assetIds": [], "sha256": [], "evidenceRefs": []}
+      ],
+      "checkpoints": [
+        {"id": "explainable-remix-plan", "requiredEvidence": ["E3", "E4"], "evidenceRefs": []},
+        {"id": "confirmed-real-generation", "requiredEvidence": ["E3", "E4"], "evidenceRefs": []},
+        {"id": "asset-install-and-plan-reparse", "requiredEvidence": ["E3", "E4"], "evidenceRefs": []},
+        {"id": "differentiated-variants", "requiredEvidence": ["E3", "E4"], "evidenceRefs": []},
+        {"id": "preview-qc-review-delivery", "requiredEvidence": ["E3", "E4"], "evidenceRefs": []}
+      ],
+      "manualAcceptance": [
+        {"criterion": "镜头保留率至少 80% 且人工替换率不超过 20%", "reviewer": null, "decidedAt": null, "decision": null, "evidenceRefs": []},
+        {"criterion": "无黑边、主体或字幕安全区、包装和预览导出一致", "reviewer": null, "decidedAt": null, "decision": null, "evidenceRefs": []},
+        {"criterion": "外发、费用、内容审核和批准交付", "reviewer": null, "decidedAt": null, "decision": null, "evidenceRefs": []}
+      ],
+      "incidentEvidence": {
+        "failure": {"evidenceRefs": [], "notes": null},
+        "cancellation": {"evidenceRefs": [], "notes": null},
+        "recovery": {"evidenceRefs": [], "notes": null},
+        "unknownState": {"evidenceRefs": [], "notes": null},
+        "lateResult": {"evidenceRefs": [], "notes": null},
+        "retry": {"evidenceRefs": [], "notes": null},
+        "restart": {"evidenceRefs": [], "notes": null}
+      },
+      "zeroToleranceObservations": [],
+      "openGaps": ["模板待票据 31 使用真实脚本、授权素材与 Provider 填写；不得把模板本身作为通过证据。"]
+    },
+    {
+      "id": "GL03",
+      "name": "画布驱动生成真实金标闭环",
+      "recordStatus": "模板",
+      "matrixItems": ["X11", "X12", "X13", "X14", "X15", "X16", "X17", "X18"],
+      "identityRefs": {
+        "acceptanceRunId": null,
+        "commonRunId": null,
+        "projectId": null,
+        "canvasId": null,
+        "canvasRevision": null,
+        "inputSnapshotRef": null,
+        "capabilitySnapshotRef": null
+      },
+      "realInputs": [
+        {"role": "saved-canvas-revision", "canvasId": null, "canvasRevision": null, "nodeIds": [], "edgeIds": []},
+        {"role": "provider-capabilities", "textCapabilityRef": null, "imageCapabilityRef": null, "videoCapabilityRef": null},
+        {"role": "stable-input-references", "textOutputRefs": [], "assetIds": [], "assetVersionIds": [], "sha256": []}
+      ],
+      "runRefs": [
+        {"domain": "canvas", "runId": null},
+        {"domain": "generation", "runIds": []},
+        {"domain": "remix-or-render", "runIds": []}
+      ],
+      "truthSourceRefs": {"timelineIds": [], "previewRunIds": [], "reviewIds": [], "deliveryIds": []},
+      "realMediaRefs": [
+        {"role": "generated-images", "assetIds": [], "assetVersionIds": [], "sha256": [], "evidenceRefs": []},
+        {"role": "generated-videos", "assetIds": [], "assetVersionIds": [], "sha256": [], "evidenceRefs": []},
+        {"role": "downstream-preview", "assetIds": [], "sha256": [], "evidenceRefs": []}
+      ],
+      "checkpoints": [
+        {"id": "real-text-output-adopted", "requiredEvidence": ["E3", "E4"], "evidenceRefs": []},
+        {"id": "real-image-generated-and-installed", "requiredEvidence": ["E3", "E4"], "evidenceRefs": []},
+        {"id": "real-video-generated-and-installed", "requiredEvidence": ["E3", "E4"], "evidenceRefs": []},
+        {"id": "downstream-continuation-or-remix", "requiredEvidence": ["E3", "E4"], "evidenceRefs": []},
+        {"id": "preview-review-and-invalidation", "requiredEvidence": ["E3", "E4"], "evidenceRefs": []}
+      ],
+      "manualAcceptance": [
+        {"criterion": "Toonflow 操作、节点来源与稳定引用关系", "reviewer": null, "decidedAt": null, "decision": null, "evidenceRefs": []},
+        {"criterion": "图片或视频可读可播放及下游续创关系", "reviewer": null, "decidedAt": null, "decision": null, "evidenceRefs": []},
+        {"criterion": "上游变化、过期提示、预览与人工审核", "reviewer": null, "decidedAt": null, "decision": null, "evidenceRefs": []}
+      ],
+      "incidentEvidence": {
+        "failure": {"evidenceRefs": [], "notes": null},
+        "cancellation": {"evidenceRefs": [], "notes": null},
+        "recovery": {"evidenceRefs": [], "notes": null},
+        "unknownState": {"evidenceRefs": [], "notes": null},
+        "lateResult": {"evidenceRefs": [], "notes": null},
+        "retry": {"evidenceRefs": [], "notes": null},
+        "restart": {"evidenceRefs": [], "notes": null}
+      },
+      "zeroToleranceObservations": [],
+      "openGaps": ["模板待票据 32 使用已验证真实 Provider 与保存画布填写；不得把模板本身作为通过证据。"]
+    }
+  ]
+}
