@@ -92,11 +92,12 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
         return {"revision": state["revision"], "settings": state["settings"], "tracks": state["tracks"], "assets": public_assets(project_id), "runs": [public_run(project_id, run) for run in state["runs"]]}
 
     def find_run(state, run_id):
+        domain_run_id = run_id.removeprefix("timeline:") if run_id.startswith("timeline:") else run_id
         try:
-            validate_storage_id(run_id)
+            validate_storage_id(domain_run_id)
         except ValueError:
             fail("timeline_run_missing", "渲染任务不存在。", 404)
-        run = next((item for item in state["runs"] if item.get("id") == run_id), None)
+        run = next((item for item in state["runs"] if item.get("id") == domain_run_id and (run_id == domain_run_id or item.get("commonRunId", "timeline:" + domain_run_id) == run_id)), None)
         if run is None:
             fail("timeline_run_missing", "渲染任务不存在。", 404)
         return run
@@ -159,7 +160,7 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 attempt = run.get("attempt", 1)
             sources = render_inputs.resolve(store.path(project_id, "runs", run_id), source_names)
             suffix = ".wav" if run["format"] == "wav" else ".mp4"
-            staging = store.path(project_id, "runs", run_id, "output" + suffix)
+            staging = store.path(project_id, "runs", run_id, "attempt-{}.staging{}".format(attempt, suffix))
             actual_renderer = renderer
             if actual_renderer is None:
                 from .timeline_render import render_timeline
@@ -202,6 +203,13 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             with lock:
                 state = state_for(project_id)
                 run = find_run(state, run_id)
+                if run.get("attempt", 1) != locals().get("attempt"):
+                    if staging is not None and staging.exists():
+                        _retain_late_output(staging, store.path(project_id, "runs", run_id, "attempt-{}{}".format(attempt, staging.suffix)))
+                        run.setdefault("logs", []).append({"event": "retained_not_adopted", "attempt": attempt, "reason": "superseded_attempt"})
+                        retained_staging = True
+                        save(project_id, state)
+                    return
                 if run.get("attempt", 1) == locals().get("attempt") and run["status"] == "cancel_requested":
                     if staging is not None and staging.exists():
                         _retain_late_output(staging, store.path(project_id, "runs", run_id, "attempt-{}{}".format(attempt, staging.suffix)))
@@ -438,6 +446,8 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 if existing.get("retryOf") != original["id"] or existing.get("inputFingerprint") != original.get("inputFingerprint"):
                     fail("timeline_idempotency_conflict", "幂等键已用于不同的重试请求。")
                 return response(project_id, state)
+            if any(item.get("status") in ACTIVE_STATUSES for item in state["runs"]):
+                fail("timeline_run_active", "当前项目已有渲染任务正在执行。")
             retry_id = uuid4().hex
             sources = retry_sources(project_id, original, retry_id)
             retry = {
@@ -475,12 +485,13 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
 
     def cleanup_paths(project_id, state, run_id):
         run = find_run(state, run_id)
-        if run["status"] not in TERMINAL_STATUSES or (project_id, run_id) in active_workers:
+        domain_run_id = run["id"]
+        if run["status"] not in TERMINAL_STATUSES or (project_id, domain_run_id) in active_workers:
             fail("timeline_run_active", "任务尚未完全停止，暂不能清理。")
-        paths = [store.path(project_id, "runs", run_id)]
+        paths = [store.path(project_id, "runs", domain_run_id)]
         if run.get("output"):
-            expected = run_id + (".wav" if run["format"] == "wav" else ".mp4")
-            if run["output"] != expected or any(item["id"] != run_id and item.get("output") == expected for item in state["runs"]):
+            expected = domain_run_id + (".wav" if run["format"] == "wav" else ".mp4")
+            if run["output"] != expected or any(item["id"] != domain_run_id and item.get("output") == expected for item in state["runs"]):
                 fail("timeline_cleanup_unsafe", "输出文件关联异常，不能自动清理。")
             paths.append(store.path(project_id, "outputs", expected))
         return paths

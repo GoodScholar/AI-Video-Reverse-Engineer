@@ -22,6 +22,26 @@ const runStatusLabels = { queued: "排队中", running: "渲染中", cancel_requ
 function errorMessage(error: unknown, fallback: string) { return error instanceof Error ? error.message : fallback; }
 function draftOf(workspace: TimelineWorkspace): Draft { return { revision: workspace.revision, settings: workspace.settings, tracks: workspace.tracks }; }
 function snapshot(workspace: Draft | null) { return workspace ? JSON.stringify(workspace) : ""; }
+function newIdempotencyKey(prefix: string) {
+  const token = typeof globalThis.crypto?.randomUUID === "function" ? globalThis.crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return `${prefix}:${token}`;
+}
+function pendingIdempotencyKey(memory: Map<string, string>, scope: string, prefix: string) {
+  const cached = memory.get(scope);
+  if (cached) return cached;
+  try {
+    const stored = sessionStorage.getItem(scope);
+    if (stored) { memory.set(scope, stored); return stored; }
+  } catch { /* The in-memory key still protects retries in this mounted editor. */ }
+  const created = newIdempotencyKey(prefix);
+  memory.set(scope, created);
+  try { sessionStorage.setItem(scope, created); } catch { /* See fallback above. */ }
+  return created;
+}
+function clearIdempotencyKey(memory: Map<string, string>, scope: string, value: string) {
+  if (memory.get(scope) === value) memory.delete(scope);
+  try { if (sessionStorage.getItem(scope) === value) sessionStorage.removeItem(scope); } catch { /* Storage is optional. */ }
+}
 function numberInput(value: string, fallback: number) { const next = Number(value); return Number.isFinite(next) ? next : fallback; }
 function clamp(value: number, min: number, max: number) { return Math.min(max, Math.max(min, value)); }
 function id(prefix: string) { return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`; }
@@ -79,6 +99,7 @@ export function TimelineEditor({ projectId, onDraftChange, preproductionRevision
   const savedSnapshotRef = useRef(savedSnapshot);
   const busyRef = useRef<string | null>(busy);
   const recordingPendingRef = useRef(false);
+  const pendingIdempotencyKeys = useRef(new Map<string, string>());
   const audioInputRef = useRef<HTMLInputElement>(null);
   const previewRef = useRef<HTMLVideoElement | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -359,7 +380,11 @@ export function TimelineEditor({ projectId, onDraftChange, preproductionRevision
       }
       setPreflight(result);
       if (checkOnly || !result.ready) return;
-      accept(await startTimelineRun(projectId, workspace.revision, format, `timeline:${projectId}:${workspace.revision}:${format}`));
+      const keyScope = `aivre:timeline-submit:${projectId}:${workspace.revision}:${format}`;
+      const idempotencyKey = pendingIdempotencyKey(pendingIdempotencyKeys.current, keyScope, `timeline:${projectId}:${workspace.revision}:${format}`);
+      const next = await startTimelineRun(projectId, workspace.revision, format, idempotencyKey);
+      clearIdempotencyKey(pendingIdempotencyKeys.current, keyScope, idempotencyKey);
+      accept(next);
     }
     catch (reason) { if (mounted.current && projectRef.current === projectId) setError(errorMessage(reason, "无法提交渲染任务。")); }
     finally { if (mounted.current && projectRef.current === projectId) setBusy(null); }
@@ -374,7 +399,13 @@ export function TimelineEditor({ projectId, onDraftChange, preproductionRevision
   async function retry(runId: string) {
     if (busy) return;
     setBusy(`retry-${runId}`); setError("");
-    try { accept(await retryTimelineRun(projectId, runId, `timeline-retry:${runId}`)); }
+    const keyScope = `aivre:timeline-retry:${projectId}:${runId}`;
+    const idempotencyKey = pendingIdempotencyKey(pendingIdempotencyKeys.current, keyScope, `timeline-retry:${runId}`);
+    try {
+      const next = await retryTimelineRun(projectId, runId, idempotencyKey);
+      clearIdempotencyKey(pendingIdempotencyKeys.current, keyScope, idempotencyKey);
+      accept(next);
+    }
     catch (reason) { if (mounted.current && projectRef.current === projectId) setError(errorMessage(reason, "无法重试渲染任务。")); }
     finally { if (mounted.current && projectRef.current === projectId) setBusy(null); }
   }

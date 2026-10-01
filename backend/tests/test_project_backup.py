@@ -30,6 +30,26 @@ def test_roundtrip_project_files_and_new_identity(tmp_path):
         assert len(client.get('/api/projects').json()) == 2
 
 
+def test_backup_migrates_legacy_timeline_before_freezing_inventory(tmp_path):
+    with TestClient(create_app(data_dir=tmp_path)) as client:
+        pid = create(client)
+        path = tmp_path / 'project-files' / pid / 'timeline' / 'state.json'
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({
+            'schemaVersion': 1, 'revision': 0,
+            'settings': {'width': 1280, 'height': 720, 'fps': 30},
+            'tracks': [], 'runs': [],
+        }))
+
+        exported = client.post(f'/api/projects/{pid}/backup', json={})
+
+        assert exported.status_code == 200, exported.text
+        with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+            timeline = json.loads(archive.read('files/timeline/state.json'))
+            assert timeline['runContractVersion'] == 1
+            assert archive.read('files/timeline/state.json.run-contract-v1.bak')
+
+
 def test_tampered_and_traversal_archives_create_no_project(tmp_path):
     with TestClient(create_app(data_dir=tmp_path)) as client:
         pid = create(client)

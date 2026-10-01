@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+from threading import Event, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -142,7 +143,11 @@ def test_legacy_run_migration_keeps_original_state_when_atomic_replacement_fails
     backup = initial_store.path(PROJECT_ID, "state.json.run-contract-v1.bak")
     assert path.read_bytes() == original
     assert backup.read_bytes() == original
+    legacy["revision"] = 1
+    updated = json.dumps(legacy, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    path.write_bytes(updated)
     assert TimelineStore(tmp_path).load(PROJECT_ID)["runs"][0]["commonRunId"] == "timeline:legacy-run"
+    assert backup.read_bytes() == updated
 
 
 def test_rejects_overlapping_video_clips_and_wrong_asset_track_kind(tmp_path):
@@ -214,9 +219,10 @@ def test_retry_creates_linked_domain_run_and_is_idempotent(tmp_path):
     client, queue = setup(tmp_path, lambda *_args, **_kwargs: None)
     assert client.put(BASE, json=_workspace()).status_code == 200
     original = client.post(BASE + "/runs", json={"revision": 1, "format": "preview"}).json()["runs"][0]
-    assert client.post(BASE + "/runs/" + original["id"] + "/cancel", json={}).status_code == 200
+    assert client.get(BASE + "/runs/" + original["commonRunId"]).json()["id"] == original["id"]
+    assert client.post(BASE + "/runs/" + original["commonRunId"] + "/cancel", json={}).status_code == 200
 
-    retried = client.post(BASE + "/runs/" + original["id"] + "/retry", json={"idempotencyKey": "retry-original-1"})
+    retried = client.post(BASE + "/runs/" + original["commonRunId"] + "/retry", json={"idempotencyKey": "retry-original-1"})
     assert retried.status_code == 202, retried.text
     retry = retried.json()["runs"][-1]
     assert retry["id"] != original["id"]
@@ -227,6 +233,10 @@ def test_retry_creates_linked_domain_run_and_is_idempotent(tmp_path):
     repeated = client.post(BASE + "/runs/" + original["id"] + "/retry", json={"idempotencyKey": "retry-original-1"})
     assert repeated.status_code == 202
     assert [item["id"] for item in repeated.json()["runs"]] == [original["id"], retry["id"]]
+    assert len(queue.jobs) == 2
+    blocked = client.post(BASE + "/runs/" + original["id"] + "/retry", json={"idempotencyKey": "retry-original-2"})
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["code"] == "timeline_run_active"
     assert len(queue.jobs) == 2
 
 
@@ -292,6 +302,40 @@ def test_running_cancel_retains_partial_output_under_attempt_name_when_renderer_
     retained = tmp_path / "project-files" / PROJECT_ID / "timeline" / "runs" / run_id / "attempt-1.mp4"
     assert retained.read_bytes() == b"partial-late-output"
     assert not (retained.parent / "output.mp4").exists()
+
+
+def test_late_failed_attempt_cannot_fail_or_overwrite_the_recovered_attempt(tmp_path):
+    started, release = Event(), Event()
+
+    def renderer(_timeline, _sources, output, **_kwargs):
+        output.write_bytes(b"attempt-one")
+        started.set()
+        assert release.wait(3)
+        raise RuntimeError("late attempt failed")
+
+    client, queue = setup(tmp_path, renderer)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    run_id = client.post(BASE + "/runs", json={"revision": 1, "format": "preview"}).json()["runs"][0]["id"]
+    worker = Thread(target=queue.run)
+    worker.start()
+    try:
+        assert started.wait(3)
+        store = TimelineStore(tmp_path)
+        state = store.load(PROJECT_ID)
+        state["runs"][0].update(status="running", attempt=2)
+        store.save(PROJECT_ID, state)
+    finally:
+        release.set()
+        worker.join(timeout=3)
+
+    assert not worker.is_alive()
+    run = client.get(BASE + "/runs/" + run_id).json()
+    assert run["status"] == "running"
+    assert run["attempt"] == 2
+    assert run["logs"][-1] == {"event": "retained_not_adopted", "attempt": 1, "reason": "superseded_attempt"}
+    run_dir = tmp_path / "project-files" / PROJECT_ID / "timeline" / "runs" / run_id
+    assert (run_dir / "attempt-1.mp4").read_bytes() == b"attempt-one"
+    assert not (run_dir / "attempt-2.staging.mp4").exists()
 
 def test_missing_frozen_source_keeps_the_existing_safe_render_error(tmp_path):
     client, queue = setup(tmp_path, lambda *_args, **_kwargs: None)

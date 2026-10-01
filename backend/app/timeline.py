@@ -84,7 +84,9 @@ class TimelineStore:
             run.setdefault("attempt", 1)
             run.setdefault("logs", [])
         backup = self.path(project_id, "state.json.run-contract-v1.bak")
-        if not backup.exists():
+        if backup.exists() and (backup.is_symlink() or not backup.is_file()):
+            raise OSError("时间线运行契约备份无效")
+        if not backup.exists() or backup.read_bytes() != raw:
             self._atomic_bytes(backup, raw)
         self.save(project_id, migrated)
         return migrated

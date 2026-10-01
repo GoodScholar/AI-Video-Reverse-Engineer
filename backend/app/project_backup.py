@@ -194,6 +194,7 @@ def create_backup_router(data_dir, get_project, parse_project, register_project,
                 payload = project.model_dump(mode='json')
                 check_idle(payload)
                 source = safe_child(root, 'project-files', project.id)
+                TimelineStore(root).load(project.id)
                 before = inventory(source)
                 validate_core(root, project)
                 manifest = {'format': 'aivre-project', 'version': 1, 'project': payload,
