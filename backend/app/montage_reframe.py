@@ -12,12 +12,16 @@ import hashlib
 import json
 import math
 import os
+from bisect import bisect_right
+from base64 import b64decode, b64encode
+from binascii import Error as Base64Error
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 import subprocess
 import tempfile
 import sys
 import time
+import zlib
 from dataclasses import dataclass
 from statistics import median
 from typing import Any
@@ -28,7 +32,70 @@ SCHEMA_VERSION = 1
 MODEL_SHA256 = "2e04c53bfeac0ac2a30c057c7e2a777594ce39baaac35a92f74fb1e8c4fc4e0b"
 _OVERRIDE_MODES = frozenset(("auto", "center", "manual", "replace"))
 _TIMING_TICKS_PER_SECOND = 1_000_000
-MAX_VIDEO_SAMPLES = 9_000
+# Timeline clips allow 300 output seconds at 4x speed.  Automatic reframing
+# supports ordinary CFR delivery sources through 60fps; faster sources are
+# explicitly routed to review by ``probe_source_timing`` instead of silently
+# sampling them.  Keep every display frame in that declared source contract.
+MAX_SOURCE_FPS = 60
+MAX_VIDEO_SAMPLES = 300 * 4 * MAX_SOURCE_FPS
+_STORAGE_SAMPLE_KEY = "samplesZlibV1"
+_MAX_STATE_SAMPLE_BYTES = 256 * 1024**2
+_REFRAME_STORAGE_MARKERS = {
+    "schemaVersion", "sourceFingerprint", "sourceWidth", "sourceHeight", "targetAspect",
+    "detectorVersion", "modelSha256", "uncertaintyReasons", "status", "override",
+}
+
+
+def compact_reframe_storage(value: Any) -> Any:
+    """Losslessly compact repeated per-frame evidence only at JSON boundaries."""
+    remaining = [_MAX_STATE_SAMPLE_BYTES]
+    def walk(item: Any) -> Any:
+        if isinstance(item, list):
+            return [walk(child) for child in item]
+        if not isinstance(item, dict):
+            return item
+        if ("samples" in item and isinstance(item["samples"], list)
+                and _REFRAME_STORAGE_MARKERS <= set(item)):
+            raw = json.dumps(item["samples"], ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
+            remaining[0] -= len(raw)
+            if remaining[0] < 0:
+                raise ValueError("主体检测证据超过单份状态存储上限。")
+            if len(raw) >= 4096:
+                packed = b64encode(zlib.compress(raw, level=9)).decode("ascii")
+                return {**{key: walk(child) for key, child in item.items() if key != "samples"},
+                        _STORAGE_SAMPLE_KEY: packed}
+        return {key: walk(child) for key, child in item.items()}
+    return walk(value)
+
+
+def expand_reframe_storage(value: Any) -> Any:
+    """Expand trusted-size-bounded evidence before normal schema validation."""
+    remaining = [_MAX_STATE_SAMPLE_BYTES]
+    def walk(item: Any) -> Any:
+        if isinstance(item, list):
+            return [walk(child) for child in item]
+        if not isinstance(item, dict):
+            return item
+        if _STORAGE_SAMPLE_KEY in item:
+            if ("samples" in item or not isinstance(item[_STORAGE_SAMPLE_KEY], str)
+                    or not _REFRAME_STORAGE_MARKERS <= set(item)):
+                raise ValueError("主体检测压缩证据无效。")
+            try:
+                encoded = b64decode(item[_STORAGE_SAMPLE_KEY], validate=True)
+                inflater = zlib.decompressobj()
+                raw = inflater.decompress(encoded, remaining[0] + 1)
+                if len(raw) > remaining[0] or not inflater.eof or inflater.unused_data:
+                    raise ValueError
+                remaining[0] -= len(raw)
+                samples = json.loads(raw)
+                if not isinstance(samples, list) or len(samples) > MAX_VIDEO_SAMPLES:
+                    raise ValueError
+            except (Base64Error, UnicodeDecodeError, ValueError, json.JSONDecodeError, zlib.error) as error:
+                raise ValueError("主体检测压缩证据无效。") from error
+            return {**{key: walk(child) for key, child in item.items() if key != _STORAGE_SAMPLE_KEY},
+                    "samples": samples}
+        return {key: walk(child) for key, child in item.items()}
+    return walk(value)
 
 
 @dataclass(frozen=True)
@@ -71,6 +138,8 @@ def probe_source_timing(source: Path, ffprobe_path: str) -> SourceTiming:
     intervals = [right - left for left, right in zip(absolute, absolute[1:])]
     interval = median(intervals)
     tolerance = max(.001, interval * .03)
+    if interval + 1e-6 < 1 / MAX_SOURCE_FPS:
+        return SourceTiming((), (), False, f"源视频帧率超过主体检测支持上限 {MAX_SOURCE_FPS}fps")
     if interval <= 0 or any(abs(item - interval) > tolerance for item in intervals):
         return SourceTiming((), (), False, "源视频为可变帧率或帧间隔不可信")
     last_duration = _finite_float(frames[-1].get("pkt_duration_time")) if isinstance(frames[-1], dict) else None
@@ -141,7 +210,13 @@ def run_local_detector(source: Path, *, start: float, end: float, target_width: 
                 timing_file.flush()
                 command.extend(("--timing-json", timing_file.name))
             process = subprocess.Popen(command, stdout=stdout, stderr=stderr, text=True, start_new_session=True)
-            deadline = time.monotonic() + 900
+            evidence_frames = (sum(point < end and point + duration > start
+                                   for point, duration in zip(source_timing.elapsed, source_timing.durations))
+                               if media_kind == "video" and source_timing is not None else 1)
+            # The fixed detector is intentionally per-frame.  Keep the short
+            # clip floor, while giving the declared long-source contract a
+            # bounded quarter-second budget per evidence frame.
+            deadline = time.monotonic() + max(900, min(evidence_frames, MAX_VIDEO_SAMPLES) * .25)
             while process.poll() is None:
                 if cancelled() or time.monotonic() >= deadline:
                     process.terminate()
@@ -347,7 +422,9 @@ def reframe_filter(value: dict[str, Any], *, source_width: int, source_height: i
     frame_count = max(1, round(duration * trajectory_fps))
     times = [index / trajectory_fps for index in range(frame_count + 1)]
     times[-1] = duration
-    positions = [_crop_position(_center_at(result, in_point + time * speed), source_width, source_height,
+    trajectory = _trajectory(result)
+    positions = [_crop_position((.5, .5) if override["mode"] == "center" else _center_at_trajectory(
+                                    trajectory, in_point + time * speed), source_width, source_height,
                                 crop_width, crop_height) for time in times]
     # `times` is output-frame aligned, so the adapted OpenShorts helper uses
     # the render fps without losing source-time interpolation.
@@ -446,10 +523,11 @@ def _source_samples_cover(timing: SourceTiming | None, samples: list[dict[str, A
     if any(point is None for point in timing_points) or any(duration is None or duration <= 0 for duration in timing_durations):
         return False
     sample_points = [_timing_ticks(sample["timeSeconds"]) for sample in samples]
-    if any(point is None or point not in timing_points for point in sample_points):
+    if any(point is None for point in sample_points):
         return False
     if start is None or end is None:
-        return True
+        timing_set = set(timing_points)
+        return all(point in timing_set for point in sample_points)
     start_tick, end_tick = _timing_ticks(start), _timing_ticks(end)
     if not (_finite_number(start) and _finite_number(end) and 0 <= start < end and start_tick is not None and end_tick is not None):
         return False
@@ -460,8 +538,7 @@ def _source_samples_cover(timing: SourceTiming | None, samples: list[dict[str, A
     first, last = intersecting[0], intersecting[-1]
     if sample_points[0] != timing_points[first] or sample_points[-1] != timing_points[last]:
         return False
-    max_gap = _timing_ticks(.5) + max(timing_durations) + _timing_ticks(.001)
-    if any(right - left > max_gap for left, right in zip(sample_points, sample_points[1:])):
+    if sample_points != timing_points[first:last + 1]:
         return False
     return timing_points[first] + timing_durations[first] > start_tick and timing_points[last] < end_tick
 
@@ -521,24 +598,34 @@ def _override(value: Any) -> dict[str, Any]:
     return {"mode": value["mode"], "keyframes": normalized}
 
 
-def _center_at(value: dict[str, Any], source_time: float) -> tuple[float, float]:
+def _trajectory(value: dict[str, Any]) -> tuple[list[float], list[tuple[float, float]]]:
     override = value["override"]
-    if override["mode"] == "center":
-        return .5, .5
     points = ([(item["timeSeconds"], item["x"], item["y"]) for item in override["keyframes"]]
               if override["mode"] in ("manual", "replace") else
               [(item["timeSeconds"], item["center"]["x"], item["center"]["y"]) for item in value["samples"]])
-    if not points:
+    return [item[0] for item in points], [(item[1], item[2]) for item in points]
+
+
+def _center_at_trajectory(trajectory, source_time: float) -> tuple[float, float]:
+    """Interpolate one source time without rescanning a contract-sized path."""
+    times, centers = trajectory
+    if not times:
         return .5, .5
-    if source_time <= points[0][0]:
-        return points[0][1], points[0][2]
-    if source_time >= points[-1][0]:
-        return points[-1][1], points[-1][2]
-    for left, right in zip(points, points[1:]):
-        if left[0] <= source_time <= right[0]:
-            fraction = (source_time - left[0]) / (right[0] - left[0])
-            return left[1] + (right[1] - left[1]) * fraction, left[2] + (right[2] - left[2]) * fraction
-    return points[-1][1], points[-1][2]
+    if source_time <= times[0]:
+        return centers[0]
+    if source_time >= times[-1]:
+        return centers[-1]
+    right_index = bisect_right(times, source_time)
+    left_index = right_index - 1
+    fraction = (source_time - times[left_index]) / (times[right_index] - times[left_index])
+    left, right = centers[left_index], centers[right_index]
+    return left[0] + (right[0] - left[0]) * fraction, left[1] + (right[1] - left[1]) * fraction
+
+
+def _center_at(value: dict[str, Any], source_time: float) -> tuple[float, float]:
+    if value["override"]["mode"] == "center":
+        return .5, .5
+    return _center_at_trajectory(_trajectory(value), source_time)
 
 
 def _crop_position(center: tuple[float, float], width: int, height: int, crop_width: int, crop_height: int) -> tuple[int, int]:

@@ -37,7 +37,8 @@ class TimelineStore:
         if path.is_symlink() or not path.is_file():
             raise OSError("时间线状态文件无效")
         try:
-            state = json.loads(path.read_text(encoding="utf-8"))
+            from .montage_reframe import expand_reframe_storage
+            state = expand_reframe_storage(json.loads(path.read_text(encoding="utf-8")))
         except (OSError, ValueError, json.JSONDecodeError) as error:
             raise OSError("时间线状态无法读取") from error
         validate_state(state)
@@ -46,6 +47,8 @@ class TimelineStore:
 
     def save(self, project_id: str, state: Dict[str, Any]) -> None:
         validate_state(state)
+        from .montage_reframe import compact_reframe_storage
+        stored = compact_reframe_storage(state)
         path = self.path(project_id, "state.json")
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = None
@@ -53,7 +56,7 @@ class TimelineStore:
             descriptor, raw = tempfile.mkstemp(dir=str(path.parent), prefix=".timeline-", suffix=".part")
             temporary = Path(raw)
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                json.dump(state, stream, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+                json.dump(stored, stream, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(str(temporary), str(path))

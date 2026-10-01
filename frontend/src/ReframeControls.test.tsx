@@ -146,6 +146,18 @@ describe("ReframeControls", () => {
     expect(screen.getByRole("button", { name: "源时间 0:00.16 的检测样本" })).toBeVisible();
   });
 
+  it("长片段只渲染有界的检测样本导航，同时保留首尾源时间", () => {
+    const samples = Array.from({ length: 72_000 }, (_, index) => ({
+      timeSeconds: index / 60, boxes: [], center: { x: .5, y: .5 }, confidence: .9,
+    }));
+    render(<ReframeControls clipId="long-source" assetUrl="/source.mp4" reframe={{ ...reframe, samples }} analysis={undefined} disabled={false}
+      onAnalyze={vi.fn()} onCancel={vi.fn()} onChange={vi.fn()} />);
+
+    expect(screen.getAllByRole("button", { name: /的检测样本$/ })).toHaveLength(120);
+    expect(screen.getByRole("button", { name: "源时间 0:00.0 的检测样本" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "源时间 19:59.983333 的检测样本" })).toBeVisible();
+  });
+
   it("播放从非零入点同步源时间，重复新增覆盖同一关键点且不允许删除最后一点", () => {
     const onChange = vi.fn();
     render(<ReframeControls clipId="source-time" assetUrl="/source.mp4" sourceStart={4} sourceEnd={6} reframe={{ ...reframe, samples: [{ ...reframe.samples[0], timeSeconds: 4 }] }} analysis={undefined} disabled={false}

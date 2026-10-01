@@ -12,6 +12,7 @@ import json
 import math
 import os
 import stat
+from bisect import bisect_left, bisect_right
 from copy import deepcopy
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -484,7 +485,7 @@ def _visible_event_reframes(tracks: list[dict[str, Any]], start: float, end: flo
 def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width: int, height: int, *,
                    asset_media_kinds: dict[str, str] | None = None) -> list[tuple[float, float, float, float]]:
     """Project only subjects active during an event onto its output canvas."""
-    from .montage_reframe import _center_at, _crop_position, crop_geometry
+    from .montage_reframe import _center_at_trajectory, _crop_position, _trajectory, crop_geometry
     result = []
     for clip, reframe in _visible_event_reframes(tracks, start, end,
                                                   asset_media_kinds=asset_media_kinds):
@@ -511,9 +512,13 @@ def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width
         clip_source_end = float(in_point) + float(clip.get("duration", 0)) * float(speed)
         usable = [sample for sample in samples if isinstance(sample, dict) and isinstance(sample.get("timeSeconds"), (int, float))]
         usable.sort(key=lambda sample: float(sample["timeSeconds"]))
+        override = reframe.get("override")
+        mode = override.get("mode") if isinstance(override, dict) else None
+        trajectory = _trajectory(reframe)
         def project(source_time: float, box: dict[str, Any]) -> tuple[float, float, float, float] | None:
             try:
-                crop_x, crop_y = _crop_position(_center_at(reframe, source_time), source_w, source_h, crop_w, crop_h)
+                center = (.5, .5) if mode == "center" else _center_at_trajectory(trajectory, source_time)
+                crop_x, crop_y = _crop_position(center, source_w, source_h, crop_w, crop_h)
             except (KeyError, TypeError, ValueError):
                 raise PackagingError("主体构图轨迹无效，需人工确认。") from None
             try:
@@ -587,7 +592,6 @@ def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width
 
         if not usable:
             raise PackagingError("主体检测时间覆盖未知，需人工确认。")
-        override = reframe.get("override")
         explicit_risk = (reframe.get("status") == "review_required" and isinstance(override, dict)
                          and override.get("mode") in ("center", "manual", "replace"))
         if explicit_risk:
@@ -620,7 +624,11 @@ def _subject_boxes(tracks: list[dict[str, Any]], start: float, end: float, width
         # Each interval is clipped before interpolation, so an event at
         # .9-.1 of a 0-1 movement only reserves that final tenth.
         covered_until = last_time
-        for left_sample, right_sample in zip(usable, usable[1:]):
+        sample_times = [float(sample["timeSeconds"]) for sample in usable]
+        first_index = max(0, bisect_right(sample_times, source_start) - 1)
+        last_index = min(len(usable), bisect_left(sample_times, source_end) + 1)
+        event_samples = usable[first_index:last_index]
+        for left_sample, right_sample in zip(event_samples, event_samples[1:]):
             left_time, right_time = float(left_sample["timeSeconds"]), float(right_sample["timeSeconds"])
             segment_start, segment_end = max(source_start, left_time), min(source_end, right_time)
             if segment_start < segment_end:

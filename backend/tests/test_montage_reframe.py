@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import pytest
+import json
 import sys
 import time
 from types import SimpleNamespace
 
 from app import montage_reframe
-from app.montage_reframe import MODEL_SHA256, ReframeError, SourceTiming, normalize_reframe, pending_reframe, probe_source_timing, reframe_filter, retain_server_reframe_facts, run_local_detector, validate_stored_reframe
+from app.montage_reframe import MODEL_SHA256, ReframeError, SourceTiming, _center_at_trajectory, compact_reframe_storage, expand_reframe_storage, normalize_reframe, pending_reframe, probe_source_timing, reframe_filter, retain_server_reframe_facts, run_local_detector, validate_stored_reframe
 
 
 def _analysis(*, override=None, samples=None, status="ready"):
@@ -388,3 +389,57 @@ def test_probe_rejects_vfr_from_pts_even_when_nominal_rates_would_agree(monkeypa
 
     assert not timing.cfr
     assert "可变帧率" in timing.reason
+
+
+def test_probe_rejects_cfr_above_the_declared_reframe_source_rate(monkeypatch, tmp_path):
+    """The frame budget is contractual: 60fps is supported, faster CFR is explicit review."""
+    payload = {"streams": [{"start_time": "0", "duration": ".02"}], "frames": [
+        {"best_effort_timestamp_time": "0.000", "pkt_duration_time": ".010"},
+        {"best_effort_timestamp_time": "0.010", "pkt_duration_time": ".010"},
+    ]}
+    monkeypatch.setattr(montage_reframe.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
+        returncode=0, stdout=__import__("json").dumps(payload)
+    ))
+
+    timing = probe_source_timing(tmp_path / "100fps.mp4", "ffprobe")
+
+    assert not timing.cfr
+    assert "60fps" in timing.reason
+
+
+def test_contract_sized_trajectory_lookup_is_logarithmic():
+    class CountedTimes:
+        def __init__(self, size):
+            self.size, self.reads = size, 0
+        def __len__(self):
+            return self.size
+        def __getitem__(self, index):
+            self.reads += 1
+            if index < 0:
+                index += self.size
+            return index / 60
+
+    times = CountedTimes(72_000)
+    centers = [(index / 72_000, .5) for index in range(72_000)]
+
+    center = _center_at_trajectory((times, centers), 600.005)
+
+    assert .49 < center[0] < .51
+    assert times.reads < 40
+
+
+def test_contract_sized_reframe_evidence_is_losslessly_compact_on_disk():
+    samples = [{
+        "timeSeconds": index / 60,
+        "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7, "label": "person", "confidence": .9}],
+        "center": {"x": .5, "y": .45}, "confidence": .9,
+    } for index in range(72_000)]
+    reframe = _analysis(samples=samples)
+    duplicated_state = {"variant": reframe, "preview": reframe, "delivery": reframe}
+
+    compact = compact_reframe_storage(duplicated_state)
+    serialized = json.dumps(compact, separators=(",", ":")).encode()
+    restored = expand_reframe_storage(compact)
+
+    assert len(serialized) < 16 * 1024**2
+    assert restored == duplicated_state

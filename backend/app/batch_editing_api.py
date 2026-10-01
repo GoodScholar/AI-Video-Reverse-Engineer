@@ -456,7 +456,8 @@ class BatchStore:
             return {"schemaVersion": 1, "tasks": []}
         if path.is_symlink() or not path.is_file():
             raise OSError("批量混剪状态文件无效")
-        value = json.loads(path.read_text(encoding="utf-8"))
+        from .montage_reframe import expand_reframe_storage
+        value = expand_reframe_storage(json.loads(path.read_text(encoding="utf-8")))
         migrated = _migrate_legacy_recognition_cues(value)
         _validate_state(value)
         if migrated and persist_migration:
@@ -465,6 +466,8 @@ class BatchStore:
 
     def save(self, project_id: str, value: dict[str, Any]) -> None:
         _validate_state(value)
+        from .montage_reframe import compact_reframe_storage
+        stored = compact_reframe_storage(value)
         path = self.path(project_id, "state.json")
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = None
@@ -472,7 +475,7 @@ class BatchStore:
             descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=".batch-", suffix=".part")
             temporary = Path(name)
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                json.dump(value, stream, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+                json.dump(stored, stream, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, path)

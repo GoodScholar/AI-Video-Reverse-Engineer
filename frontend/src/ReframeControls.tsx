@@ -24,6 +24,7 @@ export type SubtitleMode = "cue" | "inline";
 
 const FONT = { id: "noto-sans-cjk-sc-regular", version: "Version 2.004;hotconv 1.0.118;makeotfexe 2.5.65603", sha256: "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b", source: "Noto Sans CJK SC", license: "OFL-1.1" as const };
 const kinds: PackagingElement["kind"][] = ["title", "keyword", "selling-point", "subtitle", "cta"];
+const MAX_SAMPLE_BUTTONS = 120;
 
 export function defaultPackaging(): Packaging {
   return { schemaVersion: 1, templateId: "commercial-clean", templateVersion: 1, font: { ...FONT }, safeArea: { left: .05, right: .05, top: .05, bottom: .05 }, elements: [] };
@@ -37,13 +38,18 @@ function formatTime(value: number) {
 }
 function interpolate(points: Array<{ timeSeconds: number; x: number; y: number }>, time: number) {
   if (!points.length) return { x: .5, y: .5 };
-  const ordered = [...points].sort((left, right) => left.timeSeconds - right.timeSeconds);
-  if (time <= ordered[0].timeSeconds) return ordered[0];
-  if (time >= ordered[ordered.length - 1].timeSeconds) return ordered[ordered.length - 1];
-  const right = ordered.find((item) => item.timeSeconds >= time)!;
-  const left = ordered[ordered.indexOf(right) - 1];
+  if (time <= points[0].timeSeconds) return points[0];
+  if (time >= points[points.length - 1].timeSeconds) return points[points.length - 1];
+  let low = 1, high = points.length - 1;
+  while (low < high) { const middle = Math.floor((low + high) / 2); if (points[middle].timeSeconds < time) low = middle + 1; else high = middle; }
+  const right = points[low], left = points[low - 1];
   const fraction = (time - left.timeSeconds) / (right.timeSeconds - left.timeSeconds);
   return { x: left.x + (right.x - left.x) * fraction, y: left.y + (right.y - left.y) * fraction };
+}
+
+function visibleSamples<T>(samples: T[]) {
+  if (samples.length <= MAX_SAMPLE_BUTTONS) return samples;
+  return Array.from({ length: MAX_SAMPLE_BUTTONS }, (_, index) => samples[Math.round(index * (samples.length - 1) / (MAX_SAMPLE_BUTTONS - 1))]);
 }
 
 function contentRect(stageRect: DOMRect, videoRect: DOMRect, sourceWidth: number, sourceHeight: number) {
@@ -66,10 +72,13 @@ export function ReframeControls({ clipId, assetUrl, mediaKind = "video", sourceS
   const [selectedTime, setSelectedTime] = useState<number | null>(null);
   const [visibleFrame, setVisibleFrame] = useState({ left: 0, top: 0, width: 0, height: 0 });
   const isVideo = mediaKind === "video";
-  const maximumSourceTime = isVideo ? sourceEnd ?? Math.max(sourceStart, ...(reframe?.samples.map((sample) => sample.timeSeconds) ?? [sourceStart])) : 0;
+  const samples = reframe?.samples ?? [];
+  const samplePoints = useMemo(() => samples.map((sample) => ({ timeSeconds: sample.timeSeconds, x: sample.center?.x ?? .5, y: sample.center?.y ?? .5 })), [samples]);
+  const sampleButtons = useMemo(() => visibleSamples(samples), [samples]);
+  const maximumSourceTime = isVideo ? sourceEnd ?? Math.max(sourceStart, samples.at(-1)?.timeSeconds ?? sourceStart) : 0;
   const currentTime = isVideo ? Math.min(maximumSourceTime, Math.max(sourceStart, selectedTime ?? reframe?.samples[0]?.timeSeconds ?? sourceStart)) : 0;
   const override = reframe?.override ?? { mode: "auto" as const, keyframes: [] };
-  const active = { timeSeconds: currentTime, ...(override.mode === "center" ? { x: .5, y: .5 } : interpolate(override.mode === "manual" || override.mode === "replace" ? override.keyframes : reframe?.samples.map((sample) => ({ timeSeconds: sample.timeSeconds, x: sample.center?.x ?? .5, y: sample.center?.y ?? .5 })) ?? [], currentTime)) };
+  const active = { timeSeconds: currentTime, ...(override.mode === "center" ? { x: .5, y: .5 } : interpolate(override.mode === "manual" || override.mode === "replace" ? override.keyframes : samplePoints, currentTime)) };
   const targetRatio = reframe ? reframe.targetAspect.width / reframe.targetAspect.height : .5625;
   const sourceRatio = reframe?.sourceWidth && reframe.sourceHeight ? reframe.sourceWidth / reframe.sourceHeight : 1;
   const cropWidthFraction = Math.min(1, targetRatio / sourceRatio);
@@ -154,7 +163,7 @@ export function ReframeControls({ clipId, assetUrl, mediaKind = "video", sourceS
       <video ref={source} controls playsInline preload="metadata" src={assetUrl} aria-label={`${clipId} 原片`} onTimeUpdate={selectPlaybackTime} />{overlay(false)}
     </div></>}
     {reframe ? <>
-      {isVideo && <div className="reframe-keyframes" aria-label="源时间关键点">{reframe.samples.map((sample) => <button key={sample.timeSeconds} type="button" className="secondary-action" disabled={disabled}
+      {isVideo && <div className="reframe-keyframes" aria-label="源时间关键点">{sampleButtons.map((sample) => <button key={sample.timeSeconds} type="button" className="secondary-action" disabled={disabled}
         aria-label={`源时间 ${formatTime(sample.timeSeconds)} 的检测样本`} aria-pressed={sample.timeSeconds === currentTime} onClick={() => setSourceTime(sample.timeSeconds)}>{formatTime(sample.timeSeconds)}</button>)}<label>关键点秒<input aria-label="关键点秒" type="number" min="0" step=".01" value={active.timeSeconds} disabled={disabled}
           onChange={(event) => { const input = Number(event.target.value); if (!Number.isFinite(input)) return; const timeSeconds = Math.min(maximumSourceTime, Math.max(sourceStart, input)); setSourceTime(timeSeconds); setOverride({ mode: "manual", keyframes: [...override.keyframes.filter((item) => item.timeSeconds !== active.timeSeconds && item.timeSeconds !== timeSeconds), { ...active, timeSeconds }].sort((a, b) => a.timeSeconds - b.timeSeconds) }); }} /></label>
         <button type="button" className="secondary-action" disabled={disabled} onClick={() => setOverride({ mode: "manual", keyframes: [...override.keyframes.filter((item) => item.timeSeconds !== currentTime), { ...active, timeSeconds: currentTime }].sort((a, b) => a.timeSeconds - b.timeSeconds) })}>新增关键点</button>

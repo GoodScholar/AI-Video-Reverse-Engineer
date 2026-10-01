@@ -20,7 +20,9 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 MODEL_SHA256 = "2e04c53bfeac0ac2a30c057c7e2a777594ce39baaac35a92f74fb1e8c4fc4e0b"
 DETECTOR_VERSION = "mediapipe-object-detector-0.10.21"
 _TIMING_TICKS_PER_SECOND = 1_000_000
-MAX_VIDEO_SAMPLES = 9_000
+# Must match the server contract: 300 output seconds * 4x speed * 60fps CFR.
+MAX_SOURCE_FPS = 60
+MAX_VIDEO_SAMPLES = 300 * 4 * MAX_SOURCE_FPS
 
 
 def _timing_ticks(value: float) -> int | None:
@@ -153,16 +155,24 @@ def analyze(source: Path, model: Path, start: float, end: float, target_width: i
     def detect(indices: list[int]) -> tuple[list[dict], list[str]]:
         detected_samples, detected_reasons, last_timestamp = [], [], -1
         with vision.ObjectDetector.create_from_options(options) as detector:
+            previous_index = None
             for frame_index in indices:
-                capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                # Intersecting display frames are contiguous.  Seek once and
+                # decode forward so long GOP media does not pay one random
+                # seek for every evidence frame.
+                if previous_index is None or frame_index != previous_index + 1:
+                    capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
                 ok, frame = capture.read()
                 if not ok:
                     detected_reasons.append("部分源时间无法解码")
+                    previous_index = frame_index
                     continue
                 decoded_index = round(capture.get(cv2.CAP_PROP_POS_FRAMES)) - 1
                 if decoded_index != frame_index:
                     detected_reasons.append("OpenCV 未读取到服务端确认的帧索引")
+                    previous_index = frame_index
                     continue
+                previous_index = frame_index
                 actual_time = frames[frame_index]["elapsedSeconds"]
                 timestamp = max(last_timestamp + 1, round(actual_time * 1000))
                 last_timestamp = timestamp
@@ -186,7 +196,10 @@ def analyze(source: Path, model: Path, start: float, end: float, target_width: i
                     detected_reasons.append("主体框大于目标满幅裁剪窗，可能持续被裁切")
                 if any(box["label"].lower() != "person" for box in boxes):
                     detected_reasons.append("检测到可能商品或遮挡物，无法确认满幅裁剪不会遮挡商品")
-                detected_samples.append({"timeSeconds": round(actual_time, 6), "boxes": boxes,
+                # Persist only the unique person used by crop/packaging.  Other
+                # detections have already made the result review-required and
+                # retaining them would multiply every durable preview snapshot.
+                detected_samples.append({"timeSeconds": round(actual_time, 6), "boxes": [subject],
                                          "center": {"x": round(subject["x"] + subject["width"] / 2, 6),
                                                     "y": round(subject["y"] + subject["height"] / 2, 6)},
                                          "confidence": round(subject["confidence"], 6)})

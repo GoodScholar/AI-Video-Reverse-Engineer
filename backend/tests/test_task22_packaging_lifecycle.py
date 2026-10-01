@@ -139,6 +139,34 @@ def test_legacy_recognition_cues_migrate_to_their_run_namespace_idempotently(tmp
     assert second == first
 
 
+def test_batch_store_compacts_and_restores_full_reframe_evidence(tmp_path):
+    import json
+    from app.batch_editing_api import BatchStore
+
+    task = create_batch("卖点", "脚本", id_factory=iter(["task", "variant"]).__next__)
+    tracks = _tracks(reframe=True)
+    reframe = tracks[0]["clips"][0]["reframe"]
+    reframe.update(
+        sourceFingerprint="a" * 64, sourceWidth=1920, sourceHeight=1080,
+        frameDurationSeconds=.04, samplingIntervalSeconds=None,
+        samples=[{
+            "timeSeconds": index * .04,
+            "boxes": [{"x": .4, "y": .1, "width": .2, "height": .7,
+                       "label": "person", "confidence": .9}],
+            "center": {"x": .5, "y": .45}, "confidence": .9,
+        } for index in range(200)],
+    )
+    task["variant"].update(tracks=tracks, revision=1)
+    state = {"schemaVersion": 1, "tasks": [task]}
+    store = BatchStore(tmp_path)
+
+    store.save("project", state)
+    persisted = json.loads(store.path("project", "state.json").read_text())
+
+    assert "samplesZlibV1" in persisted["tasks"][0]["variant"]["tracks"][0]["clips"][0]["reframe"]
+    assert store.load("project") == state
+
+
 def test_legacy_recognition_migration_keeps_ambiguous_history_readable_and_marked(tmp_path):
     import json
     from app.batch_editing_api import BatchStore

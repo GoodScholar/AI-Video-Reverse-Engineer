@@ -72,9 +72,12 @@ def test_worker_keeps_every_real_frame_needed_for_manual_packaging_coverage():
     ]
 
     assert module.select_sample_indices(frames, .01, .15, 2.0) == [0, 1, 2, 3]
+    # Timeline clips permit 300 output seconds at 4x speed.  The reframe
+    # contract supports CFR sources through 60fps, so the full legal source
+    # interval is 1,200 seconds / 72,000 display frames rather than 9,000.
     long_frames = [
-        {"elapsedSeconds": index * .04, "durationSeconds": .04}
-        for index in range(7_500)
+        {"elapsedSeconds": index / 60, "durationSeconds": 1 / 60}
+        for index in range(72_000)
     ]
-    complete = module.select_sample_indices(long_frames, 0, 300, 2.0)
-    assert len(complete) == 7_500 <= module.MAX_VIDEO_SAMPLES
+    complete = module.select_sample_indices(long_frames, 0, 1_200, 2.0)
+    assert len(complete) == 72_000 == module.MAX_VIDEO_SAMPLES
