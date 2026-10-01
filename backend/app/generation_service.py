@@ -9,18 +9,21 @@ from __future__ import annotations
 import json
 import io
 import os
+import re
+import stat
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import RLock, Timer
-from typing import Any, Callable, Iterable, Optional
+from threading import Lock, RLock, Timer
+from typing import Any, BinaryIO, Callable, Iterable, Optional, Protocol
 from uuid import uuid4
 
 from PIL import Image, UnidentifiedImageError
 
-from .durable_runs import freeze_run_input
+from .durable_runs import EXTERNAL_RUN_POLICY, freeze_run_input
 from .project_assets import ProjectAssets, ResultInstallationConflict
+from .video_media import probe_video
 
 
 TEXT_CAPABILITIES = {
@@ -57,6 +60,60 @@ _IMAGE_OPERATIONS = frozenset({"generate", "edit", "super-resolution"})
 _IMAGE_REFERENCE_TYPES = frozenset({"reference", "edit-source", "upscale-source"})
 _IMAGE_SUCCESS_STATUSES = frozenset({"completed", "reused"})
 _MAX_IMAGE_PIXELS = 64_000_000
+_VIDEO_CAPABILITY_KEYS = frozenset({"version", "profiles", "cancel"})
+_VIDEO_PROFILE_KEYS = frozenset({
+    "id", "mode", "referencePatterns", "combinations", "minResults", "maxResults",
+})
+_VIDEO_COMBINATION_KEYS = frozenset({
+    "durationSeconds", "aspectRatio", "resolution", "audio",
+})
+_VIDEO_PARAM_KEYS = frozenset({
+    "profileId", "mode", "references", "durationSeconds", "aspectRatio", "resolution", "audio", "resultCount",
+})
+_VIDEO_MODES = frozenset({"text-to-video", "image-to-video"})
+_VIDEO_REFERENCE_TYPES = frozenset({"first-frame", "last-frame", "reference"})
+_VIDEO_SUCCESS_STATUSES = frozenset({"completed", "reused"})
+_DEFAULT_MAX_VIDEO_RESULT_BYTES = 200_000_000
+VIDEO_MAX_REFERENCES = 32
+VIDEO_MAX_RESULTS = 64
+VIDEO_MAX_PROFILE_ID_LENGTH = 120
+VIDEO_MAX_OPTION_LENGTH = 32
+_VIDEO_MAX_REMOTE_ID_LENGTH = 512
+_VIDEO_MAX_CURSOR_LENGTH = 4096
+_VIDEO_MAX_RESULT_NAME_LENGTH = 255
+_VIDEO_ERROR_CODE = re.compile(r"[a-z][a-z0-9_.-]{0,119}")
+
+
+class _VideoResultTooLarge(OSError):
+    pass
+
+
+class VideoResultWriter(Protocol):
+    def write(self, value: bytes) -> int: ...
+    def flush(self) -> None: ...
+
+
+class _BoundedVideoWriter:
+    __slots__ = ("__output", "limit", "written")
+
+    def __init__(self, output: BinaryIO, limit: int) -> None:
+        self.__output = output
+        self.limit = limit
+        self.written = 0
+
+    def write(self, value: bytes) -> int:
+        if not isinstance(value, bytes):
+            raise TypeError("video download chunks must be bytes")
+        if self.written + len(value) > self.limit:
+            raise _VideoResultTooLarge("generation_result_too_large")
+        count = self.__output.write(value)
+        if count != len(value):
+            raise OSError("generation_result_download_failed")
+        self.written += count
+        return count
+
+    def flush(self) -> None:
+        self.__output.flush()
 
 
 class GenerationError(RuntimeError):
@@ -80,21 +137,36 @@ class GenerationAdapter:
     result_validator: Optional[Callable[[str], None]] = None
 
 
+@dataclass(frozen=True)
+class VideoGenerationAdapter:
+    """Protocol boundary for externally managed asynchronous video jobs."""
+
+    adapter_id: str
+    version: str
+    modality: str
+    capability_resolver: Callable[[str, str], Optional[dict[str, Any]]]
+    catalog: Callable[[], list[dict[str, Any]]]
+    submit: Callable[[dict[str, Any]], dict[str, Any]]
+    poll: Callable[[dict[str, Any]], dict[str, Any]]
+    download: Callable[[dict[str, Any], dict[str, Any], VideoResultWriter], None]
+    cancel: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None
+
+
 class GenerationAdapterRegistry:
     """Ordered registry; ``None`` says an adapter does not own a provider."""
 
     def __init__(self) -> None:
-        self._items: dict[str, GenerationAdapter] = {}
+        self._items: dict[str, GenerationAdapter | VideoGenerationAdapter] = {}
 
-    def register(self, adapter: GenerationAdapter) -> None:
+    def register(self, adapter: GenerationAdapter | VideoGenerationAdapter) -> None:
         if adapter.adapter_id in self._items:
             raise ValueError("generation_adapter_duplicate")
         self._items[adapter.adapter_id] = adapter
 
-    def get(self, adapter_id: str) -> Optional[GenerationAdapter]:
+    def get(self, adapter_id: str) -> Optional[GenerationAdapter | VideoGenerationAdapter]:
         return self._items.get(adapter_id)
 
-    def resolve_by_id(self, adapter_id: str) -> GenerationAdapter:
+    def resolve_by_id(self, adapter_id: str) -> GenerationAdapter | VideoGenerationAdapter:
         adapter = self.get(adapter_id)
         if adapter is None:
             raise GenerationError("generation_adapter_missing")
@@ -105,7 +177,7 @@ class GenerationAdapterRegistry:
         modality: str,
         provider: str,
         model: str,
-    ) -> tuple[GenerationAdapter, dict[str, Any]]:
+    ) -> tuple[GenerationAdapter | VideoGenerationAdapter, dict[str, Any]]:
         for adapter in self._items.values():
             if adapter.modality != modality:
                 continue
@@ -124,6 +196,9 @@ class GenerationAdapterRegistry:
                 raise GenerationError("generation_capability_unavailable")
             return adapter, catalog
         raise GenerationError("generation_adapter_missing")
+
+    def adapters(self, modality: str) -> list[GenerationAdapter | VideoGenerationAdapter]:
+        return [adapter for adapter in self._items.values() if adapter.modality == modality]
 
 
 class GenerationRunStore:
@@ -186,13 +261,22 @@ class GenerationService:
         text_adapter: Optional[Callable[[dict[str, Any]], Any]] = None,
         capability_catalog: Optional[Callable[[str, str], Optional[dict[str, Any]]]] = None,
         queue: Any = None,
+        ffmpeg_path: str = "ffmpeg",
+        ffprobe_path: str = "ffprobe",
+        max_video_result_bytes: int = _DEFAULT_MAX_VIDEO_RESULT_BYTES,
     ) -> None:
         self.store = GenerationRunStore(root)
         self.assets = ProjectAssets(root)
         self.queue = queue
         self.lock = RLock()
+        self.video_operation_locks: dict[tuple[str, str], Lock] = {}
         self.recovered_projects: set[str] = set()
         self.registry = registry or GenerationAdapterRegistry()
+        self.ffmpeg_path = ffmpeg_path
+        self.ffprobe_path = ffprobe_path
+        if type(max_video_result_bytes) is not int or max_video_result_bytes <= 0:
+            raise ValueError("max_video_result_bytes must be positive")
+        self.max_video_result_bytes = max_video_result_bytes
         if text_adapter is not None:
             self.registry.register(
                 GenerationAdapter(
@@ -243,6 +327,8 @@ class GenerationService:
             normalized = self._normalize_text_capabilities(raw_capabilities)
         elif modality == "image":
             normalized = self._normalize_image_capabilities(raw_capabilities)
+        elif modality == "video" and isinstance(adapter, VideoGenerationAdapter):
+            normalized = self._normalize_video_capabilities(raw_capabilities)
         else:
             raise GenerationError("generation_capability_unavailable")
         return {
@@ -304,6 +390,145 @@ class GenerationService:
             raise GenerationError("generation_capability_unavailable")
         return {key: raw[key] for key in _IMAGE_CAPABILITY_KEYS}
 
+    @staticmethod
+    def _normalize_video_capabilities(raw: dict[str, Any]) -> dict[str, Any]:
+        if set(raw) != _VIDEO_CAPABILITY_KEYS or type(raw.get("cancel")) is not bool:
+            raise GenerationError("generation_capability_unavailable")
+        if not isinstance(raw.get("version"), str) or not 1 <= len(raw["version"]) <= 120:
+            raise GenerationError("generation_capability_unavailable")
+        profiles = raw.get("profiles")
+        if not isinstance(profiles, list) or not profiles:
+            raise GenerationError("generation_capability_unavailable")
+        normalized_profiles = []
+        profile_ids: set[str] = set()
+        for profile in profiles:
+            if not isinstance(profile, dict) or set(profile) != _VIDEO_PROFILE_KEYS:
+                raise GenerationError("generation_capability_unavailable")
+            profile_id, mode = profile.get("id"), profile.get("mode")
+            patterns, combinations = profile.get("referencePatterns"), profile.get("combinations")
+            if (
+                not isinstance(profile_id, str) or not 1 <= len(profile_id) <= VIDEO_MAX_PROFILE_ID_LENGTH
+                or profile_id in profile_ids
+                or mode not in _VIDEO_MODES
+                or not isinstance(patterns, list) or not patterns
+                or not isinstance(combinations, list) or not combinations
+            ):
+                raise GenerationError("generation_capability_unavailable")
+            profile_ids.add(profile_id)
+            normalized_patterns: list[list[str]] = []
+            seen_patterns: set[tuple[str, ...]] = set()
+            for pattern in patterns:
+                if (
+                    not isinstance(pattern, list)
+                    or len(pattern) > VIDEO_MAX_REFERENCES
+                    or any(reference_type not in _VIDEO_REFERENCE_TYPES for reference_type in pattern)
+                    or pattern.count("first-frame") > 1
+                    or pattern.count("last-frame") > 1
+                    or (mode == "text-to-video" and pattern != [])
+                    or (mode == "image-to-video" and not pattern)
+                    or tuple(pattern) in seen_patterns
+                ):
+                    raise GenerationError("generation_capability_unavailable")
+                seen_patterns.add(tuple(pattern))
+                normalized_patterns.append(list(pattern))
+            normalized_combinations = []
+            seen_combinations: set[tuple[Any, ...]] = set()
+            for combination in combinations:
+                if not isinstance(combination, dict) or set(combination) != _VIDEO_COMBINATION_KEYS:
+                    raise GenerationError("generation_capability_unavailable")
+                identity = (
+                    combination.get("durationSeconds"), combination.get("aspectRatio"),
+                    combination.get("resolution"), combination.get("audio"),
+                )
+                if (
+                    type(identity[0]) is not int or not 1 <= identity[0] <= 300
+                    or not isinstance(identity[1], str) or not 1 <= len(identity[1]) <= VIDEO_MAX_OPTION_LENGTH
+                    or not isinstance(identity[2], str) or not 1 <= len(identity[2]) <= VIDEO_MAX_OPTION_LENGTH
+                    or type(identity[3]) is not bool
+                    or identity in seen_combinations
+                ):
+                    raise GenerationError("generation_capability_unavailable")
+                seen_combinations.add(identity)
+                normalized_combinations.append(dict(combination))
+            minimum, maximum = profile.get("minResults"), profile.get("maxResults")
+            if (
+                type(minimum) is not int or type(maximum) is not int or minimum < 1
+                or maximum < minimum or maximum > VIDEO_MAX_RESULTS
+            ):
+                raise GenerationError("generation_capability_unavailable")
+            normalized_profiles.append({
+                "id": profile_id,
+                "mode": mode,
+                "referencePatterns": normalized_patterns,
+                "combinations": normalized_combinations,
+                "minResults": minimum,
+                "maxResults": maximum,
+            })
+        return {"version": raw["version"], "profiles": normalized_profiles, "cancel": raw["cancel"]}
+
+    @staticmethod
+    def _valid_video_protocol_text(value: Any, *, maximum: int, allow_path: bool = True) -> bool:
+        if not isinstance(value, str) or not 1 <= len(value) <= maximum:
+            return False
+        if value != value.strip():
+            return False
+        if any(ord(character) < 32 or ord(character) == 127 for character in value):
+            return False
+        lowered = value.lower()
+        if lowered.startswith(("http://", "https://", "file://")):
+            return False
+        if not allow_path:
+            normalized_path = value.replace("\\", "/")
+            segments = normalized_path.split("/")
+            if (
+                normalized_path.startswith("/")
+                or re.match(r"^[a-zA-Z]:/", normalized_path)
+                or any(segment in {".", ".."} for segment in segments)
+            ):
+                return False
+        return True
+
+    def list_video_models(self) -> list[dict[str, Any]]:
+        models = []
+        seen: set[tuple[str, str]] = set()
+        for adapter in self.registry.adapters("video"):
+            if not isinstance(adapter, VideoGenerationAdapter):
+                continue
+            try:
+                entries = adapter.catalog()
+            except Exception:
+                continue
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict) or set(entry) != {"provider", "model", "label"}:
+                    continue
+                provider, model, label = entry.get("provider"), entry.get("model"), entry.get("label")
+                if (
+                    not all(isinstance(value, str) and value for value in (provider, model, label))
+                    or len(provider) > 120 or len(model) > 256 or len(label) > 256
+                ):
+                    continue
+                if (provider, model) in seen:
+                    continue
+                try:
+                    catalog = self.capabilities(provider, model, modality="video")
+                except GenerationError:
+                    continue
+                if catalog["adapterId"] != adapter.adapter_id:
+                    continue
+                seen.add((provider, model))
+                models.append({
+                    "provider": provider,
+                    "model": catalog["model"],
+                    "label": label,
+                    "adapterId": adapter.adapter_id,
+                    "adapterVersion": adapter.version,
+                    "configurationVersion": catalog["configurationVersion"],
+                    "capabilities": catalog["capabilities"],
+                })
+        return models
+
     def _recover(self, project_id: str) -> None:
         with self.lock:
             if project_id in self.recovered_projects:
@@ -312,7 +537,30 @@ class GenerationService:
             runs = self.store.load(project_id)
             changed = False
             for run in runs:
-                if run.get("status") not in {"queued", "running", "cancel_requested"}:
+                if run.get("status") not in {"submitting", "queued", "running", "cancel_requested"}:
+                    continue
+                if run.get("modality") == "video" and isinstance(run.get("remoteTaskId"), str):
+                    run["status"] = "running"
+                    run["reason"] = None
+                    run["updatedAt"] = self._now()
+                    changed = True
+                    continue
+                if run.get("modality") == "video":
+                    recovered = EXTERNAL_RUN_POLICY.recover_after_restart(run["status"])
+                    status = recovered.status
+                    if status != "unknown":
+                        status = EXTERNAL_RUN_POLICY.mark_outcome_unknown(status)
+                    for output in run.get("outputItems", []):
+                        if output.get("status") in {"pending", "running"}:
+                            output.update(status="unknown", reason="generation_submit_outcome_unknown", billingUnknown=True)
+                    run.update(
+                        status=status,
+                        outcome="unknown",
+                        reason="generation_submit_outcome_unknown",
+                        billingUnknown=True,
+                        updatedAt=self._now(),
+                    )
+                    changed = True
                     continue
                 for output in run.get("outputItems", []):
                     if output.get("status") in {"pending", "running"}:
@@ -693,6 +941,623 @@ class GenerationService:
         }
         snapshot["idempotencyKey"] = idempotency_key
         return self._create_image_run(project_id, snapshot, retry_of=previous)
+
+    def _validate_video_params(
+        self,
+        project_id: str,
+        params: dict[str, Any],
+        capabilities: dict[str, Any],
+    ) -> None:
+        if set(params) != _VIDEO_PARAM_KEYS:
+            raise GenerationError("generation_request_invalid")
+        profile = next(
+            (item for item in capabilities["profiles"] if item["id"] == params.get("profileId")),
+            None,
+        )
+        if profile is None:
+            raise GenerationError("generation_profile_unsupported")
+        if params.get("mode") != profile["mode"]:
+            raise GenerationError("generation_reference_pattern_unsupported")
+        references = params.get("references")
+        if not isinstance(references, list):
+            raise GenerationError("generation_request_invalid")
+        pattern = []
+        seen: set[tuple[str, str, str]] = set()
+        for reference in references:
+            if not isinstance(reference, dict) or set(reference) != {"assetId", "assetVersionId", "referenceType"}:
+                raise GenerationError("generation_reference_invalid")
+            identity = (reference.get("assetId"), reference.get("assetVersionId"), reference.get("referenceType"))
+            if not all(isinstance(value, str) and value for value in identity) or identity in seen:
+                raise GenerationError("generation_reference_invalid")
+            seen.add(identity)
+            pattern.append(reference["referenceType"])
+            try:
+                asset = self.assets.get(project_id, reference["assetId"])
+                if (
+                    asset.get("kind") != "image"
+                    or self.assets.version_id(asset) != reference["assetVersionId"]
+                    or not self.assets.available(project_id, asset)
+                ):
+                    raise KeyError()
+            except (KeyError, OSError, ValueError):
+                raise GenerationError("generation_reference_invalid") from None
+        if pattern not in profile["referencePatterns"]:
+            raise GenerationError("generation_reference_pattern_unsupported")
+        combination = {
+            "durationSeconds": params.get("durationSeconds"),
+            "aspectRatio": params.get("aspectRatio"),
+            "resolution": params.get("resolution"),
+            "audio": params.get("audio"),
+        }
+        if combination not in profile["combinations"]:
+            raise GenerationError("generation_combination_unsupported")
+        result_count = params.get("resultCount")
+        if type(result_count) is not int or not profile["minResults"] <= result_count <= profile["maxResults"]:
+            raise GenerationError("generation_result_count_unsupported")
+
+    def submit_video(
+        self,
+        project_id: str,
+        *,
+        disclosure: dict[str, Any],
+        video_params: dict[str, Any],
+        idempotency_key: str,
+        caller: str,
+    ) -> dict[str, Any]:
+        self._validate_disclosure(disclosure)
+        if not isinstance(video_params, dict):
+            raise GenerationError("generation_request_invalid")
+        if not isinstance(idempotency_key, str) or not 1 <= len(idempotency_key) <= 200:
+            raise GenerationError("generation_request_invalid")
+        if not isinstance(caller, str) or not 1 <= len(caller) <= 120:
+            raise GenerationError("generation_request_invalid")
+        catalog = self.capabilities(disclosure["provider"], disclosure["model"], modality="video")
+        params = json.loads(json.dumps(video_params, ensure_ascii=False, allow_nan=False))
+        self._validate_video_params(project_id, params, catalog["capabilities"])
+        snapshot = {
+            "modality": "video",
+            "provider": disclosure["provider"],
+            "model": disclosure["model"],
+            "configurationVersion": catalog["configurationVersion"],
+            "input": {"prompt": disclosure["prompt"], "videoParams": params},
+            "disclosure": dict(disclosure),
+            "idempotencyKey": idempotency_key,
+            "caller": caller,
+            "routingPolicy": {"mode": "explicit", "fallback": False},
+            "capabilitySnapshot": catalog["capabilities"],
+            "adapterId": catalog["adapterId"],
+            "adapterVersion": catalog["adapterVersion"],
+        }
+        frozen = freeze_run_input(snapshot)
+        with self.lock:
+            self.recovered_projects.add(project_id)
+            runs = self.store.load(project_id)
+            existing = next((run for run in runs if run.get("idempotencyKey") == idempotency_key), None)
+            if existing is not None:
+                if existing.get("inputFingerprint") != frozen.fingerprint:
+                    raise GenerationError("generation_idempotency_conflict")
+                return existing
+            now = self._now()
+            run_id = f"generation-run-{uuid4().hex}"
+            run = {
+                "id": run_id,
+                "commonRunId": f"run-{uuid4().hex}",
+                "domainKind": "generation",
+                "attempt": 1,
+                "status": "submitting",
+                "outcome": None,
+                "reason": None,
+                "createdAt": now,
+                "updatedAt": now,
+                **snapshot,
+                "inputSnapshot": frozen.snapshot,
+                "inputFingerprint": frozen.fingerprint,
+                "billingUnknown": False,
+                "remoteTaskId": None,
+                "lastConfirmedRemoteStatus": None,
+                "pollCursor": None,
+                "callbackCursor": None,
+                "remoteCancelResult": None,
+                "localDisposition": "active",
+                "logs": [{"event": "video_submit_started"}],
+                "outputItems": [{
+                    "index": index,
+                    "resultId": f"generation-result-{uuid4().hex}",
+                    "status": "pending",
+                    "billingUnknown": False,
+                } for index in range(params["resultCount"])],
+            }
+            runs.append(run)
+            self.store.save(project_id, runs)
+        adapter = self.registry.resolve_by_id(catalog["adapterId"])
+        if not isinstance(adapter, VideoGenerationAdapter):
+            self._finish_video_terminal(project_id, run_id, "failed", "unknown", "generation_adapter_missing", True)
+            return self.get_run(project_id, run_id)
+        try:
+            remote = adapter.submit({**run, "_projectId": project_id})
+            self._validate_video_submit_result(remote)
+        except Exception:
+            self._finish_video_terminal(project_id, run_id, "unknown", "unknown", "generation_submit_unknown", True)
+            return self.get_run(project_id, run_id)
+
+        def accepted(current: dict[str, Any]) -> None:
+            if current.get("status") != "submitting":
+                return
+            current.update(
+                status="running",
+                remoteTaskId=remote["remoteTaskId"],
+                lastConfirmedRemoteStatus=remote["status"],
+                pollCursor=remote.get("pollCursor"),
+                callbackCursor=remote.get("callbackCursor"),
+            )
+            current["logs"].append({"event": "video_remote_submitted", "remoteStatus": remote["status"]})
+
+        self._mutate(project_id, run_id, accepted)
+        return self.get_run(project_id, run_id)
+
+    @staticmethod
+    def _validate_video_submit_result(value: Any) -> None:
+        if not isinstance(value, dict) or set(value) != {"remoteTaskId", "status", "pollCursor", "callbackCursor"}:
+            raise GenerationError("generation_protocol_invalid", outcome="unknown", billing_unknown=True)
+        if not GenerationService._valid_video_protocol_text(
+            value.get("remoteTaskId"), maximum=_VIDEO_MAX_REMOTE_ID_LENGTH, allow_path=False,
+        ):
+            raise GenerationError("generation_protocol_invalid", outcome="unknown", billing_unknown=True)
+        if value.get("status") not in {"queued", "running"}:
+            raise GenerationError("generation_protocol_invalid", outcome="unknown", billing_unknown=True)
+        for key in ("pollCursor", "callbackCursor"):
+            if value.get(key) is not None and not GenerationService._valid_video_protocol_text(
+                value[key], maximum=_VIDEO_MAX_CURSOR_LENGTH, allow_path=False,
+            ):
+                raise GenerationError("generation_protocol_invalid", outcome="unknown", billing_unknown=True)
+
+    def _video_operation_lock(self, project_id: str, run_id: str) -> Lock:
+        with self.lock:
+            return self.video_operation_locks.setdefault((project_id, run_id), Lock())
+
+    def refresh_video(self, project_id: str, run_id: str) -> dict[str, Any]:
+        with self._video_operation_lock(project_id, run_id):
+            return self._refresh_video(project_id, run_id)
+
+    def _refresh_video(self, project_id: str, run_id: str) -> dict[str, Any]:
+        run = self.get_run(project_id, run_id)
+        if run.get("modality") != "video" or not isinstance(run.get("remoteTaskId"), str):
+            raise GenerationError("generation_refresh_invalid")
+        if run.get("status") in _TERMINAL_STATUSES:
+            return run
+        adapter = self._video_adapter_for_run(run)
+        if (
+            run.get("lastConfirmedRemoteStatus") == "succeeded"
+            and all(
+                item.get("status") != "pending" or isinstance(item.get("remoteResultId"), str)
+                for item in run.get("outputItems", [])
+            )
+        ):
+            self._download_video_outputs(project_id, run_id, adapter)
+            self._finish_video_run(project_id, run_id)
+            return self.get_run(project_id, run_id)
+        unknown_reason = None
+        try:
+            event = adapter.poll({**run, "_projectId": project_id})
+            self._validate_video_poll_event(event)
+        except GenerationError as error:
+            unknown_reason = error.code
+            event = {
+                "status": "unknown", "pollCursor": run.get("pollCursor"),
+                "callbackCursor": run.get("callbackCursor"), "billingUnknown": True,
+            }
+        except Exception:
+            unknown_reason = "generation_remote_unknown"
+            event = {
+                "status": "unknown", "pollCursor": run.get("pollCursor"),
+                "callbackCursor": run.get("callbackCursor"), "billingUnknown": True,
+            }
+        status = event["status"]
+        if status in {"queued", "running", "unknown"}:
+            def progress(current: dict[str, Any]) -> None:
+                if current.get("status") in _TERMINAL_STATUSES:
+                    return
+                current.update(
+                    status="running",
+                    outcome=None,
+                    reason=unknown_reason if status == "unknown" else None,
+                    lastConfirmedRemoteStatus=status,
+                    pollCursor=event.get("pollCursor"),
+                    callbackCursor=event.get("callbackCursor"),
+                    billingUnknown=event["billingUnknown"],
+                )
+                current["logs"].append({"event": "video_remote_status", "status": status})
+            self._mutate(project_id, run_id, progress)
+            return self.get_run(project_id, run_id)
+        if status == "failed":
+            self._finish_video_terminal(
+                project_id, run_id, "failed", "failed", event["reason"], event["billingUnknown"],
+                remote_status="failed", poll_cursor=event.get("pollCursor"), callback_cursor=event.get("callbackCursor"),
+            )
+            return self.get_run(project_id, run_id)
+        if status == "cancelled":
+            self._finish_video_terminal(
+                project_id, run_id, "cancelled", "cancelled", "generation_remote_cancelled", event["billingUnknown"],
+                remote_status="cancelled", poll_cursor=event.get("pollCursor"), callback_cursor=event.get("callbackCursor"),
+            )
+            return self.get_run(project_id, run_id)
+        try:
+            self._record_video_success(project_id, run_id, event)
+        except GenerationError as error:
+            def protocol_unknown(current: dict[str, Any]) -> None:
+                current.update(status="running", outcome=None, reason=error.code, billingUnknown=True)
+                current["logs"].append({"event": "video_remote_status", "status": "unknown"})
+            self._mutate(project_id, run_id, protocol_unknown)
+            return self.get_run(project_id, run_id)
+        self._download_video_outputs(project_id, run_id, adapter)
+        self._finish_video_run(project_id, run_id)
+        return self.get_run(project_id, run_id)
+
+    def _video_adapter_for_run(self, run: dict[str, Any]) -> VideoGenerationAdapter:
+        adapter = self.registry.resolve_by_id(run["adapterId"])
+        if not isinstance(adapter, VideoGenerationAdapter):
+            raise GenerationError("generation_adapter_missing")
+        if adapter.version != run.get("adapterVersion"):
+            raise GenerationError("generation_adapter_version_changed")
+        return adapter
+
+    @staticmethod
+    def _validate_video_poll_event(event: Any) -> None:
+        if not isinstance(event, dict) or event.get("status") not in {"queued", "running", "unknown", "failed", "cancelled", "succeeded"}:
+            raise GenerationError("generation_protocol_invalid", outcome="unknown", billing_unknown=True)
+        status = event["status"]
+        common = {"status", "pollCursor", "callbackCursor", "billingUnknown"}
+        expected = common | ({"reason"} if status == "failed" else {"results", "failedItems"} if status == "succeeded" else set())
+        if set(event) != expected or type(event.get("billingUnknown")) is not bool:
+            raise GenerationError("generation_protocol_invalid", outcome="unknown", billing_unknown=True)
+        for key in ("pollCursor", "callbackCursor"):
+            if event.get(key) is not None and not GenerationService._valid_video_protocol_text(
+                event[key], maximum=_VIDEO_MAX_CURSOR_LENGTH, allow_path=False,
+            ):
+                raise GenerationError("generation_protocol_invalid", outcome="unknown", billing_unknown=True)
+        if status == "failed" and (
+            not isinstance(event.get("reason"), str) or _VIDEO_ERROR_CODE.fullmatch(event["reason"]) is None
+        ):
+            raise GenerationError("generation_protocol_invalid", outcome="unknown", billing_unknown=True)
+        if status == "succeeded" and (not isinstance(event.get("results"), list) or not isinstance(event.get("failedItems"), list)):
+            raise GenerationError("generation_protocol_invalid", outcome="unknown", billing_unknown=True)
+
+    def _record_video_success(self, project_id: str, run_id: str, event: dict[str, Any]) -> None:
+        def record(run: dict[str, Any]) -> None:
+            if run.get("status") in _TERMINAL_STATUSES:
+                return
+            items = {item["index"]: item for item in run["outputItems"]}
+            observed: set[int] = set()
+            for result in event["results"]:
+                if (
+                    not isinstance(result, dict) or set(result) != {"index", "remoteResultId", "name"}
+                    or type(result.get("index")) is not int or result["index"] not in items or result["index"] in observed
+                    or not self._valid_video_protocol_text(
+                        result.get("remoteResultId"), maximum=_VIDEO_MAX_REMOTE_ID_LENGTH, allow_path=False,
+                    )
+                    or not self._valid_video_protocol_text(
+                        result.get("name"), maximum=_VIDEO_MAX_RESULT_NAME_LENGTH, allow_path=False,
+                    )
+                    or Path(result["name"]).name != result["name"]
+                    or "/" in result["name"] or "\\" in result["name"]
+                ):
+                    raise GenerationError("generation_protocol_invalid", outcome="unknown", billing_unknown=True)
+                observed.add(result["index"])
+                items[result["index"]].update(
+                    remoteResultId=result["remoteResultId"], name=result["name"].strip(), status="pending",
+                )
+            for failure in event["failedItems"]:
+                if (
+                    not isinstance(failure, dict) or set(failure) != {"index", "code", "billingUnknown"}
+                    or type(failure.get("index")) is not int or failure["index"] not in items or failure["index"] in observed
+                    or not isinstance(failure.get("code"), str) or _VIDEO_ERROR_CODE.fullmatch(failure["code"]) is None
+                    or type(failure.get("billingUnknown")) is not bool
+                ):
+                    raise GenerationError("generation_protocol_invalid", outcome="unknown", billing_unknown=True)
+                observed.add(failure["index"])
+                items[failure["index"]].update(
+                    status="failed", reason=failure["code"], billingUnknown=failure["billingUnknown"],
+                )
+            if observed != set(items):
+                raise GenerationError("generation_protocol_invalid", outcome="unknown", billing_unknown=True)
+            run.update(
+                status="running", lastConfirmedRemoteStatus="succeeded", pollCursor=event.get("pollCursor"),
+                callbackCursor=event.get("callbackCursor"), billingUnknown=event["billingUnknown"], reason=None,
+            )
+            run["logs"].append({"event": "video_remote_status", "status": "succeeded"})
+        self._mutate(project_id, run_id, record)
+
+    def _download_video_outputs(
+        self,
+        project_id: str,
+        run_id: str,
+        adapter: VideoGenerationAdapter,
+    ) -> None:
+        for item in self.get_run(project_id, run_id)["outputItems"]:
+            if item.get("status") != "pending" or not item.get("remoteResultId"):
+                continue
+            suffix = Path(item.get("name", "video.mp4")).suffix.lower()
+            if suffix not in {".mp4", ".mov", ".webm"}:
+                suffix = ".mp4"
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=self.store.root, prefix=".generation-video-", suffix=suffix,
+            )
+            temporary = Path(temporary_name)
+            try:
+                current = self.get_run(project_id, run_id)
+                try:
+                    with os.fdopen(descriptor, "wb") as output:
+                        bounded = _BoundedVideoWriter(output, self.max_video_result_bytes)
+                        adapter.download(
+                            {**current, "_projectId": project_id},
+                            {"remoteResultId": item["remoteResultId"], "name": item["name"], "index": item["index"]},
+                            bounded,
+                        )
+                        bounded.flush()
+                        os.fsync(output.fileno())
+                except _VideoResultTooLarge:
+                    self._finish_video_item(project_id, run_id, item["index"], "generation_result_too_large", False)
+                    continue
+                except Exception:
+                    self._finish_video_item(project_id, run_id, item["index"], "generation_result_download_failed", False)
+                    continue
+                try:
+                    info = os.lstat(temporary)
+                    if not stat.S_ISREG(info.st_mode) or info.st_size <= 0 or temporary.is_symlink():
+                        raise OSError()
+                    if info.st_size > self.max_video_result_bytes:
+                        self._finish_video_item(project_id, run_id, item["index"], "generation_result_too_large", False)
+                        continue
+                except OSError:
+                    self._finish_video_item(project_id, run_id, item["index"], "generation_result_download_failed", False)
+                    continue
+                try:
+                    media = probe_video(temporary, ffprobe_path=self.ffprobe_path, ffmpeg_path=self.ffmpeg_path)
+                except (OSError, ValueError):
+                    self._finish_video_item(project_id, run_id, item["index"], "generation_result_invalid", False)
+                    continue
+                self._install_video_result(project_id, run_id, adapter, item["index"], temporary, media)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+    def _install_video_result(
+        self,
+        project_id: str,
+        run_id: str,
+        adapter: VideoGenerationAdapter,
+        index: int,
+        source: Path,
+        media: dict[str, Any],
+    ) -> None:
+        with self.lock:
+            run = self.get_run(project_id, run_id)
+            item = next((value for value in run["outputItems"] if value.get("index") == index), None)
+            if item is None or item.get("status") != "pending":
+                return
+            try:
+                asset = self.assets.install_run_result(
+                    project_id,
+                    source=source,
+                    run_id=run_id,
+                    common_run_id=run["commonRunId"],
+                    result_id=item["resultId"],
+                    domain_kind="generation",
+                    domain_run_id=run_id,
+                    kind="video",
+                    name=item["name"],
+                    input_snapshot=run["inputSnapshot"],
+                    provider=run["provider"],
+                    processing_method=f"{adapter.adapter_id}@{adapter.version}",
+                    media=media,
+                )
+            except (OSError, ValueError, ResultInstallationConflict):
+                self._finish_video_item(project_id, run_id, index, "generation_result_install_failed", False)
+                return
+            item.update(
+                status="completed",
+                assetId=asset["id"],
+                assetVersionId=asset["assetVersionId"],
+                url=f"/api/projects/{project_id}/preproduction/assets/{asset['id']}/file",
+                name=asset["name"],
+                duration=asset.get("duration"),
+                width=asset.get("width"),
+                height=asset.get("height"),
+                billingUnknown=False,
+            )
+            run["logs"].append({"event": "video_result", "index": index, "resultId": item["resultId"]})
+            run["updatedAt"] = self._now()
+            runs = self.store.load(project_id)
+            stored = next(value for value in runs if value.get("id") == run_id)
+            stored.clear()
+            stored.update(run)
+            self.store.save(project_id, runs)
+
+    def _finish_video_item(self, project_id: str, run_id: str, index: int, reason: str, billing_unknown: bool) -> None:
+        def finish(run: dict[str, Any]) -> None:
+            item = next((value for value in run["outputItems"] if value.get("index") == index), None)
+            if item is not None and item.get("status") == "pending":
+                item.update(status="failed", reason=reason, billingUnknown=billing_unknown)
+                run["logs"].append({"event": "video_result_error", "index": index, "reason": reason})
+        self._mutate(project_id, run_id, finish)
+
+    def _finish_video_run(self, project_id: str, run_id: str) -> None:
+        def finish(run: dict[str, Any]) -> None:
+            successes = [item for item in run["outputItems"] if item.get("status") in _VIDEO_SUCCESS_STATUSES]
+            failures = [item for item in run["outputItems"] if item.get("status") not in _VIDEO_SUCCESS_STATUSES]
+            if successes and not failures:
+                run.update(
+                    status="completed", outcome="late_success" if run.get("localDisposition") == "stopped" else "completed",
+                    reason=None, billingUnknown=bool(run.get("billingUnknown")),
+                )
+            elif successes:
+                run.update(
+                    status="partial_success", outcome="partial_success", reason="generation_results_partial",
+                    billingUnknown=bool(run.get("billingUnknown")) or any(item.get("billingUnknown") for item in failures),
+                )
+            else:
+                run.update(
+                    status="failed", outcome="failed", reason="generation_results_failed",
+                    billingUnknown=bool(run.get("billingUnknown")) or any(item.get("billingUnknown") for item in failures),
+                )
+        self._mutate(project_id, run_id, finish)
+
+    def _finish_video_terminal(
+        self,
+        project_id: str,
+        run_id: str,
+        status: str,
+        outcome: str,
+        reason: str,
+        billing_unknown: bool,
+        *,
+        remote_status: Optional[str] = None,
+        poll_cursor: Optional[str] = None,
+        callback_cursor: Optional[str] = None,
+    ) -> None:
+        def finish(run: dict[str, Any]) -> None:
+            if run.get("status") in _TERMINAL_STATUSES:
+                return
+            item_status = "cancelled" if status == "cancelled" else "unknown" if status == "unknown" else "failed"
+            for item in run["outputItems"]:
+                if item.get("status") == "pending":
+                    item.update(status=item_status, reason=reason, billingUnknown=billing_unknown)
+            run.update(status=status, outcome=outcome, reason=reason, billingUnknown=billing_unknown)
+            if remote_status is not None:
+                run["lastConfirmedRemoteStatus"] = remote_status
+                run["pollCursor"] = poll_cursor
+                run["callbackCursor"] = callback_cursor
+        self._mutate(project_id, run_id, finish)
+
+    def stop_video_local(self, project_id: str, run_id: str) -> dict[str, Any]:
+        run = self.get_run(project_id, run_id)
+        if run.get("modality") != "video" or run.get("status") in _TERMINAL_STATUSES:
+            raise GenerationError("generation_stop_invalid")
+        def stop(current: dict[str, Any]) -> None:
+            current["localDisposition"] = "stopped"
+            current["logs"].append({"event": "video_local_stopped"})
+        self._mutate(project_id, run_id, stop)
+        return self.get_run(project_id, run_id)
+
+    def cancel_video_remote(self, project_id: str, run_id: str) -> dict[str, Any]:
+        with self._video_operation_lock(project_id, run_id):
+            return self._cancel_video_remote(project_id, run_id)
+
+    def _cancel_video_remote(self, project_id: str, run_id: str) -> dict[str, Any]:
+        run = self.get_run(project_id, run_id)
+        if run.get("modality") != "video" or run.get("status") in _TERMINAL_STATUSES:
+            raise GenerationError("generation_cancel_invalid")
+        if not run["capabilitySnapshot"].get("cancel"):
+            def unsupported(current: dict[str, Any]) -> None:
+                current["remoteCancelResult"] = "unsupported"
+                current["logs"].append({"event": "video_remote_cancel", "result": "unsupported"})
+            self._mutate(project_id, run_id, unsupported)
+            return self.get_run(project_id, run_id)
+        adapter = self._video_adapter_for_run(run)
+        if adapter.cancel is None:
+            def unsupported(current: dict[str, Any]) -> None:
+                current["remoteCancelResult"] = "unsupported"
+                current["logs"].append({"event": "video_remote_cancel", "result": "unsupported"})
+            self._mutate(project_id, run_id, unsupported)
+            return self.get_run(project_id, run_id)
+        try:
+            result = adapter.cancel({**run, "_projectId": project_id})
+            self._validate_video_cancel_result(result)
+        except Exception:
+            result = {"status": "unknown", "billingUnknown": True}
+        def cancelled(current: dict[str, Any]) -> None:
+            current["remoteCancelResult"] = result["status"]
+            current["billingUnknown"] = result["billingUnknown"]
+            if result.get("pollCursor") is not None:
+                current["pollCursor"] = result["pollCursor"]
+            if result["status"] == "cancelled":
+                current.update(
+                    status="cancelled", outcome="cancelled", reason="generation_remote_cancelled",
+                    lastConfirmedRemoteStatus="cancelled",
+                )
+                for item in current["outputItems"]:
+                    if item.get("status") == "pending":
+                        item.update(status="cancelled", reason="generation_remote_cancelled", billingUnknown=result["billingUnknown"])
+            elif result["status"] == "unknown":
+                current.update(status="running", reason="generation_cancel_unknown", lastConfirmedRemoteStatus="unknown")
+            current["logs"].append({"event": "video_remote_cancel", "result": result["status"]})
+        self._mutate(project_id, run_id, cancelled)
+        return self.get_run(project_id, run_id)
+
+    @staticmethod
+    def _validate_video_cancel_result(result: Any) -> None:
+        if not isinstance(result, dict) or set(result) not in (
+            {"status", "billingUnknown"}, {"status", "billingUnknown", "pollCursor"},
+        ):
+            raise GenerationError("generation_protocol_invalid", outcome="unknown", billing_unknown=True)
+        if result.get("status") not in {"cancelled", "unsupported", "unknown"} or type(result.get("billingUnknown")) is not bool:
+            raise GenerationError("generation_protocol_invalid", outcome="unknown", billing_unknown=True)
+        if result.get("pollCursor") is not None and not GenerationService._valid_video_protocol_text(
+            result["pollCursor"], maximum=_VIDEO_MAX_CURSOR_LENGTH, allow_path=False,
+        ):
+            raise GenerationError("generation_protocol_invalid", outcome="unknown", billing_unknown=True)
+
+    def retry_video(self, project_id: str, run_id: str, *, idempotency_key: str) -> dict[str, Any]:
+        previous = self.get_run(project_id, run_id)
+        failed = [item for item in previous.get("outputItems", []) if item.get("status") not in _VIDEO_SUCCESS_STATUSES]
+        if (
+            previous.get("modality") != "video"
+            or previous.get("status") not in {"failed", "partial_success"}
+            or previous.get("lastConfirmedRemoteStatus") != "succeeded"
+            or not failed
+            or any(not isinstance(item.get("remoteResultId"), str) for item in failed)
+        ):
+            raise GenerationError("generation_retry_invalid")
+        if not isinstance(idempotency_key, str) or not 1 <= len(idempotency_key) <= 200:
+            raise GenerationError("generation_request_invalid")
+        with self.lock:
+            runs = self.store.load(project_id)
+            existing = next((item for item in runs if item.get("idempotencyKey") == idempotency_key), None)
+            if existing is not None:
+                if existing.get("retryOf") != previous["id"]:
+                    raise GenerationError("generation_idempotency_conflict")
+                return existing
+            adapter = self._video_adapter_for_run(previous)
+            snapshot = {
+                key: previous[key] for key in (
+                    "modality", "provider", "model", "configurationVersion", "input", "disclosure", "caller",
+                    "routingPolicy", "capabilitySnapshot", "adapterId", "adapterVersion",
+                )
+            }
+            snapshot["idempotencyKey"] = idempotency_key
+            frozen = freeze_run_input(snapshot)
+            now = self._now()
+            retry_id = f"generation-run-{uuid4().hex}"
+            items = []
+            for old in previous["outputItems"]:
+                if old.get("status") in _VIDEO_SUCCESS_STATUSES:
+                    items.append({
+                        key: old[key] for key in (
+                            "index", "resultId", "remoteResultId", "assetId", "assetVersionId", "url", "name",
+                            "duration", "width", "height",
+                        ) if key in old
+                    } | {"status": "reused", "billingUnknown": False})
+                else:
+                    items.append({
+                        "index": old["index"], "resultId": f"generation-result-{uuid4().hex}",
+                        "remoteResultId": old["remoteResultId"], "name": old["name"],
+                        "status": "pending", "billingUnknown": False,
+                    })
+            retry = {
+                "id": retry_id, "commonRunId": f"run-{uuid4().hex}", "domainKind": "generation",
+                "attempt": previous.get("attempt", 1) + 1, "retryOf": previous["id"], "status": "running",
+                "outcome": None, "reason": None, "createdAt": now, "updatedAt": now, **snapshot,
+                "inputSnapshot": frozen.snapshot, "inputFingerprint": frozen.fingerprint,
+                "billingUnknown": bool(previous.get("billingUnknown")),
+                "remoteTaskId": previous["remoteTaskId"], "lastConfirmedRemoteStatus": "succeeded",
+                "pollCursor": previous.get("pollCursor"), "callbackCursor": previous.get("callbackCursor"),
+                "remoteCancelResult": previous.get("remoteCancelResult"), "localDisposition": "active",
+                "logs": [{"event": "video_local_result_retry", "retryOf": previous["id"]}], "outputItems": items,
+            }
+            runs.append(retry)
+            self.store.save(project_id, runs)
+        self._download_video_outputs(project_id, retry_id, adapter)
+        self._finish_video_run(project_id, retry_id)
+        return self.get_run(project_id, retry_id)
 
     def _mutate(
         self,

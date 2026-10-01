@@ -32,6 +32,7 @@ import { BatchEditor } from "./BatchEditor";
 import { ShotWorkspaceLayout } from "./ShotWorkspaceLayout";
 import { createPreproductionWorkspaceStore, selectWorkspaceDirty, selectWorkspaceSnapshot } from "./preproductionWorkspaceStore";
 import { ImageGenerationPanel } from "./ImageGenerationPanel";
+import { VideoGenerationPanel } from "./VideoGenerationPanel";
 
 type Props = { project: Project; tools: ReactNode; onDraftChange?: (projectId: string, dirty: boolean) => void;
   importedWorkspace?: {projectId:string;workspace:Workspace}; sectionOverride?: Section; studioMode?: boolean; onAssetsChanged?: (assets: Workspace["assets"]) => void };
@@ -138,6 +139,7 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
   const primaryEntity = useStore(workspaceStore, (state) => state.selection.primaryEntity);
   const [managedAssetId, setManagedAssetId] = useState<string | null>(null);
   const [imageGenerationOpen, setImageGenerationOpen] = useState(false);
+  const [videoGenerationOpen, setVideoGenerationOpen] = useState(false);
   useEffect(() => { setImageGenerationOpen(false); }, [project.id]);
   const [roleFilter, setRoleFilter] = useState<AssetRole | "all">("all");
   const [uploadRole, setUploadRole] = useState<AssetRole>("reference");
@@ -419,8 +421,19 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
         </section>}
 
         {section === "assets" && <section className="preproduction-panel preproduction-native-form" aria-labelledby="preproduction-assets-title">
-          <div className="preproduction-panel-heading"><div><h3 id="preproduction-assets-title">素材库</h3><p>上传后按用途标记，镜头可以绑定多份素材。</p></div><div className="preproduction-import-actions"><button type="button" className="secondary-action" onClick={() => setImageGenerationOpen((open) => !open)}>{imageGenerationOpen ? "收起图片生成" : "图片生成"}</button><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("reference")}>导入参考素材</button><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("shots")}>导入已有分镜</button><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("toolkit")}>导入工具产物</button></div></div>
+          <div className="preproduction-panel-heading"><div><h3 id="preproduction-assets-title">素材库</h3><p>上传后按用途标记，镜头可以绑定多份素材。</p></div><div className="preproduction-import-actions"><button type="button" className="secondary-action" onClick={() => setImageGenerationOpen((open) => !open)}>{imageGenerationOpen ? "收起图片生成" : "图片生成"}</button><button type="button" className="secondary-action" onClick={() => setVideoGenerationOpen((open) => !open)}>{videoGenerationOpen ? "收起视频生成" : "视频生成"}</button><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("reference")}>导入参考素材</button><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("shots")}>导入已有分镜</button><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("toolkit")}>导入工具产物</button></div></div>
           {imageGenerationOpen && <ImageGenerationPanel
+            projectId={project.id}
+            imageAssets={workspace.assets.filter((asset) => asset.kind === "image").map((asset) => ({
+              id: asset.id,
+              assetVersionId: (asset as typeof asset & { assetVersionId?: string }).assetVersionId ?? `${asset.id}-v1`,
+              name: asset.name,
+              kind: "image",
+              url: asset.url,
+            }))}
+            onInstalled={() => void reloadSavedWorkspace()}
+          />}
+          {videoGenerationOpen && <VideoGenerationPanel
             projectId={project.id}
             imageAssets={workspace.assets.filter((asset) => asset.kind === "image").map((asset) => ({
               id: asset.id,

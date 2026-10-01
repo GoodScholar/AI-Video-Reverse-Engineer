@@ -1177,7 +1177,7 @@ def create_app(
             return True
         return (
             request.method in ("POST", "PUT")
-            and bool(re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|preparation|preproduction|image-generation|source-segments|segment-searches|timeline|batch-edits|upscale|character-motion|toolkit|backup)(?:/.*)?", path))
+            and bool(re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|preparation|preproduction|image-generation|video-generation|source-segments|segment-searches|timeline|batch-edits|upscale|character-motion|toolkit|backup)(?:/.*)?", path))
         ) or (
             request.method == "PUT" and bool(re.fullmatch(r"/api/analysis-providers/[^/]+/configuration", path))
         ) or (
@@ -2594,10 +2594,15 @@ def create_app(
         data_dir, image_generation_configurations, image_generation_service,
     )
     aigc_generation_registry.register(configured_image_adapter.as_generation_adapter())
-    aigc_generation_service = GenerationService(data_dir, registry=aigc_generation_registry, queue=compute_jobs)
+    aigc_generation_service = GenerationService(
+        data_dir, registry=aigc_generation_registry, queue=compute_jobs,
+        ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
+    )
 
     from .image_generation_run_api import create_image_generation_run_router
     app.include_router(create_image_generation_run_router(aigc_generation_service, ensure_project_exists))
+    from .video_generation_run_api import create_video_generation_run_router
+    app.include_router(create_video_generation_run_router(aigc_generation_service, ensure_project_exists))
 
     app.include_router(create_aigc_content_router(data_dir, ensure_project_exists,
                                                    script_generator=generate_marketing_candidates,
