@@ -1,7 +1,7 @@
 [project]
 name = "ai-video-reverse-engineer-service"
 version = "0.1.0"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
   "fastapi==0.115.12",
     "faster-whisper==1.1.1",
@@ -12,6 +12,7 @@ dependencies = [
   "torch==2.8.0",
   "transformers==4.57.6",
   "uvicorn==0.34.3",
+  "yt-dlp==2026.8.19",
 ]
 
 [tool.pytest.ini_options]

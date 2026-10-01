@@ -10,6 +10,11 @@ import {
   importPreparationShots,
   importToolkitAssets,
   importReferenceAssets,
+  importYoutubeVideo,
+  getYoutubeImportRun,
+  cancelYoutubeImportRun,
+  retryYoutubeImportRun,
+  probeYoutubeVideo,
   runPreproductionNode,
   savePreproductionWorkspace,
   uploadPreproductionAsset,
@@ -21,6 +26,8 @@ import {
   type PreproductionNode,
   type PreproductionShot,
   type PreproductionWorkspace as Workspace,
+  type YoutubeProbe,
+  type YoutubeImportRun,
 } from "./preproductionApi";
 import "./preproduction.css";
 import { ReproductionFlow } from "./ReproductionFlow";
@@ -44,6 +51,22 @@ const kindLabels: Record<NodeKind, string> = {
 };
 const statusLabels = { pending: "待运行", queued: "已排队", running: "运行中", completed: "已完成", failed: "错误", stale: "已过期" } as const;
 const activeStatuses = new Set(["queued", "running"]);
+
+function TextAssetPreview({ url, name }: { url: string; name: string }) {
+  const [text, setText] = useState<string>();
+  const [error, setError] = useState("");
+  useEffect(() => {
+    const controller = new AbortController();
+    setText(undefined); setError("");
+    void fetch(url, { signal: controller.signal }).then(async response => {
+      if (!response.ok) throw new Error("文本素材暂不可读取，请重试下载。");
+      return response.text();
+    }).then(value => { if (!controller.signal.aborted) setText(value); })
+      .catch(reason => { if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : "文本素材暂不可读取。"); });
+    return () => controller.abort();
+  }, [url]);
+  return error ? <p role="alert">{error}</p> : <pre aria-label={`${name} 预览`} style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", maxHeight: 240, overflow: "auto" }}>{text ?? "正在读取文本…"}</pre>;
+}
 
 function isVideoFile(file: File) {
   return file.type.startsWith("video/") || /\.(mp4|mov|webm)$/i.test(file.name);
@@ -147,6 +170,11 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
   useEffect(() => { setImageGenerationOpen(false); }, [project.id]);
   const [roleFilter, setRoleFilter] = useState<AssetRole | "all">("all");
   const [uploadRole, setUploadRole] = useState<AssetRole>("reference");
+  const [youtubeUrl, setYoutubeUrl] = useState("");
+  const [youtubeProbe, setYoutubeProbe] = useState<YoutubeProbe | null>(null);
+  const [youtubeRun, setYoutubeRun] = useState<YoutubeImportRun | null>(null);
+  const [youtubeDisclosureAccepted, setYoutubeDisclosureAccepted] = useState(false);
+  const [youtubeUseSession, setYoutubeUseSession] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState("");
@@ -229,6 +257,15 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
     });
     return () => { mounted.current = false; };
   }, [project.id, workspaceStore]);
+
+  useEffect(() => {
+    const runId = window.sessionStorage.getItem(`aivre:youtube-import:${project.id}`);
+    if (!runId) { setYoutubeRun(null); return; }
+    void getYoutubeImportRun(project.id, runId).then(result => setYoutubeRun(result.run)).catch(() => {
+      window.sessionStorage.removeItem(`aivre:youtube-import:${project.id}`);
+      setYoutubeRun(null);
+    });
+  }, [project.id]);
 
   useEffect(() => {
     if (loading || !importedWorkspace || importedWorkspace.projectId !== project.id) return;
@@ -338,6 +375,49 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
     try { accept(await uploadPreproductionAsset(project.id, uploadRole, file, undefined, isVideoFile(file))); }
     catch (reason) { setError(errorMessage(reason, "无法上传素材。")); }
     finally { event.target.value = ""; if (mounted.current) setBusy(null); }
+  }
+
+  async function probeYoutube() {
+    if (!youtubeUrl.trim() || busy || dirty) return;
+    setBusy("youtube-probe"); setError("");
+    try { setYoutubeProbe(await probeYoutubeVideo(project.id, youtubeUrl.trim(), youtubeUseSession)); }
+    catch (reason) { setYoutubeProbe(null); setError(errorMessage(reason, "无法读取 YouTube 视频信息。")); }
+    finally { if (mounted.current) setBusy(null); }
+  }
+
+  async function importYoutube() {
+    if (!youtubeProbe || busy || dirty) return;
+    if (!window.confirm("请确认：你拥有该 YouTube 视频的使用权。系统不会自动登录或绕过会员、私密、地区和 DRM 限制。")) return;
+    if (!window.confirm(`即将向 ${youtubeProbe.externalRequest.downloadHosts.join("、")} 发起下载请求：${youtubeProbe.externalRequest.purpose}`)) return;
+    setBusy("youtube-import"); setError("");
+    try {
+      const started = await importYoutubeVideo(project.id, {
+        url: youtubeUrl.trim(), role: uploadRole, rightsConfirmed: true, externalRequestAccepted: true, useSession: youtubeUseSession,
+      });
+      setYoutubeRun(started.run);
+      window.sessionStorage.setItem(`aivre:youtube-import:${project.id}`, started.run.id);
+    } catch (reason) { setError(errorMessage(reason, "无法导入 YouTube 视频。")); }
+    finally { if (mounted.current) setBusy(null); }
+  }
+
+  async function refreshYoutubeRun() {
+    if (!youtubeRun || busy) return;
+    setBusy("youtube-status"); setError("");
+    try {
+      const next = await getYoutubeImportRun(project.id, youtubeRun.id);
+      setYoutubeRun(next.run);
+      if (["completed", "failed", "cancelled"].includes(next.run.status)) window.sessionStorage.removeItem(`aivre:youtube-import:${project.id}`);
+      if (next.run.status === "completed") await reloadSavedWorkspace();
+    } catch (reason) { setError(errorMessage(reason, "无法读取 YouTube 导入状态。")); }
+    finally { if (mounted.current) setBusy(null); }
+  }
+
+  async function changeYoutubeRun(action: "cancel" | "retry") {
+    if (!youtubeRun || busy) return;
+    setBusy(`youtube-${action}`); setError("");
+    try { setYoutubeRun((await (action === "cancel" ? cancelYoutubeImportRun(project.id, youtubeRun.id) : retryYoutubeImportRun(project.id, youtubeRun.id))).run); }
+    catch (reason) { setError(errorMessage(reason, "无法更新 YouTube 导入状态。")); }
+    finally { if (mounted.current) setBusy(null); }
   }
 
   async function uploadResult(event: ChangeEvent<HTMLInputElement>) {
@@ -452,8 +532,17 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
             onInstalled={() => void reloadSavedWorkspace()}
           />}
           <div className="preproduction-upload"><label>标记为<select value={uploadRole} onChange={(event) => setUploadRole(event.target.value as AssetRole)}>{Object.entries(roleLabels).map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label><button type="button" className="secondary-action" disabled={Boolean(busy) || dirty} onClick={() => uploadInputRef.current?.click()}><Upload size={16} aria-hidden="true" />{busy === "upload" ? "正在上传…" : "上传素材"}</button><input ref={uploadInputRef} aria-label="上传素材文件" hidden type="file" accept="image/*,video/*,audio/*" disabled={Boolean(busy) || dirty} onChange={upload} /></div>
+          <div className="preproduction-upload" aria-label="导入 YouTube 视频">
+            <label>YouTube 链接<input aria-label="YouTube 链接" value={youtubeUrl} placeholder="https://youtu.be/..." onChange={(event) => { setYoutubeUrl(event.target.value); setYoutubeProbe(null); }} /></label>
+            <p>读取链接会访问 YouTube 页面与播放器元数据 API；确认下载后还会访问 *.googlevideo.com。默认不读取或发送会话。</p>
+            <label><input type="checkbox" checked={youtubeDisclosureAccepted} onChange={(event) => setYoutubeDisclosureAccepted(event.target.checked)} />我已阅读并同意上述外发范围</label>
+            <label><input type="checkbox" checked={youtubeUseSession} onChange={(event) => setYoutubeUseSession(event.target.checked)} />仅在此链接需要时使用系统安全存储中的合法会话</label>
+            <button type="button" className="secondary-action" disabled={Boolean(busy) || dirty || !youtubeUrl.trim() || !youtubeDisclosureAccepted} onClick={() => void probeYoutube()}>{busy === "youtube-probe" ? "正在读取…" : "读取链接"}</button>
+            {youtubeProbe && <div role="status"><strong>{youtubeProbe.title}</strong><small>适配器：{youtubeProbe.adapter.id} {youtubeProbe.adapter.version} · 状态：{youtubeProbe.status} · 最近真实验证：{youtubeProbe.lastRealVerificationAt ?? "尚无真实验证（受控测试不计入）"}</small><p>{youtubeProbe.externalRequest.purpose}</p><button type="button" className="primary-action" disabled={Boolean(busy) || dirty} onClick={() => void importYoutube()}>{busy === "youtube-import" ? "正在创建导入…" : "确认权利并下载"}</button></div>}
+            {youtubeRun && <div role="status"><strong>导入运行：{youtubeRun.status}</strong><small>{youtubeRun.error ? `诊断：${youtubeRun.error}` : `运行标识：${youtubeRun.id}`}</small><button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void refreshYoutubeRun()}>刷新导入状态</button>{["queued", "running", "cancel_requested"].includes(youtubeRun.status) && <button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void changeYoutubeRun("cancel")}>取消导入</button>}{["failed", "cancelled"].includes(youtubeRun.status) && <button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void changeYoutubeRun("retry")}>重试导入</button>}</div>}
+          </div>
           <div className="preproduction-filters" role="group" aria-label="素材标签筛选"><button type="button" aria-pressed={roleFilter === "all"} className={roleFilter === "all" ? "is-active" : ""} onClick={() => setRoleFilter("all")}>全部</button>{(Object.entries(roleLabels) as Array<[AssetRole, string]>).map(([role, label]) => <button type="button" key={role} aria-pressed={roleFilter === role} className={roleFilter === role ? "is-active" : ""} onClick={() => setRoleFilter(role)}>{label}</button>)}</div>
-          {visibleAssets.length ? <ul className="preproduction-assets">{visibleAssets.map((asset) => <li key={asset.id}><span className="preproduction-asset-kind">{asset.kind}</span><div className="preproduction-asset-info"><strong>{asset.name}</strong>{asset.notes && <p>{asset.notes}</p>}<button type="button" className="secondary-action" aria-label={`管理素材 ${asset.name}`} onClick={() => setManagedAssetId(asset.id)}>管理素材</button><span className="preproduction-asset-role">{roleLabels[asset.role]}</span>{asset.width && asset.height ? <small>{asset.width}×{asset.height}</small> : null}<a className="preproduction-asset-download" href={asset.url} download>下载{asset.name}</a><details className={`preproduction-asset-preview ${studioMode ? "studio-asset-preview" : ""}`} open={studioMode || undefined}><summary>预览</summary>{asset.kind === "image" ? <img src={asset.url} alt={`${asset.name} 预览`} /> : asset.kind === "video" ? <video controls preload="metadata" aria-label={`${asset.name} 预览`} src={asset.url} /> : <audio controls preload="metadata" aria-label={`${asset.name} 预览`} src={asset.url} />}</details></div></li>)}</ul> : <p className="preproduction-empty">还没有匹配的素材。上传素材，或从已有参考和工具结果导入。</p>}
+          {visibleAssets.length ? <ul className="preproduction-assets">{visibleAssets.map((asset) => <li key={asset.id}><span className="preproduction-asset-kind">{asset.kind}</span><div className="preproduction-asset-info"><strong>{asset.name}</strong>{asset.notes && <p>{asset.notes}</p>}<button type="button" className="secondary-action" aria-label={`管理素材 ${asset.name}`} onClick={() => setManagedAssetId(asset.id)}>管理素材</button><span className="preproduction-asset-role">{roleLabels[asset.role]}</span>{asset.width && asset.height ? <small>{asset.width}×{asset.height}</small> : null}<a className="preproduction-asset-download" href={asset.url} download>下载{asset.name}</a><details className={`preproduction-asset-preview ${studioMode ? "studio-asset-preview" : ""}`} open={studioMode || undefined}><summary>预览</summary>{asset.kind === "image" ? <img src={asset.url} alt={`${asset.name} 预览`} /> : asset.kind === "video" ? <video controls preload="metadata" aria-label={`${asset.name} 预览`} src={asset.url} /> : asset.kind === "text" ? <TextAssetPreview url={asset.url} name={asset.name} /> : <audio controls preload="metadata" aria-label={`${asset.name} 预览`} src={asset.url} />}</details></div></li>)}</ul> : <p className="preproduction-empty">还没有匹配的素材。上传素材，或从已有参考和工具结果导入。</p>}
           {workspace.assets.find((asset) => asset.id === managedAssetId) && (() => {
             const asset = workspace.assets.find((item) => item.id === managedAssetId)!;
             return <AssetManager key={`${project.id}:${asset.id}`} projectId={project.id} asset={asset} revision={workspace.revision}

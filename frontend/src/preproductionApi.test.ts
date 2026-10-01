@@ -5,6 +5,8 @@ import {
   getCanvasLayout,
   getPreproductionWorkspace,
   importPreparationShots,
+  probeYoutubeVideo,
+  importYoutubeVideo,
   runPreproductionNode,
   savePreproductionWorkspace,
   saveCanvasLayout,
@@ -114,6 +116,25 @@ describe("preproductionApi", () => {
     );
   });
 
+  it("上传几何处理结果时随真实文件提交可验证的来源操作记录", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(response(workspace));
+    const file = new File(["png"], "产品图-裁切.png", { type: "image/png" });
+    const derivation = {
+      sourceAssetId: "asset-source",
+      operation: "crop" as const,
+      params: { x: 0, y: 0, width: 0.5, height: 1 },
+      operationId: "geometry-op-001",
+      index: 0,
+      count: 1,
+    };
+
+    await uploadPreproductionAsset("project-001", "reference", file, derivation);
+
+    const body = vi.mocked(fetch).mock.calls[0][1]?.body as FormData;
+    expect(body.get("file")).toBe(file);
+    expect(body.get("derivation")).toBe(JSON.stringify(derivation));
+  });
+
   it("本地视频上传仅在确认使用权后声明确认字段", async () => {
     vi.mocked(fetch).mockResolvedValueOnce(response(workspace));
     const file = new File(["video"], "素材.mp4", { type: "video/mp4" });
@@ -122,6 +143,17 @@ describe("preproductionApi", () => {
 
     const body = vi.mocked(fetch).mock.calls[0][1]?.body as FormData;
     expect(body.get("rightsConfirmed")).toBe("true");
+  });
+
+  it("YouTube 探测与确认导入使用明确的外发披露和权利字段", async () => {
+    const probe = { canonicalUrl: "https://www.youtube.com/watch?v=YE7VzlLtp-4", videoId: "YE7VzlLtp-4", title: "授权样片", durationSeconds: 1, uploader: "owner", status: "available" as const, adapter: { id: "yt-dlp", version: "2026.08.19" }, externalRequest: { probeHosts: ["www.youtube.com"], downloadHosts: ["*.googlevideo.com"], purpose: "读取公开视频元数据；确认后下载", sessionPolicy: "默认不读取会话" }, lastRealVerificationAt: null };
+    vi.mocked(fetch).mockResolvedValueOnce(response(probe)).mockResolvedValueOnce(response({ run: { id: "youtube-import-1", status: "queued", error: null, createdAt: "2026-10-02T00:00:00Z", inputFingerprint: "hash", idempotencyKey: "key", retryOf: null, uploadedAssetId: null } }));
+
+    await expect(probeYoutubeVideo("project-001", "https://youtu.be/YE7VzlLtp-4", true)).resolves.toEqual(probe);
+    await importYoutubeVideo("project-001", { url: "https://youtu.be/YE7VzlLtp-4", role: "reference", rightsConfirmed: true, externalRequestAccepted: true, useSession: true });
+
+    expect(fetch).toHaveBeenNthCalledWith(1, "/api/projects/project-001/preproduction/youtube/probe", expect.objectContaining({ method: "POST", body: JSON.stringify({ url: "https://youtu.be/YE7VzlLtp-4", externalRequestAccepted: true, useSession: true }) }));
+    expect(fetch).toHaveBeenNthCalledWith(2, "/api/projects/project-001/preproduction/youtube/import", expect.objectContaining({ method: "POST", body: JSON.stringify({ url: "https://youtu.be/YE7VzlLtp-4", role: "reference", rightsConfirmed: true, externalRequestAccepted: true, useSession: true }) }));
   });
 
   it("打包失败时读取后端检查错误而不下载旧结果", async () => {

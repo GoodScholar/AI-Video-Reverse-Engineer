@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import inspect
 import math
 import os
 import shutil
@@ -13,14 +14,14 @@ import zipfile
 from copy import deepcopy
 from contextlib import nullcontext
 from pathlib import Path
-from threading import RLock
+from threading import Event, RLock
 from types import SimpleNamespace
 from typing import Any, Callable, Literal, Optional
 from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.background import BackgroundTask
 
@@ -33,7 +34,7 @@ from .asset_references import (
 )
 from .batch_editing_api import BatchStore
 from .canvas_layout import CanvasLayoutConflict, CanvasLayoutStore, validate_layout
-from .durable_runs import LOCAL_RUN_POLICY
+from .durable_runs import LOCAL_RUN_POLICY, freeze_run_input
 from .timeline import TimelineStore
 from .preproduction import PreproductionStore
 from .project_assets import (
@@ -49,6 +50,18 @@ from .preproduction_nodes import FFMPEG_TIMEOUT_SECONDS, MAX_MEDIA_DURATION_SECO
 from .reference_media_storage import managed_reference_media_is_safe, resolve_reference_media_path
 from .reference_video import validate_storage_id
 from .video_sources import utc_timestamp
+from .youtube_import import (
+    MAX_YOUTUBE_SOURCE_DURATION_SECONDS,
+    SystemYoutubeCookieStore,
+    YOUTUBE_ADAPTER,
+    YtDlpYoutubeAdapter,
+    YoutubeImportError,
+    YoutubeImportCancelled,
+    YoutubeImportRuns,
+    public_youtube_import_run,
+    normalize_youtube_url,
+    probe_downloaded_youtube_video,
+)
 from .shot_production import MAX_RESULT_VERSIONS, NODE_KINDS, ShotProduction, ShotProductionError, StepSource, public_result_versions
 from .shot_organization import ShotOrganization, ShotOrganizationError
 from .preproduction_transaction import WorkspaceTransaction, WorkspaceTransactionError
@@ -59,6 +72,16 @@ MAX_SHOTS = 500
 MAX_NODES_PER_SHOT = 80
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 _MEDIA_SUFFIXES = _IMAGE_SUFFIXES | {".mp4", ".mov", ".m4a", ".mp3", ".wav", ".aac", ".webm"}
+
+
+def youtube_external_request() -> dict[str, Any]:
+    """Pre-network disclosure used by both the UI and metadata response."""
+    return {
+        "probeHosts": ["www.youtube.com", "YouTube player metadata API"],
+        "downloadHosts": ["*.googlevideo.com"],
+        "purpose": "读取公开视频元数据；确认权利后下载到本项目受管暂存区。",
+        "sessionPolicy": "默认不读取或发送会话；仅在你明确勾选后，才读取系统安全存储中的合法会话并仅发送给 YouTube。",
+    }
 
 
 class Brief(BaseModel):
@@ -161,6 +184,16 @@ class AssetMetadata(RevisionRequest):
         return value
 
 
+class YoutubeImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    url: str = Field(min_length=1, max_length=4096)
+    role: Literal["character", "scene", "motion", "audio", "reference"] = "reference"
+    rightsConfirmed: bool = False
+    externalRequestAccepted: bool = False
+    useSession: bool = False
+    idempotencyKey: str = Field(default="", max_length=128)
+
+
 class CanvasLayoutUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     layoutRevision: int = Field(ge=0)
@@ -177,6 +210,8 @@ def create_preproduction_router(
     ffprobe_path: str = "ffprobe",
     source_lock: Any = None,
     runner: Optional[Callable[..., list[str]]] = None,
+    youtube_adapter: Any = None,
+    youtube_session_store: Any = None,
 ) -> APIRouter:
     """Create the router; ``runner`` is a test seam and defaults to execute_node."""
     root = Path(data_dir)
@@ -193,7 +228,28 @@ def create_preproduction_router(
         lambda project_id, asset_id: batch_asset_references(batch_store.load(project_id), asset_id),
     ))
     lock = source_lock or RLock()
+    youtube_adapter = youtube_adapter or YtDlpYoutubeAdapter()
+    youtube_runs = YoutubeImportRuns(root)
+    youtube_cancel_events: dict[str, Event] = {}
     router = APIRouter(prefix="/api/projects/{project_id}/preproduction")
+
+    def reconcile_youtube_imports(project_id: str) -> None:
+        """Close the post-install/pre-run-record crash window without redownloading."""
+        assets = project_assets.index(project_id)
+        for run in youtube_runs.list(project_id):
+            if run["status"] not in {"failed", "cancelled"} or run.get("uploadedAssetId"):
+                continue
+            canonical = normalize_youtube_url(str(run.get("input", {}).get("url", "")))
+            video_id = (canonical or "").removeprefix("https://www.youtube.com/watch?v=")
+            asset = next((item for item in assets.values() if isinstance(item.get("videoSource"), dict)
+                          and item["videoSource"].get("sourceId") == "source-youtube-" + video_id), None)
+            if asset is None:
+                continue
+            try:
+                project_assets.file(project_id, asset)
+            except (OSError, ValueError, KeyError):
+                continue
+            youtube_runs.transition(project_id, run["id"], status="completed", error=None, uploadedAssetId=asset["id"])
 
     if runner is None:
         from .preproduction_nodes import execute_node
@@ -212,6 +268,8 @@ def create_preproduction_router(
         try:
             workspace_transaction.recover(project_id)
             project_assets.recover_local_video_installations(project_id)
+            project_assets.recover_youtube_video_installations(project_id)
+            reconcile_youtube_imports(project_id)
             return store.load(project_id)
         except (OSError, ValueError):
             fail("preproduction_storage_invalid", "前置工作台状态无法读取。", 503)
@@ -323,6 +381,7 @@ def create_preproduction_router(
                 project_id = path.parents[1].name
                 workspace_transaction.recover(project_id)
                 project_assets.recover_local_video_installations(project_id)
+                project_assets.recover_youtube_video_installations(project_id)
                 state = store.load(project_id)
                 changed = False
                 for shot in state["shots"]:
@@ -334,6 +393,14 @@ def create_preproduction_router(
                 if changed:
                     store.save(project_id, state)
             except (OSError, ValueError, json.JSONDecodeError):
+                continue
+        for path in base.glob("*/preproduction/youtube-import/runs.json"):
+            try:
+                if not path.is_symlink():
+                    project_id = path.parents[2].name
+                    youtube_runs.recover(project_id)
+                    reconcile_youtube_imports(project_id)
+            except (OSError, ValueError):
                 continue
 
     recover()
@@ -529,8 +596,192 @@ def create_preproduction_router(
                 fail("asset_delete_failed", "素材删除未能完成，请刷新检查后重试。", 503)
             return response(project_id, state)
 
+    def youtube_error(error: YoutubeImportError) -> None:
+        messages = {
+            "requires_login": "该 YouTube 内容需要已授权会话；系统不会自动登录、读取浏览器 Cookie 或绕过访问限制。",
+            "temporarily_unavailable": "YouTube 暂时不可用或站点适配已变化，请稍后重试。",
+            "unsupported_link": "该链接或内容受 DRM、私密或其他不支持的访问限制，不能导入。",
+        }
+        statuses = {"requires_login": 409, "temporarily_unavailable": 503, "unsupported_link": 422}
+        fail(f"youtube_{error.status}", messages[error.status], statuses[error.status])
+
+    def youtube_cookie() -> str | None:
+        try:
+            store = youtube_session_store or SystemYoutubeCookieStore()
+            return store.get()
+        except Exception:
+            # Public videos continue without a session.  A protected video will
+            # deterministically report requires_login; no credential detail leaks.
+            return None
+
+    def youtube_probe(body: YoutubeImportRequest, *, cancelled=None):
+        canonical = normalize_youtube_url(body.url)
+        if canonical is None:
+            raise YoutubeImportError("unsupported_link")
+        try:
+            probe = youtube_adapter.probe
+            kwargs = {"cookie": youtube_cookie() if body.useSession else None}
+            if cancelled is not None and "cancelled" in inspect.signature(probe).parameters:
+                kwargs["cancelled"] = cancelled
+            result = probe(canonical, **kwargs)
+        except YoutubeImportError:
+            raise
+        except Exception:
+            raise YoutubeImportError("temporarily_unavailable") from None
+        if result.status != "available":
+            raise YoutubeImportError(result.status)
+        if result.canonical_url != canonical:
+            # An adapter may enrich metadata but may not turn a recognized URL
+            # into another source identity after the user reviewed disclosure.
+            raise YoutubeImportError("temporarily_unavailable")
+        if result.duration is not None and result.duration > MAX_YOUTUBE_SOURCE_DURATION_SECONDS:
+            raise YoutubeImportError("unsupported_link")
+        return result
+
+    @router.post("/youtube/probe")
+    def probe_youtube(project_id: str, body: YoutubeImportRequest):
+        project_for(project_id)
+        if not body.externalRequestAccepted:
+            fail("youtube_external_request_confirmation_required", "请先确认将向 YouTube 发起元数据请求。", 422)
+        try:
+            probe = youtube_probe(body)
+        except YoutubeImportError as error:
+            youtube_error(error)
+        return {
+            "canonicalUrl": probe.canonical_url, "videoId": probe.video_id, "title": probe.title,
+            "durationSeconds": probe.duration, "uploader": probe.uploader, "status": "available",
+            "adapter": {"id": "yt-dlp", "version": str(getattr(youtube_adapter, "version", YOUTUBE_ADAPTER["version"]))},
+            "externalRequest": youtube_external_request(),
+            # E2 controlled verification and ordinary metadata probing are not
+            # E3 evidence.  Only an authorised gold-link record may set this.
+            "lastRealVerificationAt": None,
+        }
+
+    @router.get("/youtube/disclosure")
+    def youtube_disclosure(project_id: str):
+        project_for(project_id)
+        return youtube_external_request()
+
+    @router.post("/youtube/import")
+    def import_youtube(project_id: str, body: YoutubeImportRequest):
+        project_for(project_id)
+        if not body.rightsConfirmed:
+            fail("youtube_video_rights_required", "请先确认你拥有该 YouTube 视频的使用权，再导入项目。", 422)
+        if not body.externalRequestAccepted:
+            fail("youtube_external_request_confirmation_required", "请先确认将向 YouTube 发起下载请求。", 422)
+        canonical = normalize_youtube_url(body.url)
+        if canonical is None:
+            youtube_error(YoutubeImportError("unsupported_link"))
+        snapshot = {"url": canonical, "role": body.role, "useSession": body.useSession, "adapter": dict(YOUTUBE_ADAPTER)}
+        key = body.idempotencyKey.strip() or freeze_run_input(snapshot).fingerprint
+        try:
+            run, created = youtube_runs.create_or_reuse(project_id, snapshot, key)
+        except OSError:
+            fail("youtube_run_storage_failed", "YouTube 导入运行无法保存。", 503)
+        if created:
+            youtube_cancel_events[run["id"]] = Event()
+            if not compute_queue.submit("youtube-import", run["id"], lambda run_id: execute_youtube_import(project_id, run_id), project_id=project_id):
+                youtube_runs.transition(project_id, run["id"], status="failed", error="queue_unavailable")
+                fail("youtube_queue_unavailable", "YouTube 导入队列不可用，请稍后重试。", 503)
+        return JSONResponse(status_code=202, content={"run": public_youtube_import_run(run)})
+
+    @router.get("/youtube/imports/{run_id}")
+    def get_youtube_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try:
+            return {"run": public_youtube_import_run(youtube_runs.get(project_id, run_id))}
+        except (KeyError, ValueError):
+            fail("youtube_import_not_found", "YouTube 导入运行不存在。", 404)
+        except OSError:
+            fail("youtube_run_storage_failed", "YouTube 导入运行无法读取。", 503)
+
+    @router.get("/youtube/imports")
+    def list_youtube_imports(project_id: str):
+        project_for(project_id)
+        try:
+            return {"runs": [public_youtube_import_run(run) for run in youtube_runs.list(project_id)]}
+        except OSError:
+            fail("youtube_run_storage_failed", "YouTube 导入运行无法读取。", 503)
+
+    @router.post("/youtube/imports/{run_id}/cancel")
+    def cancel_youtube_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try:
+            with source_lock or nullcontext(), lock:
+                run = youtube_runs.request_cancel(project_id, run_id)
+        except KeyError:
+            fail("youtube_import_not_found", "YouTube 导入运行不存在。", 404)
+        except ValueError:
+            fail("youtube_import_not_cancellable", "该 YouTube 导入运行当前不能取消。", 409)
+        event = youtube_cancel_events.get(run_id)
+        if event is not None: event.set()
+        if run["status"] == "cancelled": shutil.rmtree(youtube_runs.staging_dir(project_id, run_id), ignore_errors=True)
+        return JSONResponse(status_code=202, content={"run": public_youtube_import_run(run)})
+
+    @router.post("/youtube/imports/{run_id}/retry")
+    def retry_youtube_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try:
+            run, created = youtube_runs.retry(project_id, run_id)
+        except KeyError:
+            fail("youtube_import_not_found", "YouTube 导入运行不存在。", 404)
+        except ValueError:
+            fail("youtube_import_not_retryable", "该 YouTube 导入运行当前不能重试。", 409)
+        except OSError:
+            fail("youtube_run_storage_failed", "YouTube 导入运行无法保存。", 503)
+        if not created:
+            return JSONResponse(status_code=202, content={"run": public_youtube_import_run(run)})
+        youtube_cancel_events[run["id"]] = Event()
+        if not compute_queue.submit("youtube-import", run["id"], lambda candidate_id: execute_youtube_import(project_id, candidate_id), project_id=project_id):
+            youtube_runs.transition(project_id, run["id"], status="failed", error="queue_unavailable")
+            fail("youtube_queue_unavailable", "YouTube 导入队列不可用，请稍后重试。", 503)
+        return JSONResponse(status_code=202, content={"run": public_youtube_import_run(run)})
+
+    def execute_youtube_import(project_id: str, run_id: str) -> None:
+        temporary: Path | None = None
+        staging = youtube_runs.staging_dir(project_id, run_id)
+        event = youtube_cancel_events.setdefault(run_id, Event())
+        try:
+            run = youtube_runs.get(project_id, run_id)
+            if run["status"] == "cancelled" or event.is_set():
+                youtube_runs.transition(project_id, run_id, status="cancelled", error="cancelled"); return
+            if run["status"] != "queued": return
+            youtube_runs.transition(project_id, run_id, status="running", error=None)
+            body = YoutubeImportRequest(url=run["input"]["url"], role=run["input"]["role"], rightsConfirmed=True, externalRequestAccepted=True, useSession=bool(run["input"].get("useSession", False)))
+            probe = youtube_probe(body, cancelled=event.is_set)
+            if event.is_set(): raise YoutubeImportCancelled()
+            staging.mkdir(parents=True, exist_ok=True)
+            descriptor, name = tempfile.mkstemp(dir=staging, prefix=".youtube-", suffix=".mp4"); os.close(descriptor); temporary = Path(name)
+            download = youtube_adapter.download
+            accepts_cancelled = "cancelled" in inspect.signature(download).parameters
+            downloaded = Path(download(probe, temporary, cookie=youtube_cookie() if body.useSession else None, **({"cancelled": event.is_set} if accepts_cancelled else {})))
+            if event.is_set(): raise YoutubeImportCancelled()
+            if downloaded.parent.resolve(strict=True) != staging.resolve(strict=True) or not downloaded.name.startswith(".youtube-"):
+                raise OSError("unmanaged YouTube staging output")
+            if downloaded != temporary: temporary.unlink(missing_ok=True); temporary = downloaded
+            metadata = probe_downloaded_youtube_video(temporary, ffprobe_path=ffprobe_path, ffmpeg_path=ffmpeg_path)
+            if event.is_set(): raise YoutubeImportCancelled()
+            with source_lock or nullcontext(), lock:
+                if event.is_set(): raise YoutubeImportCancelled()
+                installed = project_assets.install_youtube_video(project_id, source=temporary, staging_root=staging, probe=probe,
+                                                                  role=run["input"]["role"], metadata=metadata, confirmed_at=utc_timestamp())
+                youtube_runs.transition(project_id, run_id, status="completed", error=None, uploadedAssetId=installed["id"])
+                temporary = None
+        except YoutubeImportCancelled:
+            youtube_runs.transition(project_id, run_id, status="cancelled", error="cancelled")
+        except YoutubeImportError as error:
+            youtube_runs.transition(project_id, run_id, status="failed", error="youtube_" + error.status)
+        except ValueError:
+            youtube_runs.transition(project_id, run_id, status="failed", error="youtube_download_invalid")
+        except Exception:
+            youtube_runs.transition(project_id, run_id, status="failed", error="youtube_temporarily_unavailable")
+        finally:
+            if temporary is not None: temporary.unlink(missing_ok=True)
+            shutil.rmtree(staging, ignore_errors=True)
+            youtube_cancel_events.pop(run_id, None)
+
     @router.post("/assets")
-    async def upload_asset(project_id: str, role: Literal["character", "scene", "motion", "audio", "reference"] = Query(...), file: UploadFile = File(...), resultForShot: Optional[str] = Query(None), revision: Optional[int] = Query(None), rightsConfirmed: bool = Form(False)):
+    async def upload_asset(project_id: str, role: Literal["character", "scene", "motion", "audio", "reference"] = Query(...), file: UploadFile = File(...), resultForShot: Optional[str] = Query(None), revision: Optional[int] = Query(None), derivation: Optional[str] = Form(None), rightsConfirmed: bool = Form(False)):
         project_for(project_id)
         suffix = Path(file.filename or "").suffix.lower()
         if suffix not in _MEDIA_SUFFIXES:

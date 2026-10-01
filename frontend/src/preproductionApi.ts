@@ -1,7 +1,7 @@
 import { readApiError } from "./referenceMediaApi";
 
 export type AssetRole = "character" | "scene" | "motion" | "audio" | "reference";
-export type AssetKind = "image" | "video" | "audio";
+export type AssetKind = "image" | "video" | "audio" | "text";
 export type NodeKind = "reference" | "trim" | "first_frame" | "last_frame" | "crop" | "resize" | "prompt";
 export type NodeStatus = "pending" | "queued" | "running" | "completed" | "failed" | "stale";
 
@@ -204,11 +204,40 @@ export function saveCanvasLayout(projectId: string, layout: CanvasLayout): Promi
   }, "无法保存画布布局，请重新读取后重试。");
 }
 
-export function uploadPreproductionAsset(projectId: string, role: AssetRole, file: File, _ignored?: unknown, rightsConfirmed = false): Promise<PreproductionWorkspace> {
+export function uploadPreproductionAsset(projectId: string, role: AssetRole, file: File, derivation?: Omit<ImageGeometryOperation, "createdAt">, rightsConfirmed = false): Promise<PreproductionWorkspace> {
   const data = new FormData();
   data.append("file", file);
+  if (derivation) data.append("derivation", JSON.stringify(derivation));
   if (rightsConfirmed) data.append("rightsConfirmed", "true");
   return request(`${baseUrl(projectId)}/assets?role=${encodeURIComponent(role)}`, { method: "POST", body: data }, "无法上传素材，请重试。");
+}
+
+export function probeYoutubeVideo(projectId: string, url: string, useSession = false): Promise<YoutubeProbe> {
+  return request(`${baseUrl(projectId)}/youtube/probe`, {
+    method: "POST", headers: jsonHeaders, body: JSON.stringify({ url, externalRequestAccepted: true, useSession }),
+  }, "无法读取 YouTube 视频信息，请检查链接或稍后重试。");
+}
+
+export function importYoutubeVideo(projectId: string, body: YoutubeImportRequest): Promise<{ run: YoutubeImportRun }> {
+  return request(`${baseUrl(projectId)}/youtube/import`, {
+    method: "POST", headers: jsonHeaders, body: JSON.stringify(body),
+  }, "无法导入 YouTube 视频，请检查授权、链接和网络状态。");
+}
+
+export function getYoutubeImportRun(projectId: string, runId: string): Promise<{ run: YoutubeImportRun }> {
+  return request(`${baseUrl(projectId)}/youtube/imports/${encodeURIComponent(runId)}`, {}, "无法读取 YouTube 导入状态，请重试。");
+}
+
+export function getYoutubeImportRuns(projectId: string): Promise<{ runs: YoutubeImportRun[] }> {
+  return request(`${baseUrl(projectId)}/youtube/imports`, {}, "无法恢复 YouTube 导入运行状态，请重试。");
+}
+
+export function cancelYoutubeImportRun(projectId: string, runId: string): Promise<{ run: YoutubeImportRun }> {
+  return request(`${baseUrl(projectId)}/youtube/imports/${encodeURIComponent(runId)}/cancel`, { method: "POST", headers: jsonHeaders }, "无法取消 YouTube 导入，请重试。");
+}
+
+export function retryYoutubeImportRun(projectId: string, runId: string): Promise<{ run: YoutubeImportRun }> {
+  return request(`${baseUrl(projectId)}/youtube/imports/${encodeURIComponent(runId)}/retry`, { method: "POST", headers: jsonHeaders }, "无法重试 YouTube 导入，请重试。");
 }
 
 export function importReferenceAssets(projectId: string, revision: number): Promise<PreproductionWorkspace> {
