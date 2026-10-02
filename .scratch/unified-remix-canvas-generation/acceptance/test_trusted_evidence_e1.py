@@ -258,6 +258,43 @@ def test_e1_blocks_repository_alternates_outside_the_trusted_source(tmp_path):
     assert result.error_code == "SOURCE_REF_UNREACHABLE"
 
 
+@pytest.mark.parametrize("contents", (b"", b" \n\t"))
+def test_e1_blocks_any_alternates_file_even_when_empty_or_whitespace(tmp_path, contents):
+    repository, commit, source, license_text = _commit_repository(tmp_path)
+    alternates = repository / ".git" / "objects" / "info" / "alternates"
+    alternates.write_bytes(contents)
+
+    result = _verify(_definition(repository, commit, source, license_text))
+
+    assert result.valid is False
+    assert result.error_code == "SOURCE_REF_UNREACHABLE"
+
+
+def test_e1_blocks_alternates_symlink(tmp_path):
+    repository, commit, source, license_text = _commit_repository(tmp_path)
+    external, _, _, _ = _commit_repository(tmp_path, "external")
+    alternates = repository / ".git" / "objects" / "info" / "alternates"
+    alternates.symlink_to(external / ".git" / "objects")
+
+    result = _verify(_definition(repository, commit, source, license_text))
+
+    assert result.valid is False
+    assert result.error_code == "SOURCE_REF_UNREACHABLE"
+
+
+def test_e1_blocks_object_directory_symlink_to_external_store(tmp_path):
+    repository, commit, source, license_text = _commit_repository(tmp_path)
+    objects = repository / ".git" / "objects"
+    external_store = tmp_path / "external-object-store"
+    objects.rename(external_store)
+    objects.symlink_to(external_store, target_is_directory=True)
+
+    result = _verify(_definition(repository, commit, source, license_text))
+
+    assert result.valid is False
+    assert result.error_code == "SOURCE_REF_UNREACHABLE"
+
+
 def test_e1_blocks_when_commit_or_bundle_is_unreachable_without_workspace_fallback(tmp_path):
     repository, commit, source, license_text = _commit_repository(tmp_path)
     unreachable = tmp_path / "workspace-looking-directory"

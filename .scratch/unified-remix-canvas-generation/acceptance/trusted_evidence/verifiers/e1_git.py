@@ -98,7 +98,9 @@ def _validate_source(source: GitObjectSource) -> Path:
 
 def _repository_root(path: Path, sandbox: _GitSandbox) -> Path:
     try:
-        source_path = path.resolve(strict=True)
+        source_path = path.absolute()
+        if source_path.resolve(strict=True) != source_path:
+            raise _GitObjectError("Git source path must not contain symbolic links")
     except OSError as error:
         raise _GitObjectError("Git repository is unavailable") from error
     bare = _run_git(
@@ -131,22 +133,52 @@ def _repository_root(path: Path, sandbox: _GitSandbox) -> Path:
     return source_path
 
 
-def _reject_object_alternates(repository: Path, sandbox: _GitSandbox) -> None:
-    git_dir = Path(
-        _run_git(
-            ["-C", str(repository), "rev-parse", "--absolute-git-dir"],
-            cwd=repository,
-            sandbox=sandbox,
-        )
-        .decode("utf-8")
-        .strip()
-    )
-    alternates = git_dir / "objects" / "info" / "alternates"
+def _reject_symbolic_path(path: Path) -> None:
+    if not path.is_absolute():
+        raise _GitObjectError("Git object path must be absolute")
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            raise _GitObjectError("Git object path must not contain symbolic links")
+
+
+def _trusted_git_path(repository: Path, raw_path: str) -> Path:
     try:
-        if alternates.is_symlink() or (alternates.exists() and alternates.read_bytes().strip()):
-            raise _GitObjectError("Git object alternates are not trusted")
+        trusted_root = repository.resolve(strict=True)
     except OSError as error:
-        raise _GitObjectError("Git object alternates are unavailable") from error
+        raise _GitObjectError("Git repository is unavailable") from error
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        candidate = repository / candidate
+    candidate = candidate.absolute()
+    _reject_symbolic_path(candidate)
+    try:
+        relative = candidate.resolve(strict=True).relative_to(trusted_root)
+    except (OSError, ValueError) as error:
+        raise _GitObjectError("Git object path is outside its trusted source") from error
+    canonical_candidate = trusted_root / relative
+    _reject_symbolic_path(canonical_candidate)
+    return canonical_candidate
+
+
+def _git_path(repository: Path, arguments: tuple[str, ...], sandbox: _GitSandbox) -> Path:
+    raw_path = _run_git(
+        ["-C", str(repository), "rev-parse", *arguments],
+        cwd=repository,
+        sandbox=sandbox,
+    ).decode("utf-8").strip()
+    return _trusted_git_path(repository, raw_path)
+
+
+def _reject_untrusted_object_paths(repository: Path, sandbox: _GitSandbox) -> None:
+    _git_path(repository, ("--absolute-git-dir",), sandbox)
+    _git_path(repository, ("--git-common-dir",), sandbox)
+    objects = _git_path(repository, ("--git-path", "objects"), sandbox)
+    info = _trusted_git_path(repository, str(objects / "info"))
+    alternates = info / "alternates"
+    if os.path.lexists(alternates):
+        raise _GitObjectError("Git object alternates are not trusted")
 
 
 @contextmanager
@@ -155,7 +187,7 @@ def _open_object_database(source: GitObjectSource, commit: str) -> Iterator[tupl
     with _git_sandbox() as sandbox:
         if source.kind == "repository":
             repository = _repository_root(path, sandbox)
-            _reject_object_alternates(repository, sandbox)
+            _reject_untrusted_object_paths(repository, sandbox)
             _ensure_commit(repository, commit, sandbox)
             yield repository, sandbox
             return
@@ -167,20 +199,20 @@ def _open_object_database(source: GitObjectSource, commit: str) -> Iterator[tupl
         if _digest(bundle_bytes) != source.digest:
             raise _GitObjectError("Git bundle digest mismatch")
         with tempfile.TemporaryDirectory(prefix="trusted-e1-git-", dir=sandbox.root) as temporary_name:
-            temporary = Path(temporary_name)
+            temporary = Path(temporary_name).resolve()
             _run_git(
                 ["init", "--bare", f"--template={sandbox.template}", str(temporary)],
                 cwd=temporary.parent,
                 sandbox=sandbox,
             )
-            _reject_object_alternates(temporary, sandbox)
+            _reject_untrusted_object_paths(temporary, sandbox)
             _run_git(["-C", str(temporary), "bundle", "verify", str(path)], cwd=temporary, sandbox=sandbox)
             _run_git(
                 ["-C", str(temporary), "fetch", "--no-tags", str(path), commit],
                 cwd=temporary,
                 sandbox=sandbox,
             )
-            _reject_object_alternates(temporary, sandbox)
+            _reject_untrusted_object_paths(temporary, sandbox)
             _ensure_commit(temporary, commit, sandbox)
             yield temporary, sandbox
 
