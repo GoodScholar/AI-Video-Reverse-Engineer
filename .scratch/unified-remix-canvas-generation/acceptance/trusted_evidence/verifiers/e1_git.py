@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -30,23 +31,48 @@ def _digest(payload: bytes) -> str:
     return f"sha256:{hashlib.sha256(payload).hexdigest()}"
 
 
-def _git_environment() -> dict[str, str]:
-    """Provide Git no inherited repository, object, index, or config state."""
-    return {
-        "HOME": tempfile.gettempdir(),
-        "LC_ALL": "C",
-        "PATH": os.defpath,
-    }
+@dataclass(frozen=True, slots=True)
+class _GitSandbox:
+    root: Path
+    template: Path
+    environment: dict[str, str]
 
 
-def _run_git(argv: list[str], *, cwd: Path) -> bytes:
+@contextmanager
+def _git_sandbox() -> Iterator[_GitSandbox]:
+    """Create per-verification Git configuration and template isolation."""
+    with tempfile.TemporaryDirectory(prefix="trusted-e1-git-env-") as temporary_name:
+        root = Path(temporary_name)
+        home = root / "home"
+        xdg = root / "xdg"
+        template = root / "empty-template"
+        global_config = root / "global-config"
+        home.mkdir()
+        xdg.mkdir()
+        template.mkdir()
+        global_config.write_text("# intentionally empty\n", encoding="utf-8")
+        yield _GitSandbox(
+            root=root,
+            template=template,
+            environment={
+                "HOME": str(home),
+                "XDG_CONFIG_HOME": str(xdg),
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": str(global_config),
+                "LC_ALL": "C",
+                "PATH": os.defpath,
+            },
+        )
+
+
+def _run_git(argv: list[str], *, cwd: Path, sandbox: _GitSandbox) -> bytes:
     try:
         completed = subprocess.run(
             ["git", *argv],
             cwd=cwd,
             check=False,
             capture_output=True,
-            env=_git_environment(),
+            env=sandbox.environment,
             shell=False,
             timeout=30,
         )
@@ -70,21 +96,33 @@ def _validate_source(source: GitObjectSource) -> Path:
     return path
 
 
-def _repository_root(path: Path) -> Path:
+def _repository_root(path: Path, sandbox: _GitSandbox) -> Path:
     try:
         source_path = path.resolve(strict=True)
     except OSError as error:
         raise _GitObjectError("Git repository is unavailable") from error
-    bare = _run_git(["-C", str(source_path), "rev-parse", "--is-bare-repository"], cwd=source_path)
+    bare = _run_git(
+        ["-C", str(source_path), "rev-parse", "--is-bare-repository"],
+        cwd=source_path,
+        sandbox=sandbox,
+    )
     if bare.strip() == b"true":
         root = Path(
-            _run_git(["-C", str(source_path), "rev-parse", "--absolute-git-dir"], cwd=source_path)
+            _run_git(
+                ["-C", str(source_path), "rev-parse", "--absolute-git-dir"],
+                cwd=source_path,
+                sandbox=sandbox,
+            )
             .decode("utf-8")
             .strip()
         ).resolve()
     else:
         root = Path(
-            _run_git(["-C", str(source_path), "rev-parse", "--show-toplevel"], cwd=source_path)
+            _run_git(
+                ["-C", str(source_path), "rev-parse", "--show-toplevel"],
+                cwd=source_path,
+                sandbox=sandbox,
+            )
             .decode("utf-8")
             .strip()
         ).resolve()
@@ -93,40 +131,75 @@ def _repository_root(path: Path) -> Path:
     return source_path
 
 
-@contextmanager
-def _open_object_database(source: GitObjectSource, commit: str) -> Iterator[Path]:
-    path = _validate_source(source)
-    if source.kind == "repository":
-        repository = _repository_root(path)
-        _ensure_commit(repository, commit)
-        yield repository
-        return
-
+def _reject_object_alternates(repository: Path, sandbox: _GitSandbox) -> None:
+    git_dir = Path(
+        _run_git(
+            ["-C", str(repository), "rev-parse", "--absolute-git-dir"],
+            cwd=repository,
+            sandbox=sandbox,
+        )
+        .decode("utf-8")
+        .strip()
+    )
+    alternates = git_dir / "objects" / "info" / "alternates"
     try:
-        bundle_bytes = path.read_bytes()
+        if alternates.is_symlink() or (alternates.exists() and alternates.read_bytes().strip()):
+            raise _GitObjectError("Git object alternates are not trusted")
     except OSError as error:
-        raise _GitObjectError("Git bundle is unavailable") from error
-    if _digest(bundle_bytes) != source.digest:
-        raise _GitObjectError("Git bundle digest mismatch")
-    with tempfile.TemporaryDirectory(prefix="trusted-e1-git-") as temporary_name:
-        temporary = Path(temporary_name)
-        _run_git(["init", "--bare", str(temporary)], cwd=temporary.parent)
-        _run_git(["-C", str(temporary), "bundle", "verify", str(path)], cwd=temporary)
-        _run_git(["-C", str(temporary), "fetch", "--no-tags", str(path), commit], cwd=temporary)
-        _ensure_commit(temporary, commit)
-        yield temporary
+        raise _GitObjectError("Git object alternates are unavailable") from error
 
 
-def _ensure_commit(repository: Path, commit: str) -> None:
+@contextmanager
+def _open_object_database(source: GitObjectSource, commit: str) -> Iterator[tuple[Path, _GitSandbox]]:
+    path = _validate_source(source)
+    with _git_sandbox() as sandbox:
+        if source.kind == "repository":
+            repository = _repository_root(path, sandbox)
+            _reject_object_alternates(repository, sandbox)
+            _ensure_commit(repository, commit, sandbox)
+            yield repository, sandbox
+            return
+
+        try:
+            bundle_bytes = path.read_bytes()
+        except OSError as error:
+            raise _GitObjectError("Git bundle is unavailable") from error
+        if _digest(bundle_bytes) != source.digest:
+            raise _GitObjectError("Git bundle digest mismatch")
+        with tempfile.TemporaryDirectory(prefix="trusted-e1-git-", dir=sandbox.root) as temporary_name:
+            temporary = Path(temporary_name)
+            _run_git(
+                ["init", "--bare", f"--template={sandbox.template}", str(temporary)],
+                cwd=temporary.parent,
+                sandbox=sandbox,
+            )
+            _reject_object_alternates(temporary, sandbox)
+            _run_git(["-C", str(temporary), "bundle", "verify", str(path)], cwd=temporary, sandbox=sandbox)
+            _run_git(
+                ["-C", str(temporary), "fetch", "--no-tags", str(path), commit],
+                cwd=temporary,
+                sandbox=sandbox,
+            )
+            _reject_object_alternates(temporary, sandbox)
+            _ensure_commit(temporary, commit, sandbox)
+            yield temporary, sandbox
+
+
+def _ensure_commit(repository: Path, commit: str, sandbox: _GitSandbox) -> None:
     if not _COMMIT.fullmatch(commit):
         raise _GitObjectError("invalid fixed commit")
-    _run_git(["-C", str(repository), "cat-file", "-e", f"{commit}^{{commit}}"], cwd=repository)
+    _run_git(
+        ["-C", str(repository), "cat-file", "-e", f"{commit}^{{commit}}"],
+        cwd=repository,
+        sandbox=sandbox,
+    )
 
 
-def _tree_blob_id(repository: Path, commit: str, path: str) -> str | None:
+def _tree_blob_id(repository: Path, commit: str, path: str, sandbox: _GitSandbox) -> str | None:
     output = _run_git(
         ["-C", str(repository), "ls-tree", "-z", "--full-tree", commit, "--", path],
         cwd=repository,
+        sandbox=sandbox,
     )
     if not output:
         return None
@@ -145,18 +218,26 @@ class GitObjectReader:
     """Read only exact blobs from a reviewed Git object database or bundle."""
 
     def read_blob(self, source: GitObjectSource, commit: str, path: str) -> bytes:
-        with _open_object_database(source, commit) as repository:
-            object_id = _tree_blob_id(repository, commit, path)
+        with _open_object_database(source, commit) as (repository, sandbox):
+            object_id = _tree_blob_id(repository, commit, path, sandbox)
             if object_id is None:
                 raise _GitObjectError("fixed blob is unavailable")
-            return _run_git(["-C", str(repository), "cat-file", "blob", object_id], cwd=repository)
+            return _run_git(
+                ["-C", str(repository), "cat-file", "blob", object_id],
+                cwd=repository,
+                sandbox=sandbox,
+            )
 
 
-def _repository_remotes(repository: Path) -> frozenset[str]:
-    names = _run_git(["-C", str(repository), "remote"], cwd=repository).decode("utf-8").splitlines()
+def _repository_remotes(repository: Path, sandbox: _GitSandbox) -> frozenset[str]:
+    names = _run_git(["-C", str(repository), "remote"], cwd=repository, sandbox=sandbox).decode("utf-8").splitlines()
     urls: set[str] = set()
     for name in names:
-        output = _run_git(["-C", str(repository), "remote", "get-url", "--all", name], cwd=repository)
+        output = _run_git(
+            ["-C", str(repository), "remote", "get-url", "--all", name],
+            cwd=repository,
+            sandbox=sandbox,
+        )
         urls.update(value for value in output.decode("utf-8").splitlines() if value)
     return frozenset(urls)
 
@@ -164,7 +245,7 @@ def _repository_remotes(repository: Path) -> frozenset[str]:
 def _license_matches_spdx(payload: bytes, spdx: str) -> bool:
     if not _SPDX_IDENTIFIER.fullmatch(spdx):
         return False
-    text = payload.decode("utf-8", "replace")
+    text = payload.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
     expected = spdx.casefold()
     header = _SPDX_HEADER.search(text)
     if header is not None:
@@ -271,9 +352,9 @@ class GitLicenseVerifier:
             return self._result(pointer, context, valid=False, error_code="GIT_FACT_MISMATCH", facts=facts)
 
         try:
-            with _open_object_database(self.definition.object_source, self.definition.commit) as repository:
+            with _open_object_database(self.definition.object_source, self.definition.commit) as (repository, sandbox):
                 if self.definition.object_source.kind == "repository":
-                    observed_remotes = _repository_remotes(repository)
+                    observed_remotes = _repository_remotes(repository, sandbox)
                     facts["observedSourceIdentity"] = {
                         "kind": "repository",
                         "repositoryPath": str(repository),
@@ -285,20 +366,33 @@ class GitLicenseVerifier:
 
                 blob_digests: dict[str, str] = {}
                 for path, expected in self.definition.blobs.items():
-                    object_id = _tree_blob_id(repository, self.definition.commit, path)
+                    object_id = _tree_blob_id(repository, self.definition.commit, path, sandbox)
                     if object_id is None:
                         return self._result(pointer, context, valid=False, error_code="GIT_FACT_MISMATCH", facts=facts)
-                    payload = _run_git(["-C", str(repository), "cat-file", "blob", object_id], cwd=repository)
+                    payload = _run_git(
+                        ["-C", str(repository), "cat-file", "blob", object_id],
+                        cwd=repository,
+                        sandbox=sandbox,
+                    )
                     digest = _digest(payload)
                     blob_digests[path] = digest
                     if digest != expected.digest:
                         facts["blobDigests"] = blob_digests
                         return self._result(pointer, context, valid=False, error_code="GIT_FACT_MISMATCH", facts=facts)
 
-                license_id = _tree_blob_id(repository, self.definition.commit, self.definition.license_fact.path)
+                license_id = _tree_blob_id(
+                    repository,
+                    self.definition.commit,
+                    self.definition.license_fact.path,
+                    sandbox,
+                )
                 if license_id is None:
                     return self._result(pointer, context, valid=False, error_code="LICENSE_MISMATCH", facts=facts)
-                license_payload = _run_git(["-C", str(repository), "cat-file", "blob", license_id], cwd=repository)
+                license_payload = _run_git(
+                    ["-C", str(repository), "cat-file", "blob", license_id],
+                    cwd=repository,
+                    sandbox=sandbox,
+                )
                 facts["blobDigests"] = blob_digests
                 facts["license"] = {
                     "path": self.definition.license_fact.path,

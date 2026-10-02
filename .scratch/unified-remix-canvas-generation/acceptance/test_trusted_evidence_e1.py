@@ -14,6 +14,7 @@ from trusted_evidence.registry import (
     LicenseFact,
     ReuseFact,
 )
+from trusted_evidence.verifiers import e1_git
 from trusted_evidence.verifiers.e1_git import GitLicenseVerifier, GitObjectReader
 
 
@@ -110,6 +111,15 @@ def _commit_license(repository: Path, license_text: bytes) -> str:
     _git(repository, "add", "LICENSE")
     _git(repository, "commit", "-m", "replace license")
     return _git(repository, "rev-parse", "HEAD")
+
+
+def _install_template_alternates(home: Path, object_directory: Path) -> None:
+    config = home / ".config" / "git" / "config"
+    template = home / "template"
+    config.parent.mkdir(parents=True)
+    (template / "objects" / "info").mkdir(parents=True)
+    config.write_text(f"[init]\n\ttemplateDir = {template}\n")
+    (template / "objects" / "info" / "alternates").write_text(f"{object_directory}\n")
 
 
 def test_e1_verifies_exact_commit_remote_source_blobs_and_license_digest(tmp_path):
@@ -212,6 +222,42 @@ def test_e1_bundle_cannot_fall_back_to_host_git_objects(tmp_path, monkeypatch):
     assert result.error_code == "SOURCE_REF_UNREACHABLE"
 
 
+def test_e1_bundle_cannot_use_global_template_alternates(tmp_path, monkeypatch):
+    repository, commit, source, license_text = _commit_repository(tmp_path)
+    unrelated, _, _, _ = _commit_repository(tmp_path, "unrelated")
+    bundle = tmp_path / "unrelated.bundle"
+    _git(unrelated, "bundle", "create", str(bundle), "--all")
+    home = tmp_path / "global-home"
+    _install_template_alternates(home, repository / ".git" / "objects")
+    monkeypatch.setattr(e1_git.tempfile, "gettempdir", lambda: str(home))
+
+    result = _verify(
+        _definition(
+            repository,
+            commit,
+            source,
+            license_text,
+            object_source=GitObjectSource("bundle", bundle, _sha256(bundle.read_bytes())),
+        )
+    )
+
+    assert result.valid is False
+    assert result.error_code == "SOURCE_REF_UNREACHABLE"
+
+
+def test_e1_blocks_repository_alternates_outside_the_trusted_source(tmp_path):
+    repository, commit, source, license_text = _commit_repository(tmp_path)
+    external, _, _, _ = _commit_repository(tmp_path, "external")
+    alternates = repository / ".git" / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(exist_ok=True)
+    alternates.write_text(f"{external / '.git' / 'objects'}\n")
+
+    result = _verify(_definition(repository, commit, source, license_text))
+
+    assert result.valid is False
+    assert result.error_code == "SOURCE_REF_UNREACHABLE"
+
+
 def test_e1_blocks_when_commit_or_bundle_is_unreachable_without_workspace_fallback(tmp_path):
     repository, commit, source, license_text = _commit_repository(tmp_path)
     unreachable = tmp_path / "workspace-looking-directory"
@@ -283,3 +329,14 @@ def test_e1_rejects_license_text_false_positives(tmp_path, license_text):
 
     assert result.valid is False
     assert result.error_code == "LICENSE_MISMATCH"
+
+
+@pytest.mark.parametrize("line_ending", (b"\r\n", b"\r"))
+def test_e1_accepts_standard_mit_text_with_crlf_or_cr_line_endings(tmp_path, line_ending):
+    repository, _, source, license_text = _commit_repository(tmp_path)
+    normalized_license = license_text.replace(b"\n", line_ending)
+    commit = _commit_license(repository, normalized_license)
+
+    result = _verify(_definition(repository, commit, source, normalized_license))
+
+    assert result.valid is True
