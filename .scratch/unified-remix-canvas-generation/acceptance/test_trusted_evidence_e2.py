@@ -37,7 +37,10 @@ def _product_commit(
     runner.write_text(
         "#!/bin/sh\n"
         f"if [ \"$1\" = \"--version\" ]; then echo '{version}'; exit 0; fi\n"
-        f"{runner_body}\n",
+        f"{runner_body}\n"
+        "if [ -f .report.json ]; then\n"
+        "  sed 's/{\"tests\":/{\"exitcode\":0,\"summary\":{\"total\":1,\"passed\":1},\"tests\":/' .report.json > .report.json.next && mv .report.json.next .report.json\n"
+        "fi\n",
         encoding="utf-8",
     )
     runner.chmod(0o755)
@@ -246,6 +249,8 @@ def test_e2_redacts_secrets_before_storing_receipt_and_detects_receipt_tampering
             "printf '%s\\n' 'Authorization: Bearer bearer-secret' 'Cookie: session=cookie-secret' "
             "'SSH_AUTH_SOCK=/private/agent.sock' 'key=/Users/test/.ssh/id_ed25519' "
             "'-----BEGIN PRIVATE KEY-----' 'private-key-secret' '-----END PRIVATE KEY-----' 'API_KEY=top-secret'; "
+            "printf '%s\\n' 'AWS_ACCESS_KEY_ID=AKIAEXAMPLE' 'AWS_SESSION_TOKEN=session-secret' "
+            "'COOKIE=environment-cookie' 'https://username:url-password@example.invalid/path'; "
             "for value; do test_id=\"$value\"; done; printf '{\"tests\":[{\"nodeid\":\"%s\",\"outcome\":\"passed\"}]}\\n' \"$test_id\" > .report.json"
         ),
     )
@@ -259,7 +264,7 @@ def test_e2_redacts_secrets_before_storing_receipt_and_detects_receipt_tampering
     receipt_ref = result.facts["receiptRef"]
     receipt = ContentAddressedStore(acceptance).read(receipt_ref)
 
-    for secret in (b"top-secret", b"bearer-secret", b"cookie-secret", b"/private/agent.sock", b"id_ed25519", b"private-key-secret"):
+    for secret in (b"top-secret", b"bearer-secret", b"cookie-secret", b"/private/agent.sock", b"id_ed25519", b"private-key-secret", b"AKIAEXAMPLE", b"session-secret", b"environment-cookie", b"url-password"):
         assert secret not in receipt
     assert b"[REDACTED]" in receipt
     digest = receipt_ref.removeprefix("sha256:")
@@ -352,7 +357,7 @@ def test_e2_checks_setup_created_tool_after_setup_and_requires_exact_version(tmp
     bootstrap = (
         "mkdir -p generated; "
         "printf '%s\\n' '#!/bin/sh' 'if [ \"$1\" = \"--version\" ]; then echo runner 1.0; exit 0; fi' "
-        "'for value; do test_id=\"$value\"; done; printf \"{\\\"tests\\\":[{\\\"nodeid\\\":\\\"%s\\\",\\\"outcome\\\":\\\"passed\\\"}]}\\\\n\" \"$test_id\" > .report.json' > generated/runner; "
+        "'for value; do test_id=\"$value\"; done; printf \"{\\\"exitcode\\\":0,\\\"summary\\\":{\\\"total\\\":1,\\\"passed\\\":1},\\\"tests\\\":[{\\\"nodeid\\\":\\\"%s\\\",\\\"outcome\\\":\\\"passed\\\"}]}\\\\n\" \"$test_id\" > .report.json' > generated/runner; "
         "chmod +x generated/runner"
     )
     product, commit = _product_commit(tmp_path, runner_body=bootstrap, runner_path="bootstrap")

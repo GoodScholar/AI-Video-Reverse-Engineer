@@ -29,11 +29,13 @@ _DEFAULT_REDACTION: Final = (
     re.compile(r"(?i)\b(?:proxy-)?authorization\s*:\s*(?:basic|bearer|token)\s+\S+"),
     re.compile(r"(?i)\b(?:set-)?cookie\s*:\s*[^\r\n]+"),
     re.compile(r"(?i)\bssh_auth_sock\s*[:=]\s*\S+"),
-    re.compile(r"(?i)\baws_secret_access_key\s*[:=]\s*\S+"),
-    re.compile(r'(?i)"(?:api[_-]?key|secret|token|aws_secret_access_key)"\s*:\s*"[^"\\]*"'),
+    re.compile(r"(?i)\baws_(?:access_key_id|secret_access_key|session_token)\s*[:=]\s*\S+"),
+    re.compile(r'(?i)\\?"(?:api[_-]?key|secret|token|aws_(?:access_key_id|secret_access_key|session_token))\\?"\s*:\s*\\?"(?:[^"\\]|\\.)*\\?"'),
     re.compile(r"(?is)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----"),
     re.compile(r"(?i)\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password)\b\s*[:=]\s*[^\s]+"),
     re.compile(r"(?i)(?:file://)?[^\s]*\.ssh/(?:id_[^\s/]+|[^\s/]*private[^\s/]*)"),
+    re.compile(r"(?i)\b(?:cookie|set_cookie)\s*[:=]\s*[^\s]+"),
+    re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s/@:]+:[^\s/@]+@[^\s/]+"),
 )
 _DANGEROUS_CONFIG: Final = re.compile(
     r"^(?:alias\.|core\.(?:hookspath|sshcommand)|credential\.|diff\..*\.textconv|"
@@ -157,17 +159,42 @@ class SuiteRunner:
         isolated = root / "isolated.git"
         if self._git(["init", "--bare", f"--template={root / 'empty-template'}", str(isolated)], env=env).returncode:
             raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "cannot initialize isolated Git repository")
-        packed = self._git(["-C", str(source), "pack-objects", "--stdout", "--revs"], env=env, input=f"{commit}\n".encode())
-        if packed.returncode or not packed.stdout:
-            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "fixed Git object closure is incomplete")
-        if self._git(["-C", str(isolated), "index-pack", "--stdin"], env=env, input=packed.stdout).returncode:
-            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "cannot import fixed Git object closure")
+        self._stream_object_closure(source, isolated, commit, env)
         if self._git(["-C", str(isolated), "fsck", "--connectivity-only", commit], env=env).returncode:
             raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "fixed Git object closure is incomplete")
         kind = self._git(["-C", str(isolated), "cat-file", "-t", commit], env=env)
         if kind.returncode or kind.stdout.strip() != b"commit":
             raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "isolated closure lacks the fixed commit")
         return isolated
+
+    def _stream_object_closure(self, source: Path, isolated: Path, commit: str, env: dict[str, str]) -> None:
+        """Pipe the fixed object closure directly into index-pack; never buffer it."""
+        producer: subprocess.Popen[bytes] | None = None
+        consumer: subprocess.Popen[bytes] | None = None
+        try:
+            producer = subprocess.Popen(
+                ["git", "--no-replace-objects", "-C", str(source), "pack-objects", "--stdout", "--revs"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, shell=False,
+            )
+            assert producer.stdin and producer.stdout
+            consumer = subprocess.Popen(
+                ["git", "--no-replace-objects", "-C", str(isolated), "index-pack", "--stdin"],
+                stdin=producer.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, shell=False,
+            )
+            producer.stdout.close()
+            producer.stdin.write(f"{commit}\n".encode())
+            producer.stdin.close()
+            producer.wait(timeout=30)
+            consumer.wait(timeout=30)
+            if producer.returncode or consumer.returncode:
+                raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "fixed Git object closure is incomplete")
+        except (OSError, BrokenPipeError, subprocess.TimeoutExpired) as error:
+            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "fixed Git object closure is unavailable") from error
+        finally:
+            for process in (producer, consumer):
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    process.wait()
 
     def _cleanup(self, repository: Path, checkout: Path, env: dict[str, str]) -> None:
         try:
@@ -276,6 +303,10 @@ class SuiteRunner:
         paths = list(dict.fromkeys(str(Path(path).parent) for path in resolved.values()))
         return resolved, {"PATH": os.pathsep.join([*paths, *os.defpath.split(os.pathsep)]), **suite.allowed_environment}
 
+    @staticmethod
+    def _resolve_host_command(command: tuple[str, ...], hosts: dict[str, str]) -> tuple[str, ...]:
+        return (hosts.get(command[0], command[0]), *command[1:])
+
     def _lockfiles(self, suite: E2SuiteDefinition, checkout: Path) -> dict[str, str]:
         result = {}
         for path, expected in suite.lockfile_digests.items():
@@ -288,7 +319,7 @@ class SuiteRunner:
         observed = {}
         all_commands = (*suite.setup_argv, *suite.argv)
         for tool, expected in suite.tool_versions.items():
-            command = next((item[0] for item in all_commands if Path(item[0]).name == tool), hosts.get(tool, tool))
+            command = hosts.get(tool) or next((item[0] for item in all_commands if Path(item[0]).name == tool), tool)
             result = self._run((command, "--version"), cwd=cwd, checkout=checkout, env=env, timeout=suite.timeout_seconds, limit=4096, trusted_host=command in hosts.values())
             version = _summary(result.stdout + result.stderr, truncated=result.truncated, patterns=self.redaction_patterns).strip()
             observed[tool] = version
@@ -325,6 +356,11 @@ class SuiteRunner:
                 path = self._pytest_path(command, cwd, checkout, prepare=False)
                 report = json.loads(self._path(checkout, self._relative(checkout, path), file=True).read_text())
                 rows = report.get("tests") if isinstance(report, dict) else None
+                summary = report.get("summary") if isinstance(report, dict) else None
+                if not isinstance(summary, dict) or any(not isinstance(summary.get(key), int) or isinstance(summary[key], bool) for key in ("total", "passed")):
+                    raise _ReplayBlocked("TEST_SELECTION_MISSING", "pytest report summary is invalid")
+                if report.get("exitcode") != 0 or summary["total"] != len(rows) or summary["passed"] != len(rows):
+                    raise _ReplayBlocked("TEST_SELECTION_MISSING", "pytest report summary is inconsistent")
                 outcomes = {row.get("nodeid"): row.get("outcome") for row in rows if isinstance(row, dict) and isinstance(row.get("nodeid"), str) and isinstance(row.get("outcome"), str)} if isinstance(rows, list) else {}
             else:
                 if "--reporter=json" not in command and not any(command[i:i+2] == ("--reporter", "json") for i in range(len(command)-1)): raise _ReplayBlocked("TEST_SELECTION_MISSING", "Vitest reporter is disabled")
@@ -358,11 +394,15 @@ class SuiteRunner:
                 raise ValueError
             if (receipt["schema"] != "trusted-e2-receipt/v1" or receipt["suiteId"] != suite.id or receipt["subjectRef"] != pointer.subject_ref
                     or receipt["parser"] != suite.parser or receipt["inputDigest"] != expected_digest
-                    or tuple(receipt["selectedTestIds"]) != suite.expected_test_ids or not isinstance(receipt["invocations"], list)
-                    or not isinstance(receipt["toolVersions"], dict) or not isinstance(receipt["lockfileDigests"], dict)
-                    or isinstance(receipt["durationMilliseconds"], bool) or not isinstance(receipt["durationMilliseconds"], int)):
+                    or not isinstance(receipt["selectedTestIds"], list) or tuple(receipt["selectedTestIds"]) != suite.expected_test_ids
+                    or not isinstance(receipt["invocations"], list) or len(receipt["invocations"]) != len(suite.argv)
+                    or receipt["toolVersions"] != dict(suite.tool_versions) or receipt["lockfileDigests"] != dict(suite.lockfile_digests)
+                    or isinstance(receipt["durationMilliseconds"], bool) or not isinstance(receipt["durationMilliseconds"], int) or receipt["durationMilliseconds"] < 0):
                 raise ValueError
-        except (PolicyError, ValueError, TypeError, json.JSONDecodeError) as error:
+            for invocation in receipt["invocations"]:
+                if not isinstance(invocation, dict) or set(invocation) != {"exitCode", "selectedTestIds", "stdout", "stderr"} or invocation["exitCode"] != 0 or not isinstance(invocation["selectedTestIds"], list) or any(not isinstance(value, str) for value in invocation["selectedTestIds"]) or not isinstance(invocation["stdout"], str) or not isinstance(invocation["stderr"], str):
+                    raise ValueError
+        except (OSError, PolicyError, ValueError, TypeError, json.JSONDecodeError) as error:
             code = error.code if isinstance(error, PolicyError) else "POINTER_INVALID"
             raise _ReplayBlocked(code, "receipt is not a trusted E2 receipt") from error
 
@@ -379,21 +419,20 @@ class SuiteRunner:
                 locks = self._lockfiles(suite, checkout)
                 self._verify_host_tools_before_setup(suite, cwd, checkout, env, hosts)
                 for setup in suite.setup_argv:
-                    result = self._run(setup, cwd=cwd, checkout=checkout, env=env, timeout=suite.timeout_seconds, limit=_MAX_CAPTURE)
+                    result = self._run(self._resolve_host_command(setup, hosts), cwd=cwd, checkout=checkout, env=env, timeout=suite.timeout_seconds, limit=_MAX_CAPTURE, trusted_host=setup[0] in hosts)
                     if result.returncode: raise _ReplayBlocked("TEST_REPLAY_FAILED", "setup command failed")
                 tools = self._tools(suite, cwd, checkout, env, hosts)
                 selected: list[str] = []; invocations = []; replay_failed = False
                 for command in suite.argv:
                     if suite.parser == "pytest-json-v1": self._pytest_path(command, cwd, checkout, prepare=True)
-                    result = self._run(command, cwd=cwd, checkout=checkout, env=env, timeout=suite.timeout_seconds, limit=max(1, _MAX_CAPTURE // len(suite.argv)))
-                    try: actual = self._parse(suite, command, result, cwd, checkout)
-                    except _ReplayBlocked:
-                        if result.returncode: actual = ()
-                        else: raise
+                    resolved = self._resolve_host_command(command, hosts)
+                    result = self._run(resolved, cwd=cwd, checkout=checkout, env=env, timeout=suite.timeout_seconds, limit=max(1, _MAX_CAPTURE // len(suite.argv)), trusted_host=command[0] in hosts)
+                    if result.returncode:
+                        raise _ReplayBlocked("TEST_REPLAY_FAILED", "test command failed")
+                    actual = self._parse(suite, command, result, cwd, checkout)
                     selected.extend(actual); invocations.append({"exitCode": result.returncode, "selectedTestIds": actual,
                         "stdout": _summary(result.stdout, truncated=result.truncated, patterns=self.redaction_patterns),
                         "stderr": _summary(result.stderr, truncated=result.truncated, patterns=self.redaction_patterns)})
-                    if result.returncode: replay_failed = True
                 if not replay_failed and (set(selected) != set(suite.expected_test_ids) or len(selected) != len(set(selected))):
                     raise _ReplayBlocked("TEST_SELECTION_MISSING", "machine reports do not exactly cover expected tests")
                 receipt = {"schema": "trusted-e2-receipt/v1", "suiteId": suite.id, "subjectRef": subject_ref, "parser": suite.parser,
