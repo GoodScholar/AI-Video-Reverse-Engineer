@@ -80,8 +80,9 @@ class SuiteRunner:
             valid=valid, error_code=code, facts=facts, observed_at=context.observed_at,
             input_digest=_digest({"suiteId": suite.id, "subjectRef": ref, "setupArgv": suite.setup_argv,
                 "argv": suite.argv, "expectedTestIds": suite.expected_test_ids, "parser": suite.parser,
-                "workingDirectory": suite.working_directory, "lockfileDigests": dict(suite.lockfile_digests),
-                "toolVersions": dict(suite.tool_versions)}),
+                "workingDirectory": suite.working_directory, "subjectRepository": suite.subject_repository,
+                "allowedEnvironment": dict(suite.allowed_environment), "timeoutSeconds": suite.timeout_seconds,
+                "lockfileDigests": dict(suite.lockfile_digests), "toolVersions": dict(suite.tool_versions)}),
             zero_tolerance_violations=(),
         )
 
@@ -161,6 +162,8 @@ class SuiteRunner:
             raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "fixed Git object closure is incomplete")
         if self._git(["-C", str(isolated), "index-pack", "--stdin"], env=env, input=packed.stdout).returncode:
             raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "cannot import fixed Git object closure")
+        if self._git(["-C", str(isolated), "fsck", "--connectivity-only", commit], env=env).returncode:
+            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "fixed Git object closure is incomplete")
         kind = self._git(["-C", str(isolated), "cat-file", "-t", commit], env=env)
         if kind.returncode or kind.stdout.strip() != b"commit":
             raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "isolated closure lacks the fixed commit")
@@ -250,7 +253,14 @@ class SuiteRunner:
                         selector.unregister(key.fileobj); continue
                     room = max(0, limit - len(output[key.fileobj]))
                     output[key.fileobj].extend(chunk[:room]); truncated |= len(chunk) > room
-            return _CommandResult(process.wait(), bytes(output[process.stdout]), bytes(output[process.stderr]), truncated)
+            try:
+                code = process.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired as error:
+                try: os.killpg(process.pid, signal.SIGKILL)
+                except OSError: process.kill()
+                process.wait()
+                raise _ReplayBlocked("TEST_REPLAY_TIMEOUT", "registered process group timed out") from error
+            return _CommandResult(code, bytes(output[process.stdout]), bytes(output[process.stderr]), truncated)
         finally:
             selector.close()
 
@@ -285,6 +295,16 @@ class SuiteRunner:
             if result.returncode or version != expected: raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", f"tool version differs: {tool}")
         return observed
 
+    def _verify_host_tools_before_setup(self, suite: E2SuiteDefinition, cwd: Path, checkout: Path, env: dict[str, str], hosts: dict[str, str]) -> None:
+        for command in (*suite.setup_argv, *suite.argv):
+            if "/" not in command[0] and command[0] not in hosts:
+                raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "bare command is not declared in toolVersions")
+        for tool, path in hosts.items():
+            result = self._run((path, "--version"), cwd=cwd, checkout=checkout, env=env, timeout=suite.timeout_seconds, limit=4096, trusted_host=True)
+            version = _summary(result.stdout + result.stderr, truncated=result.truncated, patterns=self.redaction_patterns).strip()
+            if result.returncode or version != suite.tool_versions[tool]:
+                raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", f"host tool version differs: {tool}")
+
     def _pytest_path(self, command: tuple[str, ...], cwd: Path, checkout: Path, *, prepare: bool) -> Path:
         if "--json-report" not in command: raise _ReplayBlocked("TEST_SELECTION_MISSING", "pytest reporter is disabled")
         report = ".report.json"
@@ -316,9 +336,14 @@ class SuiteRunner:
                             for item in assertions:
                                 if isinstance(item, dict) and isinstance(item.get("fullName"), str) and isinstance(item.get("status"), str): outcomes[item["fullName"]] = item["status"]
             if not outcomes: raise _ReplayBlocked("TEST_SELECTION_MISSING", "machine report has no executed tests")
+            expected = set(suite.expected_test_ids)
+            if any(test_id not in expected for test_id in outcomes):
+                raise _ReplayBlocked("TEST_SELECTION_MISSING", "machine report contains an unallowlisted test ID")
             if any(value != "passed" for value in outcomes.values()): raise _ReplayBlocked("TEST_REPLAY_FAILED", "machine report contains a failed test")
-            return tuple(outcomes)
+            return tuple(test_id for test_id in suite.expected_test_ids if test_id in outcomes)
         except _ReplayBlocked as error:
+            if error.code == "TEST_REPLAY_FAILED":
+                raise
             raise _ReplayBlocked("TEST_SELECTION_MISSING", "machine report is missing or unsafe") from error
         except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise _ReplayBlocked("TEST_SELECTION_MISSING", "machine report is invalid") from error
@@ -327,9 +352,15 @@ class SuiteRunner:
         try:
             raw = ContentAddressedStore(Path(context.trust_root)).read(pointer.artifact_ref)
             receipt = json.loads(raw)
-            if canonical_json_bytes(receipt) != raw or not isinstance(receipt, dict) or set(receipt) < {"schema", "suiteId", "subjectRef", "parser"}:
+            expected_fields = {"schema", "suiteId", "subjectRef", "parser", "inputDigest", "selectedTestIds", "invocations", "toolVersions", "lockfileDigests", "durationMilliseconds"}
+            expected_digest = self._result(suite, pointer.subject_ref, context, valid=True, code=None, facts={}).input_digest
+            if canonical_json_bytes(receipt) != raw or not isinstance(receipt, dict) or set(receipt) != expected_fields:
                 raise ValueError
-            if receipt["schema"] != "trusted-e2-receipt/v1" or receipt["suiteId"] != suite.id or receipt["subjectRef"] != pointer.subject_ref or receipt["parser"] != suite.parser:
+            if (receipt["schema"] != "trusted-e2-receipt/v1" or receipt["suiteId"] != suite.id or receipt["subjectRef"] != pointer.subject_ref
+                    or receipt["parser"] != suite.parser or receipt["inputDigest"] != expected_digest
+                    or tuple(receipt["selectedTestIds"]) != suite.expected_test_ids or not isinstance(receipt["invocations"], list)
+                    or not isinstance(receipt["toolVersions"], dict) or not isinstance(receipt["lockfileDigests"], dict)
+                    or isinstance(receipt["durationMilliseconds"], bool) or not isinstance(receipt["durationMilliseconds"], int)):
                 raise ValueError
         except (PolicyError, ValueError, TypeError, json.JSONDecodeError) as error:
             code = error.code if isinstance(error, PolicyError) else "POINTER_INVALID"
@@ -346,6 +377,7 @@ class SuiteRunner:
             with self._checkout(source, match.group(1)) as checkout:
                 cwd = checkout if suite.working_directory == "." else self._path(checkout, suite.working_directory, file=False)
                 locks = self._lockfiles(suite, checkout)
+                self._verify_host_tools_before_setup(suite, cwd, checkout, env, hosts)
                 for setup in suite.setup_argv:
                     result = self._run(setup, cwd=cwd, checkout=checkout, env=env, timeout=suite.timeout_seconds, limit=_MAX_CAPTURE)
                     if result.returncode: raise _ReplayBlocked("TEST_REPLAY_FAILED", "setup command failed")
@@ -365,6 +397,7 @@ class SuiteRunner:
                 if not replay_failed and (set(selected) != set(suite.expected_test_ids) or len(selected) != len(set(selected))):
                     raise _ReplayBlocked("TEST_SELECTION_MISSING", "machine reports do not exactly cover expected tests")
                 receipt = {"schema": "trusted-e2-receipt/v1", "suiteId": suite.id, "subjectRef": subject_ref, "parser": suite.parser,
+                    "inputDigest": self._result(suite, subject_ref, context, valid=True, code=None, facts={}).input_digest,
                     "selectedTestIds": tuple(selected), "invocations": invocations, "toolVersions": tools, "lockfileDigests": locks,
                     "durationMilliseconds": int((time.monotonic()-started)*1000)}
             receipt_ref = ContentAddressedStore(Path(context.trust_root)).put(canonical_json_bytes(receipt))
