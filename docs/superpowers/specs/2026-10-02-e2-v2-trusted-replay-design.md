@@ -1,6 +1,6 @@
 # E2 v2 可信重放协议设计规格
 
-Status: proposed-for-review
+Status: approved
 Type: architectural-design / specification-amendment
 Decision date: 2026-10-02
 Subsystem: Trusted Acceptance Evidence Bridge / E2 trusted replay
