@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import hashlib
+import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -16,6 +18,8 @@ from ..registry import E1GitDefinition, GitObjectSource
 
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+_SPDX_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+-]*$")
+_SPDX_HEADER = re.compile(r"^\s*SPDX-License-Identifier:\s*([A-Za-z0-9][A-Za-z0-9.+-]*)\s*$", re.MULTILINE)
 
 
 class _GitObjectError(RuntimeError):
@@ -26,13 +30,23 @@ def _digest(payload: bytes) -> str:
     return f"sha256:{hashlib.sha256(payload).hexdigest()}"
 
 
-def _run_git(argv: list[str], *, cwd: Path | None = None) -> bytes:
+def _git_environment() -> dict[str, str]:
+    """Provide Git no inherited repository, object, index, or config state."""
+    return {
+        "HOME": tempfile.gettempdir(),
+        "LC_ALL": "C",
+        "PATH": os.defpath,
+    }
+
+
+def _run_git(argv: list[str], *, cwd: Path) -> bytes:
     try:
         completed = subprocess.run(
             ["git", *argv],
             cwd=cwd,
             check=False,
             capture_output=True,
+            env=_git_environment(),
             shell=False,
             timeout=30,
         )
@@ -56,12 +70,36 @@ def _validate_source(source: GitObjectSource) -> Path:
     return path
 
 
+def _repository_root(path: Path) -> Path:
+    try:
+        source_path = path.resolve(strict=True)
+    except OSError as error:
+        raise _GitObjectError("Git repository is unavailable") from error
+    bare = _run_git(["-C", str(source_path), "rev-parse", "--is-bare-repository"], cwd=source_path)
+    if bare.strip() == b"true":
+        root = Path(
+            _run_git(["-C", str(source_path), "rev-parse", "--absolute-git-dir"], cwd=source_path)
+            .decode("utf-8")
+            .strip()
+        ).resolve()
+    else:
+        root = Path(
+            _run_git(["-C", str(source_path), "rev-parse", "--show-toplevel"], cwd=source_path)
+            .decode("utf-8")
+            .strip()
+        ).resolve()
+    if root != source_path:
+        raise _GitObjectError("Git source must be a repository root")
+    return source_path
+
+
 @contextmanager
-def _open_object_database(source: GitObjectSource) -> Iterator[Path]:
+def _open_object_database(source: GitObjectSource, commit: str) -> Iterator[Path]:
     path = _validate_source(source)
     if source.kind == "repository":
-        _run_git(["-C", str(path), "rev-parse", "--git-dir"])
-        yield path
+        repository = _repository_root(path)
+        _ensure_commit(repository, commit)
+        yield repository
         return
 
     try:
@@ -70,21 +108,26 @@ def _open_object_database(source: GitObjectSource) -> Iterator[Path]:
         raise _GitObjectError("Git bundle is unavailable") from error
     if _digest(bundle_bytes) != source.digest:
         raise _GitObjectError("Git bundle digest mismatch")
-    _run_git(["bundle", "verify", str(path)])
     with tempfile.TemporaryDirectory(prefix="trusted-e1-git-") as temporary_name:
         temporary = Path(temporary_name)
-        _run_git(["init", "--bare", str(temporary)])
+        _run_git(["init", "--bare", str(temporary)], cwd=temporary.parent)
+        _run_git(["-C", str(temporary), "bundle", "verify", str(path)], cwd=temporary)
+        _run_git(["-C", str(temporary), "fetch", "--no-tags", str(path), commit], cwd=temporary)
+        _ensure_commit(temporary, commit)
         yield temporary
 
 
 def _ensure_commit(repository: Path, commit: str) -> None:
     if not _COMMIT.fullmatch(commit):
         raise _GitObjectError("invalid fixed commit")
-    _run_git(["-C", str(repository), "cat-file", "-e", f"{commit}^{{commit}}"])
+    _run_git(["-C", str(repository), "cat-file", "-e", f"{commit}^{{commit}}"], cwd=repository)
 
 
 def _tree_blob_id(repository: Path, commit: str, path: str) -> str | None:
-    output = _run_git(["-C", str(repository), "ls-tree", "-z", "--full-tree", commit, "--", path])
+    output = _run_git(
+        ["-C", str(repository), "ls-tree", "-z", "--full-tree", commit, "--", path],
+        cwd=repository,
+    )
     if not output:
         return None
     entry = output.rstrip(b"\0")
@@ -102,31 +145,67 @@ class GitObjectReader:
     """Read only exact blobs from a reviewed Git object database or bundle."""
 
     def read_blob(self, source: GitObjectSource, commit: str, path: str) -> bytes:
-        with _open_object_database(source) as repository:
-            if source.kind == "bundle":
-                _run_git(["-C", str(repository), "fetch", "--no-tags", str(source.path), commit])
-            _ensure_commit(repository, commit)
+        with _open_object_database(source, commit) as repository:
             object_id = _tree_blob_id(repository, commit, path)
             if object_id is None:
                 raise _GitObjectError("fixed blob is unavailable")
-            return _run_git(["-C", str(repository), "cat-file", "blob", object_id])
+            return _run_git(["-C", str(repository), "cat-file", "blob", object_id], cwd=repository)
 
 
 def _repository_remotes(repository: Path) -> frozenset[str]:
-    names = _run_git(["-C", str(repository), "remote"]).decode("utf-8").splitlines()
+    names = _run_git(["-C", str(repository), "remote"], cwd=repository).decode("utf-8").splitlines()
     urls: set[str] = set()
     for name in names:
-        output = _run_git(["-C", str(repository), "remote", "get-url", "--all", name])
+        output = _run_git(["-C", str(repository), "remote", "get-url", "--all", name], cwd=repository)
         urls.update(value for value in output.decode("utf-8").splitlines() if value)
     return frozenset(urls)
 
 
 def _license_matches_spdx(payload: bytes, spdx: str) -> bool:
-    normalized = payload.decode("utf-8", "replace").lower()
-    expected = spdx.lower()
-    if f"spdx-license-identifier: {expected}" in normalized:
-        return True
-    return expected == "mit" and "mit license" in normalized
+    if not _SPDX_IDENTIFIER.fullmatch(spdx):
+        return False
+    text = payload.decode("utf-8", "replace")
+    expected = spdx.casefold()
+    header = _SPDX_HEADER.search(text)
+    if header is not None:
+        return header.group(1).casefold() == expected
+    if expected != "mit":
+        return False
+    normalized = text.casefold().lstrip()
+    return (
+        normalized.startswith("mit license\n")
+        and "permission is hereby granted, free of charge, to any person obtaining a copy" in normalized
+        and 'the software is provided "as is"' in normalized
+    )
+
+
+def _verification_input_digest(pointer: EvidencePointer, definition: E1GitDefinition) -> str:
+    policy = {
+        "artifactRef": pointer.artifact_ref,
+        "repositoryId": definition.repository_id,
+        "objectSource": {
+            "kind": definition.object_source.kind,
+            "path": str(definition.object_source.path),
+            "sha256": definition.object_source.digest,
+        },
+        "remoteUrls": definition.remote_urls,
+        "commit": definition.commit,
+        "blobs": {
+            path: {
+                "sha256": fact.digest,
+                "localPath": fact.local_path,
+                "attribution": fact.attribution,
+            }
+            for path, fact in sorted(definition.blobs.items())
+        },
+        "licenseFact": {
+            "path": definition.license_fact.path,
+            "spdx": definition.license_fact.spdx,
+            "sha256": definition.license_fact.digest,
+        },
+        "reuse": {"kind": definition.reuse.kind, "attribution": definition.reuse.attribution},
+    }
+    return _digest(json.dumps(policy, separators=(",", ":"), sort_keys=True).encode("utf-8"))
 
 
 class GitLicenseVerifier:
@@ -153,7 +232,7 @@ class GitLicenseVerifier:
             error_code=error_code,
             facts=facts,
             observed_at=context.observed_at,
-            input_digest=pointer.artifact_ref,
+            input_digest=_verification_input_digest(pointer, self.definition),
             zero_tolerance_violations=(),
         )
 
@@ -166,11 +245,18 @@ class GitLicenseVerifier:
         facts: dict[str, object] = {
             "repositoryId": self.definition.repository_id,
             "commit": self.definition.commit,
-            "remoteUrls": self.definition.remote_urls,
+            "policyAttributionRemoteUrls": self.definition.remote_urls,
             "blobDigests": {},
             "license": {"path": self.definition.license_fact.path, "spdx": self.definition.license_fact.spdx},
             "reuse": {"kind": self.definition.reuse.kind, "attribution": self.definition.reuse.attribution},
         }
+        if self.definition.object_source.kind == "bundle":
+            facts["observedSourceIdentity"] = {
+                "kind": "bundle",
+                "bundleDigest": self.definition.object_source.digest,
+                "repositoryId": self.definition.repository_id,
+                "commit": self.definition.commit,
+            }
         if (
             pointer.verifier_id != self.verifier_id
             or pointer.profile_id != profile.profile_id
@@ -185,21 +271,16 @@ class GitLicenseVerifier:
             return self._result(pointer, context, valid=False, error_code="GIT_FACT_MISMATCH", facts=facts)
 
         try:
-            with _open_object_database(self.definition.object_source) as repository:
-                if self.definition.object_source.kind == "bundle":
-                    _run_git(
-                        [
-                            "-C",
-                            str(repository),
-                            "fetch",
-                            "--no-tags",
-                            str(self.definition.object_source.path),
-                            self.definition.commit,
-                        ]
-                    )
-                _ensure_commit(repository, self.definition.commit)
+            with _open_object_database(self.definition.object_source, self.definition.commit) as repository:
                 if self.definition.object_source.kind == "repository":
-                    if _repository_remotes(repository) != frozenset(self.definition.remote_urls):
+                    observed_remotes = _repository_remotes(repository)
+                    facts["observedSourceIdentity"] = {
+                        "kind": "repository",
+                        "repositoryPath": str(repository),
+                        "commit": self.definition.commit,
+                        "remoteUrls": tuple(sorted(observed_remotes)),
+                    }
+                    if observed_remotes != frozenset(self.definition.remote_urls):
                         return self._result(pointer, context, valid=False, error_code="GIT_FACT_MISMATCH", facts=facts)
 
                 blob_digests: dict[str, str] = {}
@@ -207,7 +288,7 @@ class GitLicenseVerifier:
                     object_id = _tree_blob_id(repository, self.definition.commit, path)
                     if object_id is None:
                         return self._result(pointer, context, valid=False, error_code="GIT_FACT_MISMATCH", facts=facts)
-                    payload = _run_git(["-C", str(repository), "cat-file", "blob", object_id])
+                    payload = _run_git(["-C", str(repository), "cat-file", "blob", object_id], cwd=repository)
                     digest = _digest(payload)
                     blob_digests[path] = digest
                     if digest != expected.digest:
@@ -217,7 +298,7 @@ class GitLicenseVerifier:
                 license_id = _tree_blob_id(repository, self.definition.commit, self.definition.license_fact.path)
                 if license_id is None:
                     return self._result(pointer, context, valid=False, error_code="LICENSE_MISMATCH", facts=facts)
-                license_payload = _run_git(["-C", str(repository), "cat-file", "blob", license_id])
+                license_payload = _run_git(["-C", str(repository), "cat-file", "blob", license_id], cwd=repository)
                 facts["blobDigests"] = blob_digests
                 facts["license"] = {
                     "path": self.definition.license_fact.path,

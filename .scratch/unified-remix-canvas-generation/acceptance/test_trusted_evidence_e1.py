@@ -44,7 +44,14 @@ def _commit_repository(tmp_path: Path, name: str = "upstream") -> tuple[Path, st
     _git(repository, "config", "user.name", "Acceptance")
     _git(repository, "remote", "add", "origin", REMOTE)
     source = f"export const canvas = '{name}';\n".encode()
-    license_text = b"MIT License\n\nCopyright (c) Example\n"
+    license_text = (
+        b"MIT License\n\n"
+        b"Copyright (c) Example\n\n"
+        b"Permission is hereby granted, free of charge, to any person obtaining a copy\n"
+        b"of this software and associated documentation files (the \"Software\"), to deal\n"
+        b"in the Software without restriction.\n\n"
+        b'THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.\n'
+    )
     (repository / "src").mkdir()
     (repository / "src" / "canvas.ts").write_bytes(source)
     (repository / "LICENSE").write_bytes(license_text)
@@ -98,6 +105,13 @@ def _verify(definition: E1GitDefinition):
     return GitLicenseVerifier("e1.test", definition).verify(pointer, profile, context)
 
 
+def _commit_license(repository: Path, license_text: bytes) -> str:
+    (repository / "LICENSE").write_bytes(license_text)
+    _git(repository, "add", "LICENSE")
+    _git(repository, "commit", "-m", "replace license")
+    return _git(repository, "rev-parse", "HEAD")
+
+
 def test_e1_verifies_exact_commit_remote_source_blobs_and_license_digest(tmp_path):
     repository, commit, source, license_text = _commit_repository(tmp_path)
 
@@ -112,7 +126,27 @@ def test_e1_verifies_exact_commit_remote_source_blobs_and_license_digest(tmp_pat
     _git(repository, "bundle", "create", str(bundle), "--all")
     bundle_source = GitObjectSource("bundle", bundle, _sha256(bundle.read_bytes()))
     assert GitObjectReader().read_blob(bundle_source, commit, "src/canvas.ts") == source
-    assert _verify(_definition(repository, commit, source, license_text, object_source=bundle_source)).valid is True
+    bundle_result = _verify(_definition(repository, commit, source, license_text, object_source=bundle_source))
+    assert bundle_result.valid is True
+    assert bundle_result.facts["observedSourceIdentity"] == {
+        "kind": "bundle",
+        "bundleDigest": _sha256(bundle.read_bytes()),
+        "repositoryId": "github.com/example/upstream",
+        "commit": commit,
+    }
+    assert bundle_result.facts["policyAttributionRemoteUrls"] == (REMOTE,)
+    changed_policy = _verify(
+        _definition(
+            repository,
+            commit,
+            source,
+            license_text,
+            object_source=bundle_source,
+            remote_urls=("https://github.com/example/reviewed-mirror.git",),
+        )
+    )
+    assert changed_policy.valid is True
+    assert changed_policy.input_digest != bundle_result.input_digest
 
 
 def test_e1_ignores_untracked_and_uncommitted_workspace_changes(tmp_path):
@@ -125,6 +159,57 @@ def test_e1_ignores_untracked_and_uncommitted_workspace_changes(tmp_path):
 
     assert result.valid is True
     assert result.facts["blobDigests"]["src/canvas.ts"] == _sha256(source)
+
+
+def test_e1_clears_git_environment_redirects_before_reading_objects(tmp_path, monkeypatch):
+    repository, commit, source, license_text = _commit_repository(tmp_path)
+    redirect, _, _, _ = _commit_repository(tmp_path, "redirect")
+    poisoned_objects = redirect / ".git" / "objects"
+    monkeypatch.setenv("GIT_DIR", str(redirect / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(redirect))
+    monkeypatch.setenv("GIT_OBJECT_DIRECTORY", str(poisoned_objects))
+    monkeypatch.setenv("GIT_ALTERNATE_OBJECT_DIRECTORIES", str(poisoned_objects))
+    monkeypatch.setenv("GIT_COMMON_DIR", str(redirect / ".git"))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(redirect / ".git" / "index"))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "remote.origin.url")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "https://attacker.invalid/repo.git")
+
+    result = _verify(_definition(repository, commit, source, license_text))
+
+    assert result.valid is True
+
+
+def test_e1_rejects_repository_subdirectory_that_discovers_a_parent_repository(tmp_path):
+    repository, commit, source, license_text = _commit_repository(tmp_path)
+    nested = repository / "nested"
+    nested.mkdir()
+
+    result = _verify(_definition(nested, commit, source, license_text))
+
+    assert result.valid is False
+    assert result.error_code == "SOURCE_REF_UNREACHABLE"
+
+
+def test_e1_bundle_cannot_fall_back_to_host_git_objects(tmp_path, monkeypatch):
+    repository, commit, source, license_text = _commit_repository(tmp_path)
+    unrelated, _, _, _ = _commit_repository(tmp_path, "unrelated")
+    bundle = tmp_path / "unrelated.bundle"
+    _git(unrelated, "bundle", "create", str(bundle), "--all")
+    monkeypatch.setenv("GIT_DIR", str(repository / ".git"))
+
+    result = _verify(
+        _definition(
+            repository,
+            commit,
+            source,
+            license_text,
+            object_source=GitObjectSource("bundle", bundle, _sha256(bundle.read_bytes())),
+        )
+    )
+
+    assert result.valid is False
+    assert result.error_code == "SOURCE_REF_UNREACHABLE"
 
 
 def test_e1_blocks_when_commit_or_bundle_is_unreachable_without_workspace_fallback(tmp_path):
@@ -187,3 +272,14 @@ def test_e1_rejects_host_repository_head_as_toonflow_source(tmp_path):
 
     assert result.valid is False
     assert result.error_code == "SOURCE_REF_UNREACHABLE"
+
+
+@pytest.mark.parametrize("license_text", (b"not the MIT License\n", b"SPDX-License-Identifier: MIT-0\n"))
+def test_e1_rejects_license_text_false_positives(tmp_path, license_text):
+    repository, _, source, _ = _commit_repository(tmp_path)
+    commit = _commit_license(repository, license_text)
+
+    result = _verify(_definition(repository, commit, source, license_text))
+
+    assert result.valid is False
+    assert result.error_code == "LICENSE_MISMATCH"
