@@ -15,8 +15,13 @@ _VALUE: Final = r'''(?:"(?:[^"\\\r\n]|\\.)*(?:"|$)|'(?:[^'\\\r\n]|\\.)*(?:'|$)|[
 
 # Replacement and residual detection intentionally share this exact vocabulary.
 DEFAULT_SECRET_PATTERNS: Final[tuple[Pattern[str], ...]] = (
-    re.compile(r"(?im)^.*\b(?:proxy-)?authorization\s*:\s*[^\r\n]*"),
-    re.compile(r"(?im)^.*\b(?:set-)?cookie\s*:\s*[^\r\n]*"),
+    re.compile(r"(?im)^.*\b(?:proxy-)?authorization\s*(?::|=)\s*[^\r\n]*"),
+    re.compile(r"(?im)^.*\b(?:set-)?cookie\s*(?::|=)\s*[^\r\n]*"),
+    re.compile(
+        r"(?i)\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
+        r"sk-(?:proj-)?[A-Za-z0-9_-]{16,}|(?:AKIA|ASIA)[A-Z0-9]{16})\b"
+    ),
+    re.compile(r"(?i)\b(?:sig|signature)=[A-Za-z0-9%+/_=-]{16,}"),
     re.compile(
         rf"(?i)\b(?:OPENAI_API_KEY|GITHUB_TOKEN|AZURE_CLIENT_SECRET|"
         rf"AWS_[A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)[A-Z0-9_]*)\b\s*[:=]\s*{_VALUE}"
