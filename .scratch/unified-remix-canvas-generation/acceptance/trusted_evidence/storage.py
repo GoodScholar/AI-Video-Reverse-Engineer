@@ -135,7 +135,13 @@ class CatalogSnapshot:
     content_digest: str
 
 
-def _pointer_dict(pointer: EvidencePointer) -> dict[str, str]:
+@dataclass(frozen=True, slots=True)
+class CatalogAppendResult:
+    snapshot: CatalogSnapshot
+    idempotent: bool
+
+
+def _pointer_dict(pointer: EvidencePointer) -> dict[str, object]:
     return {
         "id": pointer.id,
         "profileId": pointer.profile_id,
@@ -144,6 +150,16 @@ def _pointer_dict(pointer: EvidencePointer) -> dict[str, str]:
         "artifactRef": pointer.artifact_ref,
         "registeredAt": pointer.registered_at,
     }
+
+
+def validate_pointer(pointer: EvidencePointer) -> EvidencePointer:
+    """Reapply the six-field wire contract to typed construction inputs."""
+    if not isinstance(pointer, EvidencePointer):
+        raise PolicyError("POINTER_INVALID", "catalog requires an EvidencePointer")
+    try:
+        return EvidencePointer.from_dict(_pointer_dict(pointer))
+    except (TypeError, ValueError) as error:
+        raise PolicyError("POINTER_INVALID", "invalid evidence pointer") from error
 
 
 class CatalogRepository:
@@ -228,9 +244,8 @@ class CatalogRepository:
             self._replace_if_current(snapshot.content_digest, replacement)
             return self._snapshot(replacement)
 
-    def append(self, pointer: EvidencePointer) -> CatalogSnapshot:
-        if not isinstance(pointer, EvidencePointer):
-            raise PolicyError("POINTER_INVALID", "catalog requires an EvidencePointer")
+    def append(self, pointer: EvidencePointer) -> CatalogAppendResult:
+        pointer = validate_pointer(pointer)
         with self._exclusive_lock():
             raw = self._read_raw()
             snapshot = self._snapshot(raw)
@@ -240,15 +255,16 @@ class CatalogRepository:
             if existing is not None:
                 if existing != pointer:
                     raise PolicyError("POINTER_INVALID", "catalog pointer id cannot be overwritten")
-                return snapshot
+                return CatalogAppendResult(snapshot, idempotent=True)
             replacement = canonical_json_bytes(
                 {
                     "version": 2,
                     "evidence": [*(_pointer_dict(item) for item in snapshot.pointers), _pointer_dict(pointer)],
                 }
             )
+            replacement_snapshot = self._snapshot(replacement)
             self._replace_if_current(snapshot.content_digest, replacement)
-            return self._snapshot(replacement)
+            return CatalogAppendResult(replacement_snapshot, idempotent=False)
 
 
 def _without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:

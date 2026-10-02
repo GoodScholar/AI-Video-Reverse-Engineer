@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .models import EvidencePointer
 from .registry import PolicyError, load_profiles, load_trusted_registry
-from .storage import CatalogRepository, CatalogSnapshot, ContentAddressedStore
+from .storage import CatalogRepository, CatalogSnapshot, ContentAddressedStore, validate_pointer
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,8 +26,7 @@ class EvidenceRegistrar:
         self.catalog = CatalogRepository(self.root)
 
     def register(self, pointer: EvidencePointer) -> RegistrationResult:
-        if not isinstance(pointer, EvidencePointer):
-            raise PolicyError("POINTER_INVALID", "registration requires an EvidencePointer")
+        pointer = validate_pointer(pointer)
         registry = load_trusted_registry(self.root)
         profiles = load_profiles(self.root)
         profile = profiles.get(pointer.profile_id)
@@ -46,7 +45,5 @@ class EvidenceRegistrar:
             raise PolicyError("PROFILE_SCOPE_MISMATCH", "profile does not permit this verifier")
         self.store.read(pointer.artifact_ref)
         self.catalog.migrate_empty_v1_for_write()
-        before = self.catalog.read()
-        existing = next((item for item in before.pointers if item.id == pointer.id), None)
-        snapshot = self.catalog.append(pointer)
-        return RegistrationResult(pointer, snapshot, existing == pointer)
+        appended = self.catalog.append(pointer)
+        return RegistrationResult(pointer, appended.snapshot, appended.idempotent)

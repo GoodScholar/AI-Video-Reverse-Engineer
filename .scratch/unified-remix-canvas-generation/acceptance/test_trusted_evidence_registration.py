@@ -81,7 +81,11 @@ def _pointer(artifact_ref: str, *, pointer_id: str = "sample-e2-a1b2c3d4", verif
 
 
 def _append_in_process(root: str, raw_pointer: dict[str, object]) -> str:
-    return CatalogRepository(Path(root)).append(EvidencePointer.from_dict(raw_pointer)).content_digest
+    return CatalogRepository(Path(root)).append(EvidencePointer.from_dict(raw_pointer)).snapshot.content_digest
+
+
+def _register_in_process(root: str, raw_pointer: dict[str, object]) -> bool:
+    return EvidenceRegistrar(Path(root)).register(EvidencePointer.from_dict(raw_pointer)).idempotent
 
 
 def test_content_store_derives_path_from_sha256_and_never_overwrites_different_bytes(tmp_path):
@@ -207,3 +211,75 @@ def test_catalog_rejects_non_integer_version_without_implicit_migration(tmp_path
     with pytest.raises(PolicyError, match="POINTER_INVALID"):
         CatalogRepository(root).read()
     assert catalog.read_text(encoding="utf-8") == '{"version":true,"evidence":[]}'
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"id": ""},
+        {"subject_ref": "git://product@short"},
+        {"artifact_ref": "sha256:not-a-digest"},
+        {"registered_at": "not-rfc3339"},
+    ),
+    ids=("id", "subject", "artifact", "registered_at"),
+)
+def test_constructed_invalid_pointer_is_rejected_before_catalog_write(tmp_path, overrides):
+    root = _policy_root(tmp_path)
+    artifact_ref = ContentAddressedStore(root).put(b"receipt")
+    values = {
+        "id": "sample-e2-invalid",
+        "profile_id": "sample/v1",
+        "verifier_id": "e2.sample",
+        "subject_ref": "git://product@" + "a" * 40,
+        "artifact_ref": artifact_ref,
+        "registered_at": "2026-10-02T08:30:00Z",
+    }
+    values.update(overrides)
+    pointer = EvidencePointer(**values)
+    catalog = root / "evidence-catalog.json"
+    before = catalog.read_bytes()
+
+    with pytest.raises(PolicyError, match="POINTER_INVALID"):
+        EvidenceRegistrar(root).register(pointer)
+
+    assert catalog.read_bytes() == before
+
+
+def test_catalog_append_validates_constructed_pointer_before_atomic_replace(tmp_path):
+    root = _policy_root(tmp_path)
+    repository = CatalogRepository(root)
+    repository.migrate_empty_v1_for_write()
+    before = (root / "evidence-catalog.json").read_bytes()
+    pointer = EvidencePointer(
+        id="",
+        profile_id="sample/v1",
+        verifier_id="e2.sample",
+        subject_ref="git://product@" + "a" * 40,
+        artifact_ref="sha256:" + "b" * 64,
+        registered_at="2026-10-02T08:30:00Z",
+    )
+
+    with pytest.raises(PolicyError, match="POINTER_INVALID"):
+        repository.append(pointer)
+
+    assert (root / "evidence-catalog.json").read_bytes() == before
+
+
+def test_concurrent_identical_registrations_have_one_first_write_and_idempotent_replays(tmp_path):
+    root = _policy_root(tmp_path)
+    pointer = _pointer(ContentAddressedStore(root).put(b"receipt"))
+    raw_pointer = {
+        "id": pointer.id,
+        "profileId": pointer.profile_id,
+        "verifierId": pointer.verifier_id,
+        "subjectRef": pointer.subject_ref,
+        "artifactRef": pointer.artifact_ref,
+        "registeredAt": pointer.registered_at,
+    }
+
+    with ProcessPoolExecutor(max_workers=4) as executor:
+        idempotent = list(executor.map(_register_in_process, (str(root),) * 4, (raw_pointer,) * 4))
+
+    assert idempotent.count(False) == 1
+    assert idempotent.count(True) == 3
+    assert CatalogRepository(root).read().pointers == (pointer,)
