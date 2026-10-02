@@ -77,6 +77,47 @@ class _SecondTraversalSubstitution(Mapping[str, str]):
         return self._current[key]
 
 
+class _SingleTraversalList(list[object]):
+    def __init__(self, values: list[object]) -> None:
+        super().__init__(values)
+        self.traversals = 0
+
+    def __iter__(self):
+        self.traversals += 1
+        if self.traversals > 1:
+            raise AssertionError("command sequence was traversed more than once")
+        return super().__iter__()
+
+
+class _FailingTraversalList(list[object]):
+    def __iter__(self):
+        raise RuntimeError("untrusted traversal failure")
+
+
+class _MutableCommandString(str):
+    hostile = False
+
+    def __len__(self):
+        if self.hostile:
+            raise RuntimeError("mutable command length changed")
+        return str.__len__(self)
+
+    def __str__(self):
+        if self.hostile:
+            raise RuntimeError("mutable command string changed")
+        return str.__str__(self)
+
+    def startswith(self, *args, **kwargs):
+        if self.hostile:
+            raise RuntimeError("mutable command prefix changed")
+        return str.startswith(self, *args, **kwargs)
+
+
+class _MisleadingEmptyCommandString(str):
+    def __len__(self):
+        return 1
+
+
 def _valid_e1_git(**overrides: object) -> dict[str, object]:
     definition = {
         "repositoryId": "toonflow",
@@ -288,8 +329,8 @@ def test_e2_loader_builds_a_typed_deeply_immutable_suite_contract(tmp_path):
     assert definition.id == "e2.safe"
     assert definition.subject_repository == "git://product/repository"
     assert definition.working_directory == "."
-    assert definition.argv == ("pytest", "-q")
-    assert definition.setup_argv == ("uv", "sync")
+    assert definition.argv == (("pytest", "-q"),)
+    assert definition.setup_argv == (("uv", "sync"),)
     assert definition.expected_test_ids == ("tests/test_contract.py::test_policy",)
     assert definition.parser == "pytest-json-v1"
     assert definition.allowed_environment == {"CI": "1"}
@@ -328,9 +369,92 @@ def test_e2_loader_uses_an_empty_immutable_setup_argv_when_json_omits_it(tmp_pat
     assert definition.setup_argv == ()
 
 
+def test_e2_loader_accepts_nested_setup_and_test_command_sequences(tmp_path):
+    definition = E2SuiteDefinition.from_policy(
+        root=tmp_path,
+        verifier_id="e2.safe",
+        raw=_valid_suite(
+            setupArgv=[
+                ["uv", "venv", "backend/.venv"],
+                [
+                    "uv",
+                    "pip",
+                    "sync",
+                    "--python",
+                    "backend/.venv/bin/python",
+                    "backend/requirements.lock",
+                ],
+            ],
+            argv=[
+                ["npm", "test", "--", "--run", "src/CreativeCanvas.test.tsx", "-t", "first test"],
+                ["npm", "test", "--", "--run", "src/CreativeCanvas.test.tsx", "-t", "second test"],
+            ],
+        ),
+    )
+
+    assert definition.setup_argv == (
+        ("uv", "venv", "backend/.venv"),
+        (
+            "uv",
+            "pip",
+            "sync",
+            "--python",
+            "backend/.venv/bin/python",
+            "backend/requirements.lock",
+        ),
+    )
+    assert definition.argv == (
+        ("npm", "test", "--", "--run", "src/CreativeCanvas.test.tsx", "-t", "first test"),
+        ("npm", "test", "--", "--run", "src/CreativeCanvas.test.tsx", "-t", "second test"),
+    )
+
+
+def test_e2_loader_accepts_an_explicit_empty_setup_command_sequence(tmp_path):
+    definition = E2SuiteDefinition.from_policy(
+        root=tmp_path,
+        verifier_id="e2.safe",
+        raw=_valid_suite(setupArgv=[]),
+    )
+
+    assert definition.setup_argv == ()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("argv", []),
+        ("argv", [[]]),
+        ("argv", [["pytest"], []]),
+        ("argv", ["pytest", ["-q"]]),
+        ("argv", [["pytest"], "-q"]),
+        ("argv", [["pytest", ""]]),
+        ("argv", [["pytest", 1]]),
+        ("argv", [1]),
+        ("argv", "pytest -q"),
+        ("argv", b"pytest -q"),
+        ("argv", {"pytest": "-q"}),
+        ("argv", {"pytest", "-q"}),
+        ("setupArgv", [[]]),
+        ("setupArgv", [["uv"], []]),
+        ("setupArgv", ["uv", ["sync"]]),
+        ("setupArgv", "uv sync"),
+        ("setupArgv", {"uv": "sync"}),
+    ),
+)
+def test_e2_loader_rejects_malformed_command_sequences(tmp_path, field, value):
+    with pytest.raises(PolicyError, match="POINTER_INVALID"):
+        E2SuiteDefinition.from_policy(
+            root=tmp_path,
+            verifier_id="e2.safe",
+            raw=_valid_suite(**{field: value}),
+        )
+
+
 def test_e2_factory_snapshots_and_deeply_freezes_source_containers(tmp_path):
-    setup_argv = ["uv", "sync"]
-    argv = ["pytest", "-q"]
+    setup_command = ["uv", "sync"]
+    test_command = ["pytest", "-q"]
+    setup_argv = [setup_command]
+    argv = [test_command]
     expected_test_ids = ["tests/test_contract.py::test_policy"]
     allowed_environment = {"CI": "1"}
     lockfile_digests = {"requirements.lock": "sha256:" + "a" * 64}
@@ -350,15 +474,17 @@ def test_e2_factory_snapshots_and_deeply_freezes_source_containers(tmp_path):
         raw=suite,
     )
     suite["workingDirectory"] = "rewritten"
-    setup_argv.append("--unsafe")
-    argv.append("--unsafe")
+    setup_command.append("--unsafe")
+    test_command.append("--unsafe")
+    setup_argv.append(["injected"])
+    argv.append(["injected"])
     expected_test_ids.append("tests/test_contract.py::test_untrusted")
     allowed_environment["SECRET_TOKEN"] = "leaked"
     lockfile_digests["requirements.lock"] = "sha256:" + "b" * 64
     tool_versions["python"] = "rewritten"
 
-    assert definition.setup_argv == ("uv", "sync")
-    assert definition.argv == ("pytest", "-q")
+    assert definition.setup_argv == (("uv", "sync"),)
+    assert definition.argv == (("pytest", "-q"),)
     assert definition.expected_test_ids == ("tests/test_contract.py::test_policy",)
     assert definition.allowed_environment == {"CI": "1"}
     assert definition.lockfile_digests == {"requirements.lock": "sha256:" + "a" * 64}
@@ -385,6 +511,109 @@ def test_e2_factory_validates_and_freezes_the_same_single_mapping_snapshot(tmp_p
 
     assert allowed_environment.traversals == 1
     assert definition.allowed_environment == {"CI": "1"}
+
+
+def test_e2_factory_snapshots_each_command_sequence_exactly_once(tmp_path):
+    setup_command = _SingleTraversalList(["uv", "sync"])
+    test_command = _SingleTraversalList(["pytest", "-q"])
+    setup_argv = _SingleTraversalList([setup_command])
+    argv = _SingleTraversalList([test_command])
+
+    definition = E2SuiteDefinition.from_policy(
+        root=tmp_path,
+        verifier_id="e2.safe",
+        raw=_valid_suite(setupArgv=setup_argv, argv=argv),
+    )
+
+    assert setup_argv.traversals == 1
+    assert setup_command.traversals == 1
+    assert argv.traversals == 1
+    assert test_command.traversals == 1
+    assert definition.setup_argv == (("uv", "sync"),)
+    assert definition.argv == (("pytest", "-q"),)
+
+
+def test_e2_factory_rejects_a_shared_inner_command_without_traversing_it_twice(tmp_path):
+    shared_command = _SingleTraversalList(["pytest", "-q"])
+
+    with pytest.raises(PolicyError, match="POINTER_INVALID"):
+        E2SuiteDefinition.from_policy(
+            root=tmp_path,
+            verifier_id="e2.safe",
+            raw=_valid_suite(argv=[shared_command, shared_command]),
+        )
+
+    assert shared_command.traversals == 1
+
+
+def test_e2_factory_rejects_an_inner_command_shared_across_setup_and_test_fields(tmp_path):
+    shared_command = _SingleTraversalList(["uv", "sync"])
+
+    with pytest.raises(PolicyError, match="POINTER_INVALID"):
+        E2SuiteDefinition.from_policy(
+            root=tmp_path,
+            verifier_id="e2.safe",
+            raw=_valid_suite(setupArgv=[shared_command], argv=[shared_command]),
+        )
+
+    assert shared_command.traversals == 1
+
+
+def test_e2_factory_converts_command_snapshot_failures_to_a_stable_policy_error(tmp_path):
+    with pytest.raises(PolicyError, match="POINTER_INVALID"):
+        E2SuiteDefinition.from_policy(
+            root=tmp_path,
+            verifier_id="e2.safe",
+            raw=_valid_suite(argv=_FailingTraversalList(["pytest", "-q"])),
+        )
+
+
+@pytest.mark.parametrize("nested", (False, True))
+def test_e2_factory_detaches_command_arguments_from_mutable_str_subclasses(tmp_path, nested):
+    source = _MutableCommandString("pytest")
+    argv = [[source, "-q"]] if nested else [source, "-q"]
+
+    definition = E2SuiteDefinition.from_policy(
+        root=tmp_path,
+        verifier_id="e2.safe",
+        raw=_valid_suite(argv=argv),
+    )
+    source.hostile = True
+    argument = definition.argv[0][0]
+
+    assert type(argument) is str
+    assert argument == "pytest"
+    assert len(argument) == 6
+    assert argument.startswith("py")
+
+
+@pytest.mark.parametrize("nested", (False, True))
+def test_e2_factory_does_not_invoke_hostile_str_subclass_behavior(tmp_path, nested):
+    source = _MutableCommandString("pytest")
+    source.hostile = True
+    argv = [[source, "-q"]] if nested else [source, "-q"]
+
+    definition = E2SuiteDefinition.from_policy(
+        root=tmp_path,
+        verifier_id="e2.safe",
+        raw=_valid_suite(argv=argv),
+    )
+
+    assert type(definition.argv[0][0]) is str
+    assert definition.argv[0][0] == "pytest"
+
+
+@pytest.mark.parametrize("nested", (False, True))
+def test_e2_factory_rejects_empty_str_subclasses_with_misleading_behavior(tmp_path, nested):
+    source = _MisleadingEmptyCommandString("")
+    argv = [[source]] if nested else [source]
+
+    with pytest.raises(PolicyError, match="POINTER_INVALID"):
+        E2SuiteDefinition.from_policy(
+            root=tmp_path,
+            verifier_id="e2.safe",
+            raw=_valid_suite(argv=argv),
+        )
 
 
 def test_e2_public_constructor_is_disabled_without_an_acceptance_root():

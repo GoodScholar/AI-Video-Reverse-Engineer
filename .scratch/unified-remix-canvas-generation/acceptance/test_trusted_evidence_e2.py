@@ -109,6 +109,50 @@ def test_e2_runs_only_registry_argv_in_detached_clean_checkout_with_minimal_envi
     assert result.facts["receiptRef"].startswith("sha256:")
 
 
+def test_e2_flat_and_single_nested_argv_have_the_same_normalized_input_digest(tmp_path, monkeypatch):
+    product, commit = _product_commit(tmp_path)
+    acceptance = tmp_path / "acceptance"
+    acceptance.mkdir()
+    monkeypatch.chdir(product)
+    context = _context(acceptance, commit)
+    command = ["./runner", "--json-report", "tests/test_contract.py::test_policy"]
+
+    flat = SuiteRunner().run(_suite(acceptance, argv=command), context.subject_ref, context)
+    nested = SuiteRunner().run(_suite(acceptance, argv=[command]), context.subject_ref, context)
+
+    assert flat.valid is True
+    assert nested.valid is True
+    assert flat.input_digest == nested.input_digest
+
+
+def test_e2_multi_invocation_contract_fails_closed_until_task5_associates_test_results(tmp_path, monkeypatch):
+    product, commit = _product_commit(tmp_path)
+    acceptance = tmp_path / "acceptance"
+    acceptance.mkdir()
+    monkeypatch.chdir(product)
+    context = _context(acceptance, commit)
+
+    result = SuiteRunner().run(
+        _suite(
+            acceptance,
+            argv=[
+                ["./runner", "--json-report", "tests/test_contract.py::test_first"],
+                ["./runner", "--json-report", "tests/test_contract.py::test_second"],
+            ],
+            expectedTestIds=[
+                "tests/test_contract.py::test_first",
+                "tests/test_contract.py::test_second",
+            ],
+        ),
+        context.subject_ref,
+        context,
+    )
+
+    assert result.valid is False
+    assert result.error_code == "SUITE_NOT_ALLOWLISTED"
+    assert "receiptRef" not in result.facts
+
+
 def test_e2_dirty_current_workspace_cannot_change_fixed_commit_result(tmp_path, monkeypatch):
     product, commit = _product_commit(tmp_path)
     acceptance = tmp_path / "acceptance"

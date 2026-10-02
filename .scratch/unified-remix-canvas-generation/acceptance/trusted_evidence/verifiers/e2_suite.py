@@ -49,6 +49,15 @@ def _safe_summary(data: bytes, patterns: tuple[re.Pattern[str], ...]) -> str:
         raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "receipt output cannot be safely redacted") from error
 
 
+def _single_invocation(commands: tuple[tuple[str, ...], ...]) -> tuple[str, ...]:
+    if len(commands) != 1:
+        raise _ReplayBlocked(
+            "SUITE_NOT_ALLOWLISTED",
+            "multiple registered invocations require the Task 5 executor contract",
+        )
+    return commands[0]
+
+
 class SuiteRunner:
     """Run registry argv only after rebuilding the exact commit in a private Git repo."""
 
@@ -204,8 +213,9 @@ class SuiteRunner:
 
     def _check_tools(self, suite: E2SuiteDefinition, cwd: Path, checkout: Path, environment: dict[str, str]) -> dict[str, str]:
         observed = {}
+        argv = _single_invocation(suite.argv)
         for tool, expected in suite.tool_versions.items():
-            command = suite.argv[0] if Path(suite.argv[0]).name == tool else tool
+            command = argv[0] if Path(argv[0]).name == tool else tool
             completed = self._run_command((command, "--version"), cwd=cwd, checkout=checkout, environment=environment, timeout=suite.timeout_seconds)
             version = _safe_summary(completed.stdout + completed.stderr, self.redaction_patterns).strip()
             observed[tool] = version
@@ -221,16 +231,17 @@ class SuiteRunner:
         return suite.expected_test_ids
 
     def _pytest_report(self, suite: E2SuiteDefinition, cwd: Path, checkout: Path) -> tuple[str, ...]:
-        if "--json-report" not in suite.argv:
+        argv = _single_invocation(suite.argv)
+        if "--json-report" not in argv:
             raise _ReplayBlocked("TEST_SELECTION_MISSING", "pytest JSON reporter is not enabled")
         report_path = ".report.json"
-        for index, argument in enumerate(suite.argv):
+        for index, argument in enumerate(argv):
             if argument.startswith("--json-report-file="):
                 report_path = argument.removeprefix("--json-report-file=")
             elif argument == "--json-report-file":
-                if index + 1 == len(suite.argv):
+                if index + 1 == len(argv):
                     raise _ReplayBlocked("TEST_SELECTION_MISSING", "pytest JSON report path is missing")
-                report_path = suite.argv[index + 1]
+                report_path = argv[index + 1]
         if not report_path or Path(report_path).is_absolute() or ".." in Path(report_path).parts:
             raise _ReplayBlocked("TEST_SELECTION_MISSING", "pytest JSON report path is unsafe")
         try:
@@ -247,7 +258,8 @@ class SuiteRunner:
         return self._outcomes(suite, outcomes)
 
     def _vitest_report(self, suite: E2SuiteDefinition, stdout: bytes) -> tuple[str, ...]:
-        if "--reporter=json" not in suite.argv and not any(suite.argv[index:index + 2] == ("--reporter", "json") for index in range(len(suite.argv) - 1)):
+        argv = _single_invocation(suite.argv)
+        if "--reporter=json" not in argv and not any(argv[index:index + 2] == ("--reporter", "json") for index in range(len(argv) - 1)):
             raise _ReplayBlocked("TEST_SELECTION_MISSING", "Vitest JSON reporter is not enabled")
         try:
             report = json.loads(stdout.decode("utf-8"))
@@ -273,24 +285,26 @@ class SuiteRunner:
         facts: dict[str, object] = {"suiteId": suite.id, "subjectRef": subject_ref}
         if match is None or subject_ref != context.subject_ref:
             return self._result(suite, subject_ref, context, valid=False, error_code="SUITE_NOT_ALLOWLISTED", facts=facts)
-        if not all(test_id in suite.argv for test_id in suite.expected_test_ids):
-            facts["expectedTestIds"] = suite.expected_test_ids
-            return self._result(suite, subject_ref, context, valid=False, error_code="TEST_SELECTION_MISSING", facts=facts)
         started = time.monotonic()
         try:
+            argv = _single_invocation(suite.argv)
+            setup_argv = () if not suite.setup_argv else _single_invocation(suite.setup_argv)
+            if not all(test_id in argv for test_id in suite.expected_test_ids):
+                facts["expectedTestIds"] = suite.expected_test_ids
+                return self._result(suite, subject_ref, context, valid=False, error_code="TEST_SELECTION_MISSING", facts=facts)
             with tempfile.TemporaryDirectory(prefix="trusted-e2-source-") as name:
                 source = self._source_repository(Path(name))
             with self._detached_checkout(source, match.group(1)) as checkout:
                 cwd = checkout if suite.working_directory == "." else self._checked_path(checkout, suite.working_directory, file=False)
                 lockfiles = self._check_lockfiles(suite, checkout)
                 environment = self._environment(suite)
-                if suite.setup_argv:
-                    setup = self._run_command(suite.setup_argv, cwd=cwd, checkout=checkout, environment=environment, timeout=suite.timeout_seconds)
+                if setup_argv:
+                    setup = self._run_command(setup_argv, cwd=cwd, checkout=checkout, environment=environment, timeout=suite.timeout_seconds)
                     if setup.returncode != 0:
                         facts["setupExitCode"] = setup.returncode
                         return self._result(suite, subject_ref, context, valid=False, error_code="TEST_REPLAY_FAILED", facts=facts)
                 tools = self._check_tools(suite, cwd, checkout, environment)
-                completed = self._run_command(suite.argv, cwd=cwd, checkout=checkout, environment=environment, timeout=suite.timeout_seconds)
+                completed = self._run_command(argv, cwd=cwd, checkout=checkout, environment=environment, timeout=suite.timeout_seconds)
                 selected = () if completed.returncode else self._selected_tests(suite, completed.stdout, cwd, checkout)
                 receipt = {
                     "schema": "trusted-e2-receipt/v1", "suiteId": suite.id, "subjectRef": subject_ref,

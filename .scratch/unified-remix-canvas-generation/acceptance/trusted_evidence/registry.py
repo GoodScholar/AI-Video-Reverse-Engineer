@@ -127,8 +127,8 @@ class E2SuiteDefinition:
     id: str
     subject_repository: str
     working_directory: str
-    setup_argv: tuple[str, ...]
-    argv: tuple[str, ...]
+    setup_argv: tuple[tuple[str, ...], ...]
+    argv: tuple[tuple[str, ...], ...]
     expected_test_ids: tuple[str, ...]
     parser: Literal["pytest-json-v1", "vitest-json-v1"]
     allowed_environment: Mapping[str, str]
@@ -177,12 +177,23 @@ class E2SuiteDefinition:
         working_directory = _controlled_relative_path(
             suite["workingDirectory"], "suite.workingDirectory", acceptance_root
         )
+        command_container_ids: set[int] = set()
         setup_argv = (
-            _literal_argv(suite["setupArgv"], "suite.setupArgv")
+            _command_sequence(
+                suite["setupArgv"],
+                "suite.setupArgv",
+                allow_empty=True,
+                container_ids=command_container_ids,
+            )
             if "setupArgv" in suite
             else ()
         )
-        argv = _literal_argv(suite["argv"], "suite.argv")
+        argv = _command_sequence(
+            suite["argv"],
+            "suite.argv",
+            allow_empty=False,
+            container_ids=command_container_ids,
+        )
         expected_test_ids = _literal_argv(suite["expectedTestIds"], "suite.expectedTestIds")
         if len(expected_test_ids) != len(set(expected_test_ids)):
             raise PolicyError("POINTER_INVALID", "suite.expectedTestIds must be unique")
@@ -331,6 +342,65 @@ def _literal_argv(value: object, field: str) -> tuple[str, ...]:
     if not argv:
         raise PolicyError("POINTER_INVALID", f"{field} must not be empty")
     return argv
+
+
+def _command_argument(value: object, field: str) -> str:
+    try:
+        if not isinstance(value, str):
+            raise PolicyError("POINTER_INVALID", f"{field} arguments must be strings")
+        argument = str.__str__(value)
+        if type(argument) is not str or not argument:
+            raise PolicyError("POINTER_INVALID", f"{field} arguments must be non-empty strings")
+        return argument
+    except PolicyError:
+        raise
+    except Exception as error:
+        raise PolicyError("POINTER_INVALID", f"{field} argument cannot be normalized") from error
+
+
+def _command_sequence(
+    value: object,
+    field: str,
+    *,
+    allow_empty: bool,
+    container_ids: set[int],
+) -> tuple[tuple[str, ...], ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise PolicyError(
+            "POINTER_INVALID",
+            f"{field} must be a flat command or a sequence of commands",
+        )
+    snapshot = _snapshot_command_container(value, field, container_ids)
+    if not snapshot:
+        if allow_empty:
+            return ()
+        raise PolicyError("POINTER_INVALID", f"{field} must contain at least one command")
+    if all(isinstance(item, str) for item in snapshot):
+        return (tuple(_command_argument(item, field) for item in snapshot),)
+    if all(isinstance(item, (list, tuple)) for item in snapshot):
+        commands = []
+        for item in snapshot:
+            command = _snapshot_command_container(item, field, container_ids)
+            if not command:
+                raise PolicyError("POINTER_INVALID", f"{field} commands must not be empty")
+            commands.append(tuple(_command_argument(argument, field) for argument in command))
+        return tuple(commands)
+    raise PolicyError("POINTER_INVALID", f"{field} must not mix command nesting levels")
+
+
+def _snapshot_command_container(
+    value: list[object] | tuple[object, ...],
+    field: str,
+    container_ids: set[int],
+) -> tuple[object, ...]:
+    identity = id(value)
+    if identity in container_ids:
+        raise PolicyError("POINTER_INVALID", f"{field} must not reuse a command container")
+    container_ids.add(identity)
+    try:
+        return tuple(value)
+    except Exception as error:
+        raise PolicyError("POINTER_INVALID", f"{field} cannot be snapshotted") from error
 
 
 def _controlled_relative_path_text(value: object, field: str) -> str:
