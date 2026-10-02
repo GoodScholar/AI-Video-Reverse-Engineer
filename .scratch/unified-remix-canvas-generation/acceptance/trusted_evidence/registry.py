@@ -30,6 +30,7 @@ _REUSE_KINDS = frozenset(
 )
 _GIT_REMOTE_SCHEMES = frozenset({"https", "ssh", "git"})
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_SUBJECT_REPOSITORY = "git://product/repository"
 
 
 class PolicyError(ValueError):
@@ -135,6 +136,67 @@ class E2SuiteDefinition:
     lockfile_digests: Mapping[str, str]
     tool_versions: Mapping[str, str]
 
+    def __post_init__(self) -> None:
+        identifier = _nonempty_string(self.id, "suite.id")
+        if self.subject_repository != _SUBJECT_REPOSITORY:
+            raise PolicyError("POINTER_INVALID", "suite.subjectRepository is not the product repository")
+        working_directory = _controlled_relative_path_text(
+            self.working_directory, "suite.workingDirectory"
+        )
+        setup_argv = _string_list(self.setup_argv, "suite.setupArgv")
+        argv = _literal_argv(self.argv, "suite.argv")
+        expected_test_ids = _literal_argv(self.expected_test_ids, "suite.expectedTestIds")
+        if len(expected_test_ids) != len(set(expected_test_ids)):
+            raise PolicyError("POINTER_INVALID", "suite.expectedTestIds must be unique")
+        parser = _nonempty_string(self.parser, "suite.parser.kind")
+        if parser not in _SUITE_PARSERS:
+            raise PolicyError("POINTER_INVALID", "suite.parser.kind is not registered")
+
+        allowed_environment = _required_mapping(
+            self.allowed_environment, "suite.allowedEnvironment"
+        )
+        for name, value in allowed_environment.items():
+            if name not in _SAFE_ENVIRONMENT or value != _SAFE_ENVIRONMENT[name]:
+                raise PolicyError("POINTER_INVALID", "suite.allowedEnvironment has an unsafe value")
+
+        if (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, int)
+            or self.timeout_seconds <= 0
+        ):
+            raise PolicyError("POINTER_INVALID", "suite.timeoutSeconds must be a positive integer")
+
+        lockfile_digests = _required_mapping(self.lockfile_digests, "suite.lockfileDigests")
+        if not lockfile_digests:
+            raise PolicyError("POINTER_INVALID", "suite.lockfileDigests must not be empty")
+        for path, digest in lockfile_digests.items():
+            _controlled_relative_path_text(path, "suite.lockfileDigests path")
+            if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+                raise PolicyError(
+                    "POINTER_INVALID", "suite.lockfileDigests values must be SHA-256 digests"
+                )
+
+        tool_versions = _required_mapping(self.tool_versions, "suite.toolVersions")
+        if not tool_versions:
+            raise PolicyError("POINTER_INVALID", "suite.toolVersions must not be empty")
+        for tool, version in tool_versions.items():
+            if not isinstance(tool, str) or not _TOOL_NAME.fullmatch(tool):
+                raise PolicyError("POINTER_INVALID", "suite.toolVersions keys must be tool names")
+            if not isinstance(version, str) or not version or "\n" in version or "\r" in version:
+                raise PolicyError(
+                    "POINTER_INVALID", "suite.toolVersions values must be single-line strings"
+                )
+
+        object.__setattr__(self, "id", identifier)
+        object.__setattr__(self, "working_directory", working_directory)
+        object.__setattr__(self, "setup_argv", setup_argv)
+        object.__setattr__(self, "argv", argv)
+        object.__setattr__(self, "expected_test_ids", expected_test_ids)
+        object.__setattr__(self, "parser", parser)
+        object.__setattr__(self, "allowed_environment", MappingProxyType(dict(allowed_environment)))
+        object.__setattr__(self, "lockfile_digests", MappingProxyType(dict(lockfile_digests)))
+        object.__setattr__(self, "tool_versions", MappingProxyType(dict(tool_versions)))
+
 
 def _nonempty_string(value: object, field: str, code: str = "POINTER_INVALID") -> str:
     if not isinstance(value, str) or not value:
@@ -223,12 +285,17 @@ def _literal_argv(value: object, field: str) -> tuple[str, ...]:
     return argv
 
 
-def _controlled_relative_path(value: object, field: str, root: Path) -> str:
+def _controlled_relative_path_text(value: object, field: str) -> str:
     path_text = _nonempty_string(value, field)
     path = Path(path_text)
     if path.is_absolute() or ".." in path.parts:
         raise PolicyError("POINTER_INVALID", f"{field} must remain below acceptance root")
-    _inside_root(root, root / path)
+    return path_text
+
+
+def _controlled_relative_path(value: object, field: str, root: Path) -> str:
+    path_text = _controlled_relative_path_text(value, field)
+    _inside_root(root, root / path_text)
     return path_text
 
 

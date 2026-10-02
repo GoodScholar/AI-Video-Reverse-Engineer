@@ -51,6 +51,24 @@ def _valid_suite(**overrides: object) -> dict[str, object]:
     return suite
 
 
+def _direct_e2_suite(**overrides: object) -> E2SuiteDefinition:
+    values: dict[str, object] = {
+        "id": "e2.safe",
+        "subject_repository": "git://product/repository",
+        "working_directory": ".",
+        "setup_argv": (),
+        "argv": ("pytest", "-q"),
+        "expected_test_ids": ("tests/test_contract.py::test_policy",),
+        "parser": "pytest-json-v1",
+        "allowed_environment": {"CI": "1"},
+        "timeout_seconds": 60,
+        "lockfile_digests": {"requirements.lock": "sha256:" + "a" * 64},
+        "tool_versions": {"python": "3.13"},
+    }
+    values.update(overrides)
+    return E2SuiteDefinition(**values)  # type: ignore[arg-type]
+
+
 def _valid_e1_git(**overrides: object) -> dict[str, object]:
     definition = {
         "repositoryId": "toonflow",
@@ -300,6 +318,64 @@ def test_e2_loader_uses_an_empty_immutable_setup_argv_when_json_omits_it(tmp_pat
 
     assert isinstance(definition, E2SuiteDefinition)
     assert definition.setup_argv == ()
+
+
+def test_e2_direct_construction_copies_and_deeply_freezes_source_containers():
+    setup_argv = ["uv", "sync"]
+    argv = ["pytest", "-q"]
+    expected_test_ids = ["tests/test_contract.py::test_policy"]
+    allowed_environment = {"CI": "1"}
+    lockfile_digests = {"requirements.lock": "sha256:" + "a" * 64}
+    tool_versions = {"python": "3.13"}
+
+    definition = _direct_e2_suite(
+        setup_argv=setup_argv,
+        argv=argv,
+        expected_test_ids=expected_test_ids,
+        allowed_environment=allowed_environment,
+        lockfile_digests=lockfile_digests,
+        tool_versions=tool_versions,
+    )
+    setup_argv.append("--unsafe")
+    argv.append("--unsafe")
+    expected_test_ids.append("tests/test_contract.py::test_untrusted")
+    allowed_environment["SECRET_TOKEN"] = "leaked"
+    lockfile_digests["requirements.lock"] = "sha256:" + "b" * 64
+    tool_versions["python"] = "rewritten"
+
+    assert definition.setup_argv == ("uv", "sync")
+    assert definition.argv == ("pytest", "-q")
+    assert definition.expected_test_ids == ("tests/test_contract.py::test_policy",)
+    assert definition.allowed_environment == {"CI": "1"}
+    assert definition.lockfile_digests == {"requirements.lock": "sha256:" + "a" * 64}
+    assert definition.tool_versions == {"python": "3.13"}
+    with pytest.raises(TypeError):
+        definition.allowed_environment["CI"] = "rewritten"
+    with pytest.raises(TypeError):
+        definition.lockfile_digests["requirements.lock"] = "sha256:" + "b" * 64
+    with pytest.raises(TypeError):
+        definition.tool_versions["python"] = "rewritten"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("id", ""),
+        ("subject_repository", "git://untrusted/repository"),
+        ("working_directory", "../../outside"),
+        ("argv", ()),
+        ("expected_test_ids", ("duplicate", "duplicate")),
+        ("parser", "untrusted-parser"),
+        ("allowed_environment", {"SECRET_TOKEN": "value"}),
+        ("timeout_seconds", True),
+        ("lockfile_digests", {"../outside.lock": "sha256:" + "a" * 64}),
+        ("lockfile_digests", {"requirements.lock": "not-a-digest"}),
+        ("tool_versions", {"python": ""}),
+    ),
+)
+def test_e2_direct_construction_rejects_invalid_policy(field, value):
+    with pytest.raises(PolicyError, match="POINTER_INVALID"):
+        _direct_e2_suite(**{field: value})
 
 
 def test_empty_profiles_directory_returns_empty_without_other_policy_files(tmp_path):
