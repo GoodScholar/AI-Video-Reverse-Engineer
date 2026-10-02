@@ -6,9 +6,11 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 import json
 import math
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 from types import MappingProxyType
+from typing import Literal
+from urllib.parse import urlparse
 
 from .models import AcceptanceProfile
 
@@ -23,6 +25,12 @@ _SAFE_ENVIRONMENT = MappingProxyType(
     {"CI": "1", "NO_COLOR": "1", "PYTHONDONTWRITEBYTECODE": "1"}
 )
 _SUITE_PARSERS = frozenset({"pytest-json-v1", "vitest-json-v1"})
+_GIT_SOURCE_KINDS = frozenset({"repository", "bundle"})
+_REUSE_KINDS = frozenset(
+    {"direct-copy", "algorithm-port", "structural-adaptation", "reference-only"}
+)
+_GIT_REMOTE_SCHEMES = frozenset({"https", "ssh", "git"})
+_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
 
 class PolicyError(ValueError):
@@ -44,7 +52,7 @@ class VerifierDefinition:
     verifier_id: str
     type_id: str
     level: str
-    definition: Mapping[str, object]
+    definition: Mapping[str, object] | E1GitDefinition
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +82,44 @@ class RevocationSet:
     fingerprints: frozenset[str]
     signature_digests: frozenset[str]
     evidence_digests: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class GitObjectSource:
+    kind: Literal["repository", "bundle"]
+    path: Path
+    digest: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class GitBlobFact:
+    digest: str
+    local_path: str | None
+    attribution: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class LicenseFact:
+    path: str
+    spdx: str
+    digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReuseFact:
+    kind: Literal["direct-copy", "algorithm-port", "structural-adaptation", "reference-only"]
+    attribution: str
+
+
+@dataclass(frozen=True, slots=True)
+class E1GitDefinition:
+    repository_id: str
+    object_source: GitObjectSource
+    remote_urls: tuple[str, ...]
+    commit: str
+    blobs: Mapping[str, GitBlobFact]
+    license_fact: LicenseFact
+    reuse: ReuseFact
 
 
 def _nonempty_string(value: object, field: str, code: str = "POINTER_INVALID") -> str:
@@ -253,12 +299,131 @@ def _validate_suite(value: object, root: Path) -> Mapping[str, object]:
     return frozen
 
 
-def _validate_git_definition(value: object) -> Mapping[str, object]:
-    if not isinstance(value, Mapping):
-        raise PolicyError("POINTER_INVALID", "git definition must be an object")
-    frozen = _freeze_policy_value(value, "git definition")
-    assert isinstance(frozen, Mapping)
-    return frozen
+def _repository_relative_path(value: object, field: str) -> str:
+    path_text = _nonempty_string(value, field)
+    if "\\" in path_text:
+        raise PolicyError("POINTER_INVALID", f"{field} must use a relative Git path")
+    path = PurePosixPath(path_text)
+    if path.is_absolute() or path == PurePosixPath(".") or ".." in path.parts:
+        raise PolicyError("POINTER_INVALID", f"{field} must use a relative Git path")
+    return path.as_posix()
+
+
+def _digest(value: object, field: str) -> str:
+    digest = _nonempty_string(value, field)
+    if not _DIGEST.fullmatch(digest):
+        raise PolicyError("POINTER_INVALID", f"{field} must be sha256:<64-hex>")
+    return digest
+
+
+def _git_object_source(value: object, root: Path) -> GitObjectSource:
+    source = _required_mapping(value, "git.objectSource")
+    kind = _nonempty_string(source.get("kind"), "git.objectSource.kind")
+    if kind not in _GIT_SOURCE_KINDS:
+        raise PolicyError("POINTER_INVALID", "git.objectSource.kind is not registered")
+    expected = {"kind", "path"} | ({"sha256"} if kind == "bundle" else set())
+    _exact_keys(source, expected, "git.objectSource")
+    path_text = _controlled_relative_path(source["path"], "git.objectSource.path", root)
+    digest = _digest(source["sha256"], "git.objectSource.sha256") if kind == "bundle" else None
+    return GitObjectSource(
+        kind=kind,  # type: ignore[arg-type]
+        path=(root / path_text).resolve(),
+        digest=digest,
+    )
+
+
+def _trusted_remote_urls(value: object) -> tuple[str, ...]:
+    urls = _literal_argv(value, "git.remoteUrls")
+    if len(urls) != len(set(urls)):
+        raise PolicyError("POINTER_INVALID", "git.remoteUrls must be unique")
+    for remote_url in urls:
+        parsed = urlparse(remote_url)
+        if (
+            parsed.scheme not in _GIT_REMOTE_SCHEMES
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise PolicyError("POINTER_INVALID", "git.remoteUrls must be trusted URLs")
+    return urls
+
+
+def _git_blobs(value: object) -> Mapping[str, GitBlobFact]:
+    blobs = _required_mapping(value, "git.blobs")
+    if not blobs:
+        raise PolicyError("POINTER_INVALID", "git.blobs must not be empty")
+    parsed: dict[str, GitBlobFact] = {}
+    for path, raw_fact in blobs.items():
+        normalized_path = _repository_relative_path(path, "git.blobs path")
+        if normalized_path in parsed:
+            raise PolicyError("POINTER_INVALID", "git.blobs contains duplicate paths")
+        fact = _required_mapping(raw_fact, f"git.blobs.{normalized_path}")
+        allowed = {"sha256", "localPath", "attribution"}
+        if set(fact) - allowed or "sha256" not in fact:
+            raise PolicyError("POINTER_INVALID", "git blob fact has unsupported fields")
+        has_local_path = "localPath" in fact
+        has_attribution = "attribution" in fact
+        if has_local_path != has_attribution:
+            raise PolicyError("POINTER_INVALID", "git blob localPath and attribution must appear together")
+        parsed[normalized_path] = GitBlobFact(
+            digest=_digest(fact["sha256"], "git blob sha256"),
+            local_path=(
+                _repository_relative_path(fact["localPath"], "git blob localPath")
+                if has_local_path
+                else None
+            ),
+            attribution=(
+                _nonempty_string(fact["attribution"], "git blob attribution")
+                if has_attribution
+                else None
+            ),
+        )
+    return MappingProxyType(parsed)
+
+
+def _license_fact(value: object) -> LicenseFact:
+    fact = _required_mapping(value, "git.licenseFact")
+    _exact_keys(fact, {"path", "spdx", "sha256"}, "git.licenseFact")
+    return LicenseFact(
+        path=_repository_relative_path(fact["path"], "git.licenseFact.path"),
+        spdx=_nonempty_string(fact["spdx"], "git.licenseFact.spdx"),
+        digest=_digest(fact["sha256"], "git.licenseFact.sha256"),
+    )
+
+
+def _reuse_fact(value: object) -> ReuseFact:
+    fact = _required_mapping(value, "git.reuse")
+    _exact_keys(fact, {"kind", "attribution"}, "git.reuse")
+    kind = _nonempty_string(fact["kind"], "git.reuse.kind")
+    if kind not in _REUSE_KINDS:
+        raise PolicyError("POINTER_INVALID", "git.reuse.kind is not registered")
+    return ReuseFact(
+        kind=kind,  # type: ignore[arg-type]
+        attribution=_nonempty_string(fact["attribution"], "git.reuse.attribution"),
+    )
+
+
+def _validate_git_definition(value: object, root: Path) -> E1GitDefinition:
+    definition = _required_mapping(value, "git definition")
+    _exact_keys(
+        definition,
+        {"repositoryId", "objectSource", "remoteUrls", "commit", "blobs", "licenseFact", "reuse"},
+        "git definition",
+    )
+    commit = _nonempty_string(definition["commit"], "git.commit")
+    if not _COMMIT.fullmatch(commit):
+        raise PolicyError("POINTER_INVALID", "git.commit must be a complete 40-hex commit")
+    return E1GitDefinition(
+        repository_id=_nonempty_string(definition["repositoryId"], "git.repositoryId"),
+        object_source=_git_object_source(definition["objectSource"], root),
+        remote_urls=_trusted_remote_urls(definition["remoteUrls"]),
+        commit=commit,
+        blobs=_git_blobs(definition["blobs"]),
+        license_fact=_license_fact(definition["licenseFact"]),
+        reuse=_reuse_fact(definition["reuse"]),
+    )
 
 
 def _parse_registry(raw: Mapping[str, object], root: Path) -> TrustedRegistry:
@@ -306,7 +471,7 @@ def _parse_registry(raw: Mapping[str, object], root: Path) -> TrustedRegistry:
             definition = _validate_suite(entry["suite"], root)
         else:
             _exact_keys(entry, {"id", "type", "git"}, "E1 verifier entry")
-            definition = _validate_git_definition(entry["git"])
+            definition = _validate_git_definition(entry["git"], root)
         verifiers[verifier_id] = VerifierDefinition(verifier_id, type_id, verifier_type.level, definition)
 
     return TrustedRegistry(MappingProxyType(verifier_types), MappingProxyType(verifiers))

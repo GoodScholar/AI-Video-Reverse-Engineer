@@ -1,9 +1,13 @@
 import json
 from pathlib import Path
+from dataclasses import FrozenInstanceError
+from copy import deepcopy
 
 import pytest
 
 from trusted_evidence.registry import (
+    E1GitDefinition,
+    GitObjectSource,
     PolicyError,
     load_profiles,
     load_revocations,
@@ -46,6 +50,38 @@ def _valid_suite(**overrides: object) -> dict[str, object]:
     return suite
 
 
+def _valid_e1_git(**overrides: object) -> dict[str, object]:
+    definition = {
+        "repositoryId": "toonflow",
+        "objectSource": {
+            "kind": "bundle",
+            "path": "trust/git/toonflow.bundle",
+            "sha256": "sha256:" + "a" * 64,
+        },
+        "remoteUrls": ["https://github.com/toonflow/toonflow.git"],
+        "commit": "b" * 40,
+        "blobs": {
+            "packages/canvas/source.ts": {
+                "sha256": "sha256:" + "c" * 64,
+                "localPath": "frontend/src/CreativeCanvas.tsx",
+                "attribution": "Toonflow canvas adaptation",
+            }
+        },
+        "licenseFact": {
+            "path": "LICENSE",
+            "spdx": "MIT",
+            "sha256": "sha256:" + "d" * 64,
+        },
+        "reuse": {"kind": "structural-adaptation", "attribution": "Toonflow MIT"},
+    }
+    definition.update(overrides)
+    return definition
+
+
+def _e1_entry(git: dict[str, object]) -> dict[str, object]:
+    return {"id": "e1.source", "type": "e1.git-license.v1", "git": git}
+
+
 def test_phase_one_registry_has_e1_e2_implementations_but_no_production_e3_or_e4_entry():
     registry = load_trusted_registry(ACCEPTANCE)
 
@@ -53,6 +89,58 @@ def test_phase_one_registry_has_e1_e2_implementations_but_no_production_e3_or_e4
     assert registry.verifiers == {}
     assert registry.verifiers_for_level("E3") == ()
     assert registry.verifiers_for_level("E4") == ()
+
+
+def test_e1_loader_builds_an_immutable_typed_git_policy(tmp_path):
+    _write_json(tmp_path / "trusted-registry.json", _registry([_e1_entry(_valid_e1_git())]))
+
+    definition = load_trusted_registry(tmp_path).verifiers["e1.source"].definition
+
+    assert isinstance(definition, E1GitDefinition)
+    assert isinstance(definition.object_source, GitObjectSource)
+    assert definition.object_source.kind == "bundle"
+    assert definition.object_source.path == (tmp_path / "trust/git/toonflow.bundle").resolve()
+    assert definition.object_source.digest == "sha256:" + "a" * 64
+    assert definition.blobs["packages/canvas/source.ts"].local_path == "frontend/src/CreativeCanvas.tsx"
+    with pytest.raises(TypeError):
+        definition.blobs["new"] = definition.blobs["packages/canvas/source.ts"]
+    with pytest.raises(FrozenInstanceError):
+        definition.object_source.path = tmp_path  # type: ignore[misc]
+
+    repository_policy = _valid_e1_git(objectSource={"kind": "repository", "path": "trust/git/product"})
+    _write_json(tmp_path / "trusted-registry.json", _registry([_e1_entry(repository_policy)]))
+    repository_definition = load_trusted_registry(tmp_path).verifiers["e1.source"].definition
+    assert isinstance(repository_definition, E1GitDefinition)
+    assert repository_definition.object_source.kind == "repository"
+    assert repository_definition.object_source.digest is None
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda policy: policy["objectSource"].update(kind="unknown"),
+        lambda policy: policy["objectSource"].update(path="../../outside"),
+        lambda policy: policy["objectSource"].pop("sha256"),
+        lambda policy: policy["objectSource"].update(kind="repository", sha256="sha256:" + "a" * 64),
+        lambda policy: policy.update(commit="a" * 39),
+        lambda policy: policy.update(remoteUrls=[]),
+        lambda policy: policy.update(remoteUrls=["https://github.com/toonflow/toonflow.git"] * 2),
+        lambda policy: policy.update(remoteUrls=["not-a-url"]),
+        lambda policy: policy.update(blobs={}),
+        lambda policy: policy.update(blobs={"../escape": {"sha256": "sha256:" + "c" * 64}}),
+        lambda policy: policy["blobs"]["packages/canvas/source.ts"].update(sha256="not-a-digest"),
+        lambda policy: policy["licenseFact"].update(spdx=""),
+        lambda policy: policy["reuse"].update(kind="unreviewed"),
+        lambda policy: policy.update(command=["git", "status"]),
+    ),
+)
+def test_e1_loader_rejects_unclosed_or_invalid_git_policy(tmp_path, mutate):
+    policy = deepcopy(_valid_e1_git())
+    mutate(policy)
+    _write_json(tmp_path / "trusted-registry.json", _registry([_e1_entry(policy)]))
+
+    with pytest.raises(PolicyError, match="POINTER_INVALID"):
+        load_trusted_registry(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -187,7 +275,7 @@ def test_empty_profiles_directory_returns_empty_without_other_policy_files(tmp_p
 def test_profile_rejects_unknown_items_verifiers_levels_and_supporting_range_ownership(tmp_path):
     _write_json(
         tmp_path / "trusted-registry.json",
-        _registry([{"id": "e1.source", "type": "e1.git-license.v1", "git": {}}]),
+        _registry([_e1_entry(_valid_e1_git())]),
     )
     _write_json(
         tmp_path / "matrix-contract.json",
