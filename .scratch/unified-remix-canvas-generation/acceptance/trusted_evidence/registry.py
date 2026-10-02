@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 import json
-import math
 from pathlib import Path, PurePosixPath
 import re
 from types import MappingProxyType
@@ -52,7 +51,7 @@ class VerifierDefinition:
     verifier_id: str
     type_id: str
     level: str
-    definition: Mapping[str, object] | E1GitDefinition
+    definition: E1GitDefinition | E2SuiteDefinition
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +119,21 @@ class E1GitDefinition:
     blobs: Mapping[str, GitBlobFact]
     license_fact: LicenseFact
     reuse: ReuseFact
+
+
+@dataclass(frozen=True, slots=True)
+class E2SuiteDefinition:
+    id: str
+    subject_repository: str
+    working_directory: str
+    setup_argv: tuple[str, ...]
+    argv: tuple[str, ...]
+    expected_test_ids: tuple[str, ...]
+    parser: Literal["pytest-json-v1", "vitest-json-v1"]
+    allowed_environment: Mapping[str, str]
+    timeout_seconds: int
+    lockfile_digests: Mapping[str, str]
+    tool_versions: Mapping[str, str]
 
 
 def _nonempty_string(value: object, field: str, code: str = "POINTER_INVALID") -> str:
@@ -224,26 +238,7 @@ def _required_mapping(value: object, field: str) -> Mapping[str, object]:
     return value
 
 
-def _freeze_policy_value(value: object, field: str) -> object:
-    if value is None or isinstance(value, (bool, str, int)):
-        return value
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise PolicyError("POINTER_INVALID", f"{field} must contain finite JSON values")
-        return value
-    if isinstance(value, Mapping):
-        frozen: dict[str, object] = {}
-        for key, nested_value in value.items():
-            if not isinstance(key, str):
-                raise PolicyError("POINTER_INVALID", f"{field} mapping keys must be strings")
-            frozen[key] = _freeze_policy_value(nested_value, field)
-        return MappingProxyType(frozen)
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze_policy_value(item, field) for item in value)
-    raise PolicyError("POINTER_INVALID", f"{field} must contain JSON values")
-
-
-def _validate_suite(value: object, root: Path) -> Mapping[str, object]:
+def _validate_suite(value: object, root: Path, verifier_id: str) -> E2SuiteDefinition:
     value = _required_mapping(value, "suite")
     allowed = {
         "subjectRepository",
@@ -260,17 +255,19 @@ def _validate_suite(value: object, root: Path) -> Mapping[str, object]:
     required = allowed - {"setupArgv"}
     if set(value) - allowed or required - set(value):
         raise PolicyError("POINTER_INVALID", "suite contains an unsupported field")
-    _nonempty_string(value["subjectRepository"], "suite.subjectRepository")
-    _controlled_relative_path(value["workingDirectory"], "suite.workingDirectory", root)
-    for field in ("setupArgv", "argv"):
-        if field in value:
-            _literal_argv(value[field], f"suite.{field}")
+    subject_repository = _nonempty_string(value["subjectRepository"], "suite.subjectRepository")
+    working_directory = _controlled_relative_path(
+        value["workingDirectory"], "suite.workingDirectory", root
+    )
+    setup_argv = _literal_argv(value["setupArgv"], "suite.setupArgv") if "setupArgv" in value else ()
+    argv = _literal_argv(value["argv"], "suite.argv")
     expected_test_ids = _literal_argv(value["expectedTestIds"], "suite.expectedTestIds")
     if len(expected_test_ids) != len(set(expected_test_ids)):
         raise PolicyError("POINTER_INVALID", "suite.expectedTestIds must be unique")
     parser = _required_mapping(value["parser"], "suite.parser")
     _exact_keys(parser, {"kind"}, "suite.parser")
-    if _nonempty_string(parser["kind"], "suite.parser.kind") not in _SUITE_PARSERS:
+    parser_kind = _nonempty_string(parser["kind"], "suite.parser.kind")
+    if parser_kind not in _SUITE_PARSERS:
         raise PolicyError("POINTER_INVALID", "suite.parser.kind is not registered")
     allowed_environment = _required_mapping(value["allowedEnvironment"], "suite.allowedEnvironment")
     for name, environment_value in allowed_environment.items():
@@ -294,9 +291,19 @@ def _validate_suite(value: object, root: Path) -> Mapping[str, object]:
             raise PolicyError("POINTER_INVALID", "suite.toolVersions keys must be tool names")
         if not isinstance(version, str) or not version or "\n" in version or "\r" in version:
             raise PolicyError("POINTER_INVALID", "suite.toolVersions values must be single-line strings")
-    frozen = _freeze_policy_value(value, "suite")
-    assert isinstance(frozen, Mapping)
-    return frozen
+    return E2SuiteDefinition(
+        id=verifier_id,
+        subject_repository=subject_repository,
+        working_directory=working_directory,
+        setup_argv=setup_argv,
+        argv=argv,
+        expected_test_ids=expected_test_ids,
+        parser=parser_kind,  # type: ignore[arg-type]
+        allowed_environment=MappingProxyType(dict(allowed_environment)),
+        timeout_seconds=timeout,
+        lockfile_digests=MappingProxyType(dict(lockfile_digests)),
+        tool_versions=MappingProxyType(dict(tool_versions)),
+    )
 
 
 def _repository_relative_path(value: object, field: str) -> str:
@@ -468,7 +475,7 @@ def _parse_registry(raw: Mapping[str, object], root: Path) -> TrustedRegistry:
             raise PolicyError("VERIFIER_NOT_REGISTERED", f"unregistered verifier type: {type_id}")
         if type_id == "e2.argv-suite.v1":
             _exact_keys(entry, {"id", "type", "suite"}, "E2 verifier entry")
-            definition = _validate_suite(entry["suite"], root)
+            definition = _validate_suite(entry["suite"], root, verifier_id)
         else:
             _exact_keys(entry, {"id", "type", "git"}, "E1 verifier entry")
             definition = _validate_git_definition(entry["git"], root)

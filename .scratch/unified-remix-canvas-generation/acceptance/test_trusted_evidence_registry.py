@@ -6,6 +6,7 @@ from copy import deepcopy
 import pytest
 
 from trusted_evidence.registry import (
+    E2SuiteDefinition,
     E1GitDefinition,
     GitObjectSource,
     PolicyError,
@@ -239,7 +240,7 @@ def test_verifier_type_schema_rejects_e2_definition_and_e1_generic_definition(tm
             load_trusted_registry(tmp_path)
 
 
-def test_loaded_suite_policy_is_deeply_immutable(tmp_path):
+def test_e2_loader_builds_a_typed_deeply_immutable_suite_contract(tmp_path):
     _write_json(
         tmp_path / "trusted-registry.json",
         _registry(
@@ -257,13 +258,48 @@ def test_loaded_suite_policy_is_deeply_immutable(tmp_path):
     )
 
     definition = load_trusted_registry(tmp_path).verifiers["e2.safe"].definition
-    assert definition["argv"] == ("pytest", "-q")
-    assert definition["setupArgv"] == ("uv", "sync")
-    assert definition["parser"]["kind"] == "pytest-json-v1"
+    assert isinstance(definition, E2SuiteDefinition)
+    assert definition.id == "e2.safe"
+    assert definition.subject_repository == "git://product/repository"
+    assert definition.working_directory == "."
+    assert definition.argv == ("pytest", "-q")
+    assert definition.setup_argv == ("uv", "sync")
+    assert definition.expected_test_ids == ("tests/test_contract.py::test_policy",)
+    assert definition.parser == "pytest-json-v1"
+    assert definition.allowed_environment == {"CI": "1"}
+    assert definition.timeout_seconds == 60
+    assert definition.lockfile_digests == {"requirements.lock": "sha256:" + "a" * 64}
+    assert definition.tool_versions == {"python": "3.13"}
     with pytest.raises((AttributeError, TypeError)):
-        definition["argv"].append("--unsafe")
+        definition.argv.append("--unsafe")
     with pytest.raises(TypeError):
-        definition["parser"]["kind"] = "rewritten"
+        definition.allowed_environment["CI"] = "rewritten"
+    with pytest.raises(TypeError):
+        definition.lockfile_digests["requirements.lock"] = "sha256:" + "b" * 64
+    with pytest.raises(TypeError):
+        definition.tool_versions["python"] = "rewritten"
+    with pytest.raises(FrozenInstanceError):
+        definition.timeout_seconds = 1  # type: ignore[misc]
+
+
+def test_e2_loader_uses_an_empty_immutable_setup_argv_when_json_omits_it(tmp_path):
+    _write_json(
+        tmp_path / "trusted-registry.json",
+        _registry(
+            [
+                {
+                    "id": "e2.safe",
+                    "type": "e2.argv-suite.v1",
+                    "suite": _valid_suite(),
+                }
+            ]
+        ),
+    )
+
+    definition = load_trusted_registry(tmp_path).verifiers["e2.safe"].definition
+
+    assert isinstance(definition, E2SuiteDefinition)
+    assert definition.setup_argv == ()
 
 
 def test_empty_profiles_directory_returns_empty_without_other_policy_files(tmp_path):
