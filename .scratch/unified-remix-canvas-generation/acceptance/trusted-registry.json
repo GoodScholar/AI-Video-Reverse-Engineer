@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "verifierTypes": {
+    "e1.git-license.v1": {"level": "E1"},
+    "e2.argv-suite.v1": {"level": "E2"}
+  },
+  "verifiers": []
+}
