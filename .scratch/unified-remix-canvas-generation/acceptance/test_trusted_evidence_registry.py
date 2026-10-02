@@ -55,6 +55,8 @@ def test_phase_one_registry_has_e1_e2_implementations_but_no_production_e3_or_e4
             "suite": {"argv": ["pytest", "-q"], "cwd": "../outside"},
         },
         {"id": "e2.bad", "type": "e2.argv-suite.v1", "suite": {}},
+        {"type": "e2.argv-suite.v1", "suite": {"argv": ["pytest"]}},
+        {"id": "e2.bad", "type": "e2.argv-suite.v1", "suite": {"argv": ["pytest"], "metadata": {}}},
     ),
 )
 def test_registry_rejects_shell_strings_unknown_verifier_types_and_nonliteral_argv(tmp_path, entry):
@@ -85,10 +87,55 @@ def test_registry_rejects_suite_cwd_that_escapes_through_a_symlink(tmp_path):
         load_trusted_registry(tmp_path)
 
 
+def test_verifier_type_schema_rejects_e2_definition_and_e1_generic_definition(tmp_path):
+    for entry in (
+        {"id": "e2.bad", "type": "e2.argv-suite.v1", "definition": {"shell": "pytest"}},
+        {"id": "e1.bad", "type": "e1.git-license.v1", "definition": {}},
+    ):
+        _write_json(tmp_path / "trusted-registry.json", _registry([entry]))
+
+        with pytest.raises(PolicyError, match="POINTER_INVALID"):
+            load_trusted_registry(tmp_path)
+
+
+def test_loaded_suite_policy_is_deeply_immutable(tmp_path):
+    _write_json(
+        tmp_path / "trusted-registry.json",
+        _registry(
+            [
+                {
+                    "id": "e2.safe",
+                    "type": "e2.argv-suite.v1",
+                    "suite": {
+                        "argv": ["pytest", "-q"],
+                        "setupArgv": ["uv", "sync"],
+                        "parser": {"nested": ["kept"]},
+                    },
+                }
+            ]
+        ),
+    )
+
+    definition = load_trusted_registry(tmp_path).verifiers["e2.safe"].definition
+    assert definition["argv"] == ("pytest", "-q")
+    assert definition["setupArgv"] == ("uv", "sync")
+    assert definition["parser"]["nested"] == ("kept",)
+    with pytest.raises((AttributeError, TypeError)):
+        definition["argv"].append("--unsafe")
+    with pytest.raises(TypeError):
+        definition["parser"]["nested"] = ()
+
+
+def test_empty_profiles_directory_returns_empty_without_other_policy_files(tmp_path):
+    (tmp_path / "profiles").mkdir()
+
+    assert load_profiles(tmp_path) == {}
+
+
 def test_profile_rejects_unknown_items_verifiers_levels_and_supporting_range_ownership(tmp_path):
     _write_json(
         tmp_path / "trusted-registry.json",
-        _registry([{"id": "e1.source", "type": "e1.git-license.v1"}]),
+        _registry([{"id": "e1.source", "type": "e1.git-license.v1", "git": {}}]),
     )
     _write_json(
         tmp_path / "matrix-contract.json",

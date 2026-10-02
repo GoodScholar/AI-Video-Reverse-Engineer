@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 import re
 from types import MappingProxyType
@@ -157,9 +158,43 @@ def _literal_argv(value: object, field: str) -> tuple[str, ...]:
     return argv
 
 
+def _freeze_policy_value(value: object, field: str) -> object:
+    if value is None or isinstance(value, (bool, str, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise PolicyError("POINTER_INVALID", f"{field} must contain finite JSON values")
+        return value
+    if isinstance(value, Mapping):
+        frozen: dict[str, object] = {}
+        for key, nested_value in value.items():
+            if not isinstance(key, str):
+                raise PolicyError("POINTER_INVALID", f"{field} mapping keys must be strings")
+            frozen[key] = _freeze_policy_value(nested_value, field)
+        return MappingProxyType(frozen)
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_policy_value(item, field) for item in value)
+    raise PolicyError("POINTER_INVALID", f"{field} must contain JSON values")
+
+
 def _validate_suite(value: object, root: Path) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise PolicyError("POINTER_INVALID", "suite must be an object")
+    allowed = {
+        "subjectRepository",
+        "workingDirectory",
+        "cwd",
+        "setupArgv",
+        "argv",
+        "expectedTestIds",
+        "parser",
+        "allowedEnvironment",
+        "timeoutSeconds",
+        "lockfileDigests",
+        "toolVersions",
+    }
+    if set(value) - allowed:
+        raise PolicyError("POINTER_INVALID", "suite contains an unsupported field")
     forbidden = {"shell", "command", "env", "environment", "runner", "module", "pythonModule"}
     if forbidden & set(value):
         raise PolicyError("POINTER_INVALID", "suite contains a forbidden execution field")
@@ -173,7 +208,17 @@ def _validate_suite(value: object, root: Path) -> Mapping[str, object]:
         if Path(cwd).is_absolute() or ".." in Path(cwd).parts:
             raise PolicyError("POINTER_INVALID", "suite.cwd must remain below acceptance root")
         _inside_root(root, root / cwd)
-    return MappingProxyType(dict(value))
+    frozen = _freeze_policy_value(value, "suite")
+    assert isinstance(frozen, Mapping)
+    return frozen
+
+
+def _validate_git_definition(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise PolicyError("POINTER_INVALID", "git definition must be an object")
+    frozen = _freeze_policy_value(value, "git definition")
+    assert isinstance(frozen, Mapping)
+    return frozen
 
 
 def _parse_registry(raw: Mapping[str, object], root: Path) -> TrustedRegistry:
@@ -207,9 +252,8 @@ def _parse_registry(raw: Mapping[str, object], root: Path) -> TrustedRegistry:
     for entry in entries_raw:
         if not isinstance(entry, Mapping):
             raise PolicyError("POINTER_INVALID", "verifier entry must be an object")
-        allowed = {"id", "type", "definition", "suite"}
-        if set(entry) - allowed or {"id", "type"} - set(entry):
-            raise PolicyError("POINTER_INVALID", "verifier entry has unsupported fields")
+        if not {"id", "type"} <= set(entry):
+            raise PolicyError("POINTER_INVALID", "verifier entry is missing id or type")
         verifier_id = _nonempty_string(entry["id"], "verifier.id")
         if verifier_id in verifiers:
             raise PolicyError("POINTER_INVALID", f"duplicate verifier id: {verifier_id}")
@@ -217,16 +261,12 @@ def _parse_registry(raw: Mapping[str, object], root: Path) -> TrustedRegistry:
         verifier_type = verifier_types.get(type_id)
         if verifier_type is None:
             raise PolicyError("VERIFIER_NOT_REGISTERED", f"unregistered verifier type: {type_id}")
-        if "suite" in entry:
-            if type_id != "e2.argv-suite.v1":
-                raise PolicyError("POINTER_INVALID", "only E2 verifier entries may contain suites")
+        if type_id == "e2.argv-suite.v1":
+            _exact_keys(entry, {"id", "type", "suite"}, "E2 verifier entry")
             definition = _validate_suite(entry["suite"], root)
-        elif "definition" in entry:
-            if not isinstance(entry["definition"], Mapping):
-                raise PolicyError("POINTER_INVALID", "verifier.definition must be an object")
-            definition = MappingProxyType(dict(entry["definition"]))
         else:
-            definition = MappingProxyType({})
+            _exact_keys(entry, {"id", "type", "git"}, "E1 verifier entry")
+            definition = _validate_git_definition(entry["git"])
         verifiers[verifier_id] = VerifierDefinition(verifier_id, type_id, verifier_type.level, definition)
 
     return TrustedRegistry(MappingProxyType(verifier_types), MappingProxyType(verifiers))
@@ -336,10 +376,13 @@ def load_profiles(root: Path) -> dict[str, AcceptanceProfile]:
         return {}
     if not profiles_dir.is_dir():
         raise PolicyError("POINTER_INVALID", "profiles must be a directory")
+    profile_paths = sorted(profiles_dir.glob("*.json"))
+    if not profile_paths:
+        return {}
     registry = load_trusted_registry(acceptance_root)
     item_ids, requirements = _matrix_requirements(acceptance_root)
     profiles: dict[str, AcceptanceProfile] = {}
-    for path in sorted(profiles_dir.glob("*.json")):
+    for path in profile_paths:
         _inside_root(acceptance_root, path)
         raw = _read_json(acceptance_root, str(path.relative_to(acceptance_root)))
         assert raw is not None
