@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from types import MappingProxyType
-from typing import Literal, Mapping, Protocol
+import math
 import re
+from types import MappingProxyType
+from typing import Literal, Protocol
 
 
 _SUBJECT_REF_PATTERN = re.compile(r"^git://product@[0-9a-f]{40}$")
@@ -14,16 +16,14 @@ _ARTIFACT_REF_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _RFC3339_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
 )
-_POINTER_FIELDS = frozenset(
-    {
-        "id",
-        "profile_id",
-        "verifier_id",
-        "subject_ref",
-        "artifact_ref",
-        "registered_at",
-    }
-)
+_CATALOG_POINTER_FIELDS = {
+    "id": "id",
+    "profileId": "profile_id",
+    "verifierId": "verifier_id",
+    "subjectRef": "subject_ref",
+    "artifactRef": "artifact_ref",
+    "registeredAt": "registered_at",
+}
 
 
 def _require_nonempty_string(value: object, field_name: str) -> str:
@@ -43,10 +43,51 @@ def _require_rfc3339(value: object, field_name: str) -> str:
     return timestamp
 
 
+def _freeze_json_value(value: object, field_name: str, ancestors: set[int] | None = None) -> object:
+    if value is None or isinstance(value, (bool, str, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{field_name} must contain finite JSON values")
+        return value
+    if isinstance(value, (Mapping, list, tuple)):
+        ancestors = set() if ancestors is None else ancestors
+        value_id = id(value)
+        if value_id in ancestors:
+            raise ValueError(f"{field_name} must not contain cycles")
+        ancestors.add(value_id)
+        try:
+            if isinstance(value, Mapping):
+                frozen = {}
+                for key, nested_value in value.items():
+                    if not isinstance(key, str):
+                        raise ValueError(f"{field_name} mapping keys must be strings")
+                    frozen[key] = _freeze_json_value(nested_value, field_name, ancestors)
+                return MappingProxyType(frozen)
+            return tuple(_freeze_json_value(item, field_name, ancestors) for item in value)
+        finally:
+            ancestors.remove(value_id)
+    raise ValueError(f"{field_name} must contain JSON values")
+
+
 def _freeze_mapping(value: Mapping[str, object], field_name: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{field_name} must be a mapping")
-    return MappingProxyType(dict(value))
+    frozen = _freeze_json_value(value, field_name)
+    assert isinstance(frozen, Mapping)
+    return frozen
+
+
+def _freeze_string_tuple(value: object, field_name: str) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ValueError(f"{field_name} must be a list or tuple of non-empty strings")
+    return tuple(_require_nonempty_string(item, field_name) for item in value)
+
+
+def _freeze_string_set(value: object, field_name: str) -> frozenset[str]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple, set, frozenset)):
+        raise ValueError(f"{field_name} must be a collection of non-empty strings")
+    return frozenset(_require_nonempty_string(item, field_name) for item in value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,27 +107,28 @@ class EvidencePointer:
             raise ValueError("pointer must be a mapping")
 
         keys = set(raw)
-        unknown = keys - _POINTER_FIELDS
+        expected_fields = set(_CATALOG_POINTER_FIELDS)
+        unknown = keys - expected_fields
         if unknown:
             raise ValueError(f"unknown fields: {', '.join(sorted(unknown))}")
-        missing = _POINTER_FIELDS - keys
+        missing = expected_fields - keys
         if missing:
             raise ValueError(f"missing fields: {', '.join(sorted(missing))}")
 
-        subject_ref = _require_nonempty_string(raw["subject_ref"], "subject_ref")
+        subject_ref = _require_nonempty_string(raw["subjectRef"], "subjectRef")
         if not _SUBJECT_REF_PATTERN.fullmatch(subject_ref):
             raise ValueError("subject_ref must be git://product@<40-hex>")
-        artifact_ref = _require_nonempty_string(raw["artifact_ref"], "artifact_ref")
+        artifact_ref = _require_nonempty_string(raw["artifactRef"], "artifactRef")
         if not _ARTIFACT_REF_PATTERN.fullmatch(artifact_ref):
             raise ValueError("artifact_ref must be sha256:<64-hex>")
 
         return cls(
             id=_require_nonempty_string(raw["id"], "id"),
-            profile_id=_require_nonempty_string(raw["profile_id"], "profile_id"),
-            verifier_id=_require_nonempty_string(raw["verifier_id"], "verifier_id"),
+            profile_id=_require_nonempty_string(raw["profileId"], "profileId"),
+            verifier_id=_require_nonempty_string(raw["verifierId"], "verifierId"),
             subject_ref=subject_ref,
             artifact_ref=artifact_ref,
-            registered_at=_require_rfc3339(raw["registered_at"], "registered_at"),
+            registered_at=_require_rfc3339(raw["registeredAt"], "registeredAt"),
         )
 
 
@@ -119,10 +161,7 @@ class VerificationResult:
         object.__setattr__(
             self,
             "zero_tolerance_violations",
-            tuple(
-                _require_nonempty_string(violation, "zero_tolerance_violations")
-                for violation in self.zero_tolerance_violations
-            ),
+            _freeze_string_tuple(self.zero_tolerance_violations, "zero_tolerance_violations"),
         )
 
 
@@ -157,14 +196,23 @@ class AcceptanceProfile:
         _require_nonempty_string(self.version, "version")
         if not _SUBJECT_REF_PATTERN.fullmatch(self.subject_ref):
             raise ValueError("subject_ref must be git://product@<40-hex>")
-        object.__setattr__(self, "owned_item_ids", frozenset(self.owned_item_ids))
-        object.__setattr__(self, "supporting_item_ids", frozenset(self.supporting_item_ids))
+        object.__setattr__(self, "owned_item_ids", _freeze_string_set(self.owned_item_ids, "owned_item_ids"))
+        object.__setattr__(
+            self,
+            "supporting_item_ids",
+            _freeze_string_set(self.supporting_item_ids, "supporting_item_ids"),
+        )
+        if not isinstance(self.required_verifier_ids, Mapping):
+            raise ValueError("required_verifier_ids must be a mapping")
         object.__setattr__(
             self,
             "required_verifier_ids",
             MappingProxyType(
                 {
-                    item_id: tuple(verifier_ids)
+                    _require_nonempty_string(item_id, "required_verifier_ids key"): _freeze_string_tuple(
+                        verifier_ids,
+                        "required_verifier_ids values",
+                    )
                     for item_id, verifier_ids in self.required_verifier_ids.items()
                 }
             ),
@@ -179,9 +227,9 @@ class TruthQueryPolicy:
     max_age_seconds: int | None = None
 
     def __post_init__(self) -> None:
-        schemes = frozenset(self.allowed_schemes)
-        if not schemes or any(not isinstance(scheme, str) or not scheme for scheme in schemes):
-            raise ValueError("allowed_schemes must contain non-empty schemes")
+        schemes = _freeze_string_set(self.allowed_schemes, "allowed_schemes")
+        if not schemes:
+            raise ValueError("allowed_schemes must not be empty")
         if self.max_age_seconds is not None and self.max_age_seconds < 0:
             raise ValueError("max_age_seconds must be non-negative")
         object.__setattr__(self, "allowed_schemes", schemes)
