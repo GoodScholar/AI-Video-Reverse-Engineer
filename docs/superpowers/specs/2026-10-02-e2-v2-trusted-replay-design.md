@@ -121,12 +121,19 @@ v2 suite 是 registry 拥有的闭合策略，pointer 不能提供或覆盖任�
   "dependencyRepositoryRefs": {
     "npm": "sha256:<offline-npm-repository-digest>"
   },
-  "derivedEntrypoints": {},
+  "derivedEntrypoints": {
+    "vitest": {
+      "path": "frontend/node_modules/vitest/vitest.mjs",
+      "type": "js-module",
+      "digest": "sha256:<installed-entry-file-digest>",
+      "interpreter": "node"
+    }
+  },
   "setupInvocations": [
     {
       "id": "npm-ci",
       "tool": "npm",
-      "args": ["ci", "--ignore-scripts"]
+      "args": ["ci", "--ignore-scripts", "--offline", "--cache=@dependency-repository/npm"]
     }
   ],
   "testInvocations": [
@@ -156,14 +163,15 @@ v2 suite 是 registry 拥有的闭合策略，pointer 不能提供或覆盖任�
 规则：
 
 - `tool` 是工具链 manifest 的逻辑 entrypoint，不是文件名搜索请求；
-- suite 可声明 setup 后的 `derivedEntrypoints`，但只能是位于 checkout 的 venv symlink（目标精确等于包内 CPython）或 lockfile + 离线仓库共同证明摘要的 dependency entry file；不得发现 `.bin`、PATH 或任意新 executable；
+- `derivedEntrypoints` 是按逻辑名排序的对象；每项只允许且必须包含 `path/type/digest/interpreter`。`path` 是 NFC、无 `.`/`..` 的 checkout 相对路径；`type` 仅为 `js-module`、`python-module`、`python-venv-symlink` 或 `native-executable`；`digest` 对普通文件取原始 bytes SHA-256，对 symlink 取 UTF-8 规范 target bytes SHA-256；`interpreter` 必须是同一 suite 的 toolchain entrypoint 逻辑名，`native-executable` 固定为 `null`；
+- setup 后 runner 必须从已验证 lock mapping 重建预期安装树，以 repository manifest 的 `installTreeDigest` 核对完整树，再在该树内按 `path/type/digest/interpreter` 重新解析每个入口。`python-venv-symlink` 的规范 target 必须精确指向包内 CPython；`js-module/python-module` 只能由登记解释器直接加载；`native-executable` 还必须属于包条目的 `nativeClosure`。路径被替换、类型变化、摘要不符、解释器不符、入口离开安装树或通过 `.bin`/PATH 发现均为 `E2_DERIVED_ENTRYPOINT_INVALID`；
 - setup/test 都是非空、不可变的 invocation 对象；v1 的裸 `setupArgv/argv` 不自动升级；
 - parser 与 selection 分开。selection 描述 registry 预期身份，report 证明实际身份；二者不能通过“字符串在 argv 中出现”替代；
 - 每个 Task 11 Vitest 精确测试名使用一个 invocation，文件参数和 `-t` 参数分别核对；`-t` 值必须由 loader 对 `exactName` 做 ECMAScript RegExp 元字符转义后加 `^...$` 生成，registry 不接受任意正则；
 - Python suite 使用 `pytest-nodeids/v1`，argv 中逐一携带精确 node ID；
 - report 路径必须位于隔离 checkout 的受控临时子目录，执行前确认不存在，执行后只读一次；
-- npm 仅用于 `ci --ignore-scripts --offline`；测试由包内 Node 直接加载 lockfile 安装并核验摘要的 `node_modules/vitest/vitest.mjs`，不经过 npm package-script shell 或项目 `.bin` PATH；
-- `dependencyRepositoryRefs` 是离线依赖仓库的内容地址。v2 禁止 live registry/download；uv/npm 必须使用已验证离线仓库与固定 lockfile。
+- npm setup 的规范 argv 必须含 `ci --ignore-scripts --offline --cache=@dependency-repository/npm`；Python setup 必须含 `uv sync --offline --no-index --find-links=@dependency-repository/python`，并固定 `UV_OFFLINE=1`、`PIP_NO_INDEX=1`。`@dependency-repository/<ecosystem>` 是唯一受支持的 argv token，由 runner 在 spawn 前替换成 containment 内已验证只读 view 的绝对路径；registry 不接受其他变量、路径模板或环境展开。测试由包内 Node/Python 直接加载已验证 derived entrypoint，不经过 npm package-script shell、项目 `.bin` PATH 或 venv activation script；
+- `dependencyRepositoryRefs` 只能引用 6.3 节的内容地址。network namespace 默认无 egress；任何 DNS/socket/live registry 探测即 `E2_LIVE_REGISTRY_ACCESS`，即使本地缓存最终令命令退出 0 也不能接受。
 
 ### 6.2 `trusted-e2-toolchain-tar-zstd/v1`
 
@@ -183,13 +191,27 @@ manifest 必须是 archive 的第一个 member，固定路径 `.trusted-e2-toolc
   "containerFormat": "trusted-e2-toolchain-tar-zstd/v1",
   "payloadTreeDigest": "sha256:<canonical-files-list-digest>",
   "platform": {
+    "schema": "e2-platform-identity/v1",
+    "executionKind": "native-rootfs",
     "executionOs": "linux",
     "arch": "arm64",
-    "abi": "gnu",
-    "minimumOs": "debian-13",
-    "minimumKernel": "6.2",
+    "executionImageDigest": "sha256:<canonical-rootfs-image-digest>",
+    "osReleaseDigest": "sha256:<canonical-os-release-digest>",
+    "loader": {"path": "/lib/ld-linux-aarch64.so.1", "sha256": "sha256:<digest>", "buildId": "hex:<elf-build-id>"},
+    "libc": {"family": "glibc", "version": "2.41", "sha256": "sha256:<digest>", "buildId": "hex:<elf-build-id>"},
     "containmentBackend": "linux-cgroup-v2/v1",
-    "allowedSystemLibraries": ["linux-vdso.so.1", "libc.so.6", "libm.so.6", "libpthread.so.0", "libdl.so.2", "ld-linux-aarch64.so.1"]
+    "hostCompatibility": {
+      "schema": "linux-host-compat/v1",
+      "kernelVersionScheme": "numeric-triplet/v1",
+      "kernelMinInclusive": [6, 2, 0],
+      "kernelMaxExclusive": [7, 0, 0],
+      "kernelAbiBuildIds": ["sha256:<allowed-kernel-abi-build-id>"],
+      "requiredCapabilities": ["cgroup.kill", "clone3.into-cgroup", "namespace.user", "namespace.mount", "namespace.pid", "namespace.network", "namespace.ipc"]
+    },
+    "allowedSystemLibraries": [
+      {"path": "/lib/libc.so.6", "soname": "libc.so.6", "sha256": "sha256:<digest>", "buildId": "hex:<elf-build-id>"},
+      {"path": "/lib/libm.so.6", "soname": "libm.so.6", "sha256": "sha256:<digest>", "buildId": "hex:<elf-build-id>"}
+    ]
   },
   "entrypoints": {
     "git": {"argvPrefix": ["bin/git"], "version": "git version 2.53.0"},
@@ -204,8 +226,8 @@ manifest 必须是 archive 的第一个 member，固定路径 `.trusted-e2-toolc
     "git": {"roots": ["bin/git", "libexec/git-core", "share/git-core/templates"], "treeDigest": "sha256:<digest>"}
   },
   "dynamicDependencies": {
-    "bin/git": ["lib/libz.so.1", "system:libc.so.6"],
-    "bin/node": ["system:libc.so.6", "system:libm.so.6"]
+    "bin/git": ["lib/libz.so.1", "system:/lib/libc.so.6@sha256:<digest>"],
+    "bin/node": ["system:/lib/libc.so.6@sha256:<digest>", "system:/lib/libm.so.6@sha256:<digest>"]
   },
   "files": [
     {"path": "bin", "type": "dir", "mode": "0555"},
@@ -230,24 +252,91 @@ manifest 必须是 archive 的第一个 member，固定路径 `.trusted-e2-toolc
 
 运行时闭包规则：
 
-- `platform` 是执行环境身份，不是打包机器标签；必须精确匹配 execution OS、architecture、ABI、最低 OS/kernel 和注册的 containment backend；
-- manifest 必须列出每个 ELF/Mach-O entrypoint 和 helper 的完整动态依赖。依赖要么是包内 file，要么是 `allowedSystemLibraries` 的 `system:` 项；运行前离线扫描，发现未列依赖、RPATH 越界或宿主任意搜索路径即 `E2_DYNAMIC_DEPENDENCY_UNTRUSTED`；
+- `executionKind` 仅为 `native-rootfs` 或 `vm-guest-rootfs`。`platform` 是执行环境身份，不是打包机器标签；`schema/executionKind/executionOs/arch/executionImageDigest/osReleaseDigest/loader/libc/containmentBackend` 逐字段精确比较。`osReleaseDigest` 是 image 内规范 `/etc/os-release` regular-file bytes 的 SHA-256；native backend 的 `executionImageDigest` 必须等于 containment profile 登记的 `executorImageDigest`，VM backend 则必须等于精确 `guestImageDigest` manifest 登记的 rootfs digest。不存在自由文本 `minimumOs/minimumKernel` 比较；
+- `linux-host-compat/v1` 是唯一允许的 Linux host predicate：实际 `uname.release` 必须先匹配 `^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:[-+].*)?$`，仅前三个十进制分量作为无符号 32-bit tuple，按 major/minor/patch 数值字典序满足 `minInclusive <= actual < maxExclusive`；后缀不参与排序。`kernelAbiBuildId` 定义为规范 JSON `{executionOs,arch,unameRelease,kernelGnuBuildId}` bytes 的 SHA-256，其中 `kernelGnuBuildId` 必须由只读 `/sys/kernel/notes` 的 GNU build-id note 唯一取得；缺失/多个/畸形 note 即 `E2_CONTAINMENT_UNAVAILABLE`。所得 digest 必须精确命中 `kernelAbiBuildIds`，从而约束相同 numeric version 的发行版变体。allowlist 必须非空、bytewise 排序、无重复；能力集合也必须与实测集合逐项满足；
+- loader、libc 和每个系统动态库按规范绝对路径、文件 SHA-256 与 ELF build ID 三者精确核对；SONAME 仅作附加一致性检查。同 SONAME、不同 bytes/build ID 必须 `E2_TOOLCHAIN_PLATFORM_MISMATCH`，不得以版本字符串或“ABI 看起来兼容”放行；
+- manifest 必须列出每个 ELF/Mach-O entrypoint 和 helper 的完整动态依赖。依赖要么是包内 file，要么按规范绝对路径命中 `allowedSystemLibraries` 的完整 identity；运行前离线扫描，发现未列依赖、RPATH 越界、SONAME-only 命中或宿主任意搜索路径即 `E2_DYNAMIC_DEPENDENCY_UNTRUSTED`；
 - CPython closure 必须包括可执行文件、`libpython`、完整 stdlib、`lib-dynload`、编码和 CA/zoneinfo 等运行必需资源；venv 解释器只能链接回该 closure；
 - npm closure 必须包括 `npm-cli.js` 的完整模块树和包内 Node；Git closure 必须包括 `libexec/git-core` helpers、templates 及实际会调用的 shims；单个 launcher 文件不构成闭包；
 - shebang 不通过 `/usr/bin/env` 解析。entrypoint 展开为 manifest 中的绝对 argv prefix；runner 不传入宿主 PATH；
 - runner 始终 `shell=False`。npm v2 仅允许不执行 lifecycle script 的离线安装；测试由包内 Node/Python 直接加载已验证依赖 entrypoint，不经过 package-script shell；
-- v2 禁止 live dependency download。`dependencyRepositoryRefs` 指向另一个内容寻址、带完整条目摘要和同等解包预算的只读离线仓库；uv/npm 必须启用 offline 模式，lockfile 中每个包必须映射到仓库中的精确 digest。
+- v2 禁止 live dependency download。`dependencyRepositoryRefs` 必须符合下一节的唯一映射与精确安装树规则；uv/npm 必须启用 offline/no-index 模式。
 - 离线依赖中的 native extension/`.node` 文件也要做动态依赖扫描并遵守平台 allowlist；setup 禁止 lifecycle/postinstall script，缺少预构建闭包时阻塞而不是现场编译或联网下载。
 
 稳定容器错误码为：`E2_TOOLCHAIN_PACKAGE_TOO_LARGE`、`E2_TOOLCHAIN_ARCHIVE_INVALID`、`E2_TOOLCHAIN_ENTRY_LIMIT`、`E2_TOOLCHAIN_EXPANSION_LIMIT`、`E2_TOOLCHAIN_CLOSURE_INVALID`、`E2_DYNAMIC_DEPENDENCY_UNTRUSTED` 和 `E2_DEPENDENCY_REPOSITORY_INVALID`。
 
-### 6.3 `trusted-e2-receipt/v2`
+### 6.3 `trusted-e2-dependency-repository/v1`
+
+每个 `dependencyRepositoryRef` 指向一个 suite-scope、只读、内容寻址的 dependency container。唯一容器格式为 `trusted-e2-dependency-repository-tar-zstd/v1`：其 zstd/ustar/header/path/member/symlink 规则与 6.2 节完全相同，manifest 固定为首个 member `.trusted-e2-dependencies/manifest.json`，container 存放于：
+
+```text
+trust/dependencies/sha256/<digest前2位>/<64位digest>
+```
+
+引用 digest 对完整压缩 bytes 取 SHA-256。manifest 最大 1 MiB，不自列举；其余 member 必须由 `files` 完整列举。包 archive 只能位于固定 CAS member 路径 `blobs/sha256/<digest前2位>/<64位digest>`，路径 digest 必须等于 archive 原始 bytes digest：
+
+```json
+{
+  "schema": "trusted-e2-dependency-repository/v1",
+  "containerFormat": "trusted-e2-dependency-repository-tar-zstd/v1",
+  "ecosystem": "npm",
+  "payloadTreeDigest": "sha256:<canonical-files-list-digest>",
+  "platformIdentityDigest": "sha256:<canonical-e2-platform-identity-digest>",
+  "installationTreeDigest": "sha256:<canonical-complete-installation-tree-digest>",
+  "packages": [
+    {
+      "packageId": "npm:vitest@3.0.8",
+      "name": "vitest",
+      "version": "3.0.8",
+      "archiveKind": "npm-tgz",
+      "archivePath": "blobs/sha256/ab/ab<62-hex>",
+      "archiveDigest": "sha256:ab<62-hex>",
+      "archiveSize": 12345,
+      "installTreeDigest": "sha256:<canonical-installed-files-digest>",
+      "nativeClosure": []
+    }
+  ],
+  "lockMappings": [
+    {
+      "lockfilePath": "frontend/package-lock.json",
+      "lockfileDigest": "sha256:<digest>",
+      "lockNode": "node_modules/vitest",
+      "packageId": "npm:vitest@3.0.8",
+      "archiveDigest": "sha256:ab<62-hex>",
+      "installTreeDigest": "sha256:<canonical-installed-files-digest>"
+    }
+  ],
+  "files": [
+    {"path": "blobs", "type": "dir", "mode": "0555"},
+    {"path": "blobs/sha256", "type": "dir", "mode": "0555"},
+    {"path": "blobs/sha256/ab", "type": "dir", "mode": "0555"},
+    {"path": "blobs/sha256/ab/ab<62-hex>", "type": "file", "size": 12345, "mode": "0444", "sha256": "sha256:ab<62-hex>"}
+  ]
+}
+```
+
+正式规则：
+
+- manifest 是拒绝未知/缺失/重复字段的规范 JSON；`payloadTreeDigest/platformIdentityDigest/installationTreeDigest` 和所有 package/mapping/file digest 都是必填 64-hex SHA-256，不能使用版本字符串或文件名替代；
+- `ecosystem` 仅为 `npm` 或 `python`，一个 container 只含一个 ecosystem。`packageId` 的规范形式分别为 `npm:<NFC-name>@<exact-semver>` 与 `python:<PEP-503-normalized-name>==<PEP-440-exact-version>`；禁止 version range、tag、latest、URL、VCS/path dependency 和重复 `(name, version)`；
+- `archiveKind` 仅为与 ecosystem 一致的 `npm-tgz`、`python-wheel` 或 `python-sdist`；archive 内嵌 metadata 的 name/version 必须与条目逐字段一致。runner 在 no-exec 临时根先做路径、类型、member 数、单项/总量和压缩比检查，再向 package manager 暴露只读 view；archive path escape、特殊文件、hardlink、重复/大小写折叠 path 或未登记 symlink 均为 `E2_DEPENDENCY_REPOSITORY_INVALID`；
+- `packages` 按 `packageId` bytewise 升序，`lockMappings` 按 `(lockfilePath, lockNode)` bytewise 升序，均不得重复。npm `lockNode` 是 package-lock v3 的规范 packages key；Python `lockNode` 是锁文件内规范化的 distribution name + version + marker/environment tuple；marker 必须在 suite 的精确平台身份下先确定求值；
+- suite 使用的每个 ecosystem 在 `dependencyRepositoryRefs` 中必须恰有一个引用，未使用的 ecosystem 不得出现；suite 中每个 lockfile node 必须在对应 repository 中取得一条 mapping，且 mapping 的 `lockfilePath/lockfileDigest` 必须精确命中 suite `lockfileDigests`。`packageId/archiveDigest/installTreeDigest` 必须与 package 条目逐字段相等。零条、两条、同包多摘要、同 node 多包或 lockfile 中未固定 archive hash 均为 `E2_DEPENDENCY_MAPPING_INVALID`；
+- repository 必须是该 suite 的精确闭包：每个 `packages` 条目和每个 blob 都必须由一个 lock mapping 引用，且每个 mapping 必须被安装。额外包、额外 blob、未使用 mapping、缺包或 archive 路径与 digest 不一致均为 `E2_DEPENDENCY_REPOSITORY_INVALID`；
+- 每个 package 的 `installTreeDigest` 对该包完成规范解包后、执行任何项目代码前得到的完整安装条目数组取规范 JSON SHA-256；top-level `installationTreeDigest` 对所有实际安装 package 的条目并集取摘要。条目 schema 与 toolchain `files` 相同并额外要求 `ownerPackageId`；排序、路径、mode、symlink 和大小写折叠规则不变。runner 必须同时匹配逐包 digest 和 top-level digest，不接受包间覆盖；
+- `nativeClosure` 必须逐项列出安装树内 ELF/Mach-O/`.node`/Python extension 的 `path/digest/format/needed/rpath`；`needed` 只能精确引用同安装树文件、toolchain file 或 platform identity 中 path+digest+buildId 已固定的 system library。非空 native file 未列、同 SONAME 不同 ABI、RPATH 越界或运行时编译均为 `E2_DYNAMIC_DEPENDENCY_UNTRUSTED`；
+- 解包预算固定为：container 压缩 bytes 最大 1 GiB、最多 100,000 members、最多 20,000 package 条目、单 archive 最大 256 MiB、全部 blob 最大 2 GiB、全部安装树最大 4 GiB、container 和任一 archive 的展开比都不得超过 100:1。manifest/member/archive/install tree 任一预算在写出越界 bytes 前失败；
+- npm 只从校验后的只读 cache view 执行 `ci --ignore-scripts --offline`；Python 只从校验后的 wheel/sdist view 执行 `uv sync --offline --no-index`，并禁止 build isolation 联网、禁止未登记 build backend 和任意 install/lifecycle script。需要构建而没有登记且闭合的本地 build closure 时阻塞，不现场下载或编译；
+- setup 前后网络 namespace 维持无 egress，并记录 socket-deny counter。runner 同时把 npm/Python registry URL 固定到不可达 sentinel；counter 非零或工具尝试解析/连接 sentinel 时，无论退出码为何都返回 `E2_LIVE_REGISTRY_ACCESS`。
+
+### 6.4 `trusted-e2-receipt/v2`
 
 receipt 是审计对象，不是缓存真相。它至少包含：
 
 - `schema`、`suiteId`、`profileId`、`subjectRef`；
 - `suitePolicyDigest`、`toolchainRef`、`toolchainManifestDigest`；
-- lockfile、离线依赖仓库与依赖 entrypoint 的实际摘要；
+- 精确 `executionImageDigest`，以及实测 host/guest kernel numeric tuple、kernel ABI build digest、loader/libc/library bytes/build identity 和满足的 capability set；
+- lockfile、`dependencyRepositoryRef`、repository manifest、每个 package archive、完整安装树与每个 derived entrypoint 的实际摘要；
 - 每个 invocation 的 registry ID、规范 policy argv、exit code、只含预期身份的 `selectedTestIds`；
 - containment backend/profile，以及每个 invocation 的 `teardown: "verified-empty"` 证明摘要；不保存宿主 realm 路径或原始 ID；
 - 已脱敏后截断的 stdout/stderr、是否截断及安全字节数；
@@ -310,7 +399,9 @@ Git 调用统一使用以下环境/参数；suite、仓库和宿主都不能覆�
 
 #### 8.2.2 config、attributes 与外部对象源
 
-原始 `config` 和 `config.worktree` 只允许以下键，且值必须符合 Git 标准布尔/整数/格式约束：
+runner 用自有 parser 有界读取原始 `config` 和 `config.worktree`，先拒绝 NUL、无效 UTF-8、重复 section/key、续行、畸形 quoted subsection 和 include 展开，再把 ASCII 大小写不敏感的规范键分为以下三类。原始 config 绝不交给 Git，任何原始值都不复制进 sanitized view。
+
+**结构键：允许存在并验证，但仍由 runner 重建而非复制。**
 
 ```text
 core.repositoryformatversion
@@ -322,7 +413,32 @@ core.precomposeunicode
 extensions.worktreeconfig
 ```
 
-`core.repositoryformatversion` 必须恰为 `0`；其余六键只能是 Git 规范布尔值；拒绝重复 section/key、续行歧义和 NUL。任何其他键一律 `GIT_CONFIG_UNSAFE`，包括但不限于 `include.*`、`includeIf.*`、`core.hooksPath`、`core.attributesFile`、`core.excludesFile`、`core.fsmonitor`、`core.sshCommand`、`filter.*`、`credential.*`、`url.*`、`http.*`、`protocol.*`、`remote.*`、`submodule.*`、`diff.*`、`merge.*`、`difftool.*`、`mergetool.*`、`alias.*`、`safe.*`、`extensions.partialClone` 和 `extensions.objectFormat`。
+`core.repositoryformatversion` 必须恰为 `0`；其余六键只能是 Git 规范布尔值。
+
+**惰性元数据键：允许存在，但只做语法/大小检查并丢弃。** 键名中的 `<name>` 必须是 1–255 个 NFC 字符，不含控制字符、`[`、`]`、NUL 或换行；值最大 64 KiB，runner 不将 URL/path 解引用，不把值写入日志或 receipt：
+
+```text
+remote.<name>.url
+remote.<name>.pushurl
+remote.<name>.fetch
+remote.<name>.tagopt
+remote.<name>.mirror
+remote.<name>.prune
+remote.<name>.prunetags
+remote.<name>.skipdefaultupdate
+branch.<name>.remote
+branch.<name>.merge
+branch.<name>.mergeoptions
+branch.<name>.rebase
+branch.<name>.pushremote
+branch.<name>.description
+branch.<name>.vscode-merge-base
+codex.localenvironmentconfigpath
+```
+
+这组键只解释“仓库通常携带的 UI/协作元数据”；它们不能影响固定对象 closure 或 checkout。普通 `remote.origin.url/fetch`、`branch.main.remote/merge/vscode-merge-base` 和 `codex.localEnvironmentConfigPath` 因而不会阻塞，但 sanitized view 中仍不存在这些键。
+
+**危险执行/重定向键：存在即 `GIT_CONFIG_UNSAFE`。** 至少包括 `include.*`、`includeIf.*`、`core.hooksPath`、`core.attributesFile`、`core.excludesFile`、`core.fsmonitor`、`core.sshCommand`、`core.alternateRefsCommand`、`filter.*`、`credential.*`、`url.*`、`http.*`、`protocol.*`、`submodule.*`、`diff.*`、`merge.*`（结构键 `branch.<name>.merge` 除外）、`difftool.*`、`mergetool.*`、`alias.*`、`safe.*`、`remote.<name>.promisor`、`remote.<name>.partialclonefilter`、`remote.<name>.proxy`、`remote.<name>.uploadpack`、`remote.<name>.receivepack`、`extensions.partialClone` 和 `extensions.objectFormat`。未命中结构键或惰性键的未知键也 fail closed；不能因“不打算使用”就把未知键归入惰性类。
 
 以下对象存在即拒绝，不以“看起来为空”放行：
 
@@ -340,7 +456,7 @@ extensions.worktreeconfig
 - objects tree 只允许 fan-out loose objects 与 `objects/pack/pack-<40hex>.pack/.idx` 成对普通文件；最多 1,024 个 pack。v2 拒绝 `.bitmap`、`.rev`、`.mtimes`、`.promisor`、multi-pack-index、commit-graph、cruft/keep sidecar 和未知 pack sidecar；
 - 单个 pack 最大 4 GiB、单个 idx 最大 256 MiB、全部 object 文件最大 16 GiB；loose object 最大 256 MiB。超限为 `GIT_OBJECT_BUDGET_EXCEEDED`；布局、配对或类型不符为 `GIT_OBJECT_LAYOUT_UNSAFE`；
 - 原始 `.idx` 只做有界类型/配对检查，不交给 Git；runner 把每个受控 pack stream 输入 sanitized view 内的 `git index-pack --strict` 重新生成 idx，随后以 `git fsck --strict` 核对目标 commit closure。loose object 复制后同样由该 sanitized view 校验；
-- sanitized bare view 只写入固定 commit 所需的已验证 object closure、一个内部 ref 和最小受信 config；不复制原 hooks、attributes、index、logs、reflogs、remotes 或宿主 config。
+- sanitized bare view 只写入固定 commit 所需的已验证 object closure、一个内部 ref 和由 runner 常量生成的最小受信 config；不复制原 hooks、attributes、index、logs、reflogs、remote/branch/codex 元数据或宿主 config。
 
 所有 runner 直接读取的 Git 控制文件使用统一 `BoundedStableReader`：`O_NOFOLLOW`、普通文件检查、读取前后 stat 一致、精确上限、无部分接受。
 
@@ -350,7 +466,7 @@ extensions.worktreeconfig
 | --- | ---: | --- |
 | 工作树 `.git` gitdir 指针 | 4 KiB | 只允许单行 `gitdir: <path>`，解析后仍在受信 repository 边界 |
 | `commondir`、单个 loose ref、HEAD | 4 KiB | 禁止 NUL、多行注入和路径逃逸 |
-| `config`、`config.worktree` | 256 KiB | 只允许上列七个键 |
+| `config`、`config.worktree` | 256 KiB | 只允许结构键或明确惰性键；危险/未知键拒绝，惰性值不复制 |
 | `packed-refs` | 8 MiB | 最多 100,000 条 ref，逐行语法校验 |
 | `shallow`、`info/grafts`、alternates | 8 MiB | 存在即拒绝；仍先做有界类型/大小检查 |
 | runner 直接读取的全部 Git 元数据 | 16 MiB 聚合 | 超出即停止，不继续调用 Git |
@@ -382,7 +498,9 @@ containment backend 必须满足：
 - child 位于隔离 user/mount/PID/network/IPC 环境，不能访问 systemd/launchd、Docker socket、SSH agent 或其他可代为在 realm 外启动进程的宿主服务；
 - backend 的类型、版本和 host/guest 兼容性由 registry 与 toolchain manifest 双重固定。
 
-`containmentProfile` 不是自由字符串：静态 registry 必须同时固定 backend schema、host OS/arch/ABI/minimum version、content-addressed supervisor binary/code digest、required kernel capabilities，以及 VM 模式下的 guest image digest。supervisor 通过绝对受信引用装配，不从 PATH 发现；启动前 capability probe 任一项不满足即 `E2_CONTAINMENT_UNAVAILABLE`。
+`containmentProfile` 不是自由字符串：静态 registry 必须固定 backend schema、host OS/arch、规范 `hostCompatibility` predicate、content-addressed supervisor binary/code digest、required kernel capabilities，并为 native 模式固定 `executorImageDigest`、为 VM 模式固定 `guestImageDigest` 与 guest rootfs digest。profile 的 predicate 规范 JSON digest 必须与 toolchain manifest 绑定；supervisor 通过绝对受信引用装配，不从 PATH 发现。
+
+启动前 supervisor 必须产生规范 `PlatformMeasurementV1`：host/guest OS、arch、从 `uname.release` 派生的 numeric triplet、kernel ABI build digest、execution/guest/rootfs image digest、loader/libc path+bytes+build ID、每个系统库 identity 和 capability probe 结果。比较器只执行 6.2 节定义的 exact-field + numeric-tuple predicate，不调用发行版自带版本比较器，也不接受缺字段或未知 scheme。native backend 的 measurement 与 receipt 必须包含实测 host kernel ABI、固定 rootfs、loader/libc identity；VM backend 必须包含 host predicate 结果和精确 guest image/rootfs measurement。边界版本恰等于 `minInclusive` 接受、恰等于 `maxExclusive` 拒绝；发行版变体未命中 kernel ABI build allowlist、或同 SONAME 但 bytes/build ID 不同均返回 `E2_TOOLCHAIN_PLATFORM_MISMATCH`。
 
 v1 允许两类 backend：
 
@@ -409,20 +527,39 @@ stdout/stderr 各有独立、确定性的 `StreamingRedactor/v1`。同一 byte s
 1. **UTF8_PENDING：** 使用严格增量 UTF-8 decoder，只保留一个未完成 code point 所需的最多 3 个尾字节；非法序列立即 `OUTPUT_REDACTION_UNSAFE`，EOF 时残缺序列同样失败。
 2. **RECORD_PENDING：** 解码字符累积到当前逻辑记录。LF 结束记录；CRLF 作为同一个结束符并规范为 LF；孤立 CR 是记录正文。没有终止换行的最后记录在 EOF 走同一 sanitize/flush 路径。原始记录（不含结束符）允许最大 64 KiB；在结束符前收到第 64 KiB+1 byte 才失败，不释放任何部分。
 3. **PRIVATE_KEY_BLOCK：** 完整记录匹配 `-----BEGIN <TYPE> PRIVATE KEY-----` 后，只输出一次 `[REDACTED_PRIVATE_KEY]\n`，持续丢弃后续记录直到匹配对应 END；BEGIN/END 可跨输入 chunk 但不能跨逻辑记录。EOF 前未出现 END 仍安全地保持整块删除并完成；孤立 END 或嵌套 BEGIN 返回 `OUTPUT_REDACTION_UNSAFE`。
-4. **JSON_VALUE_PENDING：** 完整记录出现 secret JSON key 与冒号、但值尚未形成完整 JSON scalar 时，不释放该 fragment；跨后续记录累计到 scalar 闭合后整体替换为 `[REDACTED]`。pending fragment 与普通 record 共用 64 KiB 上限；EOF 仍未闭合则失败。
+4. **JSON_VALUE_PENDING：** 完整记录出现 secret JSON key 与冒号、且冒号后只有 JSON whitespace 时，不释放该 fragment；后续记录只允许继续 whitespace，直到同一 JSON scalar 开始。string/number/literal 一旦开始，必须按下述 grammar 唯一闭合；string 内出现原始换行、结构值 `{`/`[`、无效 escape 或 EOF 未闭合均失败。pending fragment 与普通 record 共用 64 KiB 上限。
 5. **SANITIZE_RECORD：** 对完整记录按下列固定顺序替换，再执行同一词汇的 residual scan。只有 residual scan 通过的规范记录可释放到安全流。
 6. **EOF：** flush 增量 decoder；处理无换行尾记录；确认不处于歧义 JSON 状态；完成 residual scan。任何失败都丢弃本轮 receipt。
 
-v1 固定模式集合：
+v1 先采用 RFC 5234 的 `ALPHA/DIGIT/HEXDIG/SP/HTAB`，再使用以下封闭词法；`OWS = *(SP / HTAB)`，所有位置以 Unicode scalar index 计，ASCII 大小写不敏感只应用于明确标注的 key/header，不做 locale case fold。
 
-- 行级 HTTP/代理认证头：`Authorization`、`Proxy-Authorization`、`Cookie`、`Set-Cookie`；
-- env/assignment/JSON key（ASCII 大小写不敏感，分隔词允许 `_`、`-` 或空格）：`api key`、`client secret`、`password`、`access token`、`refresh token`、`token`、`secret`、`credential`、`SSH_AUTH_SOCK`，以及以 `_KEY/_SECRET/_TOKEN/_PASSWORD/_CREDENTIAL` 结尾的环境名。key 后必须是 `:` 或 `=`；quoted value 消费到配对引号，未闭合则消费到 record 末端，无引号 value 消费到空白或 record 末端；
-- URL userinfo：`[A-Za-z][A-Za-z0-9+.-]*://` 后、首个 `/` 前包含 `user:password@` 的完整 authority；
-- raw Provider/token 形态：`gh[pousr]_[A-Za-z0-9]{20,}`、`github_pat_[A-Za-z0-9_]{20,}`、`sk-(proj-)?[A-Za-z0-9_-]{16,}`、`(?:AKIA|ASIA)[A-Z0-9]{16}`、`(?:sig|signature)=[A-Za-z0-9%+/_=-]{16,}`；
-- OpenSSH/PKCS/PGP 风格 `-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----` 到对应 END block；
-- `.ssh/id_*`、包含 `private` 的 key path 和 agent socket path。
+**共同引号与 escape。** `dq = DQUOTE *(dq-char / dq-escape) DQUOTE`，其中 `dq-char` 排除 `DQUOTE`、反斜杠、C0 control，`dq-escape = "\\" (DQUOTE / "\\" / "/" / "b" / "f" / "n" / "r" / "t" / ("u" 4HEXDIG))`；Unicode surrogate 必须成对。`sq = "'" *(sq-char / sq-escape) "'"`，其中 `sq-char` 排除单引号、反斜杠、C0 control，`sq-escape = "\\" ("'" / "\\")`。候选 secret token 中的其他 escape、尾随反斜杠或未闭合 quote 一律 `OUTPUT_REDACTION_UNSAFE`，不以 record 末端隐式闭合。
 
-每个模式的 key/header 可跨 chunk，因为判定只发生在完整 record；多行私钥由独立 block state 覆盖。64 KiB 是最大 raw record/look-behind 边界，不存在更早释放的“安全前缀”。
+**assignment。** key 先 trim，再把一个或多个 `_`、`-`、SP 折叠为单个 SP 并转 ASCII lowercase；规范 key 集合为 `api key/client secret/password/access token/refresh token/token/secret/credential/ssh auth sock`，或原始环境名匹配 `(?i)^[A-Z_][A-Z0-9_]*(?:_KEY|_SECRET|_TOKEN|_PASSWORD|_CREDENTIAL)$`。grammar 为：
+
+```text
+assignment = boundary secret-key OWS (":" / "=") OWS assign-value
+boundary   = BOF / SP / HTAB / ";" / "," / "(" / "{" / "["
+assign-value = dq / sq / bare / empty
+bare       = 1*(Unicode scalar except SP / HTAB / ";" / "," / C0 control)
+empty      = zero chars only when next token is EOR / SP / HTAB / ";" / ","
+```
+
+quoted value 可含空格与已转义 quote/backslash；bare 在第一个 delimiter 前终止，因此 `TOKEN=abc PASSWORD=def` 是两个 assignment。每个 secret value（包括 empty）只替换为 `[REDACTED]`；key 与 delimiter 保留。secret key 后出现无法归入四种 value 的字符或 quoted value 未闭合时 fail closed。
+
+**JSON member。** 仅接受 `DQUOTE json-secret-key DQUOTE OWS ":" json-ws json-scalar`；key string 按 RFC 8259 escape 恰好解码一次，所得 Unicode scalar 序列再按 assignment 的 key 规则规范化，非法 escape/surrogate 立即失败。`json-ws` 只允许 SP/HTAB 或逻辑记录分隔，`json-scalar` 仅为 RFC 8259 string、`-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`、`true`、`false`、`null`。string 使用上面的 `dq` 规则；secret value 为 object/array、非法 number/literal、跨记录 string、incomplete escape 或 EOF 前没有 scalar 时 fail closed。完整 scalar 替换为 JSON string `"[REDACTED]"`。
+
+**认证 header。** grammar 为 `BOF OWS header-name OWS ":" header-value EOR`，`header-name` 仅为 ASCII case-insensitive 的 `Authorization/Proxy-Authorization/Cookie/Set-Cookie`，`header-value` 是除 C0 control（HTAB 除外）外的任意 scalar，可为空；冒号后的完整值替换为 ` [REDACTED]`。header 名只在 record 起始位置生效，避免正文中的同名片段产生不同解释。
+
+**URL userinfo。** `scheme = ALPHA *(ALPHA / DIGIT / "+" / "-" / ".")`；识别 `scheme "://" authority`，authority 在首个 `/`、`?`、`#`、SP、HTAB 或 EOR 前结束。authority 必须恰有一个 literal `@`，其前 userinfo 必须含至少一个 literal `:`，以第一个 colon 分隔 user/password；userinfo 字符只允许 RFC 3986 unreserved、sub-delims、colon 或 `pct-encoded = "%" 2HEXDIG`，hostport 必须非空。percent encoding 只校验一次、不解码为结构字符；残缺 `%`、第二个 literal `@`、空 hostport 或其他歧义均 fail closed。只把完整 userinfo 替换为 `[REDACTED]`，保留 `scheme://[REDACTED]@hostport`。
+
+**path 与 agent socket。** `bare-path` 必须以 `/`、`./`、`../`、`~/` 或 `[A-Za-z]:[\\/]` 开始，并在 SP/HTAB、`"'<>|()[]{};,` 或 EOR 前结束；SP/HTAB 确定地终止 bare-path，lexer 绝不猜测相邻词是否属于同一路径。`quoted-path` 使用上述 `dq/sq`，恰好反转一次该 grammar 的 escape 后还必须以上述五类 prefix 之一开始；这是表示含空格 path 的唯一形式。quote/escape 在 record/EOF 不完整时 fail closed。统一 `/` 与 `\\` 为 separator 后，以下 path 整体替换为 `[REDACTED_PATH]`：组件 `.ssh` 后的 basename 匹配 `^id_[^/]+$`；任一组件 ASCII lowercase 后包含 `private`；basename 匹配 `^(?:agent\.[0-9]+|agent\.sock|ssh-agent\.sock)$`。`SSH_AUTH_SOCK` assignment 无论值是否匹配 basename 都按 assignment 脱敏。
+
+**raw token 与 private-key block。** raw token 正则固定为 `gh[pousr]_[A-Za-z0-9]{20,}`、`github_pat_[A-Za-z0-9_]{20,}`、`sk-(proj-)?[A-Za-z0-9_-]{16,}`、`(?:AKIA|ASIA)[A-Z0-9]{16}`、`(?:sig|signature)=[A-Za-z0-9%+/_=-]{16,}`。private block 的整条记录 grammar 为 `-----BEGIN (?:[A-Z0-9]+(?: [A-Z0-9]+)* )?PRIVATE KEY(?: BLOCK)?-----`；END 必须使用逐 ASCII byte 相同的完整 interior label，因而同时覆盖 `PRIVATE KEY`、`RSA PRIVATE KEY`、`OPENSSH PRIVATE KEY` 和 `PGP PRIVATE KEY BLOCK`。
+
+一条记录先判定完整 header/private-block，再对正文做 leftmost-longest scan；同起点优先级固定为 JSON member、assignment、URL userinfo、path、raw token。替换区间不得重叠；若同一字节可形成两个不同结束位置且无法由 longest 规则唯一决定、或任一候选词法未完整闭合，则 fail closed。替换后用同一 lexer/regex 做 residual scan，仍命中任何候选或解析歧义即失败。
+
+key/header/path/token 可跨输入 chunk，因为判定只发生在完整逻辑 token/record；多行私钥由独立 block state 覆盖。64 KiB 是最大 raw record/pending fragment/look-behind 边界，不存在更早释放的“安全前缀”。EOF 对未终止 record 走完全相同 grammar：它可以终止已经完整的 bare value/path/header value/raw token，但不能替 quote、escape、percent encoding 或 JSON scalar 猜测闭合。
 
 只有已脱敏且 residual scan 通过的字节进入 32 KiB 持久化缓冲。缓冲满后继续消费、解码、状态转换、脱敏和 residual scan 直到真实 EOF，只是不再保存后续安全正文；最终追加固定 `...[truncated-after-redaction]` 标记。不得因摘要已满而关闭 pipe、停止验证或跳过 EOF flush。
 
@@ -503,7 +640,7 @@ profile 可以降低这些上限，不能在同一 schema 版本中提高。
 | `E2_POINTER_MISSING` | requirement 没有未撤销 matching pointer | 阻塞 |
 | `E2_POINTER_AMBIGUOUS` | requirement 有多个未撤销 matching pointer | 阻塞 |
 | `E2_TOOLCHAIN_UNAVAILABLE` | 内容寻址工具链包缺失或不可读 | 阻塞 |
-| `E2_TOOLCHAIN_PLATFORM_MISMATCH` | execution OS/architecture/ABI/minimum OS/kernel/containment 不匹配 | 阻塞 |
+| `E2_TOOLCHAIN_PLATFORM_MISMATCH` | exact image/rootfs/OS/arch/loader/libc/library identity 或规范 host predicate 不匹配 | 阻塞 |
 | `E2_TOOLCHAIN_MANIFEST_TOO_LARGE` | 固定 manifest 超 1 MiB | 阻塞 |
 | `E2_TOOLCHAIN_CLOSURE_INVALID` | manifest、CPython/npm/Git closure、entrypoint 或 file tree 不完整 | 阻塞 |
 | `E2_TOOLCHAIN_PACKAGE_TOO_LARGE` | 压缩包超 1 GiB | 阻塞 |
@@ -511,11 +648,14 @@ profile 可以降低这些上限，不能在同一 schema 版本中提高。
 | `E2_TOOLCHAIN_ENTRY_LIMIT` | payload member 超 100,000 | 阻塞 |
 | `E2_TOOLCHAIN_EXPANSION_LIMIT` | 单文件、总展开量或压缩比超限 | 阻塞 |
 | `E2_DYNAMIC_DEPENDENCY_UNTRUSTED` | 动态库、RPATH 或系统 ABI 不在 manifest 平台闭包 | 阻塞 |
-| `E2_DEPENDENCY_REPOSITORY_INVALID` | 离线 Python/npm 仓库缺失、摘要错或 lock 映射不闭合 | 阻塞 |
+| `E2_DEPENDENCY_REPOSITORY_INVALID` | 离线仓库容器/manifest/CAS 路径/预算/精确 package closure 无效或含额外包 | 阻塞 |
+| `E2_DEPENDENCY_MAPPING_INVALID` | lockfile node 到 package/archive/install tree 不是恰好一个精确映射 | 阻塞 |
+| `E2_DERIVED_ENTRYPOINT_INVALID` | derived entrypoint 路径、类型、摘要、解释器或安装树归属不符 | 阻塞 |
+| `E2_LIVE_REGISTRY_ACCESS` | setup 尝试 DNS/socket/live npm/Python registry 访问 | 阻塞 |
 | `E2_HOST_TOOL_FALLBACK` | 检测到主机 PATH/解释器/工具回退 | 阻塞 |
 | `GIT_METADATA_TOO_LARGE` | Git 控制元数据超单文件或聚合预算 | 阻塞 |
 | `GIT_METADATA_UNSAFE` | Git 元数据为 symlink、变型、越界或语法不安全 | 阻塞 |
-| `GIT_CONFIG_UNSAFE` | 出现非七键 allowlist config、include/helper/filter/hook 等输入 | 阻塞 |
+| `GIT_CONFIG_UNSAFE` | config 出现危险/未知键或非法结构；明确惰性 remote/branch/codex 键不在此列 | 阻塞 |
 | `GIT_EXTERNAL_OBJECT_SOURCE` | alternate/http-alternate/replace/graft/shallow/promisor | 阻塞 |
 | `GIT_REF_UNSAFE` | loose/packed ref 类型、语法、重复或路径不安全 | 阻塞 |
 | `GIT_OBJECT_LAYOUT_UNSAFE` | pack/index/loose object 配对、类型或 sidecar 不允许 | 阻塞 |
@@ -539,7 +679,7 @@ E2 v2 在进入 Ticket 23 真实 profile 前，必须用与生产命令形态相
 ### 11.1 Python fixture
 
 - 工具链包内 CPython 3.13.x、uv、Git；
-- 从内容寻址离线 Python 仓库固定安装 `pytest==8.3.5` 与 `pytest-json-report==1.5.0`，每个 wheel/sdist 摘要与 lock 映射闭合；
+- 从 `trusted-e2-dependency-repository/v1` Python container 用 `uv sync --offline --no-index --find-links=@dependency-repository/python` 固定安装 `pytest==8.3.5` 与 `pytest-json-report==1.5.0`，每个 wheel/sdist 摘要、lock mapping、install tree 与 Python derived entrypoint 闭合；
 - 运行至少一个通过测试，并实际产生 `.report.json`；
 - 验证真实 summary 可以只有 `collected / passed / total`，零值 `failed/skipped` 省略仍通过；
 - 再覆盖失败、零收集、deselected 和超限 report，确认 counts/exit/tests 闭合及稳定错误码。
@@ -547,19 +687,27 @@ E2 v2 在进入 Ticket 23 真实 profile 前，必须用与生产命令形态相
 ### 11.2 Vitest fixture
 
 - 工具链包内 Node、完整 npm CLI closure；项目 lock 固定 Vitest `3.0.8`；
-- 从内容寻址离线 npm 仓库用 `npm ci --ignore-scripts --offline` 或等价受信 setup 安装固定依赖；
+- 从 `trusted-e2-dependency-repository/v1` npm container 用 `npm ci --ignore-scripts --offline --cache=@dependency-repository/npm` 安装固定依赖，并核对完整 install tree 与 `vitest.mjs` derived entrypoint；
 - 同一个真实测试文件至少定义两个测试；每次采用 `测试文件参数 + -t + 转义并锚定的精确 fullName + JSON reporter` 分别执行；
 - 对每次真实 Vitest 3.0.8 report，验证一个 expected assertion 为 passed、同文件另一个未匹配 assertion 为 skipped，`numTotalTests=2`、`numPassedTests=1`、`numPendingTests=1` 且 receipt 只保存 expected ID；
-- 再构造非 expected passed/failed、expected skipped、未锚定/多测试正则、错误文件、零 expected、缺 npm 模块和主机 PATH 投毒，全部 fail closed。
+- 再构造非 expected passed/failed、expected skipped、未锚定/多测试正则、错误文件、零 expected、缺 npm 模块和主机 PATH 投毒，全部 fail closed；
+- 两种生态都要分别构造额外 repository package/blob、同 lock node 两个 mapping、安装后替换 entrypoint、registry socket 探测，确认对应稳定码且不进入 test invocation。
 
 ### 11.3 Containment 与流式脱敏 fixture
 
 - containment helper 依次覆盖普通后台 child、double-fork、`setsid()`、`setpgid()`、关闭 stdio、持续持有 stdout/stderr，以及上述形态在 leader exit 0、非零和 timeout 下的组合；
 - 每次都以 cgroup/VM membership 观察到成员并由 backend 终止，最终取得 empty/destroyed proof；只清空 PGID 而 realm 仍 populated 的 fixture 必须失败；
-- 同一秘密语料以单 chunk、每个 byte 一个 chunk 和所有相邻 split point 重放，输出必须完全相同；覆盖 LF、CRLF、无尾换行、UTF-8 code point 跨块、私钥 block、URL userinfo、JSON/header token、EOF flush，以及 64 KiB 恰好/64 KiB+1；
+- 同一秘密语料以单 chunk、每个 byte 一个 chunk 和所有相邻 split point 重放，输出必须完全相同；覆盖 LF、CRLF、无尾换行、UTF-8 code point 跨块、私钥 block、多个 assignment、empty value、escaped quote/backslash、percent encoding、带空格 quoted path、agent socket、URL userinfo、JSON/header token、EOF flush，以及 64 KiB 恰好/64 KiB+1；
+- 对 trailing backslash、未闭合 quoted path/value、残缺 `%HH`、跨行 JSON string、secret object/array 和 EOF 未完成 scalar 均必须得到 `OUTPUT_REDACTION_UNSAFE`；同一语料仍逐字节和所有相邻 split point 重放；
 - 安全摘要达到 32 KiB 后，fixture 继续发送尾部秘密和非法 UTF-8，runner 必须继续消费到 EOF 并拒绝，而不是因缓冲已满提前成功。
 
-### 11.4 Ticket 23 profile 映射
+### 11.4 平台身份 fixture
+
+- native fixture 固定 exact executor/rootfs image digest，并实测 kernel numeric triplet、kernel ABI build digest、loader/libc/system library bytes 与 build ID；VM fixture固定 exact guest image 与 guest rootfs digest；
+- 分别覆盖 `minInclusive - 1 patch`、恰等于 `minInclusive`、`maxExclusive - 1 patch`、恰等于 `maxExclusive`，只接受闭区间下界和开区间上界内值；
+- 用相同 numeric kernel version 的不同发行版 ABI build、以及相同 SONAME/版本字符串但不同 library bytes/build ID 运行，均须 `E2_TOOLCHAIN_PLATFORM_MISMATCH`；receipt 必须保存规范 measurement，不保存自由文本“兼容”判断。
+
+### 11.5 Ticket 23 profile 映射
 
 - 后端四个 pytest node ID 可在一个显式 invocation 中运行，或按 profile 分组；实际集合必须等于注册集合；
 - 前端持久化五项、API 两项、结构两项均采用“一精确测试名一 invocation”；
@@ -570,13 +718,16 @@ E2 v2 在进入 Ticket 23 真实 profile 前，必须用与生产命令形态相
 
 | 场景 | 必须观察到的结果 |
 | --- | --- |
-| 同一秘密语料以单 chunk、每字节 chunk、每个 split point 输入；覆盖 LF/CRLF、UTF-8 跨块、无尾换行、私钥、URL/JSON/header token | 输出/错误码与 chunk 划分无关；receipt 无 token 片段 |
+| 同一秘密语料以单 chunk、每字节 chunk、每个 split point 输入；覆盖 LF/CRLF、UTF-8 跨块、无尾换行、私钥、多个/空 assignment、escaped quote/backslash、percent-encoded userinfo、带空格 quoted path、agent socket、URL/JSON/header token | 输出/错误码与 chunk 划分无关；receipt 无 token/path 片段 |
+| trailing escape、未闭合 quoted path/value、残缺 `%HH`、跨行 JSON string、secret object/array、EOF 未完成 scalar | `OUTPUT_REDACTION_UNSAFE`；EOF 不替解析器猜测闭合，所有 chunk 划分同码 |
 | 安全输出已满 32 KiB，随后出现秘密或非法 UTF-8 | runner 仍消费到 EOF 并返回 `OUTPUT_REDACTION_UNSAFE`；不得提前成功 |
 | 未决 record 恰好 64 KiB 与 64 KiB+1 | 前者仅在完整安全边界可 flush；后者稳定失败；两者都无截断前泄漏 |
 | leader exit 0 后 child double-fork + `setsid()` + 关闭 stdio并持续运行 | child 仍属于 containment leaf，被 `terminate_all` 清除；以 kernel/VM empty proof 验证，不用 PGID 空替代 |
 | leader 非零/超时，后代持有 stdout 或另建 PGID | 同样取得 empty proof；超时返回 `TEST_REPLAY_TIMEOUT`，无法证明清空则 `E2_CONTAINMENT_CLEANUP_FAILED` |
 | 平台只有 PGID/killpg、没有注册 containment backend | `E2_CONTAINMENT_UNAVAILABLE`；该平台/profile 不可注册 |
-| supervisor/VM image digest、host ABI 或 kernel capability 与 containment profile 不符 | `E2_CONTAINMENT_UNAVAILABLE`；不创建 replay session |
+| supervisor digest 或所需 kernel capability 与 containment profile 不符 | `E2_CONTAINMENT_UNAVAILABLE`；不创建 replay session |
+| exact executor/guest/rootfs image digest、OS/arch、loader/libc/library bytes/build ID 不符 | `E2_TOOLCHAIN_PLATFORM_MISMATCH`；版本字符串或 SONAME 相同不能放行 |
+| kernel 版本恰等于 min、恰低于 min、恰低于 max、恰等于 max | 仅接受 `min <= actual < max`；同版本不同发行版 ABI build ID 未列入 allowlist 仍拒绝；receipt 含实测 identity |
 | pointer artifact 缺失、摘要错、schema 错或超限 | 阶段 B 进程启动数为 0；checkout/temp/CAS/catalog/contract 均无变化 |
 | requirement 有两个未撤销 matching pointer，或新 pointer 已追加但旧 pointer 未撤销 | `E2_POINTER_AMBIGUOUS`；不按时间/ID/可用性挑选；spawn/checkout/CAS/catalog/contract 均零变化 |
 | requirement 唯一 active pointer 是最后一个且 artifact 损坏 | 前面 requirement 也不重放，证明 barrier 是操作级 |
@@ -584,18 +735,22 @@ E2 v2 在进入 Ticket 23 真实 profile 前，必须用与生产命令形态相
 | 主机 PATH 放置同名假 Git/uv/node/npm/python | 假工具执行标记不存在；runner 只执行 package entrypoint |
 | toolchain archive 含重复 path、hardlink、PAX、越界 symlink、100,001 项、超 4 GiB 展开量或压缩比超 100:1 | 分别返回规范 archive/entry/expansion 稳定码；任何 entry 不得变为可执行 |
 | npm 包只含 `npm-cli.js`，或缺 CPython stdlib/Git helper/动态库声明 | `E2_TOOLCHAIN_CLOSURE_INVALID` 或 `E2_DYNAMIC_DEPENDENCY_UNTRUSTED`，不回退宿主 |
-| setup 试图访问 live npm/Python registry，或离线仓库与 lock digest 不闭合 | `E2_DEPENDENCY_REPOSITORY_INVALID`；无网络回退 |
+| dependency container 含额外 package/blob、缺包、非固定 CAS path 或超预算 | `E2_DEPENDENCY_REPOSITORY_INVALID`；不进入 setup/test |
+| 同一 lock node 有零个/多个 mapping、同 package 多 archive/install tree 摘要 | `E2_DEPENDENCY_MAPPING_INVALID`；不得挑一个“可安装”的候选 |
+| setup 后 derived entrypoint 被替换、变型、移出安装树、摘要/解释器不符或经 `.bin`/PATH 发现 | `E2_DERIVED_ENTRYPOINT_INVALID`；test invocation 数为 0 |
+| setup 试图 DNS/socket/live npm/Python registry，即使 cache 命中且退出 0 | `E2_LIVE_REGISTRY_ACCESS`；无网络回退，不接受 setup |
 | pytest 1.5.0 真实通过报告省略零值字段 | 接受；`total == len(tests)`，`collected/deselected` 闭合 |
 | pytest summary 与 tests、exitcode 或 deselected 矛盾 | `REPORT_SCHEMA_INVALID` 或 `TEST_SELECTION_MISSING` |
 | Vitest 3.0.8 同文件两个测试，以锚定 `-t` 分别运行 | 每次接受 1 passed expected + 1 skipped non-expected；counts 全闭合；receipt 只含 expected ID |
 | Vitest 非 expected assertion 为 passed/failed，或 registry 提供未锚定/未转义 regex | `TEST_SELECTION_MISSING` 或 policy 拒绝；skipped 之外的额外执行不可忽略 |
 | `.git` 指针 4097 字节、`packed-refs` 超 8 MiB、聚合元数据超 16 MiB | `GIT_METADATA_TOO_LARGE`，不部分解析、不调用后续测试 |
+| 普通仓库 config 含 `remote.origin.url/fetch`、`branch.main.remote/merge/vscode-merge-base`、`codex.localEnvironmentConfigPath` | 有界解析后成功构造 sanitized view；这些键和值均未复制、未解引用、未进入 receipt |
 | Git config include/helper/filter/hook、alternate/http-alternate、replace/graft/shallow/promisor | 对应 `GIT_CONFIG_UNSAFE` 或 `GIT_EXTERNAL_OBJECT_SOURCE`；工具链 Git 从未打开被拒绝的原始 `.git` |
 | refs 重复/越界/symlink，pack 缺 idx、未知 bitmap/rev/promisor sidecar，object budget 超限 | `GIT_REF_UNSAFE`、`GIT_OBJECT_LAYOUT_UNSAFE` 或 `GIT_OBJECT_BUDGET_EXCEEDED`；不构造 checkout |
 | report 超 1 MiB 或读取中变化 | `REPORT_TOO_LARGE` 或 `REPORT_SCHEMA_INVALID`；不持久化 report 原文 |
 | 成功 collect | 仅新增一个规范 v2 CAS receipt；catalog/contract 字节不变 |
 | 成功 verify/promote/reconcile 的验证阶段 | CAS 对象数和字节不变；只允许最终 projection writer 按既有规则改 contract |
-| Task 11 最小 Python + Vitest + containment fixture | 使用真实工具、真实 reporter、真实 skipped 行、真实 cgroup/VM empty proof 全部通过后，才允许编写真实 profile 数据 |
+| Task 11 最小 Python + Vitest + dependency + platform + containment fixture | 使用真实工具、真实 offline container/derived entrypoint、真实 reporter/skipped 行、精确平台 measurement、真实 cgroup/VM empty proof 全部通过后，才允许编写真实 profile 数据 |
 
 ## 13. 固定参考与三引擎职责一致性
 
@@ -626,11 +781,12 @@ E2 v2 在进入 Ticket 23 真实 profile 前，必须用与生产命令形态相
 ## 16. 规格自审结论
 
 - 无未决占位决策；具体 package digest、产品 commit 和 reviewer 公钥属于未来真实输入，不是本规格缺口。
-- 首轮五项和本轮六项独立审查问题均有不变量、失败码和验收行；PGID 不再冒充后代证明，Vitest skipped 行按真实 3.0.8 schema 闭合。
+- 既有五项、上一轮六项与本轮四项独立审查问题均有不变量、失败码和验收行；PGID 不再冒充后代证明，Vitest skipped 行按真实 3.0.8 schema 闭合。
 - 两阶段顺序、验证零写入、collect 后写入和 contract 原子投影之间无冲突。
-- 工具链容器格式、manifest 边界、解包预算、动态依赖和离线依赖仓库唯一且版本化。
-- `StreamingRedactor/v1` 的 chunk-independent 状态、EOF、record 上限和截断后继续消费规则明确。
-- candidate set/唯一 active pointer/gate 前并发复核明确；Git config/ref/object allow/deny 与预算明确。
+- 工具链与依赖仓库容器格式、固定 CAS/manifest、package/archive/install tree/derived entrypoint、解包预算、动态依赖和离线映射均唯一且版本化；live registry 探测 fail closed。
+- exact executor/guest/rootfs identity 与规范 host predicate 分离；native measurement、版本边界、发行版 ABI 和 library build identity 均有唯一比较与 receipt 语义。
+- `StreamingRedactor/v1` 的 chunk-independent 状态、assignment/JSON/header/URL/path/agent-socket 词法、escape/EOF、record 上限和截断后继续消费规则明确。
+- candidate set/唯一 active pointer/gate 前并发复核明确；Git config 区分结构键、明确惰性元数据与危险/未知键，普通 remote/branch 仓库可净化，ref/object allow/deny 与预算不变。
 - pytest/Vitest 兼容规则与真实 Task 11 命令形态一致；同文件 skipped assertion 不再造成系统性误拒绝。
 - 固定参考、138 项冻结合同、E1/E3/E4 和三引擎职责均未被扩大或替代。
 - 本规格范围可由一个后续实施计划覆盖，但本次任务停在书面规格审查门。
