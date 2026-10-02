@@ -13,7 +13,7 @@ E2 v2 以“先证明输入可验证，再允许执行”为核心顺序，取�
 1. **阶段 A：无副作用 artifact 预检。** 对一次 `promote`、`reconcile` 或正式只读 `validate` 选中的全部 E2 指针先完成结构、路径、大小、摘要、规范 JSON、schema 和策略绑定校验。任一指针无效时，不启动任何 E2 子进程、不创建 checkout、不写 CAS、不修改 catalog/contract。
 2. **阶段 B：可信重放。** 只有阶段 A 全部通过后，才从内容寻址、按平台和架构封闭的可信工具链包启动固定命令。验证重放只在内存中生成本轮事实，永不写 CAS；新 `collect` 只有在整轮重放、报告解析、输出脱敏和残留进程清理全部成功后，才原子写入新的 v2 receipt。
 3. **输出先脱敏，再截断。** stdout/stderr 经过跨分块流式脱敏器后才进入有界安全缓冲；原始字节不会因硬截断留下 token 片段。receipt 只持久化注册表拥有的预期测试身份，不保存报告中任意、未受信的 ID。
-4. **每次调用独立进程组。** setup 和 test invocation 各自拥有独立进程组；父进程成功、失败或超时后都必须检查并终止残留后代，确认进程组消失后才可接受该调用。
+4. **每次调用进入不可逃逸 containment leaf。** setup 和 test invocation 各自拥有内核/VM 强制继承的成员边界；父进程成功、失败或超时后都必须终止 leaf 全部成员并取得 empty proof。PGID 仅辅助发信号。
 5. **真实 reporter 合同。** `pytest-json-v1` 兼容 `pytest-json-report 1.5.0` 对零值 outcome 字段的省略，同时严格闭合 `collected / deselected / total / tests`；`vitest-json-v1` 支持 Task 11 的“测试文件参数 + `-t` 精确测试名”选择形态。
 6. **不再信任主机工具。** Git、uv、Node、npm CLI 运行时闭包以及 profile 需要的 Python 运行时都必须来自内容寻址工具链包；不得发现、验证后复制或执行主机 `PATH` 中的同名程序。
 7. **所有直接读取都有上限。** Git 控制元数据、machine report、receipt 和工具链 manifest 均有固定单文件及聚合字节上限；超限使用稳定阻塞码，不读取后再“尽量继续”。
@@ -39,8 +39,8 @@ E2 v2 以“先证明输入可验证，再允许执行”为核心顺序，取�
 | 已知缺陷 | v2 防线 |
 | --- | --- |
 | 输出先硬截断再脱敏，边界处可留下 Provider token 片段 | 原始流先进入跨分块脱敏器，只有脱敏后的字节可进入截断缓冲 |
-| 父进程成功退出后，后台后代仍可存活 | 每次 invocation 独立进程组；成功、失败、超时均执行残留探测、终止和消失确认 |
-| pytest 真实 summary 省略零值字段；Task 11 Vitest 选择不是完整 ID 单参数；npm 只是 JS launcher 而非单文件 | parser 采用真实 schema 兼容规则；selection 与 argv 分离建模；工具链 package 显式封闭 npm CLI 模块树 |
+| 父进程成功退出后，后台后代可通过 double-fork、`setsid()` 或 `setpgid()` 逃离原 PGID | invocation 必须运行在平台不可逃逸 containment realm；PGID 只辅助发信号，不作为“全部后代已清空”的证明 |
+| pytest 真实 summary 省略零值字段；Vitest 3.0.8 的 `-t` 会把同文件未匹配项保留为 skipped；npm 只是 JS launcher 而非单文件 | parser 采用真实 schema 兼容规则；Vitest 允许非预期 skipped、拒绝非预期 executed；工具链 package 显式封闭 npm CLI 模块树 |
 | artifact 指针无效时仍重放并写新 CAS | 全操作阶段 A 先预检全部 artifact；验证路径阶段 B 不写 CAS |
 | `.git` 指针、`commondir`、`packed-refs` 等读取无上限 | 所有直接 Git 元数据读取走统一有界读取器，并受单文件/聚合预算约束 |
 
@@ -49,16 +49,18 @@ E2 v2 以“先证明输入可验证，再允许执行”为核心顺序，取�
 协议还必须防止：
 
 - 通过主机 `PATH`、shell、shebang `/usr/bin/env`、npm 的宿主模块树或可替换 symlink 注入未登记工具；
-- 用错误 OS/architecture 的二进制包、缺文件工具链包或部分 npm 安装冒充受信闭包；
+- 用错误 OS/architecture/ABI 的二进制包、歧义 archive、压缩炸弹、缺文件工具链包或部分 npm 安装冒充受信闭包；
 - stale report、超限 report、报告行重复、summary 自相矛盾、选择零测试或报告额外测试；
 - 用测试名正则“可能匹配”代替对本轮实际测试身份的证明；
 - 把任意 report node ID、失败输出中的秘密、完整环境或主机绝对路径写入 receipt；
 - 进程在输出管道保持打开时让 runner 永久等待 EOF；
+- 旧 pointer 未撤销时追加新 pointer，令运行者任意挑选“较方便”的证据；
+- 让 Git 消费宿主 config、attributes、hooks、helper、alternate object store、replace/graft/shallow/promisor 或未审查 pack sidecar；
 - 在 policy/catalog/contract 快照变化后提交旧验证结果。
 
 ### 3.3 信任边界外
 
-本协议不抵抗同时拥有受保护 Git 历史、registry/profile、工具链包内容与其摘要发布权限的治理攻击者。OS 内核、已固定平台 ABI 和系统动态库属于平台信任根，但任何宿主可执行文件、包管理器、解释器、用户配置和 `PATH` 都不属于信任根。
+本协议不抵抗同时拥有受保护 Git 历史、registry/profile、工具链包内容与其摘要发布权限的治理攻击者。已登记的 containment supervisor、OS 内核、固定平台 ABI 和 manifest 明确允许的系统动态库属于平台信任根；任何宿主可执行文件、包管理器、解释器、用户配置、`PATH` 和单纯 POSIX PGID 都不属于信任根。
 
 ## 4. 强制不变量
 
@@ -66,14 +68,15 @@ E2 v2 以“先证明输入可验证，再允许执行”为核心顺序，取�
 
 1. **A-before-B：** 一次验证操作选中的全部 E2 artifact 未全部通过阶段 A 前，不得进入任一 E2 阶段 B。
 2. **验证零写入：** `E2SuiteVerifier.verify`、正式 `validate`、`promote` 的验证阶段和 `reconcile` 的验证阶段不得调用 `ContentAddressedStore.put`，也不得修改 catalog、contract 或 trust 输入。
-3. **采集后写入：** `collect` 只可在成功重放、报告闭合、进程组归零、输出脱敏完成后写一次规范 receipt；失败运行不产生 receipt 对象。
+3. **采集后写入：** `collect` 只可在成功重放、报告闭合、containment realm 空且销毁、输出脱敏完成后写一次规范 receipt；失败运行不产生 receipt 对象。
 4. **无宿主回退：** 工具链 entrypoint 缺失、摘要不符或平台不符时阻塞；不得搜索主机 `PATH`，不得用系统同名工具补位。
-5. **每调用一进程组：** setup/test invocation 不共享进程组；一个 invocation 的后代不得跨越到下一个 invocation。
+5. **不可逃逸 containment：** 每个 setup/test invocation 都在独立 containment leaf 中执行；double-fork、`setsid()`、`setpgid()` 和关闭 stdio 不能改变 membership。PGID 为空不能证明 leaf 为空。
 6. **先脱敏后截断：** 只有已从流式脱敏器释放的安全字节可以计入持久化输出上限。
-7. **身份最小化：** receipt 的测试身份必须是 `expectedTestIds` 的有序子集；成功 receipt 必须恰好覆盖该 invocation 的预期集合，不能持久化任何额外报告 ID。
+7. **身份最小化：** receipt 的测试身份必须是 `expectedTestIds` 的有序子集；Vitest 未匹配 skipped 身份只用于内存 count 闭合，不进入 receipt/facts。成功 receipt 必须恰好覆盖预期 executed 集合。
 8. **报告闭合：** process exit、report exit/success、summary counts、tests rows 和 registry selection 必须互相一致。
 9. **有界读取：** 任一受控文件在打开前、读取中或读取后超限、变型、变 inode 或变 mtime，均阻塞本轮验证。
-10. **固定主体：** checkout、lockfile、package script 和测试文件均来自精确 `git://product@<40-sha>`；当前工作树不参与重放。
+10. **固定主体：** checkout、lockfile、依赖 entrypoint 和测试文件均来自精确 `git://product@<40-sha>` 与内容寻址离线仓库；当前工作树不参与重放。
+11. **唯一证据选择：** 对冻结快照中的每个 requirement，必须恰有一个未撤销 matching pointer；零个或多个都在阶段 A 阻塞，运行者无选择权。
 
 ## 5. 总体架构与顺序
 
@@ -82,6 +85,7 @@ pointer 集合 + registry/profile/contract 快照
                      │
                      ▼
          阶段 A：E2 artifact barrier
+         ├─ 冻结 candidate set；每 requirement 唯一 active pointer
          ├─ 六字段 pointer/profile/verifier/subject 配对
          ├─ CAS 派生路径、类型、大小、稳定读取、SHA-256
          └─ receipt/v2 规范 JSON、schema、policy/toolchain 绑定
@@ -90,10 +94,10 @@ pointer 集合 + registry/profile/contract 快照
          阶段 B：TrustedReplaySession
          ├─ 验证并展开 trusted toolchain package
          ├─ 有界核验 Git 元数据并构造固定对象 checkout
-         ├─ 核对 lockfiles / package scripts / dependency policy
-         ├─ 每 invocation 独立进程组执行
+         ├─ 核对 lockfiles / 离线依赖仓库 / dependency entrypoints
+         ├─ 每 invocation 独立不可逃逸 containment leaf
          ├─ 流式脱敏 → 安全截断；有界解析 machine report
-         └─ 清理所有后代并生成内存 VerificationResult
+         └─ 证明 containment 为空并生成内存 VerificationResult
                      │
                      ▼
          快照复核 → 聚合 → 原子状态投影
@@ -113,6 +117,11 @@ v2 suite 是 registry 拥有的闭合策略，pointer 不能提供或覆盖任�
   "subjectRepository": "product",
   "workingDirectory": "frontend",
   "toolchainRef": "sha256:<toolchain-package-digest>",
+  "containmentProfile": "linux-cgroup-v2/v1",
+  "dependencyRepositoryRefs": {
+    "npm": "sha256:<offline-npm-repository-digest>"
+  },
+  "derivedEntrypoints": {},
   "setupInvocations": [
     {
       "id": "npm-ci",
@@ -123,8 +132,8 @@ v2 suite 是 registry 拥有的闭合策略，pointer 不能提供或覆盖任�
   "testInvocations": [
     {
       "id": "frontend-persistence-1",
-      "tool": "npm",
-      "args": ["test", "--", "--run", "src/CreativeCanvas.test.tsx", "-t", "<精确测试名>", "--reporter=json", "--outputFile=<受控相对路径>"],
+      "tool": "node",
+      "args": ["node_modules/vitest/vitest.mjs", "run", "src/CreativeCanvas.test.tsx", "-t", "^<转义后的精确 fullName>$", "--reporter=json", "--outputFile=<受控相对路径>"],
       "selection": {
         "kind": "vitest-file-exact-name/v1",
         "file": "frontend/src/CreativeCanvas.test.tsx",
@@ -140,37 +149,48 @@ v2 suite 是 registry 拥有的闭合策略，pointer 不能提供或覆盖任�
   "expectedTestIds": ["frontend/src/CreativeCanvas.test.tsx::<完整 fullName>"],
   "allowedEnvironment": {"CI": "1", "TZ": "UTC"},
   "timeoutSeconds": 120,
-  "lockfileDigests": {"frontend/package-lock.json": "sha256:<digest>"},
-  "packageScriptDigests": {"frontend/package.json#scripts.test": "sha256:<digest>"}
+  "lockfileDigests": {"frontend/package-lock.json": "sha256:<digest>"}
 }
 ```
 
 规则：
 
 - `tool` 是工具链 manifest 的逻辑 entrypoint，不是文件名搜索请求；
+- suite 可声明 setup 后的 `derivedEntrypoints`，但只能是位于 checkout 的 venv symlink（目标精确等于包内 CPython）或 lockfile + 离线仓库共同证明摘要的 dependency entry file；不得发现 `.bin`、PATH 或任意新 executable；
 - setup/test 都是非空、不可变的 invocation 对象；v1 的裸 `setupArgv/argv` 不自动升级；
 - parser 与 selection 分开。selection 描述 registry 预期身份，report 证明实际身份；二者不能通过“字符串在 argv 中出现”替代；
-- 每个 Task 11 Vitest 精确测试名使用一个 invocation，文件参数和 `-t` 参数分别核对；
+- 每个 Task 11 Vitest 精确测试名使用一个 invocation，文件参数和 `-t` 参数分别核对；`-t` 值必须由 loader 对 `exactName` 做 ECMAScript RegExp 元字符转义后加 `^...$` 生成，registry 不接受任意正则；
 - Python suite 使用 `pytest-nodeids/v1`，argv 中逐一携带精确 node ID；
 - report 路径必须位于隔离 checkout 的受控临时子目录，执行前确认不存在，执行后只读一次；
-- `packageScriptDigests` 绑定 npm 间接执行的已提交脚本内容，防止 `npm test` 把未审查脚本变成第二命令入口。
+- npm 仅用于 `ci --ignore-scripts --offline`；测试由包内 Node 直接加载 lockfile 安装并核验摘要的 `node_modules/vitest/vitest.mjs`，不经过 npm package-script shell 或项目 `.bin` PATH；
+- `dependencyRepositoryRefs` 是离线依赖仓库的内容地址。v2 禁止 live registry/download；uv/npm 必须使用已验证离线仓库与固定 lockfile。
 
-### 6.2 `TrustedToolchainManifestV1`
+### 6.2 `trusted-e2-toolchain-tar-zstd/v1`
 
-工具链包位于 acceptance root 下的预配置只读内容仓库：
+v2 只接受一种工具链容器：**zstd 单帧压缩的规范 POSIX ustar**，schema/format 字面值为 `trusted-e2-toolchain-tar-zstd/v1`。工具链包位于 acceptance root 下的预配置只读内容仓库：
 
 ```text
 trust/toolchains/sha256/<digest前2位>/<64位digest>
 ```
 
-registry 只保存 `toolchainRef`。包整体 SHA-256 必须等于引用；缺包直接阻塞，不允许运行时联网取得替代工具包。
+`toolchainRef` 是对完整压缩包字节的 SHA-256，不是 manifest 或展开目录的摘要。缺包直接阻塞，不允许运行时联网取得替代包。
 
-包内 manifest 至少包含：
+manifest 必须是 archive 的第一个 member，固定路径 `.trusted-e2-toolchain/manifest.json`，UTF-8 规范 JSON，最大 1 MiB。manifest 不自列举；保留路径及其隐式父目录不进入 `files`。`files` 必须逐条、且只逐条列出 archive 的其余所有 member：
 
 ```json
 {
   "schema": "trusted-e2-toolchain/v1",
-  "platform": {"os": "darwin", "arch": "arm64"},
+  "containerFormat": "trusted-e2-toolchain-tar-zstd/v1",
+  "payloadTreeDigest": "sha256:<canonical-files-list-digest>",
+  "platform": {
+    "executionOs": "linux",
+    "arch": "arm64",
+    "abi": "gnu",
+    "minimumOs": "debian-13",
+    "minimumKernel": "6.2",
+    "containmentBackend": "linux-cgroup-v2/v1",
+    "allowedSystemLibraries": ["linux-vdso.so.1", "libc.so.6", "libm.so.6", "libpthread.so.0", "libdl.so.2", "ld-linux-aarch64.so.1"]
+  },
   "entrypoints": {
     "git": {"argvPrefix": ["bin/git"], "version": "git version 2.53.0"},
     "uv": {"argvPrefix": ["bin/uv"], "version": "uv 0.11.14 (...)"},
@@ -179,24 +199,47 @@ registry 只保存 `toolchainRef`。包整体 SHA-256 必须等于引用；缺�
     "python": {"argvPrefix": ["python/bin/python3"], "version": "Python 3.13.x"}
   },
   "closures": {
-    "npm": {"root": "lib/node_modules/npm", "treeDigest": "sha256:<digest>"}
+    "cpython": {"roots": ["python/bin", "python/lib/python3.13", "lib/libpython3.13.so.1.0"], "treeDigest": "sha256:<digest>"},
+    "npm": {"roots": ["lib/node_modules/npm"], "treeDigest": "sha256:<digest>"},
+    "git": {"roots": ["bin/git", "libexec/git-core", "share/git-core/templates"], "treeDigest": "sha256:<digest>"}
+  },
+  "dynamicDependencies": {
+    "bin/git": ["lib/libz.so.1", "system:libc.so.6"],
+    "bin/node": ["system:libc.so.6", "system:libm.so.6"]
   },
   "files": [
-    {"path": "<relative path>", "type": "file", "size": 123, "mode": "0500", "sha256": "sha256:<digest>"}
+    {"path": "bin", "type": "dir", "mode": "0555"},
+    {"path": "bin/git", "type": "file", "size": 123, "mode": "0555", "sha256": "sha256:<digest>"},
+    {"path": "bin/python3", "type": "symlink", "mode": "0777", "target": "../python/bin/python3"}
   ]
 }
 ```
 
-强制要求：
+`payloadTreeDigest` 是对按 path byte 升序后的完整 `files` 数组做规范 JSON 编码所得 SHA-256；每个 closure `treeDigest` 对其 `roots` 覆盖的 file entries 用同一算法计算。receipt 的 `toolchainManifestDigest` 是 manifest 规范 JSON bytes 的 SHA-256。三者都不等同于 `toolchainRef`，从而避免 manifest 自引用。
 
-- `platform.os/arch` 必须与运行平台精确相等；不同平台使用不同 package digest；
-- `files` 是完整闭包清单，拒绝绝对路径、`..`、设备文件、FIFO、socket、越界 symlink 和未列出的额外条目；
-- npm 必须包含完整 `npm-cli.js` 模块树，或在 manifest 中声明并审核一个真正自包含的 npm launcher；单独复制 `bin/npm` symlink 或 `npm-cli.js` 不构成闭包；
-- shebang 不通过 `/usr/bin/env` 解析。脚本 entrypoint 展开为显式、已列入 manifest 的解释器前缀；npm 固定由包内 Node 启动；
-- Task 11 的 Python profile 必须含包内 CPython。uv 创建的 venv 解释器只能指向该 CPython，不能指向宿主 Python；
-- runner 不传入宿主 `PATH`。若某工具需要 PATH，只能构造为工具链包内 entrypoint/shim 目录和已由 lockfile 安装到 checkout 的受控项目 bin 目录；
-- runner 自身始终 `shell=False`。npm 可以按其受信实现执行已提交的 package script，但该 script 文本必须由 `packageScriptDigests` 绑定，子工具只能从 lockfile 安装的项目 bin 目录解析，不能继承宿主 PATH；
-- 产品依赖不等同于工具链闭包。它们仍由固定 subject 的 lockfile、package script 摘要和 setup policy 约束；若允许下载，profile 必须固定内容摘要。不得用未锁定的实时解析补齐依赖。
+容器规则固定如下：
+
+- 只接受 ustar regular file、directory 和 symbolic link；拒绝 hard link、sparse、PAX/GNU extension、device、FIFO、socket 和未知 typeflag；
+- path 必须是 NFC UTF-8、相对路径、无空/NUL、无 `.`/`..` 组件、无反斜杠；每个 path 恰好出现一次且先有父目录；拒绝大小写折叠后重复；
+- symlink `target` 必须是 manifest 中的相对字面值，逐组件解析后仍留在展开根内；symlink 不可作为 archive 后续 member 的父目录；
+- file 必须有 `size/mode/sha256`；dir 必须有 `mode` 且 size 为 0；regular file/dir 拒绝 setuid、setgid、sticky 和 group/other writable。symlink 必须有 `mode/target` 且不接受 digest/size，mode 固定为 `0777` 但不作为目标权限；
+- archive header 的 uid/gid/mtime/uname/gname 固定为 0/空，member 顺序按 UTF-8 path byte 升序；manifest 是唯一例外，始终第一项；
+- zstd 必须恰好一个带 checksum 的 frame，禁用 dictionary、skippable/trailing frame，window 上限 256 MiB；ustar header checksum 必须正确，archive 以恰好两个 512-byte zero block 结束且之后无字节；
+- 压缩包最大 1 GiB、最多 100,000 个 payload member、单个 regular file 最大 256 MiB、展开总量最大 4 GiB、展开量/压缩包大小最大 100:1；在写出越界 entry 前即中止；
+- archive 解码、路径检查和摘要核验在 no-exec 临时根完成；所有 member 与 manifest 一致且 `payloadTreeDigest` 匹配后才把目录切为只读可执行。
+
+运行时闭包规则：
+
+- `platform` 是执行环境身份，不是打包机器标签；必须精确匹配 execution OS、architecture、ABI、最低 OS/kernel 和注册的 containment backend；
+- manifest 必须列出每个 ELF/Mach-O entrypoint 和 helper 的完整动态依赖。依赖要么是包内 file，要么是 `allowedSystemLibraries` 的 `system:` 项；运行前离线扫描，发现未列依赖、RPATH 越界或宿主任意搜索路径即 `E2_DYNAMIC_DEPENDENCY_UNTRUSTED`；
+- CPython closure 必须包括可执行文件、`libpython`、完整 stdlib、`lib-dynload`、编码和 CA/zoneinfo 等运行必需资源；venv 解释器只能链接回该 closure；
+- npm closure 必须包括 `npm-cli.js` 的完整模块树和包内 Node；Git closure 必须包括 `libexec/git-core` helpers、templates 及实际会调用的 shims；单个 launcher 文件不构成闭包；
+- shebang 不通过 `/usr/bin/env` 解析。entrypoint 展开为 manifest 中的绝对 argv prefix；runner 不传入宿主 PATH；
+- runner 始终 `shell=False`。npm v2 仅允许不执行 lifecycle script 的离线安装；测试由包内 Node/Python 直接加载已验证依赖 entrypoint，不经过 package-script shell；
+- v2 禁止 live dependency download。`dependencyRepositoryRefs` 指向另一个内容寻址、带完整条目摘要和同等解包预算的只读离线仓库；uv/npm 必须启用 offline 模式，lockfile 中每个包必须映射到仓库中的精确 digest。
+- 离线依赖中的 native extension/`.node` 文件也要做动态依赖扫描并遵守平台 allowlist；setup 禁止 lifecycle/postinstall script，缺少预构建闭包时阻塞而不是现场编译或联网下载。
+
+稳定容器错误码为：`E2_TOOLCHAIN_PACKAGE_TOO_LARGE`、`E2_TOOLCHAIN_ARCHIVE_INVALID`、`E2_TOOLCHAIN_ENTRY_LIMIT`、`E2_TOOLCHAIN_EXPANSION_LIMIT`、`E2_TOOLCHAIN_CLOSURE_INVALID`、`E2_DYNAMIC_DEPENDENCY_UNTRUSTED` 和 `E2_DEPENDENCY_REPOSITORY_INVALID`。
 
 ### 6.3 `trusted-e2-receipt/v2`
 
@@ -204,9 +247,9 @@ receipt 是审计对象，不是缓存真相。它至少包含：
 
 - `schema`、`suiteId`、`profileId`、`subjectRef`；
 - `suitePolicyDigest`、`toolchainRef`、`toolchainManifestDigest`；
-- lockfile 与 package script 的实际摘要；
+- lockfile、离线依赖仓库与依赖 entrypoint 的实际摘要；
 - 每个 invocation 的 registry ID、规范 policy argv、exit code、只含预期身份的 `selectedTestIds`；
-- `processGroupCleanup: "verified-empty"`；
+- containment backend/profile，以及每个 invocation 的 `teardown: "verified-empty"` 证明摘要；不保存宿主 realm 路径或原始 ID；
 - 已脱敏后截断的 stdout/stderr、是否截断及安全字节数；
 - parser kind、report digest、report 大小和闭合 counts；
 - 总时长和观察时间。
@@ -219,22 +262,29 @@ receipt 和失败 `VerificationResult.facts` 都不得包含任意未预期 node
 
 阶段 A 是一次验证操作的全局 barrier，顺序固定：
 
-1. 冻结并摘要 contract、catalog、registry、profile、revocation 和 trust 输入；
-2. 解析全部目标 pointer，严格限制为六字段并核对 profile/verifier/subject；
-3. 从 `artifactRef` 派生唯一 CAS 路径；拒绝 symlink、非普通文件和路径逃逸；
-4. 使用有界稳定读取校验对象大小和 SHA-256；
-5. 拒绝重复 JSON key、非 UTF-8、非规范 JSON、未知/缺失字段；
-6. 核对 `trusted-e2-receipt/v2`、suite policy digest、toolchainRef、subject 和仅预期测试身份；
-7. 对本次选中的全部 E2 pointer 完成同样校验。
+1. 一次性冻结并摘要 contract、catalog、registry、profile、revocation 和 trust 输入；后续选择只能读取这组不可变 snapshot；
+2. 从 profile 构造完整 requirement key 集合：`(profileId, subjectRef, itemId, verifierId)`；同一 verifier 被多个 item 使用时仍保留多个 requirement key，但可共享最终选中的 pointer；
+3. 对每个 requirement 构造完整 candidate set：snapshot catalog 中 `profileId/verifierId/subjectRef` 全部相等的六字段 pointer；不得按登记时间、ID 排序或 artifact 是否看起来有效来预选；
+4. 用同一冻结 revocation snapshot 派生 active set：pointer ID 或 `artifactRef` 被撤销的 candidate 只保留审计身份，不进入 active set；
+5. 每个 requirement 的 active set 必须恰有一个 pointer。零个返回 `E2_POINTER_MISSING`；多于一个返回 `E2_POINTER_AMBIGUOUS`，即使多个 pointer 指向同一 artifact 也不自动去重；
+6. 对全部唯一 selected pointer 严格解析六字段并核对 profile/verifier/subject；
+7. 从 `artifactRef` 派生唯一 CAS 路径；拒绝 symlink、非普通文件和路径逃逸；
+8. 使用有界稳定读取校验对象大小和 SHA-256；
+9. 拒绝重复 JSON key、非 UTF-8、非规范 JSON、未知/缺失字段；
+10. 核对 `trusted-e2-receipt/v2`、suite policy digest、toolchainRef、subject 和仅预期测试身份；
+11. 对本次 selected pointer 全部完成预检后，立刻重新摘要 catalog/profile/revocation/registry/contract。与步骤 1 不同则返回 `ACCEPTANCE_STATE_CHANGED`；只有相等才打开阶段 B gate。
 
 阶段 A 允许内存分配和只读文件描述符；禁止：
 
 - 启动子进程或执行 Git；
 - 创建临时 checkout、venv、node_modules、锁文件或新 CAS 对象；
 - 修改访问时间以外的验收数据（实现应使用不会产生业务可见写入的读取方式）；
-- 在某个 pointer 通过后提前重放，等待后续 pointer 再失败。
+- 在某个 pointer 通过后提前重放，等待后续 pointer 再失败；
+- 在多个 active pointer 中尝试 artifact，直到找到可用的一个。
 
-阶段 A 失败只返回稳定阻塞码和最小路径类别，不回显 artifact 内容。
+阶段 A 失败只返回稳定阻塞码和最小路径类别，不回显 artifact 内容。多个匹配、旧 pointer 未撤销、最后一个 selected artifact 损坏或 gate 前并发追加时，`spawnCount=0`、`checkoutCount=0`、`casWrites=0`，catalog/contract 字节不变。阶段 B 开始后的并发变化仍由最终快照复核阻止状态写入，但不能倒推为“未执行过重放”。
+
+为使 append-only catalog 可恢复歧义，v2 revocation schema 必须支持 typed `pointerId` 与 `artifactRef` 撤销；这只决定 E2 candidate 是否 active，不修改旧 pointer，也不改变 E1/E3/E4 的验证语义。新增 pointer 前必须先由治理提交撤销被取代的旧 pointer，并在下一冻结快照生效；同一操作中“边追加边撤销”不能绕过 gate。
 
 ## 8. 阶段 B：可信重放
 
@@ -246,7 +296,53 @@ entrypoint 直接解析为包内绝对 argv prefix。版本输出是 manifest �
 
 ### 8.2 Git 固定主体与有界元数据
 
-Git 可执行文件必须来自工具链包。源仓库安全检查和 checkout 创建不得调用宿主 Git。所有 runner 直接读取的 Git 控制文件使用统一 `BoundedStableReader`：`O_NOFOLLOW`、普通文件检查、读取前后 stat 一致、精确上限、无部分接受。
+Git 可执行文件及 helper 必须来自工具链包。源仓库安全检查和 checkout 创建不得调用宿主 Git，也不得让工具链 Git 直接打开未经净化的原始 `.git`。runner 先用自有有界读取器检查原始布局，再在 containment 内构造只含允许对象的 sanitized bare view；工具链 Git 只接触该 view。
+
+#### 8.2.1 固定隔离环境
+
+Git 调用统一使用以下环境/参数；suite、仓库和宿主都不能覆盖：
+
+- `HOME`、`XDG_CONFIG_HOME` 指向 containment 内只读空目录；`GIT_CONFIG_NOSYSTEM=1`、`GIT_CONFIG_GLOBAL=/dev/null`、`GIT_ATTR_NOSYSTEM=1`；
+- 清除 `GIT_DIR`、`GIT_WORK_TREE`、`GIT_COMMON_DIR`、`GIT_OBJECT_DIRECTORY`、`GIT_ALTERNATE_OBJECT_DIRECTORIES`、`GIT_REPLACE_REF_BASE`、`GIT_SSH`、`GIT_SSH_COMMAND`、`SSH_AUTH_SOCK`、`GIT_ASKPASS` 和全部 `GIT_CONFIG_*` 注入变量；
+- 固定 `GIT_OPTIONAL_LOCKS=0`、`GIT_TERMINAL_PROMPT=0`、`GIT_DISCOVERY_ACROSS_FILESYSTEM=0`、`GIT_NO_REPLACE_OBJECTS=1`、`LC_ALL=C`；
+- 每次命令显式使用 `--no-replace-objects`、`-c core.hooksPath=<受信空目录>`、`-c core.autocrlf=false`；`PATH` 只含工具链 entrypoint/helper 目录；
+- 禁止网络协议和 credential/helper 调用；E2 从本地固定对象闭包工作，不 fetch、不 submodule update。
+
+#### 8.2.2 config、attributes 与外部对象源
+
+原始 `config` 和 `config.worktree` 只允许以下键，且值必须符合 Git 标准布尔/整数/格式约束：
+
+```text
+core.repositoryformatversion
+core.filemode
+core.bare
+core.logallrefupdates
+core.ignorecase
+core.precomposeunicode
+extensions.worktreeconfig
+```
+
+`core.repositoryformatversion` 必须恰为 `0`；其余六键只能是 Git 规范布尔值；拒绝重复 section/key、续行歧义和 NUL。任何其他键一律 `GIT_CONFIG_UNSAFE`，包括但不限于 `include.*`、`includeIf.*`、`core.hooksPath`、`core.attributesFile`、`core.excludesFile`、`core.fsmonitor`、`core.sshCommand`、`filter.*`、`credential.*`、`url.*`、`http.*`、`protocol.*`、`remote.*`、`submodule.*`、`diff.*`、`merge.*`、`difftool.*`、`mergetool.*`、`alias.*`、`safe.*`、`extensions.partialClone` 和 `extensions.objectFormat`。
+
+以下对象存在即拒绝，不以“看起来为空”放行：
+
+- `objects/info/alternates`、`objects/info/http-alternates`、环境 alternate/object directory；
+- `refs/replace/**`、`info/grafts`、`shallow`、任何 `.promisor`、promisor/partial clone config；
+- 任一真实 hook basename、symlink 或特殊文件；只允许有界普通 `*.sample` 且从不复制到 sanitized view。`info/attributes` 与外部 attributes 文件一律拒绝；
+- subject commit 树内任意 `.gitattributes` 若声明 `filter`、`working-tree-encoding` 或 `ident`；
+- symlinked `.git`、gitdir/common-dir/object/refs/config/pack 组件或任何越过受信 repository 边界的指针。
+
+#### 8.2.3 refs 与 object layout
+
+- `.git` gitdir 指针只允许一行 `gitdir: <path>`；`commondir` 只允许一个规范相对/绝对路径，解析后必须留在注册的 repository root；
+- HEAD 可为一个 40 位 SHA-1 或指向允许 refs tree 的规范 symbolic ref；其他 loose ref 必须是普通文件、单行 40 位 SHA-1。ref path 需通过 Git refname 语法，拒绝 symlink、特殊文件和 `refs/replace`；
+- `packed-refs` 只接受 Git v2 规范 header、40 位 object ID、合法 refname 和与前项相邻的 peeled 行；refs 必须 bytewise 升序，拒绝 packed 内重复、与 loose ref 重名、排序歧义、NUL、未知 header 和超过 100,000 条；
+- objects tree 只允许 fan-out loose objects 与 `objects/pack/pack-<40hex>.pack/.idx` 成对普通文件；最多 1,024 个 pack。v2 拒绝 `.bitmap`、`.rev`、`.mtimes`、`.promisor`、multi-pack-index、commit-graph、cruft/keep sidecar 和未知 pack sidecar；
+- 单个 pack 最大 4 GiB、单个 idx 最大 256 MiB、全部 object 文件最大 16 GiB；loose object 最大 256 MiB。超限为 `GIT_OBJECT_BUDGET_EXCEEDED`；布局、配对或类型不符为 `GIT_OBJECT_LAYOUT_UNSAFE`；
+- 原始 `.idx` 只做有界类型/配对检查，不交给 Git；runner 把每个受控 pack stream 输入 sanitized view 内的 `git index-pack --strict` 重新生成 idx，随后以 `git fsck --strict` 核对目标 commit closure。loose object 复制后同样由该 sanitized view 校验；
+- sanitized bare view 只写入固定 commit 所需的已验证 object closure、一个内部 ref 和最小受信 config；不复制原 hooks、attributes、index、logs、reflogs、remotes 或宿主 config。
+
+所有 runner 直接读取的 Git 控制文件使用统一 `BoundedStableReader`：`O_NOFOLLOW`、普通文件检查、读取前后 stat 一致、精确上限、无部分接受。
 
 固定上限如下：
 
@@ -254,38 +350,83 @@ Git 可执行文件必须来自工具链包。源仓库安全检查和 checkout 
 | --- | ---: | --- |
 | 工作树 `.git` gitdir 指针 | 4 KiB | 只允许单行 `gitdir: <path>`，解析后仍在受信 repository 边界 |
 | `commondir`、单个 loose ref、HEAD | 4 KiB | 禁止 NUL、多行注入和路径逃逸 |
-| `config`、`config.worktree` | 256 KiB | 只允许 v2 白名单键 |
+| `config`、`config.worktree` | 256 KiB | 只允许上列七个键 |
 | `packed-refs` | 8 MiB | 最多 100,000 条 ref，逐行语法校验 |
-| `shallow`、`info/grafts` | 8 MiB | 存在即按策略拒绝；也不得无界读取 |
+| `shallow`、`info/grafts`、alternates | 8 MiB | 存在即拒绝；仍先做有界类型/大小检查 |
 | runner 直接读取的全部 Git 元数据 | 16 MiB 聚合 | 超出即停止，不继续调用 Git |
 | 单次 Git 命令 stdout/stderr | 各 64 KiB | 超限视为不可验证，不截断后继续解析 |
 
-Git object pack 是对象数据流，不按上述“直接元数据”预算读取；其生产/消费必须管道化、超时化，并受临时目录配额与进程组清理约束。
+Git object pack 是对象数据流，不按上述 16 MiB“直接元数据”预算计算，但受本节独立 object budget、containment、超时和 no-symlink 约束。任何类别越界都在启动测试前阻塞；工具链 Git 不得消费被拒绝的原始输入。
 
-### 8.3 Invocation 与进程组生命周期
+### 8.3 Invocation 与不可逃逸 containment 生命周期
+
+POSIX session/PGID 只用于方便发送信号，不能证明全部后代已清空：后代可 double-fork 后 `setsid()`/`setpgid()`，或关闭 stdio 后继续运行。v2 的权威边界是 `ReplayContainmentV1`：
+
+```text
+create_session(profile) -> session_realm
+create_invocation(session_realm) -> invocation_leaf
+spawn_into(invocation_leaf, absolute_argv, env) -> leader
+terminate_all(invocation_leaf)
+prove_empty(invocation_leaf) -> empty_proof
+destroy(invocation_leaf)
+destroy_session(session_realm) -> destroyed_proof
+```
+
+containment backend 必须满足：
+
+- membership 由内核/虚拟机边界继承，非受信进程无法自行移出 invocation/session realm；
+- 第一个非受信指令执行前已加入 realm，不存在“先 exec 再移动”的竞争窗；
+- `setsid()`、`setpgid()`、double-fork、daemonize、关闭/转移 stdio 都不改变 membership；
+- supervisor 能内核级终止 realm 内全部成员，并取得“成员数为 0 / realm 已销毁”的可验证证明；
+- child 看不到可写的 containment 控制面，也没有移动自己或创建外部 realm 所需的 capability；
+- child 位于隔离 user/mount/PID/network/IPC 环境，不能访问 systemd/launchd、Docker socket、SSH agent 或其他可代为在 realm 外启动进程的宿主服务；
+- backend 的类型、版本和 host/guest 兼容性由 registry 与 toolchain manifest 双重固定。
+
+`containmentProfile` 不是自由字符串：静态 registry 必须同时固定 backend schema、host OS/arch/ABI/minimum version、content-addressed supervisor binary/code digest、required kernel capabilities，以及 VM 模式下的 guest image digest。supervisor 通过绝对受信引用装配，不从 PATH 发现；启动前 capability probe 任一项不满足即 `E2_CONTAINMENT_UNAVAILABLE`。
+
+v1 允许两类 backend：
+
+1. `linux-cgroup-v2/v1`：supervisor 创建 session cgroup 与每 invocation 独立 leaf，使用 `clone3(CLONE_INTO_CGROUP)` 在 exec 前原子加入；child 使用隔离 user/mount/PID/network/IPC namespace，不挂载可写 cgroupfs或宿主运行时 socket，且无 `CAP_SYS_ADMIN`。收尾使用 `cgroup.kill`，以 leaf `cgroup.events` 的 `populated 0` 加成功删除 leaf 作为 empty proof。仅 PGID/`killpg` 不计证明。
+2. `vm-cgroup-v1`：整个 replay session 位于一次性 VM，guest 内仍使用上述 cgroup leaf；invocation 以 guest empty proof 收尾，session 最终以 VM 停止并销毁内存/临时磁盘作为第二层证明。macOS 等无原生不可逃逸 job primitive 的 host 只能注册此类后端，不能注册“native PGID”后端。
 
 每个 setup/test invocation 严格执行：
 
-1. 创建新 session/process group，记录不可变 PGID；
-2. 启动 manifest entrypoint 的绝对 argv prefix，`shell=False`；
-3. 同时读取 stdout/stderr，并分别送入跨分块脱敏器；
-4. 一旦 leader 退出，不等待后台后代自行关闭管道：立即进入进程组收尾；
-5. 对仍存在的进程组先发送 TERM，短暂等待，再发送 KILL；成功、非零和超时路径相同；
-6. 反复探测直至进程组不存在，并回收 leader；不能证明归零则返回 `PROCESS_GROUP_CLEANUP_FAILED`；
-7. 只有归零后才解析/接受该 invocation 的结果并进入下一调用。
+1. 在 replay session 内创建新的 invocation leaf；
+2. 通过 backend `spawn_into` 启动 manifest entrypoint 的绝对 argv prefix，runner 自身 `shell=False`；
+3. 同时消费 stdout/stderr，并分别送入 `StreamingRedactor/v1`；
+4. leader 成功、非零、超时、输出/report 失败或 EOF 异常后都调用 `terminate_all`，不等待后台后代自行退出或关闭管道；
+5. `prove_empty` 成功并销毁 leaf 后，才解析/接受调用结果并进入下一 invocation；
+6. 不能证明为空返回 `E2_CONTAINMENT_CLEANUP_FAILED`；backend 不可用或 capability 不足返回 `E2_CONTAINMENT_UNAVAILABLE`；两者都不得产生成功 receipt。
 
-runner 不复用进程组。若平台无法可靠提供上述语义，该平台的 toolchain profile 不可注册为受信 E2 平台。
+setup 对 checkout 的文件变更保留在 session 文件系统中，但 invocation realm 不复用。最后一个调用后还必须销毁 session realm；session 销毁失败同样使整轮阻塞。
 
-### 8.4 跨分块流式脱敏与安全截断
+### 8.4 `StreamingRedactor/v1` 与安全截断
 
-stdout/stderr 各有独立 `StreamingRedactor`：
+stdout/stderr 各有独立、确定性的 `StreamingRedactor/v1`。同一 byte stream 无论以单块、每字节一块或任意 chunk 边界输入，必须得到相同安全输出/错误码。
 
-- 使用增量 UTF-8 解码；非法字节序列返回 `OUTPUT_REDACTION_UNSAFE`；
-- 保留跨 chunk 的未决前缀和当前逻辑记录，不在 secret token/字段可能继续延伸时提前释放；
-- secret key、认证头、Cookie、URL userinfo、Provider token、私钥块和 agent socket 模式必须跨 chunk 生效；
-- 未决原始窗口最大 64 KiB。到达上限仍无法判定安全边界时立即失败、清理进程组且不持久化任何输出；
-- 只有已脱敏且通过残留扫描的安全字节进入 32 KiB 持久化缓冲；达到上限后丢弃后续安全字节，最终追加固定 `...[truncated-after-redaction]` 标记；
-- 截断逻辑永远看不到未脱敏原文。原始 chunk 只存在于当前进程内存，不写临时文件、CAS 或日志。
+状态机固定为：
+
+1. **UTF8_PENDING：** 使用严格增量 UTF-8 decoder，只保留一个未完成 code point 所需的最多 3 个尾字节；非法序列立即 `OUTPUT_REDACTION_UNSAFE`，EOF 时残缺序列同样失败。
+2. **RECORD_PENDING：** 解码字符累积到当前逻辑记录。LF 结束记录；CRLF 作为同一个结束符并规范为 LF；孤立 CR 是记录正文。没有终止换行的最后记录在 EOF 走同一 sanitize/flush 路径。原始记录（不含结束符）允许最大 64 KiB；在结束符前收到第 64 KiB+1 byte 才失败，不释放任何部分。
+3. **PRIVATE_KEY_BLOCK：** 完整记录匹配 `-----BEGIN <TYPE> PRIVATE KEY-----` 后，只输出一次 `[REDACTED_PRIVATE_KEY]\n`，持续丢弃后续记录直到匹配对应 END；BEGIN/END 可跨输入 chunk 但不能跨逻辑记录。EOF 前未出现 END 仍安全地保持整块删除并完成；孤立 END 或嵌套 BEGIN 返回 `OUTPUT_REDACTION_UNSAFE`。
+4. **JSON_VALUE_PENDING：** 完整记录出现 secret JSON key 与冒号、但值尚未形成完整 JSON scalar 时，不释放该 fragment；跨后续记录累计到 scalar 闭合后整体替换为 `[REDACTED]`。pending fragment 与普通 record 共用 64 KiB 上限；EOF 仍未闭合则失败。
+5. **SANITIZE_RECORD：** 对完整记录按下列固定顺序替换，再执行同一词汇的 residual scan。只有 residual scan 通过的规范记录可释放到安全流。
+6. **EOF：** flush 增量 decoder；处理无换行尾记录；确认不处于歧义 JSON 状态；完成 residual scan。任何失败都丢弃本轮 receipt。
+
+v1 固定模式集合：
+
+- 行级 HTTP/代理认证头：`Authorization`、`Proxy-Authorization`、`Cookie`、`Set-Cookie`；
+- env/assignment/JSON key（ASCII 大小写不敏感，分隔词允许 `_`、`-` 或空格）：`api key`、`client secret`、`password`、`access token`、`refresh token`、`token`、`secret`、`credential`、`SSH_AUTH_SOCK`，以及以 `_KEY/_SECRET/_TOKEN/_PASSWORD/_CREDENTIAL` 结尾的环境名。key 后必须是 `:` 或 `=`；quoted value 消费到配对引号，未闭合则消费到 record 末端，无引号 value 消费到空白或 record 末端；
+- URL userinfo：`[A-Za-z][A-Za-z0-9+.-]*://` 后、首个 `/` 前包含 `user:password@` 的完整 authority；
+- raw Provider/token 形态：`gh[pousr]_[A-Za-z0-9]{20,}`、`github_pat_[A-Za-z0-9_]{20,}`、`sk-(proj-)?[A-Za-z0-9_-]{16,}`、`(?:AKIA|ASIA)[A-Z0-9]{16}`、`(?:sig|signature)=[A-Za-z0-9%+/_=-]{16,}`；
+- OpenSSH/PKCS/PGP 风格 `-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----` 到对应 END block；
+- `.ssh/id_*`、包含 `private` 的 key path 和 agent socket path。
+
+每个模式的 key/header 可跨 chunk，因为判定只发生在完整 record；多行私钥由独立 block state 覆盖。64 KiB 是最大 raw record/look-behind 边界，不存在更早释放的“安全前缀”。
+
+只有已脱敏且 residual scan 通过的字节进入 32 KiB 持久化缓冲。缓冲满后继续消费、解码、状态转换、脱敏和 residual scan 直到真实 EOF，只是不再保存后续安全正文；最终追加固定 `...[truncated-after-redaction]` 标记。不得因摘要已满而关闭 pipe、停止验证或跳过 EOF flush。
+
+截断逻辑永远看不到未脱敏原文。原始 chunk/record 只存在于当前进程内存，不写临时文件、CAS 或日志。
 
 machine report 使用独立有界通道，不复用已截断的人类输出。report 原文只在内存中解析，不进入 receipt；持久化时仅保留报告摘要、闭合 counts 和预期测试身份。
 
@@ -308,10 +449,12 @@ machine report 使用独立有界通道，不复用已截断的人类输出。re
 目标版本为 Vitest `3.0.8`：
 
 - invocation selection 必须显式建模为 `file + exactName + expectedId`；
-- argv 必须含规范化测试文件参数，以及 `-t <exactName>` 或语义等价的两个独立参数；不得要求完整 expected ID 作为单个 argv 元素；
+- argv 必须含规范化测试文件参数，以及 `-t ^<escaped exactName>$` 或语义等价的两个独立参数；loader 使用 ECMAScript RegExp 转义集合 `\\ ^ $ . * + ? ( ) [ ] { } | /` 逐字符转义并加首尾锚点，不接受 registry 自填 pattern；不得要求完整 expected ID 作为单个 argv 元素；
 - 每个 Task 11 精确名称单独 invocation，禁止用一个正则同时代表多个必测项；
-- `success`、suite/test counts、`testResults`、`assertionResults`、file identity、`fullName` 和 status 必须闭合；
-- report 中实际 assertion 集合必须恰好等于该 invocation 的 expected ID；失败、pending、todo、额外或零 assertion 均不能提供 E2 通过；
+- `success`、suite/test counts、`testResults`、`assertionResults`、file identity、`fullName` 和 status 必须对报告中的全部 assertion（含 skipped）闭合；Vitest 3.0.8 的 `numPendingTests` 必须等于 skipped assertion 数；
+- expected assertion 必须按 `file + fullName` 恰好出现一次且为 `passed`；同文件非 expected assertion 只允许 `skipped`，任何非 expected `passed/failed/pending/todo`、expected skipped/failed、重复 expected 或零 expected 都拒绝；
+- suite status 必须与“一项 expected passed、零 failed、其余只 skipped”一致，process exit 为 0 且 report `success=true`；
+- skipped assertion 的 fullName 只在内存中参与去重/count 闭合，不进入 receipt 或失败 facts；
 - report file 在执行前必须不存在，执行后按有界稳定读取一次。默认上限 1 MiB。
 
 ### 8.6 其他有界对象
@@ -337,7 +480,7 @@ profile 可以降低这些上限，不能在同一 schema 版本中提高。
 ### 9.2 `promote` / `reconcile`
 
 - E2 阶段 A 对本轮所需全部 E2 pointer 一次性完成；
-- 阶段 B 可以按确定顺序串行重放，但每个 invocation 进程组独立；
+- 阶段 B 可以按确定顺序串行重放，但每个 invocation containment leaf 独立；
 - 任一验证器阻塞/失败仍按既有逐矩阵项聚合，不允许用旧 receipt 成功替代本轮重放；
 - 所有验证完成后重新核对初始快照摘要；变化则返回 `ACCEPTANCE_STATE_CHANGED`，不写 override；
 - contract 投影仍由唯一 writer 以临时文件、flush、fsync、原子替换提交。
@@ -345,7 +488,7 @@ profile 可以降低这些上限，不能在同一 schema 版本中提高。
 ### 9.3 `collect`
 
 - 先校验 suite/subject/toolchain 的只读策略闭包，再重放；
-- 失败、超时、报告不闭合、脱敏不安全或进程组未归零时 CAS 新对象数必须为 0；
+- 失败、超时、报告不闭合、脱敏不安全或 containment 无法证明为空时 CAS 新对象数必须为 0；
 - 成功时先在内存生成规范 receipt，执行最终残留扫描，再通过 CAS 原子 `put-if-absent` 写一次；
 - collect 不写 catalog/contract。register 仍是独立命令，只登记既有 artifact。
 
@@ -357,18 +500,33 @@ profile 可以降低这些上限，不能在同一 schema 版本中提高。
 | `DIGEST_MISMATCH` | artifact/toolchain 内容摘要与引用不符 | 阻塞 |
 | `E2_ARTIFACT_TOO_LARGE` | receipt 超出固定上限 | 阻塞 |
 | `E2_ARTIFACT_SCHEMA_INVALID` | receipt 非规范或与 suite/profile/subject 不绑定 | 阻塞 |
+| `E2_POINTER_MISSING` | requirement 没有未撤销 matching pointer | 阻塞 |
+| `E2_POINTER_AMBIGUOUS` | requirement 有多个未撤销 matching pointer | 阻塞 |
 | `E2_TOOLCHAIN_UNAVAILABLE` | 内容寻址工具链包缺失或不可读 | 阻塞 |
-| `E2_TOOLCHAIN_PLATFORM_MISMATCH` | OS/architecture 不匹配 | 阻塞 |
-| `E2_TOOLCHAIN_CLOSURE_INVALID` | manifest、npm 模块树、entrypoint 或 file closure 不完整 | 阻塞 |
+| `E2_TOOLCHAIN_PLATFORM_MISMATCH` | execution OS/architecture/ABI/minimum OS/kernel/containment 不匹配 | 阻塞 |
+| `E2_TOOLCHAIN_MANIFEST_TOO_LARGE` | 固定 manifest 超 1 MiB | 阻塞 |
+| `E2_TOOLCHAIN_CLOSURE_INVALID` | manifest、CPython/npm/Git closure、entrypoint 或 file tree 不完整 | 阻塞 |
+| `E2_TOOLCHAIN_PACKAGE_TOO_LARGE` | 压缩包超 1 GiB | 阻塞 |
+| `E2_TOOLCHAIN_ARCHIVE_INVALID` | 非规范 tar+zstd、重复/危险 member 或 manifest 位置错误 | 阻塞 |
+| `E2_TOOLCHAIN_ENTRY_LIMIT` | payload member 超 100,000 | 阻塞 |
+| `E2_TOOLCHAIN_EXPANSION_LIMIT` | 单文件、总展开量或压缩比超限 | 阻塞 |
+| `E2_DYNAMIC_DEPENDENCY_UNTRUSTED` | 动态库、RPATH 或系统 ABI 不在 manifest 平台闭包 | 阻塞 |
+| `E2_DEPENDENCY_REPOSITORY_INVALID` | 离线 Python/npm 仓库缺失、摘要错或 lock 映射不闭合 | 阻塞 |
 | `E2_HOST_TOOL_FALLBACK` | 检测到主机 PATH/解释器/工具回退 | 阻塞 |
 | `GIT_METADATA_TOO_LARGE` | Git 控制元数据超单文件或聚合预算 | 阻塞 |
 | `GIT_METADATA_UNSAFE` | Git 元数据为 symlink、变型、越界或语法不安全 | 阻塞 |
+| `GIT_CONFIG_UNSAFE` | 出现非七键 allowlist config、include/helper/filter/hook 等输入 | 阻塞 |
+| `GIT_EXTERNAL_OBJECT_SOURCE` | alternate/http-alternate/replace/graft/shallow/promisor | 阻塞 |
+| `GIT_REF_UNSAFE` | loose/packed ref 类型、语法、重复或路径不安全 | 阻塞 |
+| `GIT_OBJECT_LAYOUT_UNSAFE` | pack/index/loose object 配对、类型或 sidecar 不允许 | 阻塞 |
+| `GIT_OBJECT_BUDGET_EXCEEDED` | pack/index/loose object 单项、数量或总量超预算 | 阻塞 |
 | `REPORT_TOO_LARGE` | machine report 超 1 MiB | 阻塞 |
 | `REPORT_SCHEMA_INVALID` | report schema/count/exit 自相矛盾 | 阻塞 |
 | `TEST_SELECTION_MISSING` | 实际测试未精确覆盖 registry 预期集合 | 阻塞 |
 | `E2_SETUP_FAILED` | 依赖/环境 setup 失败，未得到可信测试结论 | 阻塞 |
-| `TEST_REPLAY_TIMEOUT` | invocation 超时且已完成进程组收尾 | 阻塞 |
-| `PROCESS_GROUP_CLEANUP_FAILED` | 无法证明 invocation 后代已归零 | 阻塞 |
+| `TEST_REPLAY_TIMEOUT` | invocation 超时且已取得 containment empty proof | 阻塞 |
+| `E2_CONTAINMENT_UNAVAILABLE` | 注册 backend/能力不可用，无法建立不可逃逸 realm | 阻塞 |
+| `E2_CONTAINMENT_CLEANUP_FAILED` | 无法取得 kernel/VM empty 或 destroyed proof | 阻塞 |
 | `OUTPUT_REDACTION_UNSAFE` | 输出无法安全增量解码、脱敏或通过残留扫描 | 阻塞 |
 | `TEST_REPLAY_FAILED` | 有效、闭合的受信报告证明测试失败 | 失败 |
 
@@ -381,7 +539,7 @@ E2 v2 在进入 Ticket 23 真实 profile 前，必须用与生产命令形态相
 ### 11.1 Python fixture
 
 - 工具链包内 CPython 3.13.x、uv、Git；
-- 固定安装 `pytest==8.3.5` 与 `pytest-json-report==1.5.0`；
+- 从内容寻址离线 Python 仓库固定安装 `pytest==8.3.5` 与 `pytest-json-report==1.5.0`，每个 wheel/sdist 摘要与 lock 映射闭合；
 - 运行至少一个通过测试，并实际产生 `.report.json`；
 - 验证真实 summary 可以只有 `collected / passed / total`，零值 `failed/skipped` 省略仍通过；
 - 再覆盖失败、零收集、deselected 和超限 report，确认 counts/exit/tests 闭合及稳定错误码。
@@ -389,39 +547,55 @@ E2 v2 在进入 Ticket 23 真实 profile 前，必须用与生产命令形态相
 ### 11.2 Vitest fixture
 
 - 工具链包内 Node、完整 npm CLI closure；项目 lock 固定 Vitest `3.0.8`；
-- 用 `npm ci --ignore-scripts` 或等价受信 setup 安装固定依赖；
-- 每次执行采用 `测试文件参数 + -t + 精确测试名 + JSON reporter`；
-- 至少验证两个不同精确名称分别运行，实际 assertion ID 与各自 expected ID 一一对应；
-- 缺 `-t`、使用多测试正则、错误文件、零 assertion、额外 assertion、缺 npm 模块和主机 PATH 投毒全部 fail closed。
+- 从内容寻址离线 npm 仓库用 `npm ci --ignore-scripts --offline` 或等价受信 setup 安装固定依赖；
+- 同一个真实测试文件至少定义两个测试；每次采用 `测试文件参数 + -t + 转义并锚定的精确 fullName + JSON reporter` 分别执行；
+- 对每次真实 Vitest 3.0.8 report，验证一个 expected assertion 为 passed、同文件另一个未匹配 assertion 为 skipped，`numTotalTests=2`、`numPassedTests=1`、`numPendingTests=1` 且 receipt 只保存 expected ID；
+- 再构造非 expected passed/failed、expected skipped、未锚定/多测试正则、错误文件、零 expected、缺 npm 模块和主机 PATH 投毒，全部 fail closed。
 
-### 11.3 Ticket 23 profile 映射
+### 11.3 Containment 与流式脱敏 fixture
+
+- containment helper 依次覆盖普通后台 child、double-fork、`setsid()`、`setpgid()`、关闭 stdio、持续持有 stdout/stderr，以及上述形态在 leader exit 0、非零和 timeout 下的组合；
+- 每次都以 cgroup/VM membership 观察到成员并由 backend 终止，最终取得 empty/destroyed proof；只清空 PGID 而 realm 仍 populated 的 fixture 必须失败；
+- 同一秘密语料以单 chunk、每个 byte 一个 chunk 和所有相邻 split point 重放，输出必须完全相同；覆盖 LF、CRLF、无尾换行、UTF-8 code point 跨块、私钥 block、URL userinfo、JSON/header token、EOF flush，以及 64 KiB 恰好/64 KiB+1；
+- 安全摘要达到 32 KiB 后，fixture 继续发送尾部秘密和非法 UTF-8，runner 必须继续消费到 EOF 并拒绝，而不是因缓冲已满提前成功。
+
+### 11.4 Ticket 23 profile 映射
 
 - 后端四个 pytest node ID 可在一个显式 invocation 中运行，或按 profile 分组；实际集合必须等于注册集合；
 - 前端持久化五项、API 两项、结构两项均采用“一精确测试名一 invocation”；
 - 所有 suite 固定同一个 Ticket 23 product commit、对应 lockfile 摘要和平台工具链 digest；
-- macOS arm64 与其他平台使用不同工具链 package/ref，不允许“版本相同”替代 digest/平台相同。
+- 原生 macOS PGID profile 不可注册。macOS arm64 host 若执行正式 E2，必须使用已登记 `vm-cgroup-v1` 后端与匹配 guest OS/arm64/ABI 的工具链 package；不同执行平台使用不同 digest，不能以版本字符串相同替代。
 
 ## 12. 验收矩阵
 
 | 场景 | 必须观察到的结果 |
 | --- | --- |
-| token 跨两个、三个读取 chunk，且截断点位于 token 中间 | receipt 中无任何 token 片段；先完整脱敏再出现截断标记 |
-| 单条未决输出超过 64 KiB 且无法证明安全边界 | `OUTPUT_REDACTION_UNSAFE`；进程组归零；无 CAS 新对象 |
-| leader exit 0 后后台 child 保持运行/持有 stdout | child 被终止并确认进程组消失；无法确认则 `PROCESS_GROUP_CLEANUP_FAILED`，不得成功 |
-| leader 非零或超时并留下 child | 同样完成收尾；超时返回 `TEST_REPLAY_TIMEOUT`，清理失败优先返回 cleanup code |
+| 同一秘密语料以单 chunk、每字节 chunk、每个 split point 输入；覆盖 LF/CRLF、UTF-8 跨块、无尾换行、私钥、URL/JSON/header token | 输出/错误码与 chunk 划分无关；receipt 无 token 片段 |
+| 安全输出已满 32 KiB，随后出现秘密或非法 UTF-8 | runner 仍消费到 EOF 并返回 `OUTPUT_REDACTION_UNSAFE`；不得提前成功 |
+| 未决 record 恰好 64 KiB 与 64 KiB+1 | 前者仅在完整安全边界可 flush；后者稳定失败；两者都无截断前泄漏 |
+| leader exit 0 后 child double-fork + `setsid()` + 关闭 stdio并持续运行 | child 仍属于 containment leaf，被 `terminate_all` 清除；以 kernel/VM empty proof 验证，不用 PGID 空替代 |
+| leader 非零/超时，后代持有 stdout 或另建 PGID | 同样取得 empty proof；超时返回 `TEST_REPLAY_TIMEOUT`，无法证明清空则 `E2_CONTAINMENT_CLEANUP_FAILED` |
+| 平台只有 PGID/killpg、没有注册 containment backend | `E2_CONTAINMENT_UNAVAILABLE`；该平台/profile 不可注册 |
+| supervisor/VM image digest、host ABI 或 kernel capability 与 containment profile 不符 | `E2_CONTAINMENT_UNAVAILABLE`；不创建 replay session |
 | pointer artifact 缺失、摘要错、schema 错或超限 | 阶段 B 进程启动数为 0；checkout/temp/CAS/catalog/contract 均无变化 |
-| 多个 E2 pointer 中最后一个预检失败 | 前面通过预检的 suite 也不重放，证明 barrier 是操作级而非逐 pointer 交错 |
+| requirement 有两个未撤销 matching pointer，或新 pointer 已追加但旧 pointer 未撤销 | `E2_POINTER_AMBIGUOUS`；不按时间/ID/可用性挑选；spawn/checkout/CAS/catalog/contract 均零变化 |
+| requirement 唯一 active pointer 是最后一个且 artifact 损坏 | 前面 requirement 也不重放，证明 barrier 是操作级 |
+| 阶段 A 期间并发追加 catalog pointer | gate 前摘要复核返回 `ACCEPTANCE_STATE_CHANGED`；spawn/checkout/CAS/catalog/contract 均零变化（外部并发追加本身除外） |
 | 主机 PATH 放置同名假 Git/uv/node/npm/python | 假工具执行标记不存在；runner 只执行 package entrypoint |
-| npm 包只含 `npm-cli.js` 而缺依赖模块树 | `E2_TOOLCHAIN_CLOSURE_INVALID`，不回退主机 npm |
+| toolchain archive 含重复 path、hardlink、PAX、越界 symlink、100,001 项、超 4 GiB 展开量或压缩比超 100:1 | 分别返回规范 archive/entry/expansion 稳定码；任何 entry 不得变为可执行 |
+| npm 包只含 `npm-cli.js`，或缺 CPython stdlib/Git helper/动态库声明 | `E2_TOOLCHAIN_CLOSURE_INVALID` 或 `E2_DYNAMIC_DEPENDENCY_UNTRUSTED`，不回退宿主 |
+| setup 试图访问 live npm/Python registry，或离线仓库与 lock digest 不闭合 | `E2_DEPENDENCY_REPOSITORY_INVALID`；无网络回退 |
 | pytest 1.5.0 真实通过报告省略零值字段 | 接受；`total == len(tests)`，`collected/deselected` 闭合 |
 | pytest summary 与 tests、exitcode 或 deselected 矛盾 | `REPORT_SCHEMA_INVALID` 或 `TEST_SELECTION_MISSING` |
-| Vitest 使用文件参数和 `-t` 精确名 | 接受正确单项；无需完整 expected ID 作为单个 argv 参数 |
-| Vitest 一个正则匹配多个预期项 | profile schema 或 selection 校验拒绝 |
+| Vitest 3.0.8 同文件两个测试，以锚定 `-t` 分别运行 | 每次接受 1 passed expected + 1 skipped non-expected；counts 全闭合；receipt 只含 expected ID |
+| Vitest 非 expected assertion 为 passed/failed，或 registry 提供未锚定/未转义 regex | `TEST_SELECTION_MISSING` 或 policy 拒绝；skipped 之外的额外执行不可忽略 |
 | `.git` 指针 4097 字节、`packed-refs` 超 8 MiB、聚合元数据超 16 MiB | `GIT_METADATA_TOO_LARGE`，不部分解析、不调用后续测试 |
+| Git config include/helper/filter/hook、alternate/http-alternate、replace/graft/shallow/promisor | 对应 `GIT_CONFIG_UNSAFE` 或 `GIT_EXTERNAL_OBJECT_SOURCE`；工具链 Git 从未打开被拒绝的原始 `.git` |
+| refs 重复/越界/symlink，pack 缺 idx、未知 bitmap/rev/promisor sidecar，object budget 超限 | `GIT_REF_UNSAFE`、`GIT_OBJECT_LAYOUT_UNSAFE` 或 `GIT_OBJECT_BUDGET_EXCEEDED`；不构造 checkout |
 | report 超 1 MiB 或读取中变化 | `REPORT_TOO_LARGE` 或 `REPORT_SCHEMA_INVALID`；不持久化 report 原文 |
 | 成功 collect | 仅新增一个规范 v2 CAS receipt；catalog/contract 字节不变 |
 | 成功 verify/promote/reconcile 的验证阶段 | CAS 对象数和字节不变；只允许最终 projection writer 按既有规则改 contract |
-| Task 11 最小 Python + Vitest fixture | 使用真实工具和真实 reporter 全部通过后，才允许编写真实 profile 数据 |
+| Task 11 最小 Python + Vitest + containment fixture | 使用真实工具、真实 reporter、真实 skipped 行、真实 cgroup/VM empty proof 全部通过后，才允许编写真实 profile 数据 |
 
 ## 13. 固定参考与三引擎职责一致性
 
@@ -445,15 +619,18 @@ E2 v2 在进入 Ticket 23 真实 profile 前，必须用与生产命令形态相
 - 本规格不实现代码、不编写 v2 实施计划、不恢复 Task 5、不启动 Task 6。
 - 不打包或提交真实生产私钥，不改变 E4 签名治理。
 - 不重新设计 E1、E3、E4、catalog、矩阵状态或产品三引擎。
-- 不承诺跨所有操作系统；只有具备可靠进程组语义并有对应 toolchain package 的平台才能注册。
+- 不承诺跨所有操作系统；只有具备不可逃逸 containment backend、对应平台/ABI toolchain package 和 empty/destroyed proof 的执行环境才能注册。POSIX PGID 不满足条件。
 - 不把工具链 package 当成产品依赖 lockfile 的替代，也不把 package manager 成功当成测试成功。
 - 不把安全输出摘要、machine report 或 receipt 暴露为业务日志系统。
 
 ## 16. 规格自审结论
 
 - 无未决占位决策；具体 package digest、产品 commit 和 reviewer 公钥属于未来真实输入，不是本规格缺口。
-- 五项最终独立审查问题分别有不变量、失败码和验收行。
+- 首轮五项和本轮六项独立审查问题均有不变量、失败码和验收行；PGID 不再冒充后代证明，Vitest skipped 行按真实 3.0.8 schema 闭合。
 - 两阶段顺序、验证零写入、collect 后写入和 contract 原子投影之间无冲突。
-- pytest/Vitest 兼容规则与 Task 11 的真实命令形态一致；npm CLI 闭包和主机 PATH 边界明确。
+- 工具链容器格式、manifest 边界、解包预算、动态依赖和离线依赖仓库唯一且版本化。
+- `StreamingRedactor/v1` 的 chunk-independent 状态、EOF、record 上限和截断后继续消费规则明确。
+- candidate set/唯一 active pointer/gate 前并发复核明确；Git config/ref/object allow/deny 与预算明确。
+- pytest/Vitest 兼容规则与真实 Task 11 命令形态一致；同文件 skipped assertion 不再造成系统性误拒绝。
 - 固定参考、138 项冻结合同、E1/E3/E4 和三引擎职责均未被扩大或替代。
 - 本规格范围可由一个后续实施计划覆盖，但本次任务停在书面规格审查门。
