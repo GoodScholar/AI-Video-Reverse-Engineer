@@ -17,6 +17,7 @@ E2 v2 以“先证明输入可验证，再允许执行”为核心顺序，取�
 5. **真实 reporter 合同。** `pytest-json-v1` 兼容 `pytest-json-report 1.5.0` 对零值 outcome 字段的省略，同时严格闭合 `collected / deselected / total / tests`；`vitest-json-v1` 支持 Task 11 的“测试文件参数 + `-t` 精确测试名”选择形态。
 6. **不再信任主机工具。** Git、uv、Node、npm CLI 运行时闭包以及 profile 需要的 Python 运行时都必须来自内容寻址工具链包；不得发现、验证后复制或执行主机 `PATH` 中的同名程序。
 7. **所有直接读取都有上限。** Git 控制元数据、machine report、receipt 和工具链 manifest 均有固定单文件及聚合字节上限；超限使用稳定阻塞码，不读取后再“尽量继续”。
+8. **Python setup 不解析项目。** v1 先用包内 uv 与包内 CPython 创建空 venv，再以 `uv pip sync` 从带 hash 的冻结 requirements lock 和 wheel-only flat view 安装依赖；不存在项目级同步步骤，不发现、安装或构建当前 project/workspace/editable。
 
 本规格不宣称 Task 5 已完成。Task 5 的五轮修复和最终独立审查仍是失败/阻塞历史；E2 v2 是对协议的后继修订，不是第六轮隐式修补。
 
@@ -43,6 +44,7 @@ E2 v2 以“先证明输入可验证，再允许执行”为核心顺序，取�
 | pytest 真实 summary 省略零值字段；Vitest 3.0.8 的 `-t` 会把同文件未匹配项保留为 skipped；npm 只是 JS launcher 而非单文件 | parser 采用真实 schema 兼容规则；Vitest 允许非预期 skipped、拒绝非预期 executed；工具链 package 显式封闭 npm CLI 模块树 |
 | artifact 指针无效时仍重放并写新 CAS | 全操作阶段 A 先预检全部 artifact；验证路径阶段 B 不写 CAS |
 | `.git` 指针、`commondir`、`packed-refs` 等读取无上限 | 所有直接 Git 元数据读取走统一有界读取器，并受单文件/聚合预算约束 |
+| Python setup 读取 `pyproject.toml`/workspace、更新 lock 或执行 first-party editable build backend | Python v1 只接受 hash-pinned requirements lock，以 `uv pip sync --no-build --no-cache` 消费受信 wheel view；checkout 项目元数据不进入依赖输入，lock 前后 bytes 必须相同，setup exec census 必须证明零 build-backend exec |
 
 ### 3.2 额外防护对象
 
@@ -77,6 +79,7 @@ E2 v2 以“先证明输入可验证，再允许执行”为核心顺序，取�
 9. **有界读取：** 任一受控文件在打开前、读取中或读取后超限、变型、变 inode 或变 mtime，均阻塞本轮验证。
 10. **固定主体：** checkout、lockfile、依赖 entrypoint 和测试文件均来自精确 `git://product@<40-sha>` 与内容寻址离线仓库；当前工作树不参与重放。
 11. **唯一证据选择：** 对冻结快照中的每个 requirement，必须恰有一个未撤销 matching pointer；零个或多个都在阶段 A 阻塞，运行者无选择权。
+12. **Python wheel-only 安装：** Python setup 只能按固定的 `uv venv` + `uv pip sync` 两步消费唯一冻结 requirements lock；禁止项目/workspace/editable/source/build backend，lockfile 不能被检查更新或改写。
 
 ## 5. 总体架构与顺序
 
@@ -170,7 +173,8 @@ v2 suite 是 registry 拥有的闭合策略，pointer 不能提供或覆盖任�
 - 每个 Task 11 Vitest 精确测试名使用一个 invocation，文件参数和 `-t` 参数分别核对；`-t` 值必须由 loader 对 `exactName` 做 ECMAScript RegExp 元字符转义后加 `^...$` 生成，registry 不接受任意正则；
 - Python suite 使用 `pytest-nodeids/v1`，argv 中逐一携带精确 node ID；
 - report 路径必须位于隔离 checkout 的受控临时子目录，执行前确认不存在，执行后只读一次；
-- npm setup 的规范 argv 必须含 `ci --ignore-scripts --offline --replace-registry-host=never --cache=@dependency-repository/npm`；Python setup 必须含 `uv sync --offline --no-index --find-links=@dependency-repository/python`，并固定 `UV_OFFLINE=1`、`PIP_NO_INDEX=1`。`@dependency-repository/<ecosystem>` 是唯一受支持的 argv token：npm token 替换为 containment 内含 `_cacache` 子目录的已验证 COW cache-root 绝对路径，Python token 替换为已验证 flat find-links 绝对目录；registry 不接受其他变量、路径模板或环境展开。测试由包内 Node/Python 直接加载已验证 derived entrypoint，不经过 npm package-script shell、项目 `.bin` PATH 或 venv activation script；
+- npm setup 的规范 argv 必须含 `ci --ignore-scripts --offline --replace-registry-host=never --cache=@dependency-repository/npm`。Python v1 setup 恰有以下两个 invocation，顺序不可交换，也不得附加第三个 setup：先以包内 uv 执行 `venv <venv-path> --python=@toolchain/python --no-project --no-config --no-python-downloads --no-cache`，再执行 `pip sync --python=<venv-path>/bin/python <requirements-lock-path> --offline --no-index --find-links=@dependency-repository/python --no-build --require-hashes --no-sources --config-file=@toolchain/uv-empty-config --no-python-downloads --no-cache`；禁止 `--seed`、`--project`、`--group`、`--extra` 或其他 source/config 参数。`<venv-path>` 与 `<requirements-lock-path>` 必须是 suite 中具体、无占位符的 checkout-root 相对路径，Task 11 固定为 `backend/.venv` 与 `backend/requirements.lock`；
+- Python setup 固定 `UV_OFFLINE=1`、`PIP_NO_INDEX=1`、`UV_PYTHON_DOWNLOADS=never`。仅 `@dependency-repository/<ecosystem>`、`@toolchain/python` 与 `@toolchain/uv-empty-config` 是受支持的 argv token：repository token 分别替换为 containment 内含 `_cacache` 的已验证 npm COW cache-root 或 Python flat find-links 绝对目录，两个 toolchain token 分别替换为已验证 CPython entrypoint 和零字节受信 `uv.toml` 的单个绝对路径；registry 不接受其他变量、路径模板或环境展开。测试由包内 Node 或 venv 中链接回包内 CPython 的解释器直接加载已验证 derived entrypoint，不经过 npm package-script shell、项目 `.bin` PATH 或 venv activation script；
 - `dependencyRepositoryRefs` 只能引用 6.3 节的内容地址。network namespace 默认无 egress；任何 DNS/socket/live registry 探测即 `E2_LIVE_REGISTRY_ACCESS`，即使本地缓存最终令命令退出 0 也不能接受。
 
 ### 6.2 `trusted-e2-toolchain-tar-zstd/v1`
@@ -220,10 +224,20 @@ manifest 必须是 archive 的第一个 member，固定路径 `.trusted-e2-toolc
     "npm": {"argvPrefix": ["bin/node", "lib/node_modules/npm/bin/npm-cli.js"], "version": "11.19.0"},
     "python": {"argvPrefix": ["python/bin/python3"], "version": "Python 3.13.x"}
   },
+  "configFiles": {
+    "uvEmpty": {"path": "config/uv-empty.toml", "size": 0, "sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
+  },
   "closures": {
     "cpython": {"roots": ["python/bin", "python/lib/python3.13", "lib/libpython3.13.so.1.0"], "treeDigest": "sha256:<digest>"},
     "npm": {"roots": ["lib/node_modules/npm"], "treeDigest": "sha256:<digest>"},
     "git": {"roots": ["bin/git", "libexec/git-core", "share/git-core/templates"], "treeDigest": "sha256:<digest>"}
+  },
+  "runtimePolicies": {
+    "uvSetup": {
+      "uvVersion": "0.11.14",
+      "allowedChildEntrypoint": "python",
+      "allowedChildArgvDigests": ["sha256:<normalized-uv-interpreter-probe-argv-digest>"]
+    }
   },
   "dynamicDependencies": {
     "bin/git": ["lib/libz.so.1", "system:/lib/libc.so.6@sha256:<digest>"],
@@ -232,7 +246,9 @@ manifest 必须是 archive 的第一个 member，固定路径 `.trusted-e2-toolc
   "files": [
     {"path": "bin", "type": "dir", "mode": "0555"},
     {"path": "bin/git", "type": "file", "size": 123, "mode": "0555", "sha256": "sha256:<digest>"},
-    {"path": "bin/python3", "type": "symlink", "mode": "0777", "target": "../python/bin/python3"}
+    {"path": "bin/python3", "type": "symlink", "mode": "0777", "target": "../python/bin/python3"},
+    {"path": "config", "type": "dir", "mode": "0555"},
+    {"path": "config/uv-empty.toml", "type": "file", "size": 0, "mode": "0444", "sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
   ]
 }
 ```
@@ -257,6 +273,8 @@ manifest 必须是 archive 的第一个 member，固定路径 `.trusted-e2-toolc
 - loader、libc 和每个系统动态库按规范绝对路径、文件 SHA-256 与 ELF build ID 三者精确核对；SONAME 仅作附加一致性检查。同 SONAME、不同 bytes/build ID 必须 `E2_TOOLCHAIN_PLATFORM_MISMATCH`，不得以版本字符串或“ABI 看起来兼容”放行；
 - manifest 必须列出每个 ELF/Mach-O entrypoint 和 helper 的完整动态依赖。依赖要么是包内 file，要么按规范绝对路径命中 `allowedSystemLibraries` 的完整 identity；运行前离线扫描，发现未列依赖、RPATH 越界、SONAME-only 命中或宿主任意搜索路径即 `E2_DYNAMIC_DEPENDENCY_UNTRUSTED`；
 - CPython closure 必须包括可执行文件、`libpython`、完整 stdlib、`lib-dynload`、编码和 CA/zoneinfo 等运行必需资源；venv 解释器只能链接回该 closure；
+- `configFiles.uvEmpty` 必须逐字段等于零字节 regular file `config/uv-empty.toml` 及其固定 SHA-256；`uv pip sync --config-file=@toolchain/uv-empty-config` 用它关闭 checkout/用户/系统配置发现，不能用宿主 `/dev/null`、临时配置或 checkout 文件替代；
+- `runtimePolicies.uvSetup` 必须固定 uv 版本、唯一允许的包内 Python child entrypoint，以及该 uv 版本解释器探针的全部规范 argv digest；规范化只把已验证 toolchain root 与 suite venv root 分别替换为固定 token，其他 argv bytes、cwd 与环境逐字节绑定。列表 bytewise 排序且无重复；未命中项不得作为“uv 内部行为”放行；
 - npm closure 必须包括 `npm-cli.js` 的完整模块树和包内 Node；Git closure 必须包括 `libexec/git-core` helpers、templates 及实际会调用的 shims；单个 launcher 文件不构成闭包；
 - shebang 不通过 `/usr/bin/env` 解析。entrypoint 展开为 manifest 中的绝对 argv prefix；runner 不传入宿主 PATH；
 - runner 始终 `shell=False`。npm v2 仅允许不执行 lifecycle script 的离线安装；测试由包内 Node/Python 直接加载已验证依赖 entrypoint，不经过 package-script shell；
@@ -360,11 +378,13 @@ Python repository 使用同一 manifest schema，但 `consumerView` 与每个 pa
 - `consumerView.schema` 必须与 ecosystem 一一对应，且其中 npm/cacache/uv 版本必须逐字段等于 toolchain manifest 的受信 closure。consumer view 是运行时派生物，不是 archive member，也不进入 `files/payloadTreeDigest`；`consumerView.treeDigest` 只绑定生成后的逻辑树，避免容器自引用。view builder 是只读纯函数：唯一输入是已验证 manifest 与 blob bytes；禁止读取 host cache、clock、locale、PATH 或 registry。view root 自身不进入摘要；其下所有生成目录 mode 为 `0555`、文件 mode 为 `0444`、mtime/uid/gid 不参与语义。生成完成后按非空相对 path byte 排序，对每个 directory/file 的 `path/type/mode/size/sha256`（directory 的 size 固定 0 且无 sha256）数组取规范 JSON SHA-256，必须等于 `consumerView.treeDigest` 才可暴露；
 - `packages` 按 `packageId` bytewise 升序，`lockMappings` 按 `(lockfilePath, lockNode)` bytewise 升序，均不得重复。npm `lockNode` 是 package-lock v3 的规范 packages key；Python `lockNode` 是锁文件内规范化的 distribution name + version + marker/environment tuple；marker 必须在 suite 的精确平台身份下先确定求值；
 - suite 使用的每个 ecosystem 在 `dependencyRepositoryRefs` 中必须恰有一个引用，未使用的 ecosystem 不得出现；suite 中每个 lockfile node 必须在对应 repository 中取得一条 mapping，且 mapping 的 `lockfilePath/lockfileDigest` 必须精确命中 suite `lockfileDigests`。`packageId/archiveDigest/installTreeDigest` 必须与 package 条目逐字段相等。零条、两条、同包多摘要、同 node 多包或 lockfile 中未固定 archive hash 均为 `E2_DEPENDENCY_MAPPING_INVALID`；
+- Python suite 必须恰有一个 requirements-format lockfile。runner 在任何 setup spawn 前以 8.2.3 节同一 `BoundedStableReader` 语义固定其原始 bytes 与 SHA-256，并只接受 UTF-8 requirements 子集：每个生效 requirement 都是唯一的 PEP 503 规范 name、`==` 精确 PEP 440 version、可选且已在固定平台求值的 marker，以及至少一个 `--hash=sha256:<64hex>`；禁止 direct URL、VCS/path、`-e/--editable`、`-r/--requirement`、`-c/--constraint`、index/find-links/config option、未固定版本、无 hash、重复 requirement 和 `pyproject.toml`/`pylock.toml`/`setup.py`/`setup.cfg` 输入。任一 source/editable/build 请求在 uv/venv spawn 前返回 `E2_PYTHON_SDIST_FORBIDDEN`，其他 lock 映射歧义返回 `E2_DEPENDENCY_MAPPING_INVALID`；
 - repository 必须是该 suite 的精确闭包：每个 `packages` 条目和每个 blob 都必须由一个 lock mapping 引用，且每个 mapping 必须被安装。额外包、额外 blob、未使用 mapping、缺包或 archive 路径与 digest 不一致均为 `E2_DEPENDENCY_REPOSITORY_INVALID`；
 - 每个 package 的 `installTreeDigest` 对该包完成规范解包后、执行任何项目代码前得到的完整安装条目数组取规范 JSON SHA-256；top-level `installationTreeDigest` 对所有实际安装 package 的条目并集取摘要。条目 schema 与 toolchain `files` 相同并额外要求 `ownerPackageId`；排序、路径、mode、symlink 和大小写折叠规则不变。runner 必须同时匹配逐包 digest 和 top-level digest，不接受包间覆盖；
 - `nativeClosure` 必须逐项列出安装树内 ELF/Mach-O/`.node`/Python extension 的 `path/digest/format/needed/rpath`；`needed` 只能精确引用同安装树文件、toolchain file 或 platform identity 中 path+digest+buildId 已固定的 system library。非空 native file 未列、同 SONAME 不同 ABI、RPATH 越界或运行时编译均为 `E2_DYNAMIC_DEPENDENCY_UNTRUSTED`；
 - 解包预算固定为：container 压缩 bytes 最大 1 GiB、最多 100,000 members、最多 20,000 package 条目、单 archive 最大 256 MiB、全部 blob 最大 2 GiB、生成 consumer view 最多 200,000 entries/2 GiB logical file bytes、全部安装树最大 4 GiB、container 和任一 archive 的展开比都不得超过 100:1。manifest/member/archive/view/install tree 任一预算在写出越界 bytes 前失败；
-- npm 从校验后的 canonical view 创建 invocation-scope copy-on-write cache root，并继续禁止 install/lifecycle script。Python 只消费预构建 wheel，禁止 sdist、source build、build isolation、build backend、setup.py/pyproject build hook 或本轮编译；不存在 Python build closure 或降级路径；
+- npm 从校验后的 canonical view 创建 invocation-scope copy-on-write cache root，并继续禁止 install/lifecycle script。Python 只消费预构建 wheel，禁止 sdist、source build、build isolation、build backend、setup.py/pyproject build hook 或本轮编译；`--no-cache` 禁止复用宿主 cache 或由 sdist 预先构建的缓存 wheel，不存在 Python build closure 或降级路径；
+- Python setup 前的 lock bytes/digest、`uv pip sync` 返回后的 lock bytes/digest 与 suite `lockfileDigests` 必须三者相等；lock 路径在 setup 期间只读，任何变化返回 `E2_DEPENDENCY_MAPPING_INVALID` 且不进入 test。checkout 中即使存在 `pyproject.toml [build-system]`、uv workspace、当前 project 或 editable metadata，也不得读取为依赖输入、不得安装当前 project、不得改变 exact repository closure；
 - setup 前后网络 namespace 维持无 egress，并记录 socket-deny counter。runner 同时把 npm/Python registry URL 固定到不可达 sentinel；counter 非零或工具尝试解析/连接 sentinel 时，无论退出码为何都返回 `E2_LIVE_REGISTRY_ACCESS`。
 
 #### 6.3.1 `python-find-links-view/v1`
@@ -375,7 +395,9 @@ Python repository 使用同一 manifest schema，但 `consumerView` 与每个 pa
 2. wheel filename 按 PEP 427 唯一解析 distribution/version/build/python/ABI/platform tags；`normalizedName` 使用 PEP 503 规则；`version` 是锁文件精确版本；`pythonTags` 是展开后按 bytewise 排序、无重复的完整 tag 集合。wheel 内唯一 `.dist-info/METADATA` 的 name/version 和唯一 `.dist-info/WHEEL` 的 tag 集合必须相等。
 3. `hash` 必须是 `sha256:<64hex>`，逐字段等于 `archiveDigest` 和锁文件记录的 artifact hash；对应 `lockMappings` 还必须重复并匹配 `originalFilename/hash`。同 basename 多 blob、同 `(normalizedName,version,pythonTags)` 多 filename/digest、`.whl` filename/tag 与 metadata 矛盾或 lock 未固定 filename/hash 均为 `E2_DEPENDENCY_VIEW_INVALID`。
 4. builder 创建唯一根 `view/python-find-links/`，按 `originalFilename` bytewise 升序把每个 blob 原始 bytes 复制为顶层 regular file；不得生成 HTML、子目录、alias、symlink 或额外 metadata。相同 filename 即使 digest 相同也视为重复并拒绝。
-5. `@dependency-repository/python` 只展开为该 `view/python-find-links` 绝对目录；规范 argv 保持 `uv sync --offline --no-index --find-links=@dependency-repository/python`。生成 view 后以固定 uv 执行只读解析探针，探针解析出的 name/version/tag/hash 集合必须与 manifest 完全相等，且网络 deny counter 为 0。
+5. runner 用自身的 requirements parser 将唯一冻结 lock 的每个生效 requirement/hash 与 `lockMappings`、wheel filename/tag/hash 和当前平台逐项闭合；view 中每个 wheel 恰被一个生效 requirement 使用。缺 wheel、hash 不匹配、tag 不兼容、额外 wheel 或同 requirement 多候选均在 uv spawn 前返回 `E2_DEPENDENCY_VIEW_INVALID`。
+6. `@dependency-repository/python` 只展开为该 `view/python-find-links` 绝对目录。固定 uv `0.11.14` 的唯一安装命令形态是 `uv pip sync --python=<venv-path>/bin/python <requirements-lock-path> --offline --no-index --find-links=@dependency-repository/python --no-build --require-hashes --no-sources --config-file=@toolchain/uv-empty-config --no-python-downloads --no-cache`；`--require-hashes` 与上述 lock 子集共同强制全部 exact pin 带 SHA-256，`--no-build` 拒绝构建 sdist，`--no-cache` 排除缓存旁路，显式空 config 排除 checkout 配置发现。
+7. `uv venv` 与 `uv pip sync` 各自位于独立 containment leaf。受信 supervisor 从 leader exec 到 empty proof 记录不可伪造的 bounded exec census；两个 Python setup invocation 都必须是包内 uv leader，任何 child exec 只能命中 toolchain manifest 对固定 uv 版本登记的包内解释器探针身份/规范 argv，且 `buildBackendProcessCount=0`。未登记 child exec、project/workspace/editable 安装或 build backend 迹象均返回 `E2_PYTHON_SDIST_FORBIDDEN`；network deny counter 仍必须为 0。
 
 #### 6.3.2 `npm-cacache-view/v1`
 
@@ -400,8 +422,8 @@ receipt 是审计对象，不是缓存真相。它至少包含：
 - `schema`、`suiteId`、`profileId`、`subjectRef`；
 - `suitePolicyDigest`、`toolchainRef`、`toolchainManifestDigest`；
 - 精确 `executionImageDigest`，以及实测 host/guest kernel numeric tuple、kernel ABI build digest、loader/libc/library bytes/build identity 和满足的 capability set；
-- lockfile、`dependencyRepositoryRef`、repository manifest、每个 package archive、生成 consumer view tree、完整安装树与每个 derived entrypoint 的实际摘要；不保存 cache index 原文或宿主/COW 路径；
-- 每个 invocation 的 registry ID、规范 policy argv、exit code、只含预期身份的 `selectedTestIds`；
+- lockfile、`dependencyRepositoryRef`、repository manifest、每个 package archive、生成 consumer view tree、完整安装树与每个 derived entrypoint 的实际摘要；Python receipt 还保存 requirements lock 的 before/after digest（两者必须相同）；不保存 lock 原文、cache index 原文或宿主/COW 路径；
+- 每个 invocation 的 registry ID、规范 policy argv、exit code、只含预期身份的 `selectedTestIds`；Python setup invocation 额外保存 exec-census proof digest、实际 `childExecCount` 与 `buildBackendProcessCount: 0`；
 - containment backend/profile，以及每个 invocation 的 `teardown: "verified-empty"` 证明摘要；不保存宿主 realm 路径或原始 ID；
 - 已脱敏后截断的 stdout/stderr、是否截断及安全字节数；
 - parser kind、report digest、report 大小和闭合 counts；
@@ -560,6 +582,7 @@ containment backend 必须满足：
 - supervisor 能内核级终止 realm 内全部成员，并取得“成员数为 0 / realm 已销毁”的可验证证明；
 - child 看不到可写的 containment 控制面，也没有移动自己或创建外部 realm 所需的 capability；
 - child 位于隔离 user/mount/PID/network/IPC 环境，不能访问 systemd/launchd、Docker socket、SSH agent 或其他可代为在 realm 外启动进程的宿主服务；
+- supervisor 从 leader 的 `execve/execveat` 到 leaf empty proof 捕获不可由 child 删除或伪造的 exec census，逐项绑定规范 executable file identity、parent relation 与 argv digest；单 leaf 最多 4,096 条，丢事件、观察器失效或超限均为 `E2_CONTAINMENT_UNAVAILABLE`，不能用结束时进程列表替代历史；
 - backend 的类型、版本和 host/guest 兼容性由 registry 与 toolchain manifest 双重固定。
 
 `containmentProfile` 不是自由字符串：静态 registry 必须固定 backend schema、host OS/arch、规范 `hostCompatibility` predicate、content-addressed supervisor binary/code digest、required kernel capabilities，并为 native 模式固定 `executorImageDigest`、为 VM 模式固定 `guestImageDigest` 与 guest rootfs digest。profile 的 predicate 规范 JSON digest 必须与 toolchain manifest 绑定；supervisor 通过绝对受信引用装配，不从 PATH 发现。
@@ -731,8 +754,8 @@ profile 可以降低这些上限，不能在同一 schema 版本中提高。
 | `E2_DYNAMIC_DEPENDENCY_UNTRUSTED` | 动态库、RPATH 或系统 ABI 不在 manifest 平台闭包 | 阻塞 |
 | `E2_DEPENDENCY_REPOSITORY_INVALID` | 离线仓库容器/manifest/CAS 路径/预算/精确 package closure 无效或含额外包 | 阻塞 |
 | `E2_DEPENDENCY_VIEW_INVALID` | wheel-only find-links 或 npm cacache 视图无法唯一生成、tree digest/filename/tag/hash/index/content/lock 绑定不符 | 阻塞 |
-| `E2_PYTHON_SDIST_FORBIDDEN` | Python repository 出现 sdist/source tree/非 wheel extension 或请求本轮构建 | 阻塞 |
-| `E2_DEPENDENCY_MAPPING_INVALID` | lockfile node 到 package/archive/install tree 不是恰好一个精确映射 | 阻塞 |
+| `E2_PYTHON_SDIST_FORBIDDEN` | Python repository/lock 请求 sdist、source、project/workspace/editable 或任何 build/child exec | 阻塞 |
+| `E2_DEPENDENCY_MAPPING_INVALID` | lockfile node 到 package/archive/install tree 不是恰好一个精确映射，或 lock setup 前后不变性失败 | 阻塞 |
 | `E2_DERIVED_ENTRYPOINT_INVALID` | derived entrypoint 路径、类型、摘要、解释器或安装树归属不符 | 阻塞 |
 | `E2_LIVE_REGISTRY_ACCESS` | setup 尝试 DNS/socket/live npm/Python registry 访问 | 阻塞 |
 | `E2_HOST_TOOL_FALLBACK` | 检测到主机 PATH/解释器/工具回退 | 阻塞 |
@@ -762,9 +785,12 @@ E2 v2 在进入 Ticket 23 真实 profile 前，必须用与生产命令形态相
 ### 11.1 Python fixture
 
 - 工具链包内 CPython 3.13.x、uv、Git；
-- 从 `trusted-e2-dependency-repository/v1` Python container 用 `uv sync --offline --no-index --find-links=@dependency-repository/python` 固定安装 `pytest==8.3.5` 与 `pytest-json-report==1.5.0`，每个 wheel 的 filename/tag/hash、lock mapping、install tree 与 Python derived entrypoint 闭合；
+- runner 先执行包内 `uv venv backend/.venv --python=@toolchain/python --no-project --no-config --no-python-downloads --no-cache`；venv 不 seed pip/setuptools/wheel，解释器规范 symlink 回包内 CPython；
+- `backend/requirements.lock` 以 exact pin + `--hash=sha256:<64hex>` 冻结 `pytest==8.3.5`、`pytest-json-report==1.5.0` 及其完整传递闭包；随后真实执行 `uv pip sync --python=backend/.venv/bin/python backend/requirements.lock --offline --no-index --find-links=@dependency-repository/python --no-build --require-hashes --no-sources --config-file=@toolchain/uv-empty-config --no-python-downloads --no-cache`，每个 wheel 的 filename/tag/hash、lock mapping、install tree 与 Python derived entrypoint 闭合；
+- setup 前后 `backend/requirements.lock` bytes 与 digest 必须完全相同；receipt 的两个 digest 相等，两个 setup leaf 的 exec census 都是包内 uv leader、child 若存在只命中登记的包内 CPython 探针，且 `buildBackendProcessCount=0`；
 - 从同一 manifest/blob 集合在两个空临时根独立生成 find-links view，要求相对 path、每个 file bytes/mode 和 `consumerView.treeDigest` 完全相同；错误 `.whl` filename/tag/hash、同 filename 冲突、缺包或额外文件均返回 `E2_DEPENDENCY_VIEW_INVALID`；
-- 分别放入 `.tar.gz`、`.zip`、`archiveKind=python-sdist`、source tree 和要求 build backend 的 lock node，全部在 uv spawn 前返回 `E2_PYTHON_SDIST_FORBIDDEN`；合法 wheel-only flat view 必须由真实 uv 离线安装成功；
+- 分别放入 `.tar.gz`、`.zip`、`archiveKind=python-sdist`、source tree、editable/direct path 和要求 build backend 的 lock node，全部在任一 uv spawn 前返回 `E2_PYTHON_SDIST_FORBIDDEN`；删除所需 wheel或把已有 hash 改为不匹配 wheel 返回 `E2_DEPENDENCY_VIEW_INVALID`，移除 hash 返回 `E2_DEPENDENCY_MAPPING_INVALID`，都发生在 uv spawn 前；合法 wheel-only flat view 必须由真实 uv 离线安装成功；
+- checkout 同时放置带可观察 marker 的 `pyproject.toml [build-system]`、uv workspace 与当前 project/editable 声明；完整 setup/test 仍不得创建 marker、不得安装当前 project，exec census 的 `buildBackendProcessCount` 仍为 0；
 - 运行至少一个通过测试，并实际产生 `.report.json`；
 - 验证真实 summary 可以只有 `collected / passed / total`，零值 `failed/skipped` 省略仍通过；
 - 再覆盖失败、零收集、deselected 和超限 report，确认 counts/exit/tests 闭合及稳定错误码。
@@ -833,8 +859,10 @@ E2 v2 在进入 Ticket 23 真实 profile 前，必须用与生产命令形态相
 | npm 包只含 `npm-cli.js`，或缺 CPython stdlib/Git helper/动态库声明 | `E2_TOOLCHAIN_CLOSURE_INVALID` 或 `E2_DYNAMIC_DEPENDENCY_UNTRUSTED`，不回退宿主 |
 | dependency container 含额外 package/blob、缺包、非固定 CAS path 或超预算 | `E2_DEPENDENCY_REPOSITORY_INVALID`；不进入 setup/test |
 | 同一 manifest/blob 在两个空根生成 Python find-links 或 npm cacache view | 相对 path、file bytes/mode 与 `consumerView.treeDigest` 逐项相同；suite token 分别解析到 flat directory 与含 `_cacache` 的 cache root |
-| Python wheel filename/tag/hash 歧义或冲突；npm index line/key/SRI/content/path 被改、package-lock `resolved/integrity` 不符 | `E2_DEPENDENCY_VIEW_INVALID`；在 uv/npm spawn 前拒绝，缺包不得触发网络 |
-| Python repository/lock 含 `.tar.gz`、`.zip`、`python-sdist`、source tree 或 build backend 请求 | `E2_PYTHON_SDIST_FORBIDDEN`；uv spawn 数为 0，不创建 build environment；合法 wheel-only flat view 可真实离线安装 |
+| Python wheel filename/tag/hash 歧义或冲突、所需 wheel 缺失；npm index line/key/SRI/content/path 被改、package-lock `resolved/integrity` 不符 | `E2_DEPENDENCY_VIEW_INVALID`；在 uv/npm spawn 前拒绝，缺包不得触发网络 |
+| Python requirements lock 缺 hash/非 exact pin/映射不唯一、hash 与唯一 wheel 不符，或发生 setup 改写 | 前三类分别固定为 `E2_DEPENDENCY_MAPPING_INVALID`、`E2_DEPENDENCY_VIEW_INVALID`、`E2_DEPENDENCY_MAPPING_INVALID`；能在 setup 前发现的 uv spawn 数为 0，任何情况都不得进入 test |
+| Python repository/lock 含 `.tar.gz`、`.zip`、`python-sdist`、source tree、editable/direct path 或 build backend 请求 | `E2_PYTHON_SDIST_FORBIDDEN`；uv spawn 数为 0，不创建 build environment；合法 wheel-only flat view 可真实离线安装 |
+| checkout 含 `pyproject.toml [build-system]`、uv workspace、当前 project/editable 与会写 marker 的 backend | 仍只执行固定 `uv venv` + `uv pip sync`；lock bytes 不变，marker 不存在，当前 project 未安装，两个 setup leaf 的 `buildBackendProcessCount` 均为 0，其他 child 只可命中登记的包内 CPython 探针 |
 | 同一 lock node 有零个/多个 mapping、同 package 多 archive/install tree 摘要 | `E2_DEPENDENCY_MAPPING_INVALID`；不得挑一个“可安装”的候选 |
 | setup 后 derived entrypoint 被替换、变型、移出安装树、摘要/解释器不符或经 `.bin`/PATH 发现 | `E2_DERIVED_ENTRYPOINT_INVALID`；test invocation 数为 0 |
 | setup 试图 DNS/socket/live npm/Python registry，即使 cache 命中且退出 0 | `E2_LIVE_REGISTRY_ACCESS`；无网络回退，不接受 setup |
@@ -880,10 +908,10 @@ E2 v2 在进入 Ticket 23 真实 profile 前，必须用与生产命令形态相
 ## 16. 规格自审结论
 
 - 无未决占位决策；具体 package digest、产品 commit 和 reviewer 公钥属于未来真实输入，不是本规格缺口。
-- 既有五项、随后六项、第二轮四项、第三轮三项与本轮两项独立审查问题均有不变量、失败码和验收行；PGID 不再冒充后代证明，Vitest skipped 行按真实 3.0.8 schema 闭合。
+- 既有五项、随后六项、第二轮四项、第三轮三项、第四轮两项与本轮一项独立审查问题均有不变量、失败码和验收行；PGID 不再冒充后代证明，Vitest skipped 行按真实 3.0.8 schema 闭合。
 - 两阶段顺序、验证零写入、collect 后写入和 contract 原子投影之间无冲突。
 - 工具链与依赖仓库统一规定 manifest 首项的唯一虚拟父目录例外；payload 缺/重复父目录和错序都有稳定拒绝与 fixture。
-- dependency manifest 能纯函数重建 byte-identical 的 Python wheel-only flat find-links 与 npm content-v2/index-v5 view；Python sdist/source build 无例外地阻塞，wheel filename/tag/hash、package-lock resolved/integrity、cache key/index/content 和 view tree digest 均闭合；live registry 探测 fail closed。
+- dependency manifest 能纯函数重建 byte-identical 的 Python wheel-only flat find-links 与 npm content-v2/index-v5 view；Python 只用固定 `uv venv` + hash-required `uv pip sync --no-build --no-cache`，不解析 project/workspace/editable，lock 前后不变且 exec census 证明零 build backend；wheel filename/tag/hash、package-lock resolved/integrity、cache key/index/content 和 view tree digest 均闭合，live registry 探测 fail closed。
 - exact executor/guest/rootfs identity 与规范 host predicate 分离；native measurement、版本边界、发行版 ABI 和 library build identity 均有唯一比较与 receipt 语义。
 - `StreamingRedactor/v1` 的 chunk-independent 状态、assignment/JSON/header/URL/path/agent-socket 词法、扩展左边界、file URL path、诊断标点 suffix、共享 residual scanner、escape/EOF、record 上限和截断后继续消费规则明确；URL userinfo 优先级未改变。
 - candidate set/唯一 active pointer/gate 前并发复核明确；Git config 区分结构键、明确惰性元数据与危险/未知键，普通 remote/branch 仓库可净化，ref/object allow/deny 与预算不变。
