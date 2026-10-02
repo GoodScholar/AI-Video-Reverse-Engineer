@@ -1,4 +1,5 @@
 import json
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from dataclasses import FrozenInstanceError
 from copy import deepcopy
@@ -51,22 +52,29 @@ def _valid_suite(**overrides: object) -> dict[str, object]:
     return suite
 
 
-def _direct_e2_suite(**overrides: object) -> E2SuiteDefinition:
-    values: dict[str, object] = {
-        "id": "e2.safe",
-        "subject_repository": "git://product/repository",
-        "working_directory": ".",
-        "setup_argv": (),
-        "argv": ("pytest", "-q"),
-        "expected_test_ids": ("tests/test_contract.py::test_policy",),
-        "parser": "pytest-json-v1",
-        "allowed_environment": {"CI": "1"},
-        "timeout_seconds": 60,
-        "lockfile_digests": {"requirements.lock": "sha256:" + "a" * 64},
-        "tool_versions": {"python": "3.13"},
-    }
-    values.update(overrides)
-    return E2SuiteDefinition(**values)  # type: ignore[arg-type]
+class _SecondTraversalSubstitution(Mapping[str, str]):
+    def __init__(self, first: dict[str, str], second: dict[str, str]) -> None:
+        self._first = first
+        self._second = second
+        self._current = first
+        self.traversals = 0
+
+    def _next(self) -> dict[str, str]:
+        self.traversals += 1
+        self._current = self._first if self.traversals == 1 else self._second
+        return self._current
+
+    def items(self):
+        return self._next().items()
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._next())
+
+    def __len__(self) -> int:
+        return len(self._current)
+
+    def __getitem__(self, key: str) -> str:
+        return self._current[key]
 
 
 def _valid_e1_git(**overrides: object) -> dict[str, object]:
@@ -320,7 +328,7 @@ def test_e2_loader_uses_an_empty_immutable_setup_argv_when_json_omits_it(tmp_pat
     assert definition.setup_argv == ()
 
 
-def test_e2_direct_construction_copies_and_deeply_freezes_source_containers():
+def test_e2_factory_snapshots_and_deeply_freezes_source_containers(tmp_path):
     setup_argv = ["uv", "sync"]
     argv = ["pytest", "-q"]
     expected_test_ids = ["tests/test_contract.py::test_policy"]
@@ -328,14 +336,20 @@ def test_e2_direct_construction_copies_and_deeply_freezes_source_containers():
     lockfile_digests = {"requirements.lock": "sha256:" + "a" * 64}
     tool_versions = {"python": "3.13"}
 
-    definition = _direct_e2_suite(
-        setup_argv=setup_argv,
+    suite = _valid_suite(
+        setupArgv=setup_argv,
         argv=argv,
-        expected_test_ids=expected_test_ids,
-        allowed_environment=allowed_environment,
-        lockfile_digests=lockfile_digests,
-        tool_versions=tool_versions,
+        expectedTestIds=expected_test_ids,
+        allowedEnvironment=allowed_environment,
+        lockfileDigests=lockfile_digests,
+        toolVersions=tool_versions,
     )
+    definition = E2SuiteDefinition.from_policy(
+        root=tmp_path,
+        verifier_id="e2.safe",
+        raw=suite,
+    )
+    suite["workingDirectory"] = "rewritten"
     setup_argv.append("--unsafe")
     argv.append("--unsafe")
     expected_test_ids.append("tests/test_contract.py::test_untrusted")
@@ -357,25 +371,102 @@ def test_e2_direct_construction_copies_and_deeply_freezes_source_containers():
         definition.tool_versions["python"] = "rewritten"
 
 
+def test_e2_factory_validates_and_freezes_the_same_single_mapping_snapshot(tmp_path):
+    allowed_environment = _SecondTraversalSubstitution(
+        {"CI": "1"},
+        {"SECRET_TOKEN": "leaked"},
+    )
+
+    definition = E2SuiteDefinition.from_policy(
+        root=tmp_path,
+        verifier_id="e2.safe",
+        raw=_valid_suite(allowedEnvironment=allowed_environment),
+    )
+
+    assert allowed_environment.traversals == 1
+    assert definition.allowed_environment == {"CI": "1"}
+
+
+def test_e2_public_constructor_is_disabled_without_an_acceptance_root():
+    with pytest.raises(TypeError, match="from_policy|load_trusted_registry"):
+        E2SuiteDefinition(  # type: ignore[call-arg]
+            id="e2.safe",
+            subject_repository="git://product/repository",
+            working_directory=".",
+            setup_argv=(),
+            argv=("pytest", "-q"),
+            expected_test_ids=("tests/test_contract.py::test_policy",),
+            parser="pytest-json-v1",
+            allowed_environment={"CI": "1"},
+            timeout_seconds=60,
+            lockfile_digests={"requirements.lock": "sha256:" + "a" * 64},
+            tool_versions={"python": "3.13"},
+        )
+
+
+def test_e2_factory_rejects_symlink_escapes_for_working_directory_and_lockfiles(tmp_path):
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (outside / "requirements.lock").write_text("outside", encoding="utf-8")
+    (tmp_path / "escaped-directory").symlink_to(outside, target_is_directory=True)
+    (tmp_path / "escaped.lock").symlink_to(outside / "requirements.lock")
+
+    with pytest.raises(PolicyError, match="POINTER_INVALID"):
+        E2SuiteDefinition.from_policy(
+            root=tmp_path,
+            verifier_id="e2.safe",
+            raw=_valid_suite(workingDirectory="escaped-directory"),
+        )
+    with pytest.raises(PolicyError, match="POINTER_INVALID"):
+        E2SuiteDefinition.from_policy(
+            root=tmp_path,
+            verifier_id="e2.safe",
+            raw=_valid_suite(
+                lockfileDigests={"escaped.lock": "sha256:" + "a" * 64},
+            ),
+        )
+
+
+def test_e2_factory_and_loader_accept_the_same_valid_policy(tmp_path):
+    suite = _valid_suite(setupArgv=["uv", "sync"])
+    direct = E2SuiteDefinition.from_policy(
+        root=tmp_path,
+        verifier_id="e2.safe",
+        raw=suite,
+    )
+    _write_json(
+        tmp_path / "trusted-registry.json",
+        _registry([{"id": "e2.safe", "type": "e2.argv-suite.v1", "suite": suite}]),
+    )
+
+    loaded = load_trusted_registry(tmp_path).verifiers["e2.safe"].definition
+
+    assert loaded == direct
+
+
 @pytest.mark.parametrize(
-    ("field", "value"),
+    ("verifier_id", "overrides"),
     (
-        ("id", ""),
-        ("subject_repository", "git://untrusted/repository"),
-        ("working_directory", "../../outside"),
-        ("argv", ()),
-        ("expected_test_ids", ("duplicate", "duplicate")),
-        ("parser", "untrusted-parser"),
-        ("allowed_environment", {"SECRET_TOKEN": "value"}),
-        ("timeout_seconds", True),
-        ("lockfile_digests", {"../outside.lock": "sha256:" + "a" * 64}),
-        ("lockfile_digests", {"requirements.lock": "not-a-digest"}),
-        ("tool_versions", {"python": ""}),
+        ("", {}),
+        ("e2.safe", {"subjectRepository": "git://untrusted/repository"}),
+        ("e2.safe", {"workingDirectory": "../../outside"}),
+        ("e2.safe", {"argv": []}),
+        ("e2.safe", {"expectedTestIds": ["duplicate", "duplicate"]}),
+        ("e2.safe", {"parser": {"kind": "untrusted-parser"}}),
+        ("e2.safe", {"allowedEnvironment": {"SECRET_TOKEN": "value"}}),
+        ("e2.safe", {"timeoutSeconds": True}),
+        ("e2.safe", {"lockfileDigests": {"../outside.lock": "sha256:" + "a" * 64}}),
+        ("e2.safe", {"lockfileDigests": {"requirements.lock": "not-a-digest"}}),
+        ("e2.safe", {"toolVersions": {"python": ""}}),
     ),
 )
-def test_e2_direct_construction_rejects_invalid_policy(field, value):
+def test_e2_factory_rejects_invalid_policy(tmp_path, verifier_id, overrides):
     with pytest.raises(PolicyError, match="POINTER_INVALID"):
-        _direct_e2_suite(**{field: value})
+        E2SuiteDefinition.from_policy(
+            root=tmp_path,
+            verifier_id=verifier_id,
+            raw=_valid_suite(**overrides),
+        )
 
 
 def test_empty_profiles_directory_returns_empty_without_other_policy_files(tmp_path):

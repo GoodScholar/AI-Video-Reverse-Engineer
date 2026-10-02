@@ -122,7 +122,7 @@ class E1GitDefinition:
     reuse: ReuseFact
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class E2SuiteDefinition:
     id: str
     subject_repository: str
@@ -136,47 +136,91 @@ class E2SuiteDefinition:
     lockfile_digests: Mapping[str, str]
     tool_versions: Mapping[str, str]
 
-    def __post_init__(self) -> None:
-        identifier = _nonempty_string(self.id, "suite.id")
-        if self.subject_repository != _SUBJECT_REPOSITORY:
-            raise PolicyError("POINTER_INVALID", "suite.subjectRepository is not the product repository")
-        working_directory = _controlled_relative_path_text(
-            self.working_directory, "suite.workingDirectory"
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise TypeError(
+            "E2SuiteDefinition requires root-aware construction via "
+            "E2SuiteDefinition.from_policy() or load_trusted_registry()"
         )
-        setup_argv = _string_list(self.setup_argv, "suite.setupArgv")
-        argv = _literal_argv(self.argv, "suite.argv")
-        expected_test_ids = _literal_argv(self.expected_test_ids, "suite.expectedTestIds")
+
+    @classmethod
+    def from_policy(
+        cls,
+        *,
+        root: Path,
+        verifier_id: str,
+        raw: object,
+    ) -> E2SuiteDefinition:
+        acceptance_root = _acceptance_root(root)
+        suite = _snapshot_mapping(raw, "suite")
+        allowed = {
+            "subjectRepository",
+            "workingDirectory",
+            "setupArgv",
+            "argv",
+            "expectedTestIds",
+            "parser",
+            "allowedEnvironment",
+            "timeoutSeconds",
+            "lockfileDigests",
+            "toolVersions",
+        }
+        required = allowed - {"setupArgv"}
+        if set(suite) - allowed or required - set(suite):
+            raise PolicyError("POINTER_INVALID", "suite contains an unsupported field")
+
+        identifier = _nonempty_string(verifier_id, "suite.id")
+        subject_repository = _nonempty_string(
+            suite["subjectRepository"], "suite.subjectRepository"
+        )
+        if subject_repository != _SUBJECT_REPOSITORY:
+            raise PolicyError("POINTER_INVALID", "suite.subjectRepository is not the product repository")
+        working_directory = _controlled_relative_path(
+            suite["workingDirectory"], "suite.workingDirectory", acceptance_root
+        )
+        setup_argv = (
+            _literal_argv(suite["setupArgv"], "suite.setupArgv")
+            if "setupArgv" in suite
+            else ()
+        )
+        argv = _literal_argv(suite["argv"], "suite.argv")
+        expected_test_ids = _literal_argv(suite["expectedTestIds"], "suite.expectedTestIds")
         if len(expected_test_ids) != len(set(expected_test_ids)):
             raise PolicyError("POINTER_INVALID", "suite.expectedTestIds must be unique")
-        parser = _nonempty_string(self.parser, "suite.parser.kind")
-        if parser not in _SUITE_PARSERS:
+
+        parser = _snapshot_mapping(suite["parser"], "suite.parser")
+        _exact_keys(parser, {"kind"}, "suite.parser")
+        parser_kind = _nonempty_string(parser["kind"], "suite.parser.kind")
+        if parser_kind not in _SUITE_PARSERS:
             raise PolicyError("POINTER_INVALID", "suite.parser.kind is not registered")
 
-        allowed_environment = _required_mapping(
-            self.allowed_environment, "suite.allowedEnvironment"
+        allowed_environment = _snapshot_mapping(
+            suite["allowedEnvironment"], "suite.allowedEnvironment"
         )
         for name, value in allowed_environment.items():
             if name not in _SAFE_ENVIRONMENT or value != _SAFE_ENVIRONMENT[name]:
                 raise PolicyError("POINTER_INVALID", "suite.allowedEnvironment has an unsafe value")
 
+        timeout = suite["timeoutSeconds"]
         if (
-            isinstance(self.timeout_seconds, bool)
-            or not isinstance(self.timeout_seconds, int)
-            or self.timeout_seconds <= 0
+            isinstance(timeout, bool)
+            or not isinstance(timeout, int)
+            or timeout <= 0
         ):
             raise PolicyError("POINTER_INVALID", "suite.timeoutSeconds must be a positive integer")
 
-        lockfile_digests = _required_mapping(self.lockfile_digests, "suite.lockfileDigests")
+        lockfile_digests = _snapshot_mapping(
+            suite["lockfileDigests"], "suite.lockfileDigests"
+        )
         if not lockfile_digests:
             raise PolicyError("POINTER_INVALID", "suite.lockfileDigests must not be empty")
         for path, digest in lockfile_digests.items():
-            _controlled_relative_path_text(path, "suite.lockfileDigests path")
+            _controlled_relative_path(path, "suite.lockfileDigests path", acceptance_root)
             if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
                 raise PolicyError(
                     "POINTER_INVALID", "suite.lockfileDigests values must be SHA-256 digests"
                 )
 
-        tool_versions = _required_mapping(self.tool_versions, "suite.toolVersions")
+        tool_versions = _snapshot_mapping(suite["toolVersions"], "suite.toolVersions")
         if not tool_versions:
             raise PolicyError("POINTER_INVALID", "suite.toolVersions must not be empty")
         for tool, version in tool_versions.items():
@@ -187,15 +231,19 @@ class E2SuiteDefinition:
                     "POINTER_INVALID", "suite.toolVersions values must be single-line strings"
                 )
 
-        object.__setattr__(self, "id", identifier)
-        object.__setattr__(self, "working_directory", working_directory)
-        object.__setattr__(self, "setup_argv", setup_argv)
-        object.__setattr__(self, "argv", argv)
-        object.__setattr__(self, "expected_test_ids", expected_test_ids)
-        object.__setattr__(self, "parser", parser)
-        object.__setattr__(self, "allowed_environment", MappingProxyType(dict(allowed_environment)))
-        object.__setattr__(self, "lockfile_digests", MappingProxyType(dict(lockfile_digests)))
-        object.__setattr__(self, "tool_versions", MappingProxyType(dict(tool_versions)))
+        definition = object.__new__(cls)
+        object.__setattr__(definition, "id", identifier)
+        object.__setattr__(definition, "subject_repository", subject_repository)
+        object.__setattr__(definition, "working_directory", working_directory)
+        object.__setattr__(definition, "setup_argv", setup_argv)
+        object.__setattr__(definition, "argv", argv)
+        object.__setattr__(definition, "expected_test_ids", expected_test_ids)
+        object.__setattr__(definition, "parser", parser_kind)
+        object.__setattr__(definition, "allowed_environment", MappingProxyType(allowed_environment))
+        object.__setattr__(definition, "timeout_seconds", timeout)
+        object.__setattr__(definition, "lockfile_digests", MappingProxyType(lockfile_digests))
+        object.__setattr__(definition, "tool_versions", MappingProxyType(tool_versions))
+        return definition
 
 
 def _nonempty_string(value: object, field: str, code: str = "POINTER_INVALID") -> str:
@@ -305,72 +353,19 @@ def _required_mapping(value: object, field: str) -> Mapping[str, object]:
     return value
 
 
+def _snapshot_mapping(value: object, field: str) -> dict[str, object]:
+    source = _required_mapping(value, field)
+    try:
+        snapshot = dict(source.items())
+    except (TypeError, ValueError) as error:
+        raise PolicyError("POINTER_INVALID", f"{field} must be an object") from error
+    if any(not isinstance(key, str) for key in snapshot):
+        raise PolicyError("POINTER_INVALID", f"{field} keys must be strings")
+    return snapshot
+
+
 def _validate_suite(value: object, root: Path, verifier_id: str) -> E2SuiteDefinition:
-    value = _required_mapping(value, "suite")
-    allowed = {
-        "subjectRepository",
-        "workingDirectory",
-        "setupArgv",
-        "argv",
-        "expectedTestIds",
-        "parser",
-        "allowedEnvironment",
-        "timeoutSeconds",
-        "lockfileDigests",
-        "toolVersions",
-    }
-    required = allowed - {"setupArgv"}
-    if set(value) - allowed or required - set(value):
-        raise PolicyError("POINTER_INVALID", "suite contains an unsupported field")
-    subject_repository = _nonempty_string(value["subjectRepository"], "suite.subjectRepository")
-    working_directory = _controlled_relative_path(
-        value["workingDirectory"], "suite.workingDirectory", root
-    )
-    setup_argv = _literal_argv(value["setupArgv"], "suite.setupArgv") if "setupArgv" in value else ()
-    argv = _literal_argv(value["argv"], "suite.argv")
-    expected_test_ids = _literal_argv(value["expectedTestIds"], "suite.expectedTestIds")
-    if len(expected_test_ids) != len(set(expected_test_ids)):
-        raise PolicyError("POINTER_INVALID", "suite.expectedTestIds must be unique")
-    parser = _required_mapping(value["parser"], "suite.parser")
-    _exact_keys(parser, {"kind"}, "suite.parser")
-    parser_kind = _nonempty_string(parser["kind"], "suite.parser.kind")
-    if parser_kind not in _SUITE_PARSERS:
-        raise PolicyError("POINTER_INVALID", "suite.parser.kind is not registered")
-    allowed_environment = _required_mapping(value["allowedEnvironment"], "suite.allowedEnvironment")
-    for name, environment_value in allowed_environment.items():
-        if name not in _SAFE_ENVIRONMENT or environment_value != _SAFE_ENVIRONMENT[name]:
-            raise PolicyError("POINTER_INVALID", "suite.allowedEnvironment has an unsafe value")
-    timeout = value["timeoutSeconds"]
-    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
-        raise PolicyError("POINTER_INVALID", "suite.timeoutSeconds must be a positive integer")
-    lockfile_digests = _required_mapping(value["lockfileDigests"], "suite.lockfileDigests")
-    if not lockfile_digests:
-        raise PolicyError("POINTER_INVALID", "suite.lockfileDigests must not be empty")
-    for path, digest in lockfile_digests.items():
-        _controlled_relative_path(path, "suite.lockfileDigests path", root)
-        if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
-            raise PolicyError("POINTER_INVALID", "suite.lockfileDigests values must be SHA-256 digests")
-    tool_versions = _required_mapping(value["toolVersions"], "suite.toolVersions")
-    if not tool_versions:
-        raise PolicyError("POINTER_INVALID", "suite.toolVersions must not be empty")
-    for tool, version in tool_versions.items():
-        if not isinstance(tool, str) or not _TOOL_NAME.fullmatch(tool):
-            raise PolicyError("POINTER_INVALID", "suite.toolVersions keys must be tool names")
-        if not isinstance(version, str) or not version or "\n" in version or "\r" in version:
-            raise PolicyError("POINTER_INVALID", "suite.toolVersions values must be single-line strings")
-    return E2SuiteDefinition(
-        id=verifier_id,
-        subject_repository=subject_repository,
-        working_directory=working_directory,
-        setup_argv=setup_argv,
-        argv=argv,
-        expected_test_ids=expected_test_ids,
-        parser=parser_kind,  # type: ignore[arg-type]
-        allowed_environment=MappingProxyType(dict(allowed_environment)),
-        timeout_seconds=timeout,
-        lockfile_digests=MappingProxyType(dict(lockfile_digests)),
-        tool_versions=MappingProxyType(dict(tool_versions)),
-    )
+    return E2SuiteDefinition.from_policy(root=root, verifier_id=verifier_id, raw=value)
 
 
 def _repository_relative_path(value: object, field: str) -> str:
