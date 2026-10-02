@@ -5,6 +5,8 @@ Type: architectural-design
 Decision date: 2026-10-02
 Subsystem: Trusted Acceptance Evidence Bridge（受信验收证据桥）
 
+> **E2 v2 取代说明（2026-10-02）：** 本文第 3.3、6.2、7.1、8.1、9、10.3、11、13.3、13.6、14 节中涉及 E2 执行、receipt、工具发现、报告解析和 Task 11 命令形态的条款，已由 [`2026-10-02-e2-v2-trusted-replay-design.md`](./2026-10-02-e2-v2-trusted-replay-design.md) 取代。E1/E3/E4、138 项冻结合同、catalog/register/promote/reconcile 权限和三引擎边界继续有效。
+
 ## 1. 背景与目的
 
 `.scratch/unified-remix-canvas-generation/acceptance/` 已由票据 01 冻结五张验收矩阵、三条金标记录模板、四种合法状态和 E1–E4 最低证据门槛：

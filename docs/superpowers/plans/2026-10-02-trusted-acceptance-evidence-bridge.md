@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-02-trusted-acceptance-evidence-bridge-design.md`（批准提交 `4e35bfef34fa49080da87cea3bbe23a6ecf23d62`）
 
+> **状态更新（2026-10-02）：** Task 5 在五轮修复后的最终独立审查仍有 2 个 Critical、3 个 Important，保持 `blocked`，其 E2 v1 合同由 `docs/superpowers/specs/2026-10-02-e2-v2-trusted-replay-design.md` 取代（`superseded`）；这不是额外修复轮。Task 6 未开始。Task 10、Task 11 后续涉及 E2 的测试形态、registry、工具链和 receipt 必须遵循 v2，需另行编写并批准实施计划；本文现有步骤不再授权继续 E2 实施。
+
 ## Global Constraints
 
 - 五张矩阵固定为 A01–A18、R01–R40、C01–C35、G01–G27、X01–X18，共 138 项；不得删项、换号、缩小分母或改变 `2026-09-30` 的空不适用基线。
