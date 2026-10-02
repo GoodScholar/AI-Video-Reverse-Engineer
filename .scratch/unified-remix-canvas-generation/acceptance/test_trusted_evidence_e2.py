@@ -105,7 +105,7 @@ def test_e2_runs_only_registry_argv_in_detached_clean_checkout_with_minimal_envi
     assert result.valid is True
     assert result.error_code is None
     assert result.facts["selectedTestIds"] == ("tests/test_contract.py::test_policy",)
-    assert "CI:1 HOME:" in result.facts["stdout"]
+    assert "CI:1 HOME:" in result.facts["invocations"][0]["stdout"]
     assert result.facts["receiptRef"].startswith("sha256:")
 
 
@@ -125,7 +125,7 @@ def test_e2_flat_and_single_nested_argv_have_the_same_normalized_input_digest(tm
     assert flat.input_digest == nested.input_digest
 
 
-def test_e2_multi_invocation_contract_fails_closed_until_task5_associates_test_results(tmp_path, monkeypatch):
+def test_e2_runs_each_registered_invocation_and_merges_exact_test_selection(tmp_path, monkeypatch):
     product, commit = _product_commit(tmp_path)
     acceptance = tmp_path / "acceptance"
     acceptance.mkdir()
@@ -148,9 +148,11 @@ def test_e2_multi_invocation_contract_fails_closed_until_task5_associates_test_r
         context,
     )
 
-    assert result.valid is False
-    assert result.error_code == "SUITE_NOT_ALLOWLISTED"
-    assert "receiptRef" not in result.facts
+    assert result.valid is True
+    assert result.facts["selectedTestIds"] == (
+        "tests/test_contract.py::test_first",
+        "tests/test_contract.py::test_second",
+    )
 
 
 def test_e2_dirty_current_workspace_cannot_change_fixed_commit_result(tmp_path, monkeypatch):
@@ -165,7 +167,7 @@ def test_e2_dirty_current_workspace_cannot_change_fixed_commit_result(tmp_path, 
 
     assert result.valid is True
     assert result.facts["selectedTestIds"] == ("tests/test_contract.py::test_policy",)
-    assert "compromised" not in result.facts["stdout"]
+    assert "compromised" not in result.facts["invocations"][0]["stdout"]
 
 
 def test_e2_rejects_catalog_command_argument_cwd_and_environment_injection(tmp_path, monkeypatch):
@@ -318,7 +320,7 @@ def test_e2_materialization_ignores_hostile_local_hook_and_smudge_configuration(
     result = SuiteRunner().run(_suite(acceptance), f"git://product@{commit}", _context(acceptance, commit))
 
     assert result.valid is False
-    assert result.error_code == "TEST_REPLAY_FAILED"
+    assert result.error_code == "SOURCE_REF_UNREACHABLE"
 
 
 def test_e2_rejects_annotated_tag_object_and_confirms_detached_head(tmp_path, monkeypatch):
@@ -392,3 +394,99 @@ def test_e2_returns_blocked_when_temporary_worktree_cleanup_fails(tmp_path, monk
 
     assert result.valid is False
     assert result.error_code == "SOURCE_REF_UNREACHABLE"
+
+
+@pytest.mark.parametrize("attack", ("alternates", "promisor"))
+def test_e2_blocks_common_object_indirection_and_promisor_configuration(tmp_path, monkeypatch, attack):
+    product, commit = _product_commit(tmp_path)
+    if attack == "alternates":
+        alternate = product / ".git" / "objects" / "info" / "alternates"
+        alternate.parent.mkdir(parents=True, exist_ok=True)
+        alternate.write_text("/untrusted/objects\n", encoding="utf-8")
+    else:
+        _run(["git", "config", "remote.origin.promisor", "true"], product)
+    acceptance = tmp_path / "acceptance"
+    acceptance.mkdir()
+    monkeypatch.chdir(product)
+
+    result = SuiteRunner().run(_suite(acceptance), f"git://product@{commit}", _context(acceptance, commit))
+
+    assert result.valid is False
+    assert result.error_code == "SOURCE_REF_UNREACHABLE"
+
+
+def test_e2_rejects_stale_or_symlinked_pytest_report_before_execution(tmp_path, monkeypatch):
+    product, commit = _product_commit(tmp_path, runner_body="true")
+    (product / ".report.json").write_text('{"tests":[{"nodeid":"tests/test_contract.py::test_policy","outcome":"passed"}]}', encoding="utf-8")
+    _run(["git", "add", ".report.json"], product)
+    _run(["git", "commit", "-m", "stale report"], product)
+    commit = _run(["git", "rev-parse", "HEAD"], product)
+    acceptance = tmp_path / "acceptance"
+    acceptance.mkdir()
+    monkeypatch.chdir(product)
+
+    stale = SuiteRunner().run(_suite(acceptance), f"git://product@{commit}", _context(acceptance, commit))
+
+    assert stale.error_code == "TEST_SELECTION_MISSING"
+
+
+def test_e2_rejects_null_vitest_assertions_and_plain_text_receipts(tmp_path, monkeypatch):
+    product, commit = _product_commit(tmp_path, runner_body="printf '{\"testResults\":[{\"assertionResults\":null}]}\\n'")
+    acceptance = tmp_path / "acceptance"
+    acceptance.mkdir()
+    monkeypatch.chdir(product)
+    context = _context(acceptance, commit)
+    suite = _suite(
+        acceptance,
+        parser={"kind": "vitest-json-v1"},
+        argv=["./runner", "--reporter=json", "canvas test"],
+        expectedTestIds=["canvas test"],
+    )
+    assert SuiteRunner().run(suite, context.subject_ref, context).error_code == "TEST_SELECTION_MISSING"
+
+    plain = ContentAddressedStore(acceptance).put(b"not a receipt")
+    verification = E2SuiteVerifier("e2.fixture", _suite(acceptance)).verify(_pointer(commit, plain), _profile(commit), context)
+    assert verification.error_code == "POINTER_INVALID"
+
+
+def test_e2_uses_declared_host_tools_without_persisting_host_path(tmp_path, monkeypatch):
+    product, commit = _product_commit(tmp_path)
+    acceptance = tmp_path / "acceptance"
+    acceptance.mkdir()
+    monkeypatch.chdir(product)
+    versions = {
+        name: subprocess.run([name, "--version"], check=True, capture_output=True, text=True).stdout.strip()
+        for name in ("uv", "npm", "node")
+    }
+    result = SuiteRunner().run(
+        _suite(acceptance, toolVersions={"runner": "runner 1.0", **versions}),
+        f"git://product@{commit}",
+        _context(acceptance, commit),
+    )
+
+    assert result.valid is True
+    receipt = ContentAddressedStore(acceptance).read(result.facts["receiptRef"])
+    assert os.environ.get("PATH", "").encode() not in receipt
+
+
+def test_e2_bounds_output_and_kills_a_timed_out_process_group(tmp_path, monkeypatch):
+    product, commit = _product_commit(
+        tmp_path,
+        runner_body=(
+            "yes output | head -c 100000; "
+            "for value; do test_id=\"$value\"; done; printf '{\"tests\":[{\"nodeid\":\"%s\",\"outcome\":\"passed\"}]}\\n' \"$test_id\" > .report.json"
+        ),
+    )
+    acceptance = tmp_path / "acceptance"
+    acceptance.mkdir()
+    monkeypatch.chdir(product)
+    bounded = SuiteRunner().run(_suite(acceptance), f"git://product@{commit}", _context(acceptance, commit))
+    assert bounded.valid is True
+    assert len(bounded.facts["invocations"][0]["stdout"].encode()) <= 32 * 1024 + len("\n...[truncated]".encode())
+
+    sleepy, sleepy_commit = _product_commit(tmp_path / "sleepy", runner_body="sleep 10 & wait")
+    monkeypatch.chdir(sleepy)
+    started = __import__("time").monotonic()
+    timed = SuiteRunner().run(_suite(acceptance, timeoutSeconds=1), f"git://product@{sleepy_commit}", _context(acceptance, sleepy_commit))
+    assert timed.error_code == "TEST_REPLAY_TIMEOUT"
+    assert __import__("time").monotonic() - started < 3

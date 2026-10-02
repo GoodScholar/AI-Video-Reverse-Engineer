@@ -1,13 +1,17 @@
-"""Replay reviewed E2 suites from isolated Git objects and machine reports."""
+"""Fail-closed E2 replay in an isolated Git object closure."""
 
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import selectors
+import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -20,15 +24,24 @@ from ..storage import ContentAddressedStore, canonical_json_bytes
 
 
 _SUBJECT_REF: Final = re.compile(r"^git://product@([0-9a-f]{40})$")
-_DEFAULT_REDACTION_PATTERNS: Final = (
-    re.compile(r"(?ims)^\s*authorization\s*:\s*(?:basic|bearer|token)\s+\S+\s*$"),
-    re.compile(r"(?im)^\s*(?:set-)?cookie\s*:\s*.+$"),
-    re.compile(r"(?im)^\s*ssh_auth_sock\s*[:=]\s*\S+\s*$"),
+_MAX_CAPTURE: Final = 32 * 1024
+_DEFAULT_REDACTION: Final = (
+    re.compile(r"(?i)\b(?:proxy-)?authorization\s*:\s*(?:basic|bearer|token)\s+\S+"),
+    re.compile(r"(?i)\b(?:set-)?cookie\s*:\s*[^\r\n]+"),
+    re.compile(r"(?i)\bssh_auth_sock\s*[:=]\s*\S+"),
+    re.compile(r"(?i)\baws_secret_access_key\s*[:=]\s*\S+"),
+    re.compile(r'(?i)"(?:api[_-]?key|secret|token|aws_secret_access_key)"\s*:\s*"[^"\\]*"'),
     re.compile(r"(?is)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----"),
     re.compile(r"(?i)\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password)\b\s*[:=]\s*[^\s]+"),
     re.compile(r"(?i)(?:file://)?[^\s]*\.ssh/(?:id_[^\s/]+|[^\s/]*private[^\s/]*)"),
 )
-_MAX_OUTPUT_BYTES: Final = 32 * 1024
+_DANGEROUS_CONFIG: Final = re.compile(
+    r"^(?:alias\.|core\.(?:hookspath|sshcommand)|credential\.|diff\..*\.textconv|"
+    r"filter\..*\.(?:clean|smudge|process)|gpg\..*\.program|include(?:if)?\.|"
+    r"merge\..*\.driver|remote\..*\.(?:uploadpack|receivepack|promisor|partialclonefilter)|"
+    r"extensions\.partialclone)$",
+    re.IGNORECASE,
+)
 
 
 class _ReplayBlocked(RuntimeError):
@@ -37,304 +50,339 @@ class _ReplayBlocked(RuntimeError):
         self.code = code
 
 
+@dataclass(frozen=True, slots=True)
+class _CommandResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    truncated: bool
+
+
 def _digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
-def _safe_summary(data: bytes, patterns: tuple[re.Pattern[str], ...]) -> str:
-    suffix = b"\n...[truncated]" if len(data) > _MAX_OUTPUT_BYTES else b""
+def _summary(data: bytes, *, truncated: bool, patterns: tuple[re.Pattern[str], ...]) -> str:
     try:
-        return redact_output(data[:_MAX_OUTPUT_BYTES] + suffix, patterns).decode("utf-8")
+        return redact_output(data + (b"\n...[truncated]" if truncated else b""), patterns).decode("utf-8")
     except RedactionError as error:
-        raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "receipt output cannot be safely redacted") from error
-
-
-def _single_invocation(commands: tuple[tuple[str, ...], ...]) -> tuple[str, ...]:
-    if len(commands) != 1:
-        raise _ReplayBlocked(
-            "SUITE_NOT_ALLOWLISTED",
-            "multiple registered invocations require the Task 5 executor contract",
-        )
-    return commands[0]
+        raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "output cannot be safely redacted") from error
 
 
 class SuiteRunner:
-    """Run registry argv only after rebuilding the exact commit in a private Git repo."""
+    """Execute immutable command sequences; nothing supplied by a pointer is executable."""
 
     def __init__(self, *, redaction_patterns: tuple[re.Pattern[str], ...] = ()) -> None:
-        self.redaction_patterns = _DEFAULT_REDACTION_PATTERNS + redaction_patterns
+        self.redaction_patterns = _DEFAULT_REDACTION + redaction_patterns
 
-    def _environment(self, suite: E2SuiteDefinition) -> dict[str, str]:
-        return {"PATH": os.defpath, **suite.allowed_environment}
-
-    def _result(self, suite: E2SuiteDefinition, subject_ref: str, context: VerificationContext, *, valid: bool, error_code: str | None, facts: dict[str, object]) -> VerificationResult:
+    def _result(self, suite: E2SuiteDefinition, ref: str, context: VerificationContext, *, valid: bool, code: str | None, facts: dict[str, object]) -> VerificationResult:
         return VerificationResult(
-            valid=valid, error_code=error_code, facts=facts, observed_at=context.observed_at,
-            input_digest=_digest({
-                "suiteId": suite.id, "subjectRef": subject_ref, "workingDirectory": suite.working_directory,
-                "setupArgv": suite.setup_argv, "argv": suite.argv, "expectedTestIds": suite.expected_test_ids,
-                "parser": suite.parser, "allowedEnvironment": dict(suite.allowed_environment),
-                "lockfileDigests": dict(suite.lockfile_digests), "toolVersions": dict(suite.tool_versions),
-            }),
+            valid=valid, error_code=code, facts=facts, observed_at=context.observed_at,
+            input_digest=_digest({"suiteId": suite.id, "subjectRef": ref, "setupArgv": suite.setup_argv,
+                "argv": suite.argv, "expectedTestIds": suite.expected_test_ids, "parser": suite.parser,
+                "workingDirectory": suite.working_directory, "lockfileDigests": dict(suite.lockfile_digests),
+                "toolVersions": dict(suite.tool_versions)}),
             zero_tolerance_violations=(),
         )
 
-    def _git_environment(self, root: Path) -> dict[str, str]:
-        for name in ("home", "xdg", "empty-template"):
-            (root / name).mkdir(exist_ok=True)
-        return {
-            "HOME": str(root / "home"), "XDG_CONFIG_HOME": str(root / "xdg"),
-            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_NO_REPLACE_OBJECTS": "1", "LC_ALL": "C", "PATH": os.defpath,
-        }
+    def _environment(self, suite: E2SuiteDefinition) -> dict[str, str]:
+        """Expose only the static allowlist; executor-owned PATH is added later."""
+        return dict(suite.allowed_environment)
 
-    def _git(self, argv: list[str], *, environment: dict[str, str], input: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
+    def _relative(self, checkout: Path, candidate: Path) -> str:
         try:
-            return subprocess.run(
-                ["git", "--no-replace-objects", *argv], input=input, check=False, capture_output=True,
-                env=environment, shell=False, timeout=30,
-            )
+            root = Path(os.path.realpath(checkout))
+            return str(Path(os.path.realpath(candidate)).relative_to(root))
+        except ValueError as error:
+            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "path escapes checkout") from error
+
+    def _git_environment(self, root: Path) -> dict[str, str]:
+        for item in ("home", "xdg", "empty-template"):
+            (root / item).mkdir(exist_ok=True)
+        return {"HOME": str(root / "home"), "XDG_CONFIG_HOME": str(root / "xdg"),
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_NO_LAZY_FETCH": "1", "LC_ALL": "C", "PATH": os.defpath}
+
+    def _git(self, argv: list[str], *, env: dict[str, str], input: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
+        try:
+            return subprocess.run(["git", "--no-replace-objects", *argv], input=input, check=False,
+                capture_output=True, env=env, shell=False, timeout=30)
         except (OSError, subprocess.TimeoutExpired) as error:
-            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "Git object source is unavailable") from error
+            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "Git source is unavailable") from error
 
     def _source_repository(self, root: Path) -> Path:
-        completed = self._git(["rev-parse", "--show-toplevel"], environment=self._git_environment(root))
-        if completed.returncode != 0:
-            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "product Git repository is unavailable")
+        result = self._git(["rev-parse", "--show-toplevel"], env=self._git_environment(root))
+        if result.returncode:
+            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "product repository is unavailable")
         try:
-            repository = Path(completed.stdout.decode("utf-8").strip()).resolve(strict=True)
+            return Path(result.stdout.decode().strip()).resolve(strict=True)
         except (OSError, UnicodeDecodeError) as error:
-            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "product Git repository is unavailable") from error
-        if not repository.is_dir():
-            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "product Git repository is unavailable")
-        return repository
+            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "product repository is unavailable") from error
 
-    def _verify_commit(self, repository: Path, commit: str, environment: dict[str, str]) -> None:
-        result = self._git(["-C", str(repository), "cat-file", "-t", commit], environment=environment)
-        if result.returncode != 0 or result.stdout.strip() != b"commit":
+    def _no_symlink_ancestors(self, path: Path) -> None:
+        current = Path(path.anchor)
+        for part in path.parts[1:]:
+            current /= part
+            if current.is_symlink():
+                raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "Git path contains a symbolic link")
+
+    def _source_safety(self, source: Path, commit: str, env: dict[str, str]) -> None:
+        for argument in ("--absolute-git-dir", "--git-common-dir"):
+            result = self._git(["-C", str(source), "rev-parse", argument], env=env)
+            if result.returncode:
+                raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "Git metadata is unavailable")
+            raw = Path(result.stdout.decode().strip())
+            path = raw if raw.is_absolute() else source / raw
+            path = path.resolve(strict=True)
+            self._no_symlink_ancestors(path)
+            for objects in (path / "objects",):
+                self._no_symlink_ancestors(objects)
+                if os.path.lexists(objects / "info" / "alternates"):
+                    raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "Git alternates are not trusted")
+        names = self._git(["-C", str(source), "config", "--local", "--list", "--name-only"], env=env)
+        config_names = names.stdout.decode("utf-8", "replace").splitlines() if names.returncode == 0 else ()
+        if any(
+            _DANGEROUS_CONFIG.fullmatch(name)
+            or name.startswith("remote.") and name.endswith((".promisor", ".partialclonefilter", ".uploadpack", ".receivepack"))
+            for name in config_names
+        ):
+            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "Git local configuration is not trusted")
+        kind = self._git(["-C", str(source), "cat-file", "-t", commit], env=env)
+        if kind.returncode or kind.stdout.strip() != b"commit":
             raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "subject is not an exact commit object")
 
-    def _isolated_repository(self, source: Path, commit: str, root: Path, environment: dict[str, str]) -> Path:
-        git_dir = self._git(["-C", str(source), "rev-parse", "--absolute-git-dir"], environment=environment)
-        if git_dir.returncode != 0:
-            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "product Git directory is unavailable")
-        if os.path.lexists(Path(git_dir.stdout.decode("utf-8").strip()) / "objects" / "info" / "alternates"):
-            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "untrusted Git object alternates are configured")
-        self._verify_commit(source, commit, environment)
+    def _isolated_repository(self, source: Path, commit: str, root: Path, env: dict[str, str]) -> Path:
+        self._source_safety(source, commit, env)
         isolated = root / "isolated.git"
-        if self._git(["init", "--bare", f"--template={root / 'empty-template'}", str(isolated)], environment=environment).returncode != 0:
-            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "isolated Git repository cannot be created")
-        packed = self._git(["-C", str(source), "pack-objects", "--stdout", "--revs"], environment=environment, input=f"{commit}\n".encode("ascii"))
-        if packed.returncode != 0 or not packed.stdout:
-            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "fixed Git objects cannot be packed")
-        if self._git(["-C", str(isolated), "index-pack", "--stdin"], environment=environment, input=packed.stdout).returncode != 0:
-            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "fixed Git objects cannot be imported")
-        self._verify_commit(isolated, commit, environment)
+        if self._git(["init", "--bare", f"--template={root / 'empty-template'}", str(isolated)], env=env).returncode:
+            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "cannot initialize isolated Git repository")
+        packed = self._git(["-C", str(source), "pack-objects", "--stdout", "--revs"], env=env, input=f"{commit}\n".encode())
+        if packed.returncode or not packed.stdout:
+            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "fixed Git object closure is incomplete")
+        if self._git(["-C", str(isolated), "index-pack", "--stdin"], env=env, input=packed.stdout).returncode:
+            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "cannot import fixed Git object closure")
+        kind = self._git(["-C", str(isolated), "cat-file", "-t", commit], env=env)
+        if kind.returncode or kind.stdout.strip() != b"commit":
+            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "isolated closure lacks the fixed commit")
         return isolated
 
-    def _remove_worktree(self, repository: Path, checkout: Path, environment: dict[str, str]) -> None:
+    def _cleanup(self, repository: Path, checkout: Path, env: dict[str, str]) -> None:
         try:
-            removed = self._git(["-C", str(repository), "worktree", "remove", "--force", str(checkout)], environment=environment)
+            removed = self._git(["-C", str(repository), "worktree", "remove", "--force", str(checkout)], env=env)
         except _ReplayBlocked as error:
-            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "temporary checkout cleanup timed out") from error
-        if removed.returncode == 0:
-            return
-        self._git(["-C", str(repository), "worktree", "prune", "--expire=now"], environment=environment)
-        raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "temporary checkout cleanup failed")
+            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "temporary checkout cleanup failed") from error
+        if removed.returncode:
+            try:
+                self._git(["-C", str(repository), "worktree", "prune", "--expire=now"], env=env)
+            finally:
+                raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "temporary checkout cleanup failed")
 
     @contextmanager
-    def _detached_checkout(self, source: Path, commit: str) -> Iterator[Path]:
+    def _checkout(self, source: Path, commit: str) -> Iterator[Path]:
         with tempfile.TemporaryDirectory(prefix="trusted-e2-") as name:
-            root = Path(name)
-            environment = self._git_environment(root)
-            isolated = self._isolated_repository(source, commit, root, environment)
+            root = Path(name); env = self._git_environment(root); isolated = self._isolated_repository(source, commit, root, env)
             checkout = root / "checkout"
-            added = self._git(
-                ["-C", str(isolated), "-c", "core.hooksPath=/dev/null", "-c", "core.autocrlf=false",
-                 "worktree", "add", "--detach", str(checkout), commit],
-                environment=environment,
-            )
-            if added.returncode != 0:
-                raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "fixed detached checkout is unavailable")
+            added = self._git(["-C", str(isolated), "-c", "core.hooksPath=/dev/null", "-c", "core.autocrlf=false",
+                "worktree", "add", "--detach", str(checkout), commit], env=env)
+            if added.returncode:
+                raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "fixed checkout is unavailable")
             try:
-                head = self._git(["-C", str(checkout), "rev-parse", "HEAD"], environment=environment)
-                if head.returncode != 0 or head.stdout.decode("ascii", "strict").strip() != commit:
-                    raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "detached checkout head does not match subject")
+                head = self._git(["-C", str(checkout), "rev-parse", "HEAD"], env=env)
+                if head.returncode or head.stdout.decode("ascii", "strict").strip() != commit:
+                    raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "checkout HEAD differs from subject")
                 yield checkout
             finally:
-                self._remove_worktree(isolated, checkout, environment)
+                self._cleanup(isolated, checkout, env)
 
-    def _checked_path(self, checkout: Path, relative: str, *, file: bool) -> Path:
-        root = checkout.resolve(strict=True)
-        current = checkout
+    def _path(self, checkout: Path, relative: str, *, file: bool, may_absent: bool = False) -> Path:
+        if Path(relative).is_absolute() or ".." in Path(relative).parts:
+            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "path escapes checkout")
+        candidate = checkout / relative; current = checkout
         for part in Path(relative).parts:
-            if part not in {"", "."}:
+            if part not in ("", "."):
                 current /= part
                 if current.is_symlink():
-                    raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "checked path contains a symbolic link")
+                    raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "path contains a symbolic link")
+        if may_absent and not candidate.exists():
+            self._relative(checkout, candidate.parent.resolve(strict=True))
+            return candidate
         try:
-            result = (checkout / relative).resolve(strict=True)
-            result.relative_to(root)
+            resolved = candidate.resolve(strict=True); self._relative(checkout, resolved)
         except (OSError, ValueError) as error:
-            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "checked path is unavailable") from error
-        if (file and not result.is_file()) or (not file and not result.is_dir()):
-            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "checked path has the wrong type")
-        return result
+            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "path is unavailable") from error
+        if (file and not resolved.is_file()) or (not file and not resolved.is_dir()):
+            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "path has wrong type")
+        return resolved
 
-    def _check_lockfiles(self, suite: E2SuiteDefinition, checkout: Path) -> dict[str, str]:
-        observed = {}
-        for path, expected in suite.lockfile_digests.items():
-            digest = "sha256:" + hashlib.sha256(self._checked_path(checkout, path, file=True).read_bytes()).hexdigest()
-            observed[path] = digest
-            if digest != expected:
-                raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "lockfile digest does not match policy")
-        return observed
-
-    def _validate_command(self, argv: tuple[str, ...], cwd: Path, checkout: Path) -> None:
-        if "/" not in argv[0]:
+    def _command_path(self, command: tuple[str, ...], cwd: Path, checkout: Path, *, trusted_host: bool = False) -> None:
+        if "/" not in command[0]:
             return
-        path = Path(argv[0])
-        if path.is_absolute():
-            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "registered command must not use an absolute path")
+        if Path(command[0]).is_absolute():
+            if trusted_host:
+                return
+            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "absolute commands are not allowed")
         try:
-            relative = str((cwd / path).resolve(strict=True).relative_to(checkout.resolve(strict=True)))
-        except (OSError, ValueError) as error:
-            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "registered command escapes checkout") from error
-        self._checked_path(checkout, relative, file=True)
-
-    def _run_command(self, argv: tuple[str, ...], *, cwd: Path, checkout: Path, environment: dict[str, str], timeout: int) -> subprocess.CompletedProcess[bytes]:
-        self._validate_command(argv, cwd, checkout)
-        try:
-            return subprocess.run(argv, cwd=cwd, check=False, capture_output=True, env=environment, shell=False, timeout=timeout)
-        except subprocess.TimeoutExpired as error:
-            raise _ReplayBlocked("TEST_REPLAY_TIMEOUT", "registered command timed out") from error
+            self._path(checkout, self._relative(checkout, (cwd / command[0]).resolve(strict=True)), file=True)
         except OSError as error:
             raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "registered command is unavailable") from error
 
-    def _check_tools(self, suite: E2SuiteDefinition, cwd: Path, checkout: Path, environment: dict[str, str]) -> dict[str, str]:
+    def _run(self, command: tuple[str, ...], *, cwd: Path, checkout: Path, env: dict[str, str], timeout: int, limit: int, trusted_host: bool = False) -> _CommandResult:
+        self._command_path(command, cwd, checkout, trusted_host=trusted_host)
+        try:
+            process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, shell=False, start_new_session=True)
+        except OSError as error:
+            raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "registered command is unavailable") from error
+        assert process.stdout and process.stderr
+        selector = selectors.DefaultSelector(); selector.register(process.stdout, selectors.EVENT_READ); selector.register(process.stderr, selectors.EVENT_READ)
+        output = {process.stdout: bytearray(), process.stderr: bytearray()}; truncated = False; deadline = time.monotonic() + timeout
+        try:
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    try: os.killpg(process.pid, signal.SIGKILL)
+                    except OSError: process.kill()
+                    process.wait()
+                    raise _ReplayBlocked("TEST_REPLAY_TIMEOUT", "registered process group timed out")
+                for key, _ in selector.select(remaining):
+                    chunk = os.read(key.fileobj.fileno(), 8192)
+                    if not chunk:
+                        selector.unregister(key.fileobj); continue
+                    room = max(0, limit - len(output[key.fileobj]))
+                    output[key.fileobj].extend(chunk[:room]); truncated |= len(chunk) > room
+            return _CommandResult(process.wait(), bytes(output[process.stdout]), bytes(output[process.stderr]), truncated)
+        finally:
+            selector.close()
+
+    def _host_tools(self, suite: E2SuiteDefinition) -> tuple[dict[str, str], dict[str, str]]:
+        host_path = os.environ.get("PATH", ""); resolved: dict[str, str] = {}
+        for tool in suite.tool_versions:
+            if any(Path(command[0]).name == tool and "/" in command[0] for command in (*suite.setup_argv, *suite.argv)):
+                continue
+            path = shutil.which(tool, path=host_path)
+            if path is None:
+                raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", f"declared tool is unavailable: {tool}")
+            resolved[tool] = str(Path(path).resolve(strict=True))
+        paths = list(dict.fromkeys(str(Path(path).parent) for path in resolved.values()))
+        return resolved, {"PATH": os.pathsep.join([*paths, *os.defpath.split(os.pathsep)]), **suite.allowed_environment}
+
+    def _lockfiles(self, suite: E2SuiteDefinition, checkout: Path) -> dict[str, str]:
+        result = {}
+        for path, expected in suite.lockfile_digests.items():
+            actual = "sha256:" + hashlib.sha256(self._path(checkout, path, file=True).read_bytes()).hexdigest()
+            result[path] = actual
+            if actual != expected: raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", "lockfile digest changed")
+        return result
+
+    def _tools(self, suite: E2SuiteDefinition, cwd: Path, checkout: Path, env: dict[str, str], hosts: dict[str, str]) -> dict[str, str]:
         observed = {}
-        argv = _single_invocation(suite.argv)
+        all_commands = (*suite.setup_argv, *suite.argv)
         for tool, expected in suite.tool_versions.items():
-            command = argv[0] if Path(argv[0]).name == tool else tool
-            completed = self._run_command((command, "--version"), cwd=cwd, checkout=checkout, environment=environment, timeout=suite.timeout_seconds)
-            version = _safe_summary(completed.stdout + completed.stderr, self.redaction_patterns).strip()
+            command = next((item[0] for item in all_commands if Path(item[0]).name == tool), hosts.get(tool, tool))
+            result = self._run((command, "--version"), cwd=cwd, checkout=checkout, env=env, timeout=suite.timeout_seconds, limit=4096, trusted_host=command in hosts.values())
+            version = _summary(result.stdout + result.stderr, truncated=result.truncated, patterns=self.redaction_patterns).strip()
             observed[tool] = version
-            if completed.returncode != 0 or version != expected:
-                raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", f"tool version does not exactly match policy: {tool}")
+            if result.returncode or version != expected: raise _ReplayBlocked("SOURCE_REF_UNREACHABLE", f"tool version differs: {tool}")
         return observed
 
-    def _outcomes(self, suite: E2SuiteDefinition, outcomes: dict[str, str]) -> tuple[str, ...]:
-        if any(test_id not in outcomes for test_id in suite.expected_test_ids):
-            raise _ReplayBlocked("TEST_SELECTION_MISSING", "expected test IDs were not executed")
-        if any(outcomes[test_id] != "passed" for test_id in suite.expected_test_ids):
-            raise _ReplayBlocked("TEST_REPLAY_FAILED", "expected test ID did not pass")
-        return suite.expected_test_ids
+    def _pytest_path(self, command: tuple[str, ...], cwd: Path, checkout: Path, *, prepare: bool) -> Path:
+        if "--json-report" not in command: raise _ReplayBlocked("TEST_SELECTION_MISSING", "pytest reporter is disabled")
+        report = ".report.json"
+        for index, value in enumerate(command):
+            if value.startswith("--json-report-file="): report = value.removeprefix("--json-report-file=")
+            elif value == "--json-report-file":
+                if index + 1 == len(command): raise _ReplayBlocked("TEST_SELECTION_MISSING", "pytest report path missing")
+                report = command[index + 1]
+        path = self._path(checkout, self._relative(checkout, (cwd / report).resolve(strict=False)), file=True, may_absent=True)
+        if prepare and path.exists():
+            if path.is_symlink() or not path.is_file(): raise _ReplayBlocked("TEST_SELECTION_MISSING", "stale report path unsafe")
+            path.unlink()
+        return path
 
-    def _pytest_report(self, suite: E2SuiteDefinition, cwd: Path, checkout: Path) -> tuple[str, ...]:
-        argv = _single_invocation(suite.argv)
-        if "--json-report" not in argv:
-            raise _ReplayBlocked("TEST_SELECTION_MISSING", "pytest JSON reporter is not enabled")
-        report_path = ".report.json"
-        for index, argument in enumerate(argv):
-            if argument.startswith("--json-report-file="):
-                report_path = argument.removeprefix("--json-report-file=")
-            elif argument == "--json-report-file":
-                if index + 1 == len(argv):
-                    raise _ReplayBlocked("TEST_SELECTION_MISSING", "pytest JSON report path is missing")
-                report_path = argv[index + 1]
-        if not report_path or Path(report_path).is_absolute() or ".." in Path(report_path).parts:
-            raise _ReplayBlocked("TEST_SELECTION_MISSING", "pytest JSON report path is unsafe")
+    def _parse(self, suite: E2SuiteDefinition, command: tuple[str, ...], result: _CommandResult, cwd: Path, checkout: Path) -> tuple[str, ...]:
         try:
-            relative = str((cwd / report_path).resolve(strict=True).relative_to(checkout.resolve(strict=True)))
-            report = json.loads(self._checked_path(checkout, relative, file=True).read_text(encoding="utf-8"))
+            if suite.parser == "pytest-json-v1":
+                path = self._pytest_path(command, cwd, checkout, prepare=False)
+                report = json.loads(self._path(checkout, self._relative(checkout, path), file=True).read_text())
+                rows = report.get("tests") if isinstance(report, dict) else None
+                outcomes = {row.get("nodeid"): row.get("outcome") for row in rows if isinstance(row, dict) and isinstance(row.get("nodeid"), str) and isinstance(row.get("outcome"), str)} if isinstance(rows, list) else {}
+            else:
+                if "--reporter=json" not in command and not any(command[i:i+2] == ("--reporter", "json") for i in range(len(command)-1)): raise _ReplayBlocked("TEST_SELECTION_MISSING", "Vitest reporter is disabled")
+                report = json.loads(result.stdout.decode("utf-8")); rows = report.get("testResults") if isinstance(report, dict) else None; outcomes = {}
+                if isinstance(rows, list):
+                    for row in rows:
+                        assertions = row.get("assertionResults") if isinstance(row, dict) else None
+                        if isinstance(assertions, list):
+                            for item in assertions:
+                                if isinstance(item, dict) and isinstance(item.get("fullName"), str) and isinstance(item.get("status"), str): outcomes[item["fullName"]] = item["status"]
+            if not outcomes: raise _ReplayBlocked("TEST_SELECTION_MISSING", "machine report has no executed tests")
+            if any(value != "passed" for value in outcomes.values()): raise _ReplayBlocked("TEST_REPLAY_FAILED", "machine report contains a failed test")
+            return tuple(outcomes)
+        except _ReplayBlocked as error:
+            raise _ReplayBlocked("TEST_SELECTION_MISSING", "machine report is missing or unsafe") from error
         except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise _ReplayBlocked("TEST_SELECTION_MISSING", "pytest JSON report is invalid") from error
-        if not isinstance(report, dict) or not isinstance(report.get("tests"), list):
-            raise _ReplayBlocked("TEST_SELECTION_MISSING", "pytest JSON report has no test list")
-        outcomes = {
-            item.get("nodeid"): item.get("outcome") for item in report["tests"]
-            if isinstance(item, dict) and isinstance(item.get("nodeid"), str) and isinstance(item.get("outcome"), str)
-        }
-        return self._outcomes(suite, outcomes)
+            raise _ReplayBlocked("TEST_SELECTION_MISSING", "machine report is invalid") from error
 
-    def _vitest_report(self, suite: E2SuiteDefinition, stdout: bytes) -> tuple[str, ...]:
-        argv = _single_invocation(suite.argv)
-        if "--reporter=json" not in argv and not any(argv[index:index + 2] == ("--reporter", "json") for index in range(len(argv) - 1)):
-            raise _ReplayBlocked("TEST_SELECTION_MISSING", "Vitest JSON reporter is not enabled")
+    def _receipt_pointer(self, pointer: EvidencePointer, suite: E2SuiteDefinition, context: VerificationContext) -> None:
         try:
-            report = json.loads(stdout.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise _ReplayBlocked("TEST_SELECTION_MISSING", "Vitest JSON stdout is invalid") from error
-        if not isinstance(report, dict) or not isinstance(report.get("testResults"), list):
-            raise _ReplayBlocked("TEST_SELECTION_MISSING", "Vitest JSON report has no test results")
-        outcomes = {}
-        for result in report["testResults"]:
-            for assertion in result.get("assertionResults", ()) if isinstance(result, dict) else ():
-                if isinstance(assertion, dict) and isinstance(assertion.get("fullName"), str) and isinstance(assertion.get("status"), str):
-                    outcomes[assertion["fullName"]] = assertion["status"]
-        return self._outcomes(suite, outcomes)
-
-    def _selected_tests(self, suite: E2SuiteDefinition, stdout: bytes, cwd: Path, checkout: Path) -> tuple[str, ...]:
-        return self._pytest_report(suite, cwd, checkout) if suite.parser == "pytest-json-v1" else self._vitest_report(suite, stdout)
-
-    def _store_receipt(self, context: VerificationContext, receipt: dict[str, object]) -> str:
-        return ContentAddressedStore(Path(context.trust_root)).put(canonical_json_bytes(receipt))
+            raw = ContentAddressedStore(Path(context.trust_root)).read(pointer.artifact_ref)
+            receipt = json.loads(raw)
+            if canonical_json_bytes(receipt) != raw or not isinstance(receipt, dict) or set(receipt) < {"schema", "suiteId", "subjectRef", "parser"}:
+                raise ValueError
+            if receipt["schema"] != "trusted-e2-receipt/v1" or receipt["suiteId"] != suite.id or receipt["subjectRef"] != pointer.subject_ref or receipt["parser"] != suite.parser:
+                raise ValueError
+        except (PolicyError, ValueError, TypeError, json.JSONDecodeError) as error:
+            code = error.code if isinstance(error, PolicyError) else "POINTER_INVALID"
+            raise _ReplayBlocked(code, "receipt is not a trusted E2 receipt") from error
 
     def run(self, suite: E2SuiteDefinition, subject_ref: str, context: VerificationContext) -> VerificationResult:
-        match = _SUBJECT_REF.fullmatch(subject_ref)
-        facts: dict[str, object] = {"suiteId": suite.id, "subjectRef": subject_ref}
-        if match is None or subject_ref != context.subject_ref:
-            return self._result(suite, subject_ref, context, valid=False, error_code="SUITE_NOT_ALLOWLISTED", facts=facts)
-        started = time.monotonic()
+        match = _SUBJECT_REF.fullmatch(subject_ref); facts: dict[str, object] = {"suiteId": suite.id, "subjectRef": subject_ref}; started = time.monotonic()
+        if match is None or subject_ref != context.subject_ref: return self._result(suite, subject_ref, context, valid=False, code="SUITE_NOT_ALLOWLISTED", facts=facts)
         try:
-            argv = _single_invocation(suite.argv)
-            setup_argv = () if not suite.setup_argv else _single_invocation(suite.setup_argv)
-            if not all(test_id in argv for test_id in suite.expected_test_ids):
-                facts["expectedTestIds"] = suite.expected_test_ids
-                return self._result(suite, subject_ref, context, valid=False, error_code="TEST_SELECTION_MISSING", facts=facts)
-            with tempfile.TemporaryDirectory(prefix="trusted-e2-source-") as name:
-                source = self._source_repository(Path(name))
-            with self._detached_checkout(source, match.group(1)) as checkout:
-                cwd = checkout if suite.working_directory == "." else self._checked_path(checkout, suite.working_directory, file=False)
-                lockfiles = self._check_lockfiles(suite, checkout)
-                environment = self._environment(suite)
-                if setup_argv:
-                    setup = self._run_command(setup_argv, cwd=cwd, checkout=checkout, environment=environment, timeout=suite.timeout_seconds)
-                    if setup.returncode != 0:
-                        facts["setupExitCode"] = setup.returncode
-                        return self._result(suite, subject_ref, context, valid=False, error_code="TEST_REPLAY_FAILED", facts=facts)
-                tools = self._check_tools(suite, cwd, checkout, environment)
-                completed = self._run_command(argv, cwd=cwd, checkout=checkout, environment=environment, timeout=suite.timeout_seconds)
-                selected = () if completed.returncode else self._selected_tests(suite, completed.stdout, cwd, checkout)
-                receipt = {
-                    "schema": "trusted-e2-receipt/v1", "suiteId": suite.id, "subjectRef": subject_ref,
-                    "exitCode": completed.returncode, "selectedTestIds": selected, "parser": suite.parser,
-                    "stdout": _safe_summary(completed.stdout, self.redaction_patterns),
-                    "stderr": _safe_summary(completed.stderr, self.redaction_patterns),
-                    "toolVersions": tools, "lockfileDigests": lockfiles,
-                    "durationMilliseconds": int((time.monotonic() - started) * 1000),
-                }
-                receipt_ref = self._store_receipt(context, receipt)
-                facts.update(receipt | {"receiptRef": receipt_ref})
-                return self._result(suite, subject_ref, context, valid=completed.returncode == 0, error_code=None if completed.returncode == 0 else "TEST_REPLAY_FAILED", facts=facts)
-        except _ReplayBlocked as error:
-            facts["durationMilliseconds"] = int((time.monotonic() - started) * 1000)
-            return self._result(suite, subject_ref, context, valid=False, error_code=error.code, facts=facts)
+            if not all(any(test in command for command in suite.argv) for test in suite.expected_test_ids): raise _ReplayBlocked("TEST_SELECTION_MISSING", "expected IDs not selected by registry argv")
+            with tempfile.TemporaryDirectory(prefix="trusted-e2-source-") as root: source = self._source_repository(Path(root))
+            hosts, env = self._host_tools(suite)
+            receipt: dict[str, object]
+            with self._checkout(source, match.group(1)) as checkout:
+                cwd = checkout if suite.working_directory == "." else self._path(checkout, suite.working_directory, file=False)
+                locks = self._lockfiles(suite, checkout)
+                for setup in suite.setup_argv:
+                    result = self._run(setup, cwd=cwd, checkout=checkout, env=env, timeout=suite.timeout_seconds, limit=_MAX_CAPTURE)
+                    if result.returncode: raise _ReplayBlocked("TEST_REPLAY_FAILED", "setup command failed")
+                tools = self._tools(suite, cwd, checkout, env, hosts)
+                selected: list[str] = []; invocations = []; replay_failed = False
+                for command in suite.argv:
+                    if suite.parser == "pytest-json-v1": self._pytest_path(command, cwd, checkout, prepare=True)
+                    result = self._run(command, cwd=cwd, checkout=checkout, env=env, timeout=suite.timeout_seconds, limit=max(1, _MAX_CAPTURE // len(suite.argv)))
+                    try: actual = self._parse(suite, command, result, cwd, checkout)
+                    except _ReplayBlocked:
+                        if result.returncode: actual = ()
+                        else: raise
+                    selected.extend(actual); invocations.append({"exitCode": result.returncode, "selectedTestIds": actual,
+                        "stdout": _summary(result.stdout, truncated=result.truncated, patterns=self.redaction_patterns),
+                        "stderr": _summary(result.stderr, truncated=result.truncated, patterns=self.redaction_patterns)})
+                    if result.returncode: replay_failed = True
+                if not replay_failed and (set(selected) != set(suite.expected_test_ids) or len(selected) != len(set(selected))):
+                    raise _ReplayBlocked("TEST_SELECTION_MISSING", "machine reports do not exactly cover expected tests")
+                receipt = {"schema": "trusted-e2-receipt/v1", "suiteId": suite.id, "subjectRef": subject_ref, "parser": suite.parser,
+                    "selectedTestIds": tuple(selected), "invocations": invocations, "toolVersions": tools, "lockfileDigests": locks,
+                    "durationMilliseconds": int((time.monotonic()-started)*1000)}
+            receipt_ref = ContentAddressedStore(Path(context.trust_root)).put(canonical_json_bytes(receipt))
+            facts.update(receipt | {"receiptRef": receipt_ref})
+            return self._result(suite, subject_ref, context, valid=not replay_failed, code=None if not replay_failed else "TEST_REPLAY_FAILED", facts=facts)
+        except (_ReplayBlocked, PolicyError) as error:
+            facts["durationMilliseconds"] = int((time.monotonic()-started)*1000)
+            return self._result(suite, subject_ref, context, valid=False, code=error.code if isinstance(error, _ReplayBlocked) else error.code, facts=facts)
 
 
 class E2SuiteVerifier:
     level = "E2"
-
     def __init__(self, verifier_id: str, definition: E2SuiteDefinition, *, runner: SuiteRunner | None = None) -> None:
-        self.verifier_id = verifier_id
-        self.definition = definition
-        self.runner = runner or SuiteRunner()
-
+        self.verifier_id, self.definition, self.runner = verifier_id, definition, runner or SuiteRunner()
     def verify(self, pointer: EvidencePointer, profile: AcceptanceProfile, context: VerificationContext) -> VerificationResult:
         if pointer.verifier_id != self.verifier_id or pointer.profile_id != profile.profile_id or pointer.subject_ref != profile.subject_ref or pointer.subject_ref != context.subject_ref:
-            return self.runner._result(self.definition, context.subject_ref, context, valid=False, error_code="SUITE_NOT_ALLOWLISTED", facts={"suiteId": self.definition.id})
-        try:
-            ContentAddressedStore(Path(context.trust_root)).read(pointer.artifact_ref)
-        except PolicyError as error:
-            return self.runner._result(self.definition, pointer.subject_ref, context, valid=False, error_code=error.code, facts={"suiteId": self.definition.id, "receiptRef": pointer.artifact_ref})
+            return self.runner._result(self.definition, context.subject_ref, context, valid=False, code="SUITE_NOT_ALLOWLISTED", facts={"suiteId": self.definition.id})
+        try: self.runner._receipt_pointer(pointer, self.definition, context)
+        except _ReplayBlocked as error:
+            return self.runner._result(self.definition, pointer.subject_ref, context, valid=False, code=error.code, facts={"suiteId": self.definition.id, "receiptRef": pointer.artifact_ref})
         return self.runner.run(self.definition, pointer.subject_ref, context)

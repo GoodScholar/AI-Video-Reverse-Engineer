@@ -21,7 +21,11 @@ def redact_output(data: bytes, patterns: tuple[Pattern[str], ...]) -> bytes:
     if any(
         marker.search(text)
         for marker in (
-            re.compile(r"(?im)^\s*(?:authorization|cookie|set-cookie|ssh_auth_sock)\s*[:=]"),
+            re.compile(r"(?i)\b(?:proxy-)?authorization\s*:\s*(?:basic|bearer|token)\s+\S+"),
+            re.compile(r"(?i)\b(?:set-)?cookie\s*:\s*[^\r\n]+"),
+            re.compile(r"(?i)\bssh_auth_sock\s*[:=]\s*\S+"),
+            re.compile(r"(?i)\baws_secret_access_key\s*[:=]\s*\S+"),
+            re.compile(r'(?i)"(?:api[_-]?key|secret|token|aws_secret_access_key)"\s*:\s*"[^"\\]*"'),
             re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
         )
     ):
