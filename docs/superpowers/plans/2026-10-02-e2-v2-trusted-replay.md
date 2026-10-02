@@ -13,11 +13,12 @@
 ## Global Constraints
 
 - 历史计划 `docs/superpowers/plans/2026-10-02-trusted-acceptance-evidence-bridge.md` 保持不变；旧 Task 5 保持 `blocked / superseded`，旧 Task 6 未开始。
+- 本轮修订基线为 `06827f2e439f84578d1e8b9d02346c1a75e10295`，不得修改已批准规格。审批前固定 commit `2f304fe25af5a3422613efbc3122ff290287c81d` 的规格 blob 与当前已批准 blob 只在第 3 行 `Status: proposed-for-review → approved` 不同；规范性正文机械验证为 `diff -u <(git show 2f304fe:docs/superpowers/specs/2026-10-02-e2-v2-trusted-replay-design.md | sed '3d') <(git show HEAD:docs/superpowers/specs/2026-10-02-e2-v2-trusted-replay-design.md | sed '3d')` 无输出，本轮零改动验证为 `git diff --exit-code 06827f2e HEAD -- docs/superpowers/specs/2026-10-02-e2-v2-trusted-replay-design.md`。
 - Ticket 23 闭环 Tasks 24–29 包含旧计划 Tasks 9–12 尚未执行的 E1/E4 前置工作；不扩展 E2 v2 规格、不改变 138 项合同、四状态、零容忍规则或 E1/E2/E3/E4 职责。
 - `trusted-e2-suite/v2`、`trusted-e2-receipt/v2`、`trusted-e2-toolchain-tar-zstd/v1`、`trusted-e2-dependency-repository/v1`、`trusted-product-raw-git-tar-zstd/v1` 均拒绝未知、缺失、重复字段；v1 suite/receipt 不迁移、不猜测升级。
 - `validate/promote/reconcile` 的全部 E2 requirement 先通过同一阶段 A barrier；失败时 `spawnCount=checkoutCount=casWrites=contractWrites=0`。verify 永不写 CAS；collect 仅完整成功后原子写一次 receipt。
 - `AcceptanceOperationSnapshotV1` 只绑定 catalog、contract 与本轮 `ReplayPolicyBindingV1` digest，用于 operation barrier/投影前 recheck；`ReplayPolicyBindingV1` 绑定 registry、suite/profile、revocation、reviewer policy、toolchain、dependency repository、raw product source 与 containment policy，明确排除 catalog、contract 和 observation time。receipt 只保存 replay binding digest。
-- runner 只接收 `VerifiedProductRepositorySourceV1`；裸 `repository_root`、`cwd`、宿主绝对路径和工作区 Git 目录不能进入 replay 或 receipt。
+- runner 只接收 `VerifiedProductRepositorySourceV1`；裸 `repository_root`、`cwd`、宿主绝对路径和未注册工作区 Git 目录不能进入 replay 或 receipt。source builder 可接收运行时 `RegisteredRepositoryBoundaryV1` capability，但其绝对路径、device/inode 与原始 `.git/gitdir/commondir` 宿主路径不得写入 container、build record、source digest 或 receipt。
 - 工具链、依赖、产品源码分别只来自 `trust/toolchains/sha256`、`trust/dependencies/sha256`、`trust/product-sources/sha256`；禁止宿主 PATH/shell/`/usr/bin/env`、live download、主机 cache 或同名工具回退。
 - 工具链预算固定为压缩 1 GiB、100,000 members、单文件 256 MiB、展开 4 GiB、100:1；依赖预算固定为压缩 1 GiB、100,000 members、20,000 packages、单 archive 256 MiB、blob 2 GiB、view 200,000 entries/2 GiB、安装树 4 GiB、100:1。
 - 固定版本为 uv 0.11.15（commit `3cffe97c2e48c9e49422c738da3af95919dd0bf5`）、Git 2.53.0、Node 24.20.0、npm 11.19.0、pytest 8.3.5、pytest-json-report 1.5.0、Vitest 3.0.8、zstandard 0.23.0；版本相同但 bytes/build identity 不同也拒绝。
@@ -40,7 +41,7 @@
 - 32 KiB 后才出现跨 chunk token、非法 UTF-8、未闭合 quote/JSON 或 agent socket 标点仍须读到 EOF并返回 `OUTPUT_REDACTION_UNSAFE`；Tasks 3、20 覆盖。
 - leader 任意结局后 double-fork+`setsid/setpgid`+关闭 stdio 仍须处于 leaf 并被清空；Tasks 14、21 覆盖。
 - uv probe cwd/env/script/cache/extra child、恶意 entry-point 越界、project/workspace/build backend、DNS/socket、derived entrypoint replacement 均须命中固定错误码且不得进入测试；Tasks 19–20 覆盖。
-- Ticket 23 缺 E4、双 active pointer、产品 source/dependency digest 不符或 collect 时 contract 改变都须阻塞且不晋升；Tasks 27–29 覆盖。
+- 真实 linked worktree 的 `.git → gitdir → commondir` 注册边界、双空根产品依赖构建、缺 E4、产品 source/dependency ref 不符或 collect 时 contract 改变均须阻塞且不晋升；Tasks 10–11、22–23、27–29 覆盖。
 
 ## Ticket 23 固定测试身份
 
@@ -71,13 +72,27 @@ class NamedDigest:
     digest: str
 
 @dataclass(frozen=True)
+class RegisteredControlRootV1:
+    logical_name: Literal["gitdir", "commondir"]
+    absolute_root: Path
+
+@dataclass(frozen=True)
+class RegisteredRepositoryBoundaryV1:
+    checkout_root: Path
+    control_roots: tuple[RegisteredControlRootV1, ...]
+
+@dataclass(frozen=True)
 class ProductRepositorySourceV1:
     subject_repository: str
+    subject_commit: str
     source_ref: str
     source_digest: str
     container_format: Literal["trusted-product-raw-git-tar-zstd/v1"]
     object_format: Literal["sha1"]
     budget: ProductSourceBudgetV1
+    boundary_digest: str
+    tracked_checkout_digest: str
+    control_metadata_digest: str
 
 @dataclass(frozen=True)
 class VerificationOperationV1:
@@ -107,7 +122,7 @@ class AcceptanceOperationSnapshotV1:
     canonical_digest: str
 ```
 
-`NamedDigest.name` 必须是 NFC、非空、无控制字符的逻辑名，`digest` 必须是小写 `sha256:<64hex>`。每个 tuple 由 builder 以 `(name.encode("utf-8"), digest.encode("ascii"))` bytewise 升序规范化；同名条目无论摘要是否相同都拒绝，不同名称可共享同一摘要。suite/profile/toolchain/source/containment 集合对 E2 binding 必须非空；dependency 集合仅在所有 suite 都声明零 ecosystem 时允许空，否则按 `<suite-id>/<ecosystem>` 唯一命名。空集合编码为 JSON `[]`，文件系统创建/遍历顺序不进入结果。
+`RegisteredRepositoryBoundaryV1` 是仅存于 builder 进程内的 capability：调用方预先打开 checkout/control root directory fd 并登记精确绝对根，builder 只按逻辑名使用，绝不序列化绝对路径。`NamedDigest.name` 必须是 NFC、非空、无控制字符的逻辑名，`digest` 必须是小写 `sha256:<64hex>`。每个 tuple 由 builder 以 `(name.encode("utf-8"), digest.encode("ascii"))` bytewise 升序规范化；同名条目无论摘要是否相同都拒绝，不同名称可共享同一摘要。suite/profile/toolchain/source/containment 集合对 E2 binding 必须非空；dependency 集合仅在所有 suite 都声明零 ecosystem 时允许空，否则按 `<suite-id>/<ecosystem>` 唯一命名。空集合编码为 JSON `[]`，文件系统创建/遍历顺序不进入结果。
 
 两个 `canonical_digest` 都对除自身外的字段按字段名排序、UTF-8 紧凑规范 JSON 编码后取 SHA-256。`build_replay_policy_binding(...)` 先规范化上述集合；`build_acceptance_operation_snapshot(root, binding)` 再读取 catalog/contract。任何 wall-clock、mtime、review observation time 都不得进入二者。顺序 collect/register 改变 catalog 只生成新的 operation snapshot，不改变已有 receipt 的 replay binding。
 
@@ -122,7 +137,7 @@ class AcceptanceOperationSnapshotV1:
 | `trusted_evidence/dependency_repository.py` / `*_dependencies.py` | lock mapping 与 deterministic Python/npm consumer views。 |
 | `trusted_evidence/product_source.py` / `git_subject.py` | content source loader、sanitized object view、fixed checkout。 |
 | `trusted_evidence/reporters.py` | 真实 pytest/Vitest report 与 selection closure。 |
-| `trusted_evidence/containment/` | 六方法协议、wire transcript、Linux supervisor/backend。 |
+| `trusted_evidence/containment/` | 七方法协议、wire transcript、Linux supervisor/backend。 |
 | `trusted_evidence/replay.py` / `collection.py` | 内存 replay 与成功后唯一 CAS receipt 写入。 |
 | `trusted_evidence/evaluation.py` / `projection.py` / `runtime.py` | operation 编排与唯一 contract writer。 |
 | `trusted_evidence/verifiers/e4_ssh.py` | E4 canonical attestation、scope/revocation、SSH 验签。 |
@@ -161,7 +176,7 @@ class AcceptanceOperationSnapshotV1:
 
 **Interfaces:**
 - Consumes: 规格 4、6.1、7、9、10、14 和既有六字段 pointer。
-- Produces: 上述 immutable 类型、`canonical_named_digests(kind, entries) -> tuple[NamedDigest, ...]`、`build_replay_policy_binding(...) -> ReplayPolicyBindingV1`、`build_acceptance_operation_snapshot(root, binding) -> AcceptanceOperationSnapshotV1`、`E2SuiteDefinitionV2.from_policy(...)`。
+- Produces: 上述 immutable 类型、运行时-only `RegisteredRepositoryBoundaryV1` capability、`canonical_named_digests(kind, entries) -> tuple[NamedDigest, ...]`、`build_replay_policy_binding(...) -> ReplayPolicyBindingV1`、`build_acceptance_operation_snapshot(root, binding) -> AcceptanceOperationSnapshotV1`、`E2SuiteDefinitionV2.from_policy(...)`。
 
 - [ ] **Step 1:** 写 `test_replay_binding_excludes_catalog_contract_and_observation_time`、`test_operation_snapshot_binds_catalog_contract_and_replay_binding`、`test_named_digest_order_is_identical_for_different_creation_order`、`test_duplicate_name_and_illegal_empty_set_reject`、`test_product_source_rejects_host_path`、`test_v1_is_not_upgraded`。
 - [ ] **Step 2:** 运行 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_e2_policy_v2.py`；预期缺类型而 RED。
@@ -295,12 +310,12 @@ class AcceptanceOperationSnapshotV1:
 
 **Interfaces:**
 - Consumes: Tasks 2、4、6；规格 §8.2 的完整 raw Git metadata threat matrix。
-- Produces: `build_product_source(raw_repository, manifest, output) -> ProductRepositorySourceV1`、`ProductSourceLoader.load(source, expected_source_digest) -> ValidatedProductRepositoryContainerV1`；source artifact 自身不反向绑定包含它的 replay policy，避免摘要环；尚未通过 Task 11 inspector 的 container 不能称为 verified source。
+- Produces: `build_product_source(checkout_root, boundary: RegisteredRepositoryBoundaryV1, subject_commit, output, build_record) -> ProductRepositorySourceV1`、`ProductSourceLoader.load(source, expected_source_digest) -> ValidatedProductRepositoryContainerV1`，以及 `build_product_source.py register-boundary --checkout-root --gitdir-root --commondir-root --output` / `build --checkout-root --repository-boundary --subject-commit --output --build-record --offline` 两个精确 CLI；source artifact 自身不反向绑定包含它的 replay policy，避免摘要环；尚未通过 Task 11 inspector 的 container 不能称为 verified source。
 
-- [ ] **Step 1:** 写 container RED tests：manifest 首项；payload 只位于 `repository/` 且完整保留 raw `.git/config`、objects、refs、packed-refs、alternates、replace、grafts、shallow/promisor 与 pack sidecars 的原始 bytes/type/mode；member/path/header/parent/sort/size/count/ratio 必须规范。hardlink、special file、path escape、重复/case-fold collision、read race 由 builder 拒绝；危险 Git metadata 不得在 builder 中被删除、改写或 bundle 化，留给 Task 11 inspector 按稳定码拒绝。
+- [ ] **Step 1:** 写 `test_real_linked_worktree_builds_canonical_registered_boundary`：用真实 `git worktree add` 生成 `.git` regular pointer、worktree gitdir、`commondir` 和反向 `gitdir` backlink，登记 checkout/gitdir/commondir 三个精确根后构建成功；同一 commit 在两个不同绝对空根得到 byte-identical container/source/build-record。写反例：`.git` 非 regular/超 4 KiB/多行/非 `gitdir: `、NUL/非法 UTF-8、未登记绝对根、gitdir 或 commondir 越界、任一路径组件 symlink、case-fold alias、重复 logical root、commondir 二次重定向、除唯一 backlink 外的循环/回指、backlink 不精确指回 checkout `.git` 均在复制 payload 前拒绝。
 - [ ] **Step 2:** 运行 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_product_source.py`；预期 RED。
-- [ ] **Step 3:** builder 对 raw repository 树生成 `.trusted-product-source/manifest.json` 首项和规范单帧 zstd+ustar；`source_ref` 是完整压缩 container SHA-256，manifest 另存 raw-tree digest/预算/object format/subject commit。loader 从 `trust/product-sources/sha256/<aa>/<digest>` 有界、no-follow、no-exec 展开并重算两个 digest，不接受 Git bundle、宿主 repository path 或工作区回退。
-- [ ] **Step 4:** 重跑 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_product_source.py`；预期相同 raw tree 在两空根生成 byte-identical container/source digest，任一 archive/raw member 变化阻塞，危险 metadata fixture 仍完整交给 inspector。
+- [ ] **Step 3:** 实现 registered boundary：checkout root 与 `gitdir/commondir` external control roots 必须由调用方分别登记为已打开的精确 directory fd；所有输入先 lexical normalize，再逐组件 `openat(O_NOFOLLOW)`，最终 `(device,inode,type)` 与登记根一致。只允许一条 checkout `.git → gitdir`、gitdir 内可选一条 `commondir → common`，以及真实 linked worktree 的 `gitdir` backlink 精确返回 checkout `.git`；backlink 只校验不递归跟随，其他 `.git/commondir/gitdir` 重定向、重复 alias、环、根外 `..`、symlink、mount/race identity 改变全部拒绝。普通 `.git` directory 模式令 `gitdir=commondir` 且只发出一份 control tree，不得伪造 external root。builder 不调用 Git：用自有有界 SHA-1 loose/pack/idx/tree reader 解析 `subject_commit` tree，只复制与 tree mode/blob bytes 精确一致的 tracked checkout entries；缺失/脏 tracked path 或 symlink target 不符即拒绝，ignored/untracked 文件绝不进入 container。payload 固定为 `repository/checkout/`、`repository/gitdir/`、`repository/common/`；原始宿主指针只解析不复制，以 `@checkout/@gitdir/@commondir` 表达拓扑。只捕获 config/config.worktree、HEAD/允许 refs、packed-refs、objects 和 inspector 所需的已知 deny-evidence path classes；index、logs/reflogs、locks、其他 worktrees 的 control dirs 与 ignored/untracked bytes 不捕获，未知 control path class 直接拒绝。
+- [ ] **Step 4:** `.trusted-product-source/manifest.json` 必为首项并绑定 subject commit、normalized logical boundary、`boundaryDigest/trackedCheckoutDigest/controlMetadataDigest/sourceDigest`；`source_ref` 是完整单帧 zstd+ustar bytes SHA-256。build record 只保存 registered-boundary input digest、subject/tree/container/source digests 与逻辑 aliases，不含绝对路径、device/inode/mtime。loader 重算全部 digest，不接受 bundle、裸宿主 path 或工作区回退。重跑 Task 10 tests，预期 linked-worktree 正例、双空根一致性、untracked/ignored exclusion、全部逃逸反例 GREEN。
 - [ ] **Step 5:** `git add .scratch/unified-remix-canvas-generation/acceptance/trusted_evidence/product_source.py .scratch/unified-remix-canvas-generation/acceptance/tools/build_product_source.py .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_product_source.py && git commit -m "feat: bind canonical raw Git product sources"`
 
 ### Task 11: 从 verified source 构造 sanitized Git checkout
@@ -311,12 +326,12 @@ class AcceptanceOperationSnapshotV1:
 - Modify: `.scratch/unified-remix-canvas-generation/acceptance/trusted_evidence/verifiers/e2_suite.py`
 
 **Interfaces:**
-- Consumes: Task 7 包内 Git、Task 10 `ValidatedProductRepositoryContainerV1`；不接受裸 path/cwd/bundle。
+- Consumes: Task 7 包内 Git、Task 10 `ValidatedProductRepositoryContainerV1` 及其 normalized `@checkout/@gitdir/@commondir` boundary；不接受裸 path/cwd/bundle 或 container 外 control root。
 - Produces: `GitMetadataInspector.inspect(container) -> VerifiedProductRepositorySourceV1`、`SanitizedGitView.build(source, commit, toolchain_git, destination) -> FixedCheckout`。
 
-- [ ] **Step 1:** 写 §8.2 全矩阵 tests：config/packed-refs/refs/objects 单项与聚合预算；unknown/dangerous config；alternates/http-alternates、replace、grafts、shallow、promisor；loose/pack/index/rev/bitmap/mtimes sidecars 配对；`.git` 内任意 symlink、duplicate/case-fold path、外部 object source 与 race；每项断言对应 `GIT_*` 稳定码且包内 Git spawn=0。
+- [ ] **Step 1:** 写 §8.2 全矩阵 tests：先重验 Task 10 boundary graph/digests、tracked commit tree 与三 logical roots；再覆盖 config/packed-refs/refs/objects 单项与聚合预算、unknown/dangerous config、alternates/http-alternates、replace、grafts、shallow、promisor、loose/pack/index/rev/bitmap/mtimes sidecars 配对、container 内 symlink/duplicate/case-fold path、外部 object source 与 race；每项断言对应 `GIT_*` 稳定码且包内 Git spawn=0。
 - [ ] **Step 2:** 运行 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_git_subject.py`；预期旧 host Git path RED。
-- [ ] **Step 3:** 对 Task 10 原样 raw `.git` staging 运行 bounded inspector，先完成 config/ref/object/sidecar allow/deny；通过后才以包内 Git `index-pack --strict`/`fsck --strict` 构造 sanitized bare view，仅复制固定 closure，永不把 raw config/hooks/attributes/log/index/remote metadata 带入 checkout。
+- [ ] **Step 3:** 对 Task 10 canonical `repository/gitdir` 与 `repository/common` 运行 bounded inspector，先完成 logical-boundary/config/ref/object/sidecar allow/deny；通过后才以包内 Git `index-pack --strict`/`fsck --strict` 构造 sanitized bare view，并从 subject tree 重建 fixed checkout、逐项比对 container 的 tracked checkout digest；仅复制固定 closure，永不带入原始 pointer、config/hooks/attributes/log/index/remote metadata。
 - [ ] **Step 4:** 重跑 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_git_subject.py`；预期 API 无 repository_root/cwd。
 - [ ] **Step 5:** `git add .scratch/unified-remix-canvas-generation/acceptance/trusted_evidence/{git_subject.py,verifiers/e2_suite.py} .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_git_subject.py && git commit -m "feat: sanitize verified product sources"`
 
@@ -349,7 +364,7 @@ class AcceptanceOperationSnapshotV1:
 
 **Interfaces:**
 - Consumes: Tasks 2、3、7。
-- Produces: 精确 API、canonical supervisor schema、proof digest、已批准 `linux-cgroup-v2-seccomp-notify/v1` gate。
+- Produces: 精确七方法 API、canonical supervisor schema、proof digest、已批准 `linux-cgroup-v2-seccomp-notify/v1` gate。
 
 ```python
 class ReplayContainmentV1(Protocol):
@@ -460,12 +475,12 @@ class ReplayContainmentV1(Protocol):
 
 **Interfaces:**
 - Consumes: Tasks 1、6–7、14、17。
-- Produces: 独立安全审核后可供 Ticket 23 使用的 `TICKET23_TOOLCHAIN_REF`、`TICKET23_PLATFORM_DIGEST`、`TICKET23_SUPERVISOR_DIGEST`；恶意变体只在临时 fixture 根生成，绝不注册。
+- Produces: 独立安全审核后可供 Ticket 23 使用的 `TICKET23_TOOLCHAIN_REF`、`TICKET23_PLATFORM_DIGEST`、`TICKET23_SUPERVISOR_DIGEST`，以及 `build_e2_toolchain_fixture.py materialize --artifact-ref <ref> --output-root <empty-root> --offline`；恶意变体只在临时 fixture 根生成，绝不注册。
 
 - [ ] **Step 1:** 写 archive→`E2_TOOLCHAIN_ARCHIVE_INVALID`、uv/advisory→`E2_TOOLCHAIN_CLOSURE_INVALID`、ABI→`E2_TOOLCHAIN_PLATFORM_MISMATCH`、PATH marker→`E2_HOST_TOOL_FALLBACK`。
 - [ ] **Step 2:** 在登记 Linux executor 运行 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q -m e2_linux_integration .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_fixture_toolchain_platform.py`；预期真实包 RED。
 - [ ] **Step 3:** `input-manifest.json` 按逻辑名列出每个本地输入路径、expected SHA-256、mode、target member，`PROVENANCE.json` 固定来源 URL/release/许可证/审核者/取得方式；builder 先完整验证 manifest/provenance 和 Task 14 supervisor binary/Cargo.lock、security snapshot、platform measurement，任一外部 bytes 缺失或不匹配立即停止，代码中不得有 HTTP client/download fallback。精确运行 `python .scratch/unified-remix-canvas-generation/acceptance/tools/build_e2_toolchain_fixture.py --input-manifest .scratch/unified-remix-canvas-generation/acceptance/fixtures/e2-v2/toolchain/input-manifest.json --provenance .scratch/unified-remix-canvas-generation/acceptance/fixtures/e2-v2/toolchain/PROVENANCE.json --output .scratch/unified-remix-canvas-generation/acceptance/fixtures/e2-v2/toolchain/out/toolchain.tar.zst --content-store-root .scratch/unified-remix-canvas-generation/acceptance/trust/toolchains --offline`，只生成唯一 canonical positive artifact、完全相同 bytes 的 content-store object 与 `out/build-record.json`；各负向变体只从它在临时根逐项突变。
-- [ ] **Step 4:** 运行 `sha256sum .scratch/unified-remix-canvas-generation/acceptance/fixtures/e2-v2/toolchain/out/toolchain.tar.zst`，并与 build record、content-store ref 完全一致；重跑 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q -m e2_linux_integration .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_fixture_toolchain_platform.py`；预期正负例 GREEN 并记录真实 digest。
+- [ ] **Step 4:** 运行 `sha256sum .scratch/unified-remix-canvas-generation/acceptance/fixtures/e2-v2/toolchain/out/toolchain.tar.zst`，并与 build record、content-store ref 完全一致；另在两个空 output roots 运行 `materialize`，要求展开树 byte/mode digest 一致且拒绝非空 root。重跑 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q -m e2_linux_integration .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_fixture_toolchain_platform.py`；预期正负例 GREEN 并记录真实 digest。
 - [ ] **Step 5:** `git add .scratch/unified-remix-canvas-generation/acceptance/tools/build_e2_toolchain_fixture.py .scratch/unified-remix-canvas-generation/acceptance/fixtures/e2-v2/toolchain .scratch/unified-remix-canvas-generation/acceptance/trust/toolchains .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_fixture_toolchain_platform.py .scratch/unified-remix-canvas-generation/acceptance/README.md && git commit -m "build: freeze trusted replay toolchain"`
 
 ### Task 19: 真实 Python 离线安装与攻击 fixture
@@ -536,18 +551,25 @@ class ReplayContainmentV1(Protocol):
 - Modify in isolated product worktree: `backend/requirements.lock`
 
 **Interfaces:**
-- Consumes: 产品实际源码，不消费 fixture digest。
-- Produces: 绝对路径、专用且隔离的 `$TICKET23_PRODUCT_ROOT`，clean `TICKET23_PRODUCT_COMMIT`、四 pytest node IDs、结构两项/持久化五项/API 两项 Vitest fullName、两个 lock digests；该 worktree 仅用于准备与行为验证，不能作为形式化 E1/E2 source。
+- Consumes: Task 10 registered-boundary builder CLI、Task 11 inspector contract 与产品实际源码；不消费 fixture digest。
+- Produces: 绝对路径、专用且隔离的 linked `$TICKET23_PRODUCT_ROOT`，由受控 worktree provisioner 给出的精确 `$TICKET23_PRODUCT_GITDIR_ROOT`/`$TICKET23_PRODUCT_COMMONDIR_ROOT`，clean `TICKET23_PRODUCT_COMMIT`、仓库外 `$TICKET23_REPOSITORY_BOUNDARY_MANIFEST`、`$TICKET23_PRODUCT_SOURCE_CONTAINER`/`$TICKET23_PRODUCT_SOURCE_BUILD_RECORD`、四 pytest node IDs、结构两项/持久化五项/API 两项 Vitest fullName、两个 lock digests；worktree 仅用于准备与行为验证，不能作为形式化 E1/E2 source。
 
-- [ ] **Step 1:** 先建立/解析专用 worktree 的绝对路径并 `export TICKET23_PRODUCT_ROOT=/absolute/path/to/ticket23-product-worktree`；运行 `test "${TICKET23_PRODUCT_ROOT#/}" != "$TICKET23_PRODUCT_ROOT" && test -d "$TICKET23_PRODUCT_ROOT/.git" && test -z "$(git -C "$TICKET23_PRODUCT_ROOT" status --porcelain)"`，要求目标唯一且初始 clean。随后显式 `cd "$TICKET23_PRODUCT_ROOT"` 读取产品实现与三个现有测试，核对真实数据流/许可/测试身份，只补缺失结构 tests 和 wheel-only lock；记录四个 pytest node IDs 与九个 Vitest fullName。
+- [ ] **Step 1:** 由受控 worktree provisioner 建立真实 linked worktree，并用其返回值执行 `export TICKET23_PRODUCT_ROOT="<exact-checkout-root>"`、`export TICKET23_PRODUCT_GITDIR_ROOT="<exact-worktree-control-root>"`、`export TICKET23_PRODUCT_COMMONDIR_ROOT="<exact-shared-common-root>"`、`export TICKET23_PRODUCT_STAGING="$(mktemp -d)"`。运行 `test "${TICKET23_PRODUCT_ROOT#/}" != "$TICKET23_PRODUCT_ROOT" && test -f "$TICKET23_PRODUCT_ROOT/.git" && test -d "$TICKET23_PRODUCT_GITDIR_ROOT" && test -d "$TICKET23_PRODUCT_COMMONDIR_ROOT" && test -z "$(find "$TICKET23_PRODUCT_STAGING" -mindepth 1 -print -quit)" && test -z "$(git -C "$TICKET23_PRODUCT_ROOT" status --porcelain)"`；不得把 `.git` file 改造成 directory，也不得把 common parent、整个 `/tmp` 或主仓库父目录登记为 control root。随后显式 `cd "$TICKET23_PRODUCT_ROOT"` 阅读产品实现与三个现有测试，核对真实数据流/许可/测试身份，只补缺失结构 tests 和 wheel-only lock。
 - [ ] **Step 2:** 写两个专用结构测试；以测试文件缺失为 RED 证据，不在依赖物化前运行产品测试或使用宿主临时安装。
 - [ ] **Step 3:** 在 `(cd "$TICKET23_PRODUCT_ROOT" && ...)` 中逐项静态核对 requirements lock 仅含 exact pin+SHA-256 wheel、package-lock v3 与两个专用测试名；不把静态核对冒充行为 GREEN。
-- [ ] **Step 4:** 在产品 worktree 运行 `(cd "$TICKET23_PRODUCT_ROOT" && git add backend/requirements.lock frontend/src/CreativeCanvasTicket23Acceptance.test.tsx && git commit -m "test: prepare ticket 23 trusted replay subject" && test -z "$(git status --porcelain)" && git rev-parse HEAD)`；预期 clean worktree 与 40 位 SHA。实际行为 RED/GREEN 固定由 Task 23 在产品专属依赖物化后执行。
-- [ ] **Step 5:** 设置仓库外绝对空目录 `$TICKET23_PRODUCT_STAGING`，用 Task 10 builder 和包内 Git 从 `$TICKET23_PRODUCT_ROOT` 构造 canonical raw Git repository container：`python .scratch/unified-remix-canvas-generation/acceptance/tools/build_product_source.py --repository-root "$TICKET23_PRODUCT_ROOT" --subject-commit "$TICKET23_PRODUCT_COMMIT" --output-root "$TICKET23_PRODUCT_STAGING" --offline`；计算 commit/container/two-lock digests。Task 25 必须先经 Task 11 inspector 生成 `VerifiedProductRepositorySourceV1`/sanitized checkout，才把完全相同的 container bytes 导入正式 content store；原 worktree path、staging path 及未验证 container 均不得进入形式化证据。
+- [ ] **Step 4:** 在产品 worktree 运行 `(cd "$TICKET23_PRODUCT_ROOT" && git add backend/requirements.lock frontend/src/CreativeCanvasTicket23Acceptance.test.tsx && git commit -m "test: prepare ticket 23 trusted replay subject" && test -z "$(git status --porcelain)")`，随后 `export TICKET23_PRODUCT_COMMIT="$(git -C "$TICKET23_PRODUCT_ROOT" rev-parse HEAD)"` 并校验 40 位 SHA；实际行为 RED/GREEN 固定由 Task 23 在产品专属依赖物化后执行。
+- [ ] **Step 5:** 执行 `export TICKET23_REPOSITORY_BOUNDARY_MANIFEST="$TICKET23_PRODUCT_STAGING/registered-repository-boundary.json"`、`export TICKET23_PRODUCT_SOURCE_CONTAINER="$TICKET23_PRODUCT_STAGING/product-source.tar.zst"`、`export TICKET23_PRODUCT_SOURCE_BUILD_RECORD="$TICKET23_PRODUCT_STAGING/product-source-build-record.json"`。先运行 `backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/build_product_source.py register-boundary --checkout-root "$TICKET23_PRODUCT_ROOT" --gitdir-root "$TICKET23_PRODUCT_GITDIR_ROOT" --commondir-root "$TICKET23_PRODUCT_COMMONDIR_ROOT" --output "$TICKET23_REPOSITORY_BOUNDARY_MANIFEST"`，再运行与 Task 10 完全一致的 `backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/build_product_source.py build --checkout-root "$TICKET23_PRODUCT_ROOT" --repository-boundary "$TICKET23_REPOSITORY_BOUNDARY_MANIFEST" --subject-commit "$TICKET23_PRODUCT_COMMIT" --output "$TICKET23_PRODUCT_SOURCE_CONTAINER" --build-record "$TICKET23_PRODUCT_SOURCE_BUILD_RECORD" --offline`。核对 build record 的 boundary/subject/tracked/control/source/container digests 与 `sha256sum "$TICKET23_PRODUCT_SOURCE_CONTAINER"`；Task 25 必须先经 Task 11 inspector，才把相同 container bytes 导入正式 content store，所有宿主 path 均不得进入形式化证据。
 
 ### Task 23: 构建 Ticket 23 产品专属 dependency containers
 
 **Files:**
+- Create: `.scratch/unified-remix-canvas-generation/acceptance/tools/build_ticket23_dependency_repositories.py`
+- Create: `.scratch/unified-remix-canvas-generation/acceptance/fixtures/ticket-23/dependencies/input-manifest.json`
+- Create from governance input: `.scratch/unified-remix-canvas-generation/acceptance/fixtures/ticket-23/dependencies/PROVENANCE.json`
+- Create generated artifact: `.scratch/unified-remix-canvas-generation/acceptance/fixtures/ticket-23/dependencies/out/python-repository.tar.zst`
+- Create generated record: `.scratch/unified-remix-canvas-generation/acceptance/fixtures/ticket-23/dependencies/out/python-build-record.json`
+- Create generated artifact: `.scratch/unified-remix-canvas-generation/acceptance/fixtures/ticket-23/dependencies/out/npm-repository.tar.zst`
+- Create generated record: `.scratch/unified-remix-canvas-generation/acceptance/fixtures/ticket-23/dependencies/out/npm-build-record.json`
 - Create: `.scratch/unified-remix-canvas-generation/acceptance/trust/dependencies/ticket-23/manifest.json`
 - Create generated blobs: `.scratch/unified-remix-canvas-generation/acceptance/trust/dependencies/sha256/<aa>/<digest>`
 - Create: `.scratch/unified-remix-canvas-generation/acceptance/test_ticket23_dependency_repositories.py`
@@ -555,16 +577,54 @@ class ReplayContainmentV1(Protocol):
 
 **Interfaces:**
 - Consumes: Task 22 commit/locks、Tasks 8–9、18–22；不得复用 fixture digest。
-- Produces: 产品专属 Python/npm refs、真实 wheel/tgz、mapping/view/install-tree/native-closure digests。
+- Produces: `TICKET23_PYTHON_DEPENDENCY_REF`、`TICKET23_NPM_DEPENDENCY_REF`；两个独立 `trusted-e2-dependency-repository-tar-zstd/v1` container、deterministic build records、真实 wheel/tgz、lock mapping/view/install-tree/native-closure digests。Task 27 只从 build record/内容存储读取 refs，Task 28 由 `TrustedReplaySession` 重新物化 view，不复用 Task 23 临时路径。
 
-- [ ] **Step 1:** 写 RED：两个 locks 无唯一 mapping 时 `E2_DEPENDENCY_REPOSITORY_INVALID`。
-- [ ] **Step 2:** 重新验证 `$TICKET23_PRODUCT_ROOT` 为绝对专用 clean worktree；运行 `(cd "$TICKET23_PRODUCT_ROOT" && sha256sum backend/requirements.lock frontend/package-lock.json > /tmp/t23-locks.before)`；仅从预审 blobs 构建 containers，禁止网络/宿主临时安装。
-- [ ] **Step 3:** 明确 RED/GREEN：将 Task 18 验证输出赋给 `TICKET23_TOOLCHAIN_ROOT`，将本 Task 从 Task 22 locks 与预审 blobs 新建的两个产品专属 view 赋给 `TICKET23_PYTHON_VIEW`、`TICKET23_NPM_VIEW`；在 `(cd "$TICKET23_PRODUCT_ROOT" && ...)` 中依次运行 `"$TICKET23_TOOLCHAIN_ROOT/bin/uv" venv backend/.venv --python="$TICKET23_TOOLCHAIN_ROOT/bin/python" --no-project --no-config --no-python-downloads --cache-dir="$TICKET23_UV_CACHE_1"`、`"$TICKET23_TOOLCHAIN_ROOT/bin/uv" pip sync --python=backend/.venv/bin/python backend/requirements.lock --offline --no-index --find-links="$TICKET23_PYTHON_VIEW" --no-build --require-hashes --no-sources --config-file="$TICKET23_TOOLCHAIN_ROOT/config/uv-empty.toml" --no-python-downloads --cache-dir="$TICKET23_UV_CACHE_2"`、`"$TICKET23_TOOLCHAIN_ROOT/bin/node" "$TICKET23_TOOLCHAIN_ROOT/lib/node_modules/npm/bin/npm-cli.js" ci --ignore-scripts --offline --replace-registry-host=never --cache="$TICKET23_NPM_VIEW"`；containers 前 RED，后 setup GREEN。
+- [ ] **Step 1:** 写 RED：两个 locks 无唯一 mapping、input/provenance/license/blob 缺失或摘要不符、任一非 wheel/tgz、两个 ecosystem 混入同一 container、非空/复用 build root 或 invocation cache、build record 含 root/time/mtime、Python/npm 两个空根构建 bytes/ref/record/view digest 不一致均失败；同时断言缺失预审 bytes 时 builder 在任何 network/spawn 前停止。
+- [ ] **Step 2:** 运行 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_ticket23_dependency_repositories.py`；预期 builder/output 缺失而 RED。重新验证 `$TICKET23_PRODUCT_ROOT` 为绝对专用 clean linked worktree，并运行 `(cd "$TICKET23_PRODUCT_ROOT" && sha256sum backend/requirements.lock frontend/package-lock.json > /tmp/t23-locks.before)`。
+- [ ] **Step 3:** `input-manifest.json` 逐项固定两个 lock digest、每个 wheel/tgz 本地预审路径、SHA-256/SRI、package ID、mapping、install-tree 与 derived-entrypoint digest；`PROVENANCE.json` 逐 blob 固定 upstream URL/release/license/auditor/acquisition。从 Task 18 build record 取得并校验 `TICKET23_TOOLCHAIN_REF=sha256:<64hex>`，再精确执行：
+
+```bash
+export TICKET23_TOOLCHAIN_REF="sha256:<Task-18-build-record-artifactRef>"
+export TICKET23_DEP_REPRO_ROOT_A="$(mktemp -d)"
+export TICKET23_DEP_REPRO_ROOT_B="$(mktemp -d)"
+export TICKET23_TOOLCHAIN_ROOT="$(mktemp -d)"
+export TICKET23_PYTHON_VIEW_ROOT="$(mktemp -d)"
+export TICKET23_NPM_VIEW_ROOT="$(mktemp -d)"
+export TICKET23_NPM_COW_UPPER="$(mktemp -d)"
+export TICKET23_UV_CACHE_1="$(mktemp -d)"
+export TICKET23_UV_CACHE_2="$(mktemp -d)"
+for root in "$TICKET23_DEP_REPRO_ROOT_A" "$TICKET23_DEP_REPRO_ROOT_B" "$TICKET23_TOOLCHAIN_ROOT" "$TICKET23_PYTHON_VIEW_ROOT" "$TICKET23_NPM_VIEW_ROOT" "$TICKET23_NPM_COW_UPPER" "$TICKET23_UV_CACHE_1" "$TICKET23_UV_CACHE_2"; do
+  test -d "$root" && test -z "$(find "$root" -mindepth 1 -print -quit)"
+done
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/build_e2_toolchain_fixture.py materialize \
+  --artifact-ref "$TICKET23_TOOLCHAIN_REF" --output-root "$TICKET23_TOOLCHAIN_ROOT" --offline
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/build_ticket23_dependency_repositories.py build \
+  --input-manifest .scratch/unified-remix-canvas-generation/acceptance/fixtures/ticket-23/dependencies/input-manifest.json \
+  --provenance .scratch/unified-remix-canvas-generation/acceptance/fixtures/ticket-23/dependencies/PROVENANCE.json \
+  --repro-root-a "$TICKET23_DEP_REPRO_ROOT_A" --repro-root-b "$TICKET23_DEP_REPRO_ROOT_B" \
+  --python-output .scratch/unified-remix-canvas-generation/acceptance/fixtures/ticket-23/dependencies/out/python-repository.tar.zst \
+  --python-build-record .scratch/unified-remix-canvas-generation/acceptance/fixtures/ticket-23/dependencies/out/python-build-record.json \
+  --npm-output .scratch/unified-remix-canvas-generation/acceptance/fixtures/ticket-23/dependencies/out/npm-repository.tar.zst \
+  --npm-build-record .scratch/unified-remix-canvas-generation/acceptance/fixtures/ticket-23/dependencies/out/npm-build-record.json \
+  --content-store-root .scratch/unified-remix-canvas-generation/acceptance/trust/dependencies --offline
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/build_ticket23_dependency_repositories.py materialize \
+  --python-build-record .scratch/unified-remix-canvas-generation/acceptance/fixtures/ticket-23/dependencies/out/python-build-record.json \
+  --npm-build-record .scratch/unified-remix-canvas-generation/acceptance/fixtures/ticket-23/dependencies/out/npm-build-record.json \
+  --python-view-root "$TICKET23_PYTHON_VIEW_ROOT" --npm-view-root "$TICKET23_NPM_VIEW_ROOT" \
+  --npm-cow-upper "$TICKET23_NPM_COW_UPPER" --offline
+export TICKET23_PYTHON_VIEW="$TICKET23_PYTHON_VIEW_ROOT/python-find-links"
+export TICKET23_NPM_VIEW="$TICKET23_NPM_VIEW_ROOT/npm-cache-root"
+```
+
+builder 必须在两个空根分别构建 Python/npm container 与 consumer view，逐 byte/digest 比较后才原子发布固定 outputs/content-store refs；record 只含规范 input/provenance/container/ref/view/install/entrypoint digests，不含绝对根或时间。`materialize` 必须从 published refs 重验全部 digest；COW upper 在挂载前仍为空，两个 uv cache 在各自 invocation 前仍为空且绝不复用。
 - [ ] **Step 4:** 运行后端四项与前端九项真实选择；预期 4 passed，九次各 1 passed、同文件未匹配项只 skipped：
 
 ```bash
 (set -e
 cd "$TICKET23_PRODUCT_ROOT"
+"$TICKET23_TOOLCHAIN_ROOT/bin/uv" venv backend/.venv --python="$TICKET23_TOOLCHAIN_ROOT/bin/python" --no-project --no-config --no-python-downloads --cache-dir="$TICKET23_UV_CACHE_1"
+"$TICKET23_TOOLCHAIN_ROOT/bin/uv" pip sync --python=backend/.venv/bin/python backend/requirements.lock --offline --no-index --find-links="$TICKET23_PYTHON_VIEW" --no-build --require-hashes --no-sources --config-file="$TICKET23_TOOLCHAIN_ROOT/config/uv-empty.toml" --no-python-downloads --cache-dir="$TICKET23_UV_CACHE_2"
+"$TICKET23_TOOLCHAIN_ROOT/bin/node" "$TICKET23_TOOLCHAIN_ROOT/lib/node_modules/npm/bin/npm-cli.js" ci --ignore-scripts --offline --replace-registry-host=never --cache="$TICKET23_NPM_VIEW"
 backend/.venv/bin/python -m pytest -q backend/tests/test_creative_canvas.py::test_canvas_document_saves_without_shot_and_returns_project_assets backend/tests/test_creative_canvas.py::test_canvas_save_rejects_stale_document_revision backend/tests/test_creative_canvas.py::test_canvas_catalog_keeps_legacy_default_and_isolates_canvas_documents backend/tests/test_creative_canvas.py::test_soft_deleted_canvas_keeps_asset_references_and_can_restore --json-report --json-report-file=.ticket23-report.json
 "$TICKET23_TOOLCHAIN_ROOT/bin/node" frontend/node_modules/vitest/vitest.mjs run frontend/src/CreativeCanvasTicket23Acceptance.test.tsx -t '^独立入口不依赖 Shot 并保留项目上下文$' --reporter=json --outputFile=.ticket23-structure-1.json
 "$TICKET23_TOOLCHAIN_ROOT/bin/node" frontend/node_modules/vitest/vitest.mjs run frontend/src/CreativeCanvasTicket23Acceptance.test.tsx -t '^Toonflow 主体控件可通过可访问路径打开和关闭$' --reporter=json --outputFile=.ticket23-structure-2.json
@@ -577,7 +637,7 @@ backend/.venv/bin/python -m pytest -q backend/tests/test_creative_canvas.py::tes
 "$TICKET23_TOOLCHAIN_ROOT/bin/node" frontend/node_modules/vitest/vitest.mjs run frontend/src/creativeCanvasApi.test.ts -t '^目录 CRUD 与所有画布工作区请求都显式携带 canvasId$' --reporter=json --outputFile=.ticket23-api-2.json
 )
 ```
-- [ ] **Step 5:** 运行 `(cd "$TICKET23_PRODUCT_ROOT" && sha256sum backend/requirements.lock frontend/package-lock.json > /tmp/t23-locks.after)` 后 `diff -u /tmp/t23-locks.before /tmp/t23-locks.after`，核对 closure/预算；该直接 worktree 运行结果只作准备验证。形式化 E2 collect 后续必须从 Task 11 sanitized checkout 重放。然后在计划仓库提交 `git add .scratch/unified-remix-canvas-generation/acceptance/trust/dependencies .scratch/unified-remix-canvas-generation/acceptance/test_ticket23_dependency_repositories.py .scratch/unified-remix-canvas-generation/acceptance/README.md && git commit -m "build: freeze ticket 23 dependency repositories"`。
+- [ ] **Step 5:** 运行 `sha256sum` 校验两个固定 output，逐项等于各自 build record 的 `containerDigest/artifactRef` 与 content-store 路径；断言 A/B 临时产物和规范 records 完全相同，并重跑 `test_ticket23_dependency_repositories.py`。再运行 `(cd "$TICKET23_PRODUCT_ROOT" && sha256sum backend/requirements.lock frontend/package-lock.json > /tmp/t23-locks.after)` 与 before diff，核对 closure/预算；形式化 E2 后续只从 Task 11 sanitized checkout、两个 published dependency refs 和全新 invocation caches 重放。最后 `git add .scratch/unified-remix-canvas-generation/acceptance/tools/build_ticket23_dependency_repositories.py .scratch/unified-remix-canvas-generation/acceptance/fixtures/ticket-23/dependencies .scratch/unified-remix-canvas-generation/acceptance/trust/dependencies .scratch/unified-remix-canvas-generation/acceptance/test_ticket23_dependency_repositories.py .scratch/unified-remix-canvas-generation/acceptance/README.md && git commit -m "build: freeze ticket 23 dependency repositories"`。
 
 ### Task 24: 实现 E4 attestation、SSH 验签、scope 与 revocation
 
@@ -609,12 +669,12 @@ backend/.venv/bin/python -m pytest -q backend/tests/test_creative_canvas.py::tes
 - Create: `.scratch/unified-remix-canvas-generation/acceptance/test_ticket23_e1_sources.py`
 
 **Interfaces:**
-- Consumes: Tasks 10–11、22 的仓库外 staged raw container；Toonflow fixed commit/MIT license。
+- Consumes: Tasks 10–11、Task 22 的 `$TICKET23_PRODUCT_SOURCE_CONTAINER`、`$TICKET23_PRODUCT_SOURCE_BUILD_RECORD` 与 registered-boundary digest；Toonflow fixed commit/MIT license。
 - Produces: 两个 E1 refs、Toonflow/license 与产品实现/测试/lock blob mappings。
 
 - [ ] **Step 1:** 写 RED：Toonflow bundle 必含 fixed commit/objects/MIT；product raw Git container 必先通过 Task 11 inspector，E1 映射只绑定 `VerifiedProductRepositorySourceV1` 的 Task 22 commit 与逐 blob digests。
 - [ ] **Step 2:** 运行 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_ticket23_e1_sources.py`；预期真实 inputs RED。
-- [ ] **Step 3:** Toonflow 用包内 Git bundle verify/cat-file；产品 staged container 先经 Task 11 全量 inspector/sanitized checkout 验证，再按 container digest 将相同 bytes 原子导入 `trust/product-sources/sha256/<aa>/<digest>`。禁止 vendor HEAD、工作区、staging path 或截图替代正式 ref。
+- [ ] **Step 3:** Toonflow 用包内 Git bundle verify/cat-file；产品 `$TICKET23_PRODUCT_SOURCE_CONTAINER` 先逐项匹配 build record 的 boundary/subject/tracked/control/source/container digests，再经 Task 11 全量 inspector/sanitized checkout 验证，最后按 container digest 将相同 bytes 原子导入 `trust/product-sources/sha256/<aa>/<digest>`。禁止 vendor HEAD、工作区、staging path 或截图替代正式 ref。
 - [ ] **Step 4:** 重跑 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_ticket23_e1_sources.py`；预期 commit/license/all blobs 闭合。
 - [ ] **Step 5:** `git add .scratch/unified-remix-canvas-generation/acceptance/trust/{git,product-sources,e1-ticket23-sources.json} .scratch/unified-remix-canvas-generation/acceptance/test_ticket23_e1_sources.py && git commit -m "build: freeze ticket 23 E1 sources"`
 
@@ -645,13 +705,13 @@ backend/.venv/bin/python -m pytest -q backend/tests/test_creative_canvas.py::tes
 
 **Interfaces:**
 - Consumes: Tasks 18–26 的真实 toolchain/platform/supervisor/source/dependency/E1/E4/public-policy digests。
-- Produces: 固定 `TICKET23_POLICY_COMMIT`；E1/E2/E4 verifier、四 suites、C01–C03 criteria、v1 typed revocation。
+- Produces: 固定 `TICKET23_POLICY_COMMIT`；E1/E2/E4 verifier、四 suites、C01–C03 criteria、v1 typed revocation，以及从 Task 23 两份 build record 精确取得的 `TICKET23_PYTHON_DEPENDENCY_REF`/`TICKET23_NPM_DEPENDENCY_REF`。
 
-- [ ] **Step 1:** 写 only-C01–C03、四 pytest、九 Vitest、same source/locks/digests、E1+E2+E4 minimum、缺 E4 阻塞 tests。
+- [ ] **Step 1:** 写 only-C01–C03、四 pytest、九 Vitest、same source/locks/digests、E1+E2+E4 minimum、缺 E4 阻塞 tests；另断言 Python/npm dependency refs 分别等于 Task 23 build record 的 artifactRef/content-store digest，交换、缺失、fixture ref 或 record/container 不一致均阻塞。
 - [ ] **Step 2:** 运行 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_ticket23_trusted_profile_v2.py`；预期 RED。
 - [ ] **Step 3:** 写全部真实 digest，禁止占位/fixture digest；撤销 v1 pointer/artifact，不改 receipt。
 - [ ] **Step 4:** 运行 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_ticket23_trusted_profile_v2.py && git diff --exit-code HEAD -- .scratch/unified-remix-canvas-generation/acceptance/matrix-contract.json`；预期 GREEN 且 contract 未改。
-- [ ] **Step 5:** `git add .scratch/unified-remix-canvas-generation/acceptance/{profiles/ticket-23.json,trusted-registry.json,trust/revocations.json,test_ticket23_trusted_profile_v2.py} && git commit -m "policy: freeze ticket 23 trusted evidence profile" && git rev-parse HEAD`
+- [ ] **Step 5:** `git add .scratch/unified-remix-canvas-generation/acceptance/{profiles/ticket-23.json,trusted-registry.json,trust/revocations.json,test_ticket23_trusted_profile_v2.py} && git commit -m "policy: freeze ticket 23 trusted evidence profile" && export TICKET23_POLICY_COMMIT="$(git rev-parse HEAD)"`
 
 ### Task 28: 从固定 policy commit collect/register
 
@@ -662,7 +722,7 @@ backend/.venv/bin/python -m pytest -q backend/tests/test_creative_canvas.py::tes
 - Create: `.scratch/unified-remix-canvas-generation/acceptance/test_ticket23_collect_register.py`
 
 **Interfaces:**
-- Consumes: Task 27 exact commit 与稳定 `ReplayPolicyBindingV1`；每次命令各自构造短生命周期 `AcceptanceOperationSnapshotV1`；仓库外私钥产生的规范 E4 signature/attachment。
+- Consumes: Task 27 exact commit、Task 23 已发布的两个真实 dependency refs 与稳定 `ReplayPolicyBindingV1`；每次命令各自构造短生命周期 `AcceptanceOperationSnapshotV1`；仓库外私钥产生的规范 E4 signature/attachment。E2 replay 每个 setup leaf 创建全新空 invocation cache，并从 refs 重新物化 Python/npm view，不读取 Task 23 临时根。
 - Produces: E1 两个、E2 四个、E4 一个 artifacts/pointers；contract 不变。
 
 - [ ] **Step 1:** 写 wrong-policy/operation-snapshot-race/missing-E4/source-dependency-mismatch 零 catalog 写、register 不晋升 tests；新增命名回归 `test_sequential_collect_register_keeps_all_prior_receipts_valid_in_final_catalog`：按 E1→E2→E4 顺序逐个 collect/register，每次 register 后 catalog digest 与 operation snapshot 都变化，但 replay-policy-binding digest 恒定；在最终 catalog 上重新 verify 全部先前 receipt，七个均有效。
@@ -743,22 +803,28 @@ backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/evi
 | Important 2：产品根与证据边界 | 22–23、25、28 |
 | Important 3：私钥扫描 | 24、26 |
 | Important 4：fixture builders | 18–21 |
+| 第三轮 Important 1：linked-worktree registered boundary | 2、10–11、22、25 |
+| 第三轮 Important 2：Ticket 23 dependency reproducibility | 8–9、18、23、27–28 |
+| 第三轮 Minor 1：规格审批差异说明 | Global Constraints、执行状态 |
+| 第三轮 Minor 2：containment 七方法 | 13–15、21 |
 
 ### 自包含接口、依赖拓扑与真实命令
 
 - bootstrap 与主链：1→2→3→4→5→6→7→8→9→10→11→12→13（独立批准门）→14→15→16→17。
 - 真实基础验收：17→18→19→20→21；任一未通过，不得写 production profile。
-- Ticket 23：21→22 product commit/raw container→23 product dependencies→24 E4 code→25 E1 refs→26 reviewer policy→27 policy commit→28 collect/register→29 promote/reconcile。
+- Ticket 23：21→22 linked product commit + registered-boundary raw container→23 双空根 product dependency containers→24 E4 code→25 E1 refs→26 reviewer policy→27 policy commit→28 collect/register→29 promote/reconcile。
 - `ProductRepositorySourceV1` 在 Task 2 定义、Task 10 构建/加载 raw container、Task 11 才产出 verified handle，Tasks 15–16/25/28 只消费 verified handle；无裸路径旁路。
 - `ReplayPolicyBindingV1` 与 `AcceptanceOperationSnapshotV1` 在 Task 2 分开构造，Tasks 5/16–17/28 只重检 operation snapshot，receipt 始终只绑定稳定 replay policy；Task 28 final-catalog 回归证明顺序 register 不使旧 receipt 失效。
-- containment 六方法、消息字段、序号/摘要链、权限、binary identity 与唯一 kernel mechanism 在 Task 13 冻结；Task 14 不能重新选型。
+- containment 七方法、消息字段、序号/摘要链、权限、binary identity 与唯一 kernel mechanism 在 Task 13 冻结；Task 14 不能重新选型。
 - Task 3 是唯一 scanner owner；receipt/barrier/collect 只调用该接口，无依赖循环。
-- Task 1 给出真实 bootstrap hashes；Tasks 18–21 各有 script/input-manifest/provenance/output/digest 命令并对缺 bytes 停止；Ticket 23 npm ci/uv venv+sync、lock 前后摘要、Cargo/Linux、真实 pytest/Vitest 均禁止临时宿主安装。
-- Review Focus 五项分别由 Tasks 5/17、3/20、14/21、19–20、27–29 持有，编号无漂移。
+- Task 1 给出真实 bootstrap hashes；Tasks 18–21 与 23 各有 script/input-manifest/provenance/output/build-record/digest 命令、双空根或等价确定性证明，并对缺 bytes 停止；Ticket 23 npm ci/uv venv+sync、显式空 invocation caches、lock 前后摘要、Cargo/Linux、真实 pytest/Vitest 均禁止临时宿主安装。
+- shell variable owner 固定：Task 18 产生 toolchain ref；Task 22 定义 product root/gitdir/commondir/staging/boundary/container/build-record/commit；Task 23 定义 reproducibility roots、toolchain root、views、COW upper、两个 uv caches 与两个 dependency refs；Task 28 的七个 artifact 变量由相应 collect 输出定义，E4 文件变量是运行前必需的仓库外治理输入。任何其他 `$TICKET23_*` 使用均为计划静态检查失败。
+- Review Focus 五项分别由 Tasks 5/17、3/20、14/21、19–20、10–11/22–23/27–29 持有，编号无漂移。
 - 29 个 Task 均为单独实现会话、单独 commit、单独新审查会话；Task 13、27、28 是不可跳过的硬门。
 
 ## 执行与批准状态
 
 - E2 v2 书面规格已批准；本修订计划等待用户复审。
+- 规格审批历史只改变 `Status` 行；本轮提交必须同时通过“相对 `06827f2e` 规格零 diff”和“相对 `2f304fe` 删除第 3 行后正文零 diff”，不得笼统声称两个 blob 相同。
 - 执行方式固定为 subagent-driven：逐 Task 新实现会话 + 新独立审查会话，前一 Task 通过才进入下一 Task，最后全分支独立审查。
 - 本次规划会话不授权实现或启动任何 Task；复审通过后从 Task 1 开始，不恢复旧 Task 6，也不跳过 Task 13、27、28。
