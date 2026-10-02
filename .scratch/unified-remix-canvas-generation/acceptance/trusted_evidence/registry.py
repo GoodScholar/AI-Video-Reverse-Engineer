@@ -18,6 +18,11 @@ _IMPLEMENTATION_TYPES = MappingProxyType(
     {"e1.git-license.v1": "E1", "e2.argv-suite.v1": "E2"}
 )
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+_TOOL_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
+_SAFE_ENVIRONMENT = MappingProxyType(
+    {"CI": "1", "NO_COLOR": "1", "PYTHONDONTWRITEBYTECODE": "1"}
+)
+_SUITE_PARSERS = frozenset({"pytest-json-v1", "vitest-json-v1"})
 
 
 class PolicyError(ValueError):
@@ -158,6 +163,21 @@ def _literal_argv(value: object, field: str) -> tuple[str, ...]:
     return argv
 
 
+def _controlled_relative_path(value: object, field: str, root: Path) -> str:
+    path_text = _nonempty_string(value, field)
+    path = Path(path_text)
+    if path.is_absolute() or ".." in path.parts:
+        raise PolicyError("POINTER_INVALID", f"{field} must remain below acceptance root")
+    _inside_root(root, root / path)
+    return path_text
+
+
+def _required_mapping(value: object, field: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise PolicyError("POINTER_INVALID", f"{field} must be an object")
+    return value
+
+
 def _freeze_policy_value(value: object, field: str) -> object:
     if value is None or isinstance(value, (bool, str, int)):
         return value
@@ -178,12 +198,10 @@ def _freeze_policy_value(value: object, field: str) -> object:
 
 
 def _validate_suite(value: object, root: Path) -> Mapping[str, object]:
-    if not isinstance(value, Mapping):
-        raise PolicyError("POINTER_INVALID", "suite must be an object")
+    value = _required_mapping(value, "suite")
     allowed = {
         "subjectRepository",
         "workingDirectory",
-        "cwd",
         "setupArgv",
         "argv",
         "expectedTestIds",
@@ -193,21 +211,43 @@ def _validate_suite(value: object, root: Path) -> Mapping[str, object]:
         "lockfileDigests",
         "toolVersions",
     }
-    if set(value) - allowed:
+    required = allowed - {"setupArgv"}
+    if set(value) - allowed or required - set(value):
         raise PolicyError("POINTER_INVALID", "suite contains an unsupported field")
-    forbidden = {"shell", "command", "env", "environment", "runner", "module", "pythonModule"}
-    if forbidden & set(value):
-        raise PolicyError("POINTER_INVALID", "suite contains a forbidden execution field")
-    if "argv" not in value:
-        raise PolicyError("POINTER_INVALID", "suite.argv is required")
+    _nonempty_string(value["subjectRepository"], "suite.subjectRepository")
+    _controlled_relative_path(value["workingDirectory"], "suite.workingDirectory", root)
     for field in ("setupArgv", "argv"):
         if field in value:
             _literal_argv(value[field], f"suite.{field}")
-    if "cwd" in value:
-        cwd = _nonempty_string(value["cwd"], "suite.cwd")
-        if Path(cwd).is_absolute() or ".." in Path(cwd).parts:
-            raise PolicyError("POINTER_INVALID", "suite.cwd must remain below acceptance root")
-        _inside_root(root, root / cwd)
+    expected_test_ids = _literal_argv(value["expectedTestIds"], "suite.expectedTestIds")
+    if len(expected_test_ids) != len(set(expected_test_ids)):
+        raise PolicyError("POINTER_INVALID", "suite.expectedTestIds must be unique")
+    parser = _required_mapping(value["parser"], "suite.parser")
+    _exact_keys(parser, {"kind"}, "suite.parser")
+    if _nonempty_string(parser["kind"], "suite.parser.kind") not in _SUITE_PARSERS:
+        raise PolicyError("POINTER_INVALID", "suite.parser.kind is not registered")
+    allowed_environment = _required_mapping(value["allowedEnvironment"], "suite.allowedEnvironment")
+    for name, environment_value in allowed_environment.items():
+        if name not in _SAFE_ENVIRONMENT or environment_value != _SAFE_ENVIRONMENT[name]:
+            raise PolicyError("POINTER_INVALID", "suite.allowedEnvironment has an unsafe value")
+    timeout = value["timeoutSeconds"]
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+        raise PolicyError("POINTER_INVALID", "suite.timeoutSeconds must be a positive integer")
+    lockfile_digests = _required_mapping(value["lockfileDigests"], "suite.lockfileDigests")
+    if not lockfile_digests:
+        raise PolicyError("POINTER_INVALID", "suite.lockfileDigests must not be empty")
+    for path, digest in lockfile_digests.items():
+        _controlled_relative_path(path, "suite.lockfileDigests path", root)
+        if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+            raise PolicyError("POINTER_INVALID", "suite.lockfileDigests values must be SHA-256 digests")
+    tool_versions = _required_mapping(value["toolVersions"], "suite.toolVersions")
+    if not tool_versions:
+        raise PolicyError("POINTER_INVALID", "suite.toolVersions must not be empty")
+    for tool, version in tool_versions.items():
+        if not isinstance(tool, str) or not _TOOL_NAME.fullmatch(tool):
+            raise PolicyError("POINTER_INVALID", "suite.toolVersions keys must be tool names")
+        if not isinstance(version, str) or not version or "\n" in version or "\r" in version:
+            raise PolicyError("POINTER_INVALID", "suite.toolVersions values must be single-line strings")
     frozen = _freeze_policy_value(value, "suite")
     assert isinstance(frozen, Mapping)
     return frozen

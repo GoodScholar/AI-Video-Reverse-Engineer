@@ -30,6 +30,22 @@ def _registry(verifiers: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
+def _valid_suite(**overrides: object) -> dict[str, object]:
+    suite = {
+        "subjectRepository": "git://product/repository",
+        "workingDirectory": ".",
+        "argv": ["pytest", "-q"],
+        "expectedTestIds": ["tests/test_contract.py::test_policy"],
+        "parser": {"kind": "pytest-json-v1"},
+        "allowedEnvironment": {"CI": "1"},
+        "timeoutSeconds": 60,
+        "lockfileDigests": {"requirements.lock": "sha256:" + "a" * 64},
+        "toolVersions": {"python": "3.13"},
+    }
+    suite.update(overrides)
+    return suite
+
+
 def test_phase_one_registry_has_e1_e2_implementations_but_no_production_e3_or_e4_entry():
     registry = load_trusted_registry(ACCEPTANCE)
 
@@ -77,10 +93,47 @@ def test_registry_rejects_suite_cwd_that_escapes_through_a_symlink(tmp_path):
                 {
                     "id": "e2.bad",
                     "type": "e2.argv-suite.v1",
-                    "suite": {"argv": ["pytest", "-q"], "cwd": "inside"},
+                    "suite": _valid_suite(workingDirectory="inside"),
                 }
             ]
         ),
+    )
+
+    with pytest.raises(PolicyError, match="POINTER_INVALID"):
+        load_trusted_registry(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"workingDirectory": "../../outside"},
+        {"workingDirectory": "/outside"},
+        {"workingDirectory": 5},
+        {"timeoutSeconds": "forever"},
+        {"timeoutSeconds": 0},
+        {"timeoutSeconds": -1},
+        {"timeoutSeconds": True},
+        {"timeoutSeconds": float("inf")},
+        {"expectedTestIds": {"not": "a list"}},
+        {"expectedTestIds": []},
+        {"expectedTestIds": ["test", 1]},
+        {"allowedEnvironment": ["SECRET=value"]},
+        {"allowedEnvironment": {"SECRET_TOKEN": "value"}},
+        {"allowedEnvironment": {"CI": "inherit"}},
+        {"parser": {"kind": "untrusted-parser"}},
+        {"parser": {"kind": "pytest-json-v1", "command": "injected"}},
+        {"parser": ["pytest-json-v1"]},
+        {"lockfileDigests": ["requirements.lock"]},
+        {"lockfileDigests": {"../outside.lock": "sha256:" + "a" * 64}},
+        {"lockfileDigests": {"requirements.lock": "not-a-digest"}},
+        {"toolVersions": ["python=3.13"]},
+        {"toolVersions": {"python": ""}},
+    ),
+)
+def test_registry_rejects_invalid_allowed_e2_suite_field(tmp_path, overrides):
+    _write_json(
+        tmp_path / "trusted-registry.json",
+        _registry([{"id": "e2.bad", "type": "e2.argv-suite.v1", "suite": _valid_suite(**overrides)}]),
     )
 
     with pytest.raises(PolicyError, match="POINTER_INVALID"):
@@ -106,11 +159,10 @@ def test_loaded_suite_policy_is_deeply_immutable(tmp_path):
                 {
                     "id": "e2.safe",
                     "type": "e2.argv-suite.v1",
-                    "suite": {
-                        "argv": ["pytest", "-q"],
-                        "setupArgv": ["uv", "sync"],
-                        "parser": {"nested": ["kept"]},
-                    },
+                    "suite": _valid_suite(
+                        setupArgv=["uv", "sync"],
+                        parser={"kind": "pytest-json-v1"},
+                    ),
                 }
             ]
         ),
@@ -119,11 +171,11 @@ def test_loaded_suite_policy_is_deeply_immutable(tmp_path):
     definition = load_trusted_registry(tmp_path).verifiers["e2.safe"].definition
     assert definition["argv"] == ("pytest", "-q")
     assert definition["setupArgv"] == ("uv", "sync")
-    assert definition["parser"]["nested"] == ("kept",)
+    assert definition["parser"]["kind"] == "pytest-json-v1"
     with pytest.raises((AttributeError, TypeError)):
         definition["argv"].append("--unsafe")
     with pytest.raises(TypeError):
-        definition["parser"]["nested"] = ()
+        definition["parser"]["kind"] = "rewritten"
 
 
 def test_empty_profiles_directory_returns_empty_without_other_policy_files(tmp_path):
