@@ -19,7 +19,7 @@
 - `validate/promote/reconcile` 的全部 E2 requirement 先通过同一阶段 A barrier；失败时 `spawnCount=checkoutCount=casWrites=contractWrites=0`。verify 永不写 CAS；collect 仅完整成功后原子写一次 receipt。
 - `AcceptanceOperationSnapshotV1` 只绑定 catalog、contract 与本轮 `ReplayPolicyBindingV1` digest，用于 operation barrier/投影前 recheck；`ReplayPolicyBindingV1` 绑定 registry、suite/profile、revocation、reviewer policy、toolchain、dependency repository、raw product source 与 containment policy，明确排除 catalog、contract 和 observation time。receipt 只保存 replay binding digest。
 - runner 只接收 `VerifiedProductRepositorySourceV1`；裸 `repository_root`、`cwd`、宿主绝对路径和未注册工作区 Git 目录不能进入 replay 或 receipt。source builder 可接收运行时 `RegisteredRepositoryBoundaryV1` capability，但其绝对路径、device/inode 与原始 `.git/gitdir/commondir` 宿主路径不得写入 container、build record、source digest 或 receipt。
-- `RegisteredRepositoryBoundaryV1` 只能由同一受信 source-runner 进程打开、持有并关闭 owning directory handles，禁止 JSON/pickle/路径形式序列化或跨进程恢复；同一命令必须先按规格 §8.2 对原始 `.git/gitdir/commondir` 字节与拓扑执行完整 `RawGitLayoutInspectorV1`，通过后才规范化和构建 container。原始 pointer/control bytes 只在该进程 owning-FD 生命期内检查，不持久化、不参与可重现 digest；持久 proof 只绑定去路径的规范逻辑拓扑。跨 Task 唯一存储由编排器在每个 executor 启动前提供并验证为绝对路径 `$TRUSTED_HANDOFF_STORE_ROOT`；该目录位于仓库/worktree 之外，宿主路径、mount 点、认证租约不得进入 record、proof 或 digest。CAS 路径恰为 `sha256/<前两位>/<后 62 位>`，pointer/transfer manifest/authenticated transport seal 分别为 `pointers/<handoff-id>.json`、`transfers/<handoff-id>.json`、`seals/<handoff-id>.json`，均 immutable/no-replace；producer 只在目标 durable store 导入成功且 seal 验签后完成 publish，consumer 依次 fetch/import/finalize/read 并每次重算 pointer、完整 record bytes 与 referenced blobs。`mktemp` 只作单 Task local cache。
+- `RegisteredRepositoryBoundaryV1` 只能由同一受信 source-runner 进程打开、持有并关闭 owning directory handles，禁止 JSON/pickle/路径形式序列化或跨进程恢复；同一命令必须先按规格 §8.2 对原始 `.git/gitdir/commondir` 字节与拓扑执行完整 `RawGitLayoutInspectorV1`，通过后才规范化和构建 container。原始 pointer/control bytes 只在该进程 owning-FD 生命期内检查，不持久化、不参与可重现 digest；持久 proof 只绑定去路径的规范逻辑拓扑。跨 Task 唯一存储由编排器在每个 executor 启动前提供并验证为绝对路径 `$TRUSTED_HANDOFF_STORE_ROOT`；该目录位于仓库/worktree 之外，宿主路径、mount 点、认证租约不得进入 record、proof 或 digest。CAS 路径恰为 `sha256/<前两位>/<后 62 位>`，pointer 为 `pointers/<handoff-id>.json`；每个 `(handoffId, consumerTask, destinationExecutorId)` 使用唯一 `transportId`，其 transfer/seal 为 `transfers/<handoff-id>/<transport-id>.json` 与 `seals/<handoff-id>/<transport-id>.json`。编排器只在目标 durable store 完整导入 closure、签名并将 transfer/seal 原子 no-replace install+fsync 后才标记该 consumer transport 可用；consumer 依次 fetch/import/finalize/read 并每次重算 pointer、完整 record bytes 与 referenced blobs。同 `transportId` 且全部 bytes 一致是幂等 retry；nonce/sequence/consumer/destination 任一改变或不匹配是 replay/tamper 并 fail closed。`mktemp` 只作单 Task local cache。
 - 工具链、依赖、产品源码分别只来自 `trust/toolchains/sha256`、`trust/dependencies/sha256`、`trust/product-sources/sha256`；禁止宿主 PATH/shell/`/usr/bin/env`、live download、主机 cache 或同名工具回退。
 - 工具链预算固定为压缩 1 GiB、100,000 members、单文件 256 MiB、展开 4 GiB、100:1；依赖预算固定为压缩 1 GiB、100,000 members、20,000 packages、单 archive 256 MiB、blob 2 GiB、view 200,000 entries/2 GiB、安装树 4 GiB、100:1。
 - 固定版本为 uv 0.11.15（commit `3cffe97c2e48c9e49422c738da3af95919dd0bf5`）、Git 2.53.0、Node 24.20.0、npm 11.19.0、pytest 8.3.5、pytest-json-report 1.5.0、Vitest 3.0.8、zstandard 0.23.0；版本相同但 bytes/build identity 不同也拒绝。
@@ -89,7 +89,7 @@ class RawGitInspectionProofV1:
     schema: Literal["trusted-raw-git-inspection-proof/v1"]
     inspector_id: Literal["raw-git-layout-inspector/v1"]
     profile_digest: str
-    raw_topology_digest: str
+    logical_topology_digest: str
     passed_rule_digests: tuple[NamedDigest, ...]
     budget_observations: tuple[NamedDigest, ...]
     subject_commit: str
@@ -99,10 +99,14 @@ class RawGitInspectionProofV1:
 class TransportSealV1:
     schema: Literal["trusted-handoff-transport-seal/v1"]
     store_namespace: str
+    handoff_id: str
+    transport_id: str
+    consumer_task: int
     record_ref: str
     record_full_bytes_digest: str
     pointer_name: str
     pointer_bytes_digest: str
+    transfer_manifest_digest: str
     source_executor_id: str
     destination_executor_id: str
     nonce: str
@@ -160,6 +164,18 @@ class ValidatedRegistrationBatchV1:
     canonical_digest: str
 
 @dataclass(frozen=True)
+class ValidatedPromotionBatchV1:
+    operation_snapshot_digest: str
+    policy_handoff_record_digest: str
+    policy_commit: str
+    subject: str
+    product_source_ref: str
+    network_proof_ref: str
+    replay_policy_binding_digest: str
+    evidence_refs: tuple[NamedDigest, ...]
+    canonical_digest: str
+
+@dataclass(frozen=True)
 class ReplayPolicyBindingV1:
     registry_digest: str
     suite_digests: tuple[NamedDigest, ...]
@@ -180,15 +196,15 @@ class AcceptanceOperationSnapshotV1:
     canonical_digest: str
 ```
 
-`RegisteredRepositoryBoundaryV1` 是仅存于 source-runner 进程内、拥有 handle 生命周期的 capability：`build` CLI 接收三个 root path 后立即 no-follow 打开为 owning handles，`RawGitLayoutInspectorV1.inspect(boundary, subject_commit)` 在任何逻辑 alias/规范化之前，以 `BoundedStableReader` 读取原始 pointer/control bytes，执行规格 §8.2 全部预算与拒绝规则，返回内存 inspection result；这些 raw bytes 仅用于当次判定，既不写入任何 artifact，也不直接或间接进入 digest。inspector 只从已验证关系派生 `CanonicalLogicalRepositoryTopologyV1`：它仅含 `@checkout/@gitdir/@commondir` aliases、关系类别、允许的 pointer/commondir 形式类别及 backlink 关系，不含 path、path bytes、device/inode/mtime。`RawGitInspectionProofV1.raw_topology_digest` 恰为该去路径逻辑拓扑的规范 JSON SHA-256，proof 只绑定此 digest、inspector/profile/rule set/budget observations、subject/source commit 和 container digest。同一命令随后构建 container 并 finalize proof；所有后续遍历只从 handles `openat`，直到 container/build-record/proof/handoff 全部发布后才关闭。Task 11 对 proof schema、inspector/profile/rules、逻辑 topology/build-record/container bindings 做正式验证，再检查 canonical container；不能把 builder 自报的布尔值当作证明。
+`RegisteredRepositoryBoundaryV1` 是仅存于 source-runner 进程内、拥有 handle 生命周期的 capability：`build` CLI 接收三个 root path 后立即 no-follow 打开为 owning handles，`RawGitLayoutInspectorV1.inspect(boundary, subject_commit)` 在任何逻辑 alias/规范化之前，以 `BoundedStableReader` 读取原始 pointer/control bytes，执行规格 §8.2 全部预算与拒绝规则，返回内存 inspection result；这些 raw bytes 仅用于当次判定，既不写入任何 artifact，也不直接或间接进入 digest。inspector 只从已验证关系派生 `CanonicalLogicalRepositoryTopologyV1`：它仅含 `@checkout/@gitdir/@commondir` aliases、关系类别、允许的 pointer/commondir 形式类别及 backlink 关系，不含 path、path bytes、device/inode/mtime。`RawGitInspectionProofV1.logical_topology_digest` 恰为该去路径逻辑拓扑的规范 JSON SHA-256，proof 只绑定此 digest、inspector/profile/rule set/budget observations、subject/source commit 和 container digest。同一命令随后构建 container 并 finalize proof；所有后续遍历只从 handles `openat`，直到 container/build-record/proof/handoff 全部发布后才关闭。Task 11 对 proof schema、inspector/profile/rules、逻辑 topology/build-record/container bindings 做正式验证，再检查 canonical container；不能把 builder 自报的布尔值当作证明。
 
 `TrustedHandoffRecordV1` 的规范 JSON 字段恰为 `schema/handoffId/kind/producerTask/producerCommit/consumerTasks/bindings`，record 内不含自摘要字段；`recordDigest = sha256(full canonical record bytes)`，`recordRef` 与之相等。pointer 固定字段恰为 `schema/handoffId/recordRef/recordDigest/producerTask/producerCommit`，其中 schema=`trusted-acceptance-handoff-pointer/v1` 且 `recordRef == recordDigest`。record schema=`trusted-acceptance-handoff/v1`、`producerCommit` 为小写 40-hex、`consumerTasks` 为升序无重复正整数、每个 binding 恰为 `name/digest`。CAS blob/record 使用 `O_CREAT|O_EXCL` 写临时 regular file、fsync 后以 hard-link-to-final 的 no-replace publish；pointer 同样以临时文件+`linkat` 原子 no-replace 发布并 fsync 父目录。目标已存在时只读回、重算并接受 byte-identical 内容，任何不同内容或并发竞态均拒绝，绝不 replace/覆盖。
 
-`TrustedHandoffStoreV1.open_from_environment()` 要求 `$TRUSTED_HANDOFF_STORE_ROOT` 为编排器验证的绝对、no-symlink、权限/owner/项目租约匹配的外部 durable store。producer 先 `publish-local`写 CAS/record/pointer，再 `export` 不含路径的 `trusted-handoff-transfer/v1` manifest 与规范 bytes 闭包；独立编排器 `upload` 验证并 no-replace 导入目标 durable store，只有目标闭包全量重算成功后才 `sign-seal`。`TransportSealV1` 严格固定 store namespace、record ref/完整 bytes digest、pointer name/bytes digest、source/destination executor identity、nonce/sequence、可选 expiry 以及 signature algorithm/key ID/signature；验签根只来自仓库内固定 registry profile 解析的 `handoff-transport-policy.json` 和 `handoff-transport-allowed-signers`，producer/consumer/orchestrator CLI 均不接受替代 policy、allowed-signers、公钥或信任路径参数。producer `finalize-publish` 同时验 upload receipt、seal 与目标导入结果，在此之前 publish 不完成；consumer 按 `fetch→import→finalize→read` 把已签闭包落入单 Task 空 cache，重算 pointer/record/blob 并核对当前 destination executor、nonce/sequence/expiry。macOS/Linux 仅传输规范 bytes 与 hex refs；重放 nonce/sequence、过期、错 executor、篡改 seal/闭包、部分导入、重复/未知 ref 或 pointer/record/blob 不一致均 fail closed。
+`TrustedHandoffStoreV1.open_from_environment()` 要求 `$TRUSTED_HANDOFF_STORE_ROOT` 为编排器验证的绝对、no-symlink、权限/owner/项目租约匹配的外部 durable store。producer 只 `publish-local` 一次 CAS/record/pointer；编排器针对每个 record 所列 consumer 独立执行 `export→upload→sign-seal→install-transport`。`export` 产生不含路径的 `trusted-handoff-transfer/v1` manifest/closure，其规范 digest 进入 `TransportSealV1`；`upload` 先将 closure no-replace 导入目标 store 并全量重算；`sign-seal` 对 store namespace、handoff/transport ID、consumer task、record/pointer/manifest digests、source/destination executor identity、nonce/sequence/expiry 签名；`install-transport` 再把 transfer manifest 和 seal 分别以 temp regular file+`linkat` 原子 no-replace 写入目标 store 的固定路径，fsync 文件与两个父目录。目标已存在时只有完整 bytes 一致才幂等成功，任何不同都拒绝；没有 install 成功的 transport 不得 fetch。验签根只来自仓库内固定 registry profile 解析的 `handoff-transport-policy.json` 和 `handoff-transport-allowed-signers`，所有 CLI 均不接受替代 trust root。consumer 按 `fetch→import→finalize→read` 以安装的 `transportId` 把闭包落入单 Task 空 cache，重算并核对 consumer task/destination identity/nonce/sequence/expiry；另一 consumer 的 seal 不能被复用。
 
 `NamedDigest.name` 必须是 NFC、非空、无控制字符的逻辑名，`digest` 必须是小写 `sha256:<64hex>`。每个 tuple 由 builder 以 `(name.encode("utf-8"), digest.encode("ascii"))` bytewise 升序规范化；同名条目无论摘要是否相同都拒绝，不同名称可共享同一摘要。suite/profile/toolchain/source/containment 集合对 E2 binding 必须非空；dependency 集合仅在所有 suite 都声明零 ecosystem 时允许空，否则按 `<suite-id>/<ecosystem>` 唯一命名。空集合编码为 JSON `[]`，文件系统创建/遍历顺序不进入结果。
 
-`ReplayPolicyBindingV1`、`AcceptanceOperationSnapshotV1` 与 `ValidatedRegistrationBatchV1` 的 `canonical_digest` 都对除自身外字段按字段名排序、UTF-8 紧凑规范 JSON 编码后取 SHA-256；它们不同于不含内嵌摘要的 handoff record full-bytes digest。任何 wall-clock、mtime、review observation time 都不得进入；顺序 collect/register 改变 catalog 只生成新的 operation snapshot，不改变已有 receipt 的 replay binding。
+`ReplayPolicyBindingV1`、`AcceptanceOperationSnapshotV1`、`ValidatedRegistrationBatchV1` 与 `ValidatedPromotionBatchV1` 的 `canonical_digest` 都对除自身外字段按字段名排序、UTF-8 紧凑规范 JSON 编码后取 SHA-256；它们不同于不含内嵌摘要的 handoff record full-bytes digest。任何 wall-clock、mtime、review observation time 都不得进入；顺序 collect/register 改变 catalog 只生成新的 operation snapshot，不改变已有 receipt 的 replay binding。
 
 | 文件/目录 | 单一职责 |
 | --- | --- |
@@ -248,11 +264,11 @@ class AcceptanceOperationSnapshotV1:
 
 **Interfaces:**
 - Consumes: 规格 4、6.1、7、9、10、14 和既有六字段 pointer。
-- Produces: 上述 immutable 类型、owning-FD context、`TrustedHandoffStoreV1.open_from_environment()`、`HandoffRegistry.publish_local/export/finalize_publish/fetch/import_/finalize/read`；producer CLI 严格子命令为 `verify-root`、`publish-local`、`export`、`finalize-publish`，编排面 CLI 严格子命令为 `upload`、`sign-seal`，consumer CLI 严格子命令为 `verify-cache`、`fetch`、`import`、`finalize`、`read`。`verify-root` 验绝对根/owner/mode/project lease；`export` 输出 canonical manifest/closure；`upload` 成功导入目标 store 才输出 upload receipt；`sign-seal` 仅在编排面读仓库外私钥；`finalize-publish` 使用固定 trust policy 验完整 seal/receipt 才成功。`verify-cache/fetch/import/finalize/read` 只在经 0700 空根检查的当次 cache 工作，`read` 只从 finalized cache 重验并输出字段。另产出 policy/snapshot builders 与 suite factory。
+- Produces: 上述 immutable 类型、owning-FD context、`TrustedHandoffStoreV1.open_from_environment()`、`HandoffRegistry.publish_local/fetch/import_/finalize/read`；producer CLI 只有 `verify-root`、`publish-local`，编排面 CLI 严格子命令为 `export`、`upload`、`sign-seal`、`install-transport`，consumer CLI 严格子命令为 `verify-cache`、`fetch`、`import`、`finalize`、`read`。编排四步都必须显式接收同一 `handoff-id/transport-id/consumer-task/source-executor-id/destination-executor-id/nonce/sequence/expiry`；`install-transport` 只在 closure 已导入、seal 已签名后将 transfer/seal 写入目标 durable store 并 fsync。consumer 的 `fetch/import/finalize/read` 四步都显式接收 `transport-id`、`consumer-task` 和 destination executor identity，`read` 只从 finalized cache 重验并输出字段。另产出 policy/snapshot builders 与 suite factory。
 
-- [ ] **Step 1:** 写 `test_replay_binding_excludes_catalog_contract_and_observation_time`、`test_operation_snapshot_binds_catalog_contract_and_replay_binding`、`test_named_digest_order_is_identical_for_different_creation_order`、`test_duplicate_name_and_illegal_empty_set_reject`、`test_product_source_rejects_host_path`、`test_v1_is_not_upgraded`；另写 handoff RED tests：record 不含自摘要且 full canonical bytes SHA-256 精确等于 pointer `recordRef/recordDigest`；owning handle 拒绝 JSON/pickle/copy；store root 非绝对、symlink、权限/owner/租约不符均拒绝；CAS/pointer no-replace；两个 producer 并发发布不同 record 时恰一方成功、另一方稳定失败，最终 bytes 不混合；相同 bytes 幂等接受。transport 用固定测试签名者覆盖 export/upload→target import→sign-seal→finalize-publish→fetch/import/finalize/read，并断言未导入目标 store 时 publish 不完成；缺/伪造 seal、非固定 trust root、重放 nonce/sequence、过期、wrong source/destination executor、partial/cross-project/macOS→Linux 篡改全部 fail closed。
+- [ ] **Step 1:** 写 `test_replay_binding_excludes_catalog_contract_and_observation_time`、`test_operation_snapshot_binds_catalog_contract_and_replay_binding`、`test_named_digest_order_is_identical_for_different_creation_order`、`test_duplicate_name_and_illegal_empty_set_reject`、`test_product_source_rejects_host_path`、`test_v1_is_not_upgraded`；另写 handoff RED tests：record 不含自摘要且 full canonical bytes SHA-256 精确等于 pointer `recordRef/recordDigest`；owning handle 拒绝 JSON/pickle/copy；store root 非绝对、symlink、权限/owner/租约不符均拒绝；CAS/pointer no-replace；两个 producer 并发发布不同 record 时恰一方成功、另一方稳定失败，最终 bytes 不混合；相同 bytes 幂等接受。transport 用固定测试签名者覆盖两个 consumer 各自独立 export/upload/sign/install/fetch/import/finalize/read，断言未 install seal 时不可 fetch、相同 `transportId`+相同 bytes retry 幂等、不同 bytes 不覆盖；一个 consumer 的 seal 用于另一 consumer，或 nonce/sequence/consumer/destination/expiry/签名/manifest 任一不符均 fail closed。
 - [ ] **Step 2:** 运行 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_e2_policy_v2.py .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_handoffs.py`；预期缺类型与 handoff owner/registry 而 RED。
-- [ ] **Step 3:** 实现严格 `NamedDigest`、规范 JSON 与两个 policy/snapshot digests；实现外部 authenticated handoff store：blob/record 以 full bytes digest 写入 `sha256/<前两位>/<后 62 位>`，临时文件和最终 hard-link 都 no-follow/no-replace，pointer 用相同 `linkat` publish，全部 fsync；已存在只比较完整 bytes。`trusted-handoff-transfer/v1` 严格包含 store namespace、handoff ID、record ref/full-bytes digest、pointer name/bytes digest、有序 blob refs、source/destination executor ID、nonce/sequence/expiry；`TransportSealV1` 字段恰为顶层接口所列，签名消息为除 `signature` 外字段的规范 JSON。registry 中的固定 transport profile 锁定 `handoff-transport-policy.json`、namespace、允许 executor 关系、key ID、algorithm、nonce/sequence registry、expiry 规则与 `handoff-transport-allowed-signers`；生产 CLI 不接受任何 trust-root 覆盖参数。只有 `trusted_handoff_orchestrator.py` 的 `sign-seal` 读仓库外 `$TRUSTED_HANDOFF_ORCHESTRATOR_SIGNING_KEY`，producer/consumer 均不可读取。`upload` 对目标 store 重算并 no-replace 导入完整闭包后输出 canonical upload receipt；`sign-seal` 只对该 receipt 指向的已导入闭包签名；`finalize-publish` 固定使用上述 trust files 验签并校验 receipt 才返回成功。`fetch/import/finalize/read` 重算 pointer/record/blob 并核对 producer/consumer/kind/commit/bindings 与 executor/replay 状态；`finalize` 之前 `read` 必须拒绝。缺任一 policy/handoff/transport 输入即阻塞，禁止 capability、store root、租约或宿主 path 入 record/digest。
+- [ ] **Step 3:** 实现严格 `NamedDigest`、规范 JSON 与两个 policy/snapshot digests；实现外部 authenticated handoff store：blob/record/pointer 以 full bytes digest/no-replace/fsync 发布。`trusted-handoff-transfer/v1` 严格包含 store namespace、handoff/transport ID、consumer task、record ref/full-bytes digest、pointer name/bytes digest、有序 blob refs、source/destination executor ID、nonce/sequence/expiry；`TransportSealV1` 字段恰为顶层接口所列，签名消息为除 `signature` 外字段的规范 JSON。registry 固定 trust root，生产 CLI 不接受覆盖；只有编排面 `sign-seal` 读仓库外私钥。`upload` 先导入并重算 closure；`sign-seal` 只签该 upload receipt 指向的 manifest；`install-transport` 以两次 temp+`linkat` no-replace 安装 manifest/seal，若第二次安装失败则 transport 不可见，清理未入口 temp；只有两文件完整且摘要互绑时才把包含两者 digest 的 ready marker 也用 temp+`linkat` no-replace 安装，并依次 fsync 三个文件和各父目录。已存在 manifest/seal/marker 只接受三者完整 bytes 全部一致的幂等 retry，任一不同拒绝；崩溃恢复不得观测到半安装运输。`fetch/import/finalize/read` 从 target store 的 ready marker 定位同一 `transportId`，重算全部 bytes 并核对 consumer/destination/replay 状态；`finalize` 之前 `read` 必须拒绝。
 - [ ] **Step 4:** 重跑 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_e2_policy_v2.py .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_handoffs.py`；预期 GREEN 且 production profile 仍为空。
 - [ ] **Step 5:** `git add .scratch/unified-remix-canvas-generation/acceptance/trusted_evidence/{e2_policy.py,handoffs.py,registry.py,errors.py} .scratch/unified-remix-canvas-generation/acceptance/tools/{trusted_handoff_store.py,trusted_handoff_orchestrator.py} .scratch/unified-remix-canvas-generation/acceptance/trust/{handoff-transport-registry.json,handoff-transport-policy.json,handoff-transport-allowed-signers} .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_{e2_policy_v2,handoffs}.py && git commit -m "feat: define trusted replay operation policy"`
 
@@ -388,7 +404,7 @@ class AcceptanceOperationSnapshotV1:
 - [ ] **Step 1:** 写 `test_real_linked_worktree_is_inspected_before_normalization_and_proof_binds_container`：真实 `.git` regular pointer、相对/绝对 gitdir/commondir 写法、精确换行/backlink/control bytes 先由 inspector 在 owning-FD 进程内读取；用 test spy 证明这些 bytes 实际被检查，但不出现于 proof/container/build-record/handoff 任一序列化字段或 digest 输入。proof 绑定 path-free logical-topology/profile/rules/budgets/subject/container；另写双根测试，同 commit 在不同绝对空根、保持相同逻辑关系与形式类别时，只要求 canonical topology/proof 语义字段、container/build-record/handoff 一致，不要求两个根的原始 pointer/control bytes 相同或其 digest 存在。写 path swap/capability serialization 反例；再逐项覆盖规格 §8.2 pointer/ref/config/objects/sidecar/预算/unknown class、非法 UTF-8/NUL/多行/换行、越界/symlink/case-fold/alias/二次重定向/循环/backlink 不精确，全部在规范化或 payload copy 前拒绝；伪造 proof、错 inspector/profile/rule/budget/logical-topology/container binding 也拒绝。
 - [ ] **Step 2:** 运行 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_product_source.py`；预期 RED。
 - [ ] **Step 3:** 唯一 source-runner 进程打开并持有三个 handles 后，先调用完整 `RawGitLayoutInspectorV1`；只有 inspection result 成功才把已验证关系派生为 `@checkout/@gitdir/@commondir` 的 path-free canonical logical topology，再用自有有界 SHA-1 loose/pack/idx/tree reader复制 subject tree 的精确 tracked bytes。原始 pointer/control bytes 仅留在 inspection 调用栈/内存中，不写 artifact、不做 digest；ignored/untracked 不捕获。finalize proof 后，将 container/build-record/proof 三者作为 blobs 交给 authenticated handoff `publish-local`，全部完成再关闭 handles。普通 `.git` directory 仍只发一份 control tree；任何 handle identity/mount/race 变化拒绝。
-- [ ] **Step 4:** container manifest 首项绑定 subject、normalized boundary、`boundaryDigest/trackedCheckoutDigest/controlMetadataDigest/sourceDigest`；proof sidecar 的 `rawTopologyDigest` 只是 `CanonicalLogicalRepositoryTopologyV1` 的规范摘要，并绑定 inspector/profile、全部规则/预算结果、subject/source commit 与最终 container digest；build record 绑定 proof ref/digest、subject/tree/container/source/boundary/logical topology，不含原始 bytes/digest、路径/device/inode/mtime。handoff bindings 恰含 `product-source-container`、`product-source-build-record`、`raw-git-inspection-proof`、`boundary-topology`、`tracked-checkout`、`control-metadata`、`source` 七项。loader 重算 container/build-record/proof digests；重跑 tests，预期原始布局恶意 bytes 拒绝、proof/container 换绑、双根 canonical 语义一致性与逃逸反例 GREEN。
+- [ ] **Step 4:** container manifest 首项绑定 subject、normalized boundary、`boundaryDigest/trackedCheckoutDigest/controlMetadataDigest/sourceDigest`；proof sidecar 的 `logicalTopologyDigest` 只是 `CanonicalLogicalRepositoryTopologyV1` 的规范摘要，并绑定 inspector/profile、全部规则/预算结果、subject/source commit 与最终 container digest；build record 绑定 proof ref/digest、subject/tree/container/source/boundary/logical topology，不含原始 bytes/digest、路径/device/inode/mtime。handoff bindings 恰含 `product-source-container`、`product-source-build-record`、`raw-git-inspection-proof`、`boundary-topology`、`tracked-checkout`、`control-metadata`、`source` 七项。loader 重算 container/build-record/proof digests；重跑 tests，预期原始布局恶意 bytes 拒绝、proof/container 换绑、双根 canonical 语义一致性与逃逸反例 GREEN。
 - [ ] **Step 5:** `git add .scratch/unified-remix-canvas-generation/acceptance/trusted_evidence/{raw_git_inspection.py,product_source.py} .scratch/unified-remix-canvas-generation/acceptance/tools/build_product_source.py .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_product_source.py && git commit -m "feat: bind canonical raw Git product sources"`
 
 ### Task 11: 从 verified source 构造 sanitized Git checkout
@@ -512,12 +528,12 @@ class ReplayContainmentV1(Protocol):
 
 **Interfaces:**
 - Consumes: Tasks 2–5、15，既有 E1 Git verifier、CAS/registration。
-- Produces: canonical E1/E2 artifact schemas、collectors/dispatch、`RegistrationBatchPreflight.validate(root, product_handoff, policy_handoff, expected_policy_commit, candidates) -> ValidatedRegistrationBatchV1`，以及 `AtomicBatchRegistrar.commit(validated_batch)`；generic CLI `collect`/`register`/`register-batch`。`register-batch` 在同一进程构造 typed preflight，批量验证 handoffs/commit/source/dependencies/profile/verifier/subject/policy 与全部 artifact canonical bytes/receipt bindings，成功后才一次原子更新 catalog 七 pointers；任一候选失败时 catalog/pointers 写入数为零。collect result JSON/capture/`validate-many` 合同保持不变。
+- Produces: canonical E1/E2 artifact schemas、collectors/dispatch、`RegistrationBatchPreflight.validate(root, product_handoff, policy_handoff, expected_policy_commit, candidates) -> ValidatedRegistrationBatchV1`，以及 `AtomicBatchRegistrar.commit(validated_batch)`；generic CLI `collect`/`register`/`register-batch`。`register-batch` 在同一进程构造 typed preflight，批量验证 handoffs/commit/source/dependencies/profile/verifier/subject/policy 与全部 artifact canonical bytes/receipt bindings，成功后才一次原子更新 catalog 七 pointers；任一候选失败时 catalog/pointers 写入数为零。collect result JSON/capture/`validate-many` 合同保持不变；`capture_collect_result.py read-catalog-ref` 以 profile/verifier/subject 精确寻址，重算 catalog pointer 与 CAS canonical bytes 后只输出唯一 `sha256:<64hex>` ref，供后续晋级显式传参。
 
-- [ ] **Step 1:** 保留 E1/E2 collect/capture/register RED tests；新增 batch preflight RED：product/policy handoff、fixed commit、source/container/proof/dependency/network-proof ref、profile/verifier/subject、replay-policy binding、artifact canonical bytes/receipt semantic binding 任一不符，或七候选缺失/重复/多余时，`preflightSuccess=0`、catalog/pointer writes=0；全部正确时返回深不可变、固定顺序 batch，register-batch 恰一次 atomic catalog commit。
+- [ ] **Step 1:** 保留 E1/E2 collect/capture/register RED tests；新增 batch preflight RED：product/policy handoff、fixed commit、source/container/proof/dependency/network-proof ref、profile/verifier/subject、replay-policy binding、artifact canonical bytes/receipt semantic binding 任一不符，或七候选缺失/重复/多余时，`preflightSuccess=0`、catalog/pointer writes=0；全部正确时返回深不可变、固定顺序 batch，register-batch 恰一次 atomic catalog commit。另为 `read-catalog-ref` 写缺失/重复/错 subject/悬空 CAS/篡改 bytes/未知字段 RED，成功 stdout 必须只有规范 ref。
 - [ ] **Step 2:** 运行 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_collection_v2.py .scratch/unified-remix-canvas-generation/acceptance/test_collect_result_capture.py .scratch/unified-remix-canvas-generation/acceptance/test_registration_batch_preflight.py`；预期 façade/result codec/preflight RED。
-- [ ] **Step 3:** 实现 collectors/result codec；实现 typed batch preflight，必须从验证对象重算所有语义而非信任 CLI 自报 digest。`AtomicBatchRegistrar` 在同一 process/lock 下 recheck operation snapshot 与 validated batch digest，以 temp catalog+fsync+atomic replace 一次提交七 pointers；不能逐项产生可见中间状态。
-- [ ] **Step 4:** 运行 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_collection_v2.py .scratch/unified-remix-canvas-generation/acceptance/test_evidence_bridge_cli.py .scratch/unified-remix-canvas-generation/acceptance/test_collect_result_capture.py .scratch/unified-remix-canvas-generation/acceptance/test_registration_batch_preflight.py`；预期 collect CAS write 0/1、capture 精确返回 ref、任一 batch candidate 错误均零 catalog 写、完整 batch 只出现全七或全零。
+- [ ] **Step 3:** 实现 collectors/result codec 与只读 `read-catalog-ref`；后者 strict parse 整个 catalog，精确匹配 profile/verifier/subject，重开对应 CAS object、校验 regular/no-symlink/no-hardlink/canonical bytes 与 ref digest 后才输出。实现 typed batch preflight，必须从验证对象重算所有语义而非信任 CLI 自报 digest。`AtomicBatchRegistrar` 在同一 process/lock 下 recheck operation snapshot 与 validated batch digest，以 temp catalog+fsync+atomic replace 一次提交七 pointers；不能逐项产生可见中间状态。
+- [ ] **Step 4:** 运行 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_collection_v2.py .scratch/unified-remix-canvas-generation/acceptance/test_evidence_bridge_cli.py .scratch/unified-remix-canvas-generation/acceptance/test_collect_result_capture.py .scratch/unified-remix-canvas-generation/acceptance/test_registration_batch_preflight.py`；预期 collect CAS write 0/1、capture 精确返回 ref、`read-catalog-ref` 对污染/悬空/篡改零输出且成功只返回一行 ref、任一 batch candidate 错误均零 catalog 写、完整 batch 只出现全七或全零。
 - [ ] **Step 5:** `git add .scratch/unified-remix-canvas-generation/acceptance/trusted_evidence/{artifact_schemas.py,cli_results.py,e1_collection.py,collection.py,registration.py,registration_preflight.py,verifiers/e2_suite.py} .scratch/unified-remix-canvas-generation/acceptance/evidence_bridge.py .scratch/unified-remix-canvas-generation/acceptance/tools/capture_collect_result.py .scratch/unified-remix-canvas-generation/acceptance/test_{trusted_evidence_collection_v2,evidence_bridge_cli,collect_result_capture,registration_batch_preflight}.py && git commit -m "feat: collect and register canonical E1 E2 artifacts"`
 
 ### Task 17: 接入 workflow 与原子 projection
@@ -531,11 +547,11 @@ class ReplayContainmentV1(Protocol):
 
 **Interfaces:**
 - Consumes: Tasks 2、4、15–16。
-- Produces: `evaluate_operation`、`AtomicContractProjector.commit(expected_operation_snapshot, overrides)`。
+- Produces: `evaluate_operation`、`AtomicContractProjector.commit(expected_operation_snapshot, overrides)`，以及 `validate_acceptance.py snapshot/read-snapshot/preflight-promotion/promote/read-result/reconcile`。`snapshot` 产出 strict `AcceptanceOperationSnapshotV1`，`read-snapshot` 重算 canonical bytes 后只返回其 digest；`preflight-promotion` 将 finalized policy cache、fixed policy commit、subject、replay/network/source bindings 与七 evidence refs 固化为 `ValidatedPromotionBatchV1`；`promote` 只接收该 typed batch 与 expected snapshot digest，重检后一次原子投影并产出 typed result；`read-result` 只从 strict result schema 返回请求字段；`reconcile` 使用投影后新 snapshot 和 promotion result digest，重新显式接收并重验同一组 policy/bindings/evidence refs，只能幂等保持或按失效证据降级。
 
-- [ ] **Step 1:** 写全操作 barrier、validate read-only、operation-snapshot CAS、稳定 replay-policy binding、fsync/replace、register 不晋升 tests。
+- [ ] **Step 1:** 写全操作 barrier、validate read-only、operation-snapshot CAS、稳定 replay-policy binding、fsync/replace、register 不晋升 tests；新增 CLI RED：`read-snapshot/read-result` 对未知字段、非 canonical bytes 或错 operation 零输出；缺任一 explicit binding/ref、preflight/snapshot 换绑、promote 前 snapshot race 均 contractWrites=0，成功 promote 恰一次原子写 C01–C03，reconcile 必须使用投影后新 snapshot 并重新显式重验全部 bindings/refs。
 - [ ] **Step 2:** 运行 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_workflow_v2.py .scratch/unified-remix-canvas-generation/acceptance/test_acceptance_contract.py`；预期 RED。
-- [ ] **Step 3:** 阶段 A 构造一次 `AcceptanceOperationSnapshotV1` 并 preflight，阶段 B 只把其绑定的 `ReplayPolicyBindingV1` 传给 replay；最终只重算/recheck operation snapshot 后唯一投影。catalog 的预期 register 变化产生新 operation snapshot，但不改变既有 receipt 的 replay binding。
+- [ ] **Step 3:** 阶段 A 构造一次 `AcceptanceOperationSnapshotV1` 并 preflight，阶段 B 只把其绑定的 `ReplayPolicyBindingV1` 传给 replay；最终只重算/recheck operation snapshot 后唯一投影。六个 CLI subcommands 均使用 canonical JSON stdout/文件且拒绝未知字段；`preflight-promotion` 参数必须逐项显式列出 subject、product source、network proof、replay binding 与七 verifier refs，不从 shell/current branch 推断。`promote` 必须在同一 lock 内重开 snapshot、typed batch、policy cache、catalog/CAS 与 contract，全部重验后用单个 temp+fsync+atomic replace 写 C01–C03；`reconcile` 不复用 pre-promotion snapshot，必须接收投影后新 snapshot 和同组显式 refs 再完成一次只读判定/必要的单次原子降级。catalog 的预期 register 变化产生新 operation snapshot，但不改变既有 receipt 的 replay binding。
 - [ ] **Step 4:** 重跑 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_workflow_v2.py .scratch/unified-remix-canvas-generation/acceptance/test_acceptance_contract.py`；预期 138 项、四状态、空不适用不变。
 - [ ] **Step 5:** `git add .scratch/unified-remix-canvas-generation/acceptance/trusted_evidence/{evaluation.py,projection.py,runtime.py} .scratch/unified-remix-canvas-generation/acceptance/validate_acceptance.py .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_workflow_v2.py && git commit -m "feat: gate acceptance with trusted replay"`
 
@@ -630,94 +646,78 @@ class ReplayContainmentV1(Protocol):
 - Modify in isolated product worktree: `backend/requirements.lock`
 - Generated external CAS blobs/record: `$TRUSTED_HANDOFF_STORE_ROOT/sha256/<aa>/<remaining-62-hex>` (product container、build record、raw inspection proof、handoff record；not tracked)
 - Generated external pointer: `$TRUSTED_HANDOFF_STORE_ROOT/pointers/ticket-23-product-source-v1.json` (not tracked)
-- Generated external transfer/upload receipt/seal: orchestrator transport workspace plus target `$TRUSTED_HANDOFF_STORE_ROOT/{transfers,seals}/ticket-23-product-source-v1.json` (not tracked)
+- Generated external per-consumer transports: target stores 中 `transfers/ticket-23-product-source-v1/{ticket-23-product-source-v1-c23,ticket-23-product-source-v1-c25,ticket-23-product-source-v1-c27,ticket-23-product-source-v1-c28}.json`、对应 `seals/` 文件与 ready markers (not tracked)
+- Ephemeral only: 0700 `TASK22_BOUNDARY_PARENT/registered-boundary.json` 与四个 consumer 的 0700 transport stage roots；分别由 Task 22 shell/编排器清理，不跟踪、不跨 Task 复用。
 
 **Interfaces:**
 - Consumes: Task 10 registered-boundary builder CLI、Task 11 inspector contract 与产品实际源码；不消费 fixture digest。
 - Produces: Task 22 内部专用的真实 linked worktree 与 clean subject commit；外部 durable store 中 `ticket-23-product-source-v1` handoff，record kind=`product-source`、producerTask=`22`、consumerTasks=`[23,25,27,28]`，并绑定 product-source container/build-record/raw-inspection-proof/boundary-topology/tracked-checkout/control-metadata/source 七个 digest；四 pytest node IDs、结构两项/持久化五项/API 两项 Vitest fullName、两个 lock digests。linked worktree path、store root 与 owning handles 均不进入 record 或跨 Task 作为数据传递。
 
-- [ ] **Step 1:** 编排器先注入并验证唯一绝对 `$TRUSTED_HANDOFF_STORE_ROOT`，运行 `backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py verify-root --store-root "$TRUSTED_HANDOFF_STORE_ROOT" --project-id ai-video-reverse-engineer --producer-task 22`；再由受控 provisioner 建立真实 linked worktree，并仅在本 Task shell 定义 `TASK22_PRODUCT_ROOT/GITDIR_ROOT/COMMONDIR_ROOT`。核对三根、`.git` regular file、clean 状态及不得登记 common parent/`/tmp`；阅读产品源码和测试，只补缺失结构 tests 与 wheel-only lock。
+- [ ] **Step 1:** 编排器注入唯一绝对 `$TRUSTED_HANDOFF_STORE_ROOT` 与受控 `$TRUSTED_WORKTREE_PROVISIONER`。下列命令将 provisioner 的 canonical JSON 严格解码为三个 shell 变量；`validate-boundary` 只接受 schema=`trusted-registered-repository-boundary/v1`、恰好 checkout/gitdir/commondir 三根及各自 root identity，拒绝未知/缺失/重复字段、非绝对路径、控制字符、symlink 组件、owner/mode 不符、identity 重用/变化、common parent/`/tmp` 过宽根与不合法 topology；`read-boundary-field` stdout 恰为一个已验证路径，禁止 `eval`：
+
+```bash
+set -euo pipefail
+TASK22_BOUNDARY_PARENT="$(mktemp -d)"
+chmod 0700 "$TASK22_BOUNDARY_PARENT"
+trap 'rm -rf -- "$TASK22_BOUNDARY_PARENT"' EXIT
+TASK22_BOUNDARY_JSON="$TASK22_BOUNDARY_PARENT/registered-boundary.json"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py verify-root \
+  --store-root "$TRUSTED_HANDOFF_STORE_ROOT" --project-id ai-video-reverse-engineer --producer-task 22
+"$TRUSTED_WORKTREE_PROVISIONER" create-linked-worktree \
+  --project-id ai-video-reverse-engineer --output-json "$TASK22_BOUNDARY_JSON"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/build_product_source.py validate-boundary \
+  --boundary-json "$TASK22_BOUNDARY_JSON" --expected-schema trusted-registered-repository-boundary/v1 \
+  --require-owner-current --expected-mode 0700 --require-git-pointer-regular --require-clean
+TASK22_PRODUCT_ROOT="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/build_product_source.py read-boundary-field --boundary-json "$TASK22_BOUNDARY_JSON" --field checkoutRoot)"
+TASK22_GITDIR_ROOT="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/build_product_source.py read-boundary-field --boundary-json "$TASK22_BOUNDARY_JSON" --field gitdirRoot)"
+TASK22_COMMONDIR_ROOT="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/build_product_source.py read-boundary-field --boundary-json "$TASK22_BOUNDARY_JSON" --field commondirRoot)"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/build_product_source.py verify-boundary-identities \
+  --boundary-json "$TASK22_BOUNDARY_JSON" --checkout-root "$TASK22_PRODUCT_ROOT" \
+  --gitdir-root "$TASK22_GITDIR_ROOT" --commondir-root "$TASK22_COMMONDIR_ROOT"
+```
+
+之后阅读该产品根内的实际源码/测试，只补缺失结构 tests 与 wheel-only lock。
 - [ ] **Step 2:** 写两个专用结构测试；以测试文件缺失为 RED 证据，不在依赖物化前运行产品测试或使用宿主临时安装。
 - [ ] **Step 3:** 在 `(cd "$TASK22_PRODUCT_ROOT" && ...)` 中逐项静态核对 requirements lock 仅含 exact pin+SHA-256 wheel、package-lock v3 与两个专用测试名；不把静态核对冒充行为 GREEN。
 - [ ] **Step 4:** 在产品 worktree 运行 `(cd "$TASK22_PRODUCT_ROOT" && git add backend/requirements.lock frontend/src/CreativeCanvasTicket23Acceptance.test.tsx && git commit -m "test: prepare ticket 23 trusted replay subject" && test -z "$(git status --porcelain)")`，随后仅在本 Task shell 定义 `TASK22_PRODUCT_COMMIT="$(git -C "$TASK22_PRODUCT_ROOT" rev-parse HEAD)"` 并校验 40 位 SHA；实际行为 RED/GREEN 固定由 Task 23 在产品专属依赖物化后执行。
-- [ ] **Step 5:** 编排器先向三个角色注入已验证的具体值：`TRUSTED_SOURCE_EXECUTOR_ID`、`TRUSTED_DESTINATION_EXECUTOR_ID`、`TRUSTED_HANDOFF_NONCE`、单调 `TRUSTED_HANDOFF_SEQUENCE`、`TRUSTED_HANDOFF_EXPIRES_AT`、`TRUSTED_HANDOFF_ORCHESTRATOR_KEY_ID`，以及预建空 0700 staging roots `TRUSTED_HANDOFF_EXPORT_OUTPUT_ROOT`、`TRUSTED_HANDOFF_ORCHESTRATOR_OUTPUT_ROOT`；另仅向编排面注入仓库外 `TRUSTED_HANDOFF_ORCHESTRATOR_SIGNING_KEY` 与目标根 `TRUSTED_TARGET_HANDOFF_STORE_ROOT`。下列 producer/orchestrator/consumer 命令是唯一发布路径，不含手工替换项。`build` 内部的 source-runner 在 owning handles 生命期内完成 raw inspect、canonical build、proof 与 local record/pointer no-replace publish，随后关闭 handles；后续 export/transport 只使用已发布规范 bytes。producer 执行：
+- [ ] **Step 5:** producer 只发布一份不含 transport identity 的 record/pointer；Task 22 不 fetch/import/finalize/read 任何 consumer seal。`build` 内部 source-runner 在 owning handles 生命期内完成 raw inspect、canonical build、proof 与 local no-replace publish，随后关闭 handles：
 
 ```bash
 set -euo pipefail
-TASK22_TRANSFER_DIR="$TRUSTED_HANDOFF_EXPORT_OUTPUT_ROOT"
-test -d "$TASK22_TRANSFER_DIR"
-test ! -L "$TASK22_TRANSFER_DIR"
-test -z "$(find "$TASK22_TRANSFER_DIR" -mindepth 1 -print -quit)"
 backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/build_product_source.py build \
-  --checkout-root "$TASK22_PRODUCT_ROOT" --gitdir-root "$TASK22_GITDIR_ROOT" --commondir-root "$TASK22_COMMONDIR_ROOT" \
+  --boundary-json "$TASK22_BOUNDARY_JSON" --checkout-root "$TASK22_PRODUCT_ROOT" \
+  --gitdir-root "$TASK22_GITDIR_ROOT" --commondir-root "$TASK22_COMMONDIR_ROOT" \
   --subject-commit "$TASK22_PRODUCT_COMMIT" --handoff-store-root "$TRUSTED_HANDOFF_STORE_ROOT" \
   --handoff-id ticket-23-product-source-v1 --producer-task 22 \
   --consumer-task 23 --consumer-task 25 --consumer-task 27 --consumer-task 28 --offline
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py export \
-  --source-store-root "$TRUSTED_HANDOFF_STORE_ROOT" --handoff-id ticket-23-product-source-v1 \
-  --store-namespace ai-video-reverse-engineer/ticket-23 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" \
-  --destination-executor-id "$TRUSTED_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_HANDOFF_NONCE" \
-  --sequence "$TRUSTED_HANDOFF_SEQUENCE" --expires-at "$TRUSTED_HANDOFF_EXPIRES_AT" \
-  --output-root "$TASK22_TRANSFER_DIR"
 ```
 
-编排器把上述 export 目录的规范 bytes 交付为只读绝对路径 `$TRUSTED_HANDOFF_EXPORT_ROOT`，然后执行；`upload` 只在目标 store 完整 no-replace 导入并重算成功后产生 receipt，`sign-seal` 之前不存在可接受 seal：
+编排器随后为四个 consumer 分别注入目标 store root、destination executor ID、nonce、单调 sequence、expiry 与预建空 0700 stage root，仅编排面可读 `$TRUSTED_HANDOFF_ORCHESTRATOR_SIGNING_KEY`。下列四段是独立 transport，每段均完整执行 export/upload/sign/install：
 
 ```bash
 set -euo pipefail
-TASK22_ORCHESTRATOR_OUT="$TRUSTED_HANDOFF_ORCHESTRATOR_OUTPUT_ROOT"
-test -d "$TASK22_ORCHESTRATOR_OUT"
-test ! -L "$TASK22_ORCHESTRATOR_OUT"
-test -z "$(find "$TASK22_ORCHESTRATOR_OUT" -mindepth 1 -print -quit)"
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py upload \
-  --export-root "$TRUSTED_HANDOFF_EXPORT_ROOT" --target-store-root "$TRUSTED_TARGET_HANDOFF_STORE_ROOT" \
-  --upload-receipt "$TASK22_ORCHESTRATOR_OUT/upload-receipt.json"
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py sign-seal \
-  --manifest "$TRUSTED_HANDOFF_EXPORT_ROOT/manifest.json" \
-  --upload-receipt "$TASK22_ORCHESTRATOR_OUT/upload-receipt.json" \
-  --signing-key "$TRUSTED_HANDOFF_ORCHESTRATOR_SIGNING_KEY" \
-  --key-id "$TRUSTED_HANDOFF_ORCHESTRATOR_KEY_ID" \
-  --output "$TASK22_ORCHESTRATOR_OUT/transport-seal.json"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py export --source-store-root "$TRUSTED_HANDOFF_STORE_ROOT" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c23 --consumer-task 23 --store-namespace ai-video-reverse-engineer/ticket-23 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_PRODUCT_C23_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_PRODUCT_C23_NONCE" --sequence "$TRUSTED_PRODUCT_C23_SEQUENCE" --expires-at "$TRUSTED_PRODUCT_C23_EXPIRES_AT" --output-root "$TRUSTED_PRODUCT_C23_STAGE_ROOT/export"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py upload --export-root "$TRUSTED_PRODUCT_C23_STAGE_ROOT/export" --target-store-root "$TRUSTED_PRODUCT_C23_TARGET_STORE_ROOT" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c23 --consumer-task 23 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_PRODUCT_C23_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_PRODUCT_C23_NONCE" --sequence "$TRUSTED_PRODUCT_C23_SEQUENCE" --expires-at "$TRUSTED_PRODUCT_C23_EXPIRES_AT" --upload-receipt "$TRUSTED_PRODUCT_C23_STAGE_ROOT/upload-receipt.json"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py sign-seal --manifest "$TRUSTED_PRODUCT_C23_STAGE_ROOT/export/manifest.json" --upload-receipt "$TRUSTED_PRODUCT_C23_STAGE_ROOT/upload-receipt.json" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c23 --consumer-task 23 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_PRODUCT_C23_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_PRODUCT_C23_NONCE" --sequence "$TRUSTED_PRODUCT_C23_SEQUENCE" --expires-at "$TRUSTED_PRODUCT_C23_EXPIRES_AT" --signing-key "$TRUSTED_HANDOFF_ORCHESTRATOR_SIGNING_KEY" --key-id "$TRUSTED_HANDOFF_ORCHESTRATOR_KEY_ID" --output "$TRUSTED_PRODUCT_C23_STAGE_ROOT/seal.json"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py install-transport --target-store-root "$TRUSTED_PRODUCT_C23_TARGET_STORE_ROOT" --manifest "$TRUSTED_PRODUCT_C23_STAGE_ROOT/export/manifest.json" --seal "$TRUSTED_PRODUCT_C23_STAGE_ROOT/seal.json" --upload-receipt "$TRUSTED_PRODUCT_C23_STAGE_ROOT/upload-receipt.json" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c23 --consumer-task 23 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_PRODUCT_C23_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_PRODUCT_C23_NONCE" --sequence "$TRUSTED_PRODUCT_C23_SEQUENCE" --expires-at "$TRUSTED_PRODUCT_C23_EXPIRES_AT"
+
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py export --source-store-root "$TRUSTED_HANDOFF_STORE_ROOT" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c25 --consumer-task 25 --store-namespace ai-video-reverse-engineer/ticket-23 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_PRODUCT_C25_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_PRODUCT_C25_NONCE" --sequence "$TRUSTED_PRODUCT_C25_SEQUENCE" --expires-at "$TRUSTED_PRODUCT_C25_EXPIRES_AT" --output-root "$TRUSTED_PRODUCT_C25_STAGE_ROOT/export"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py upload --export-root "$TRUSTED_PRODUCT_C25_STAGE_ROOT/export" --target-store-root "$TRUSTED_PRODUCT_C25_TARGET_STORE_ROOT" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c25 --consumer-task 25 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_PRODUCT_C25_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_PRODUCT_C25_NONCE" --sequence "$TRUSTED_PRODUCT_C25_SEQUENCE" --expires-at "$TRUSTED_PRODUCT_C25_EXPIRES_AT" --upload-receipt "$TRUSTED_PRODUCT_C25_STAGE_ROOT/upload-receipt.json"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py sign-seal --manifest "$TRUSTED_PRODUCT_C25_STAGE_ROOT/export/manifest.json" --upload-receipt "$TRUSTED_PRODUCT_C25_STAGE_ROOT/upload-receipt.json" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c25 --consumer-task 25 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_PRODUCT_C25_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_PRODUCT_C25_NONCE" --sequence "$TRUSTED_PRODUCT_C25_SEQUENCE" --expires-at "$TRUSTED_PRODUCT_C25_EXPIRES_AT" --signing-key "$TRUSTED_HANDOFF_ORCHESTRATOR_SIGNING_KEY" --key-id "$TRUSTED_HANDOFF_ORCHESTRATOR_KEY_ID" --output "$TRUSTED_PRODUCT_C25_STAGE_ROOT/seal.json"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py install-transport --target-store-root "$TRUSTED_PRODUCT_C25_TARGET_STORE_ROOT" --manifest "$TRUSTED_PRODUCT_C25_STAGE_ROOT/export/manifest.json" --seal "$TRUSTED_PRODUCT_C25_STAGE_ROOT/seal.json" --upload-receipt "$TRUSTED_PRODUCT_C25_STAGE_ROOT/upload-receipt.json" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c25 --consumer-task 25 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_PRODUCT_C25_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_PRODUCT_C25_NONCE" --sequence "$TRUSTED_PRODUCT_C25_SEQUENCE" --expires-at "$TRUSTED_PRODUCT_C25_EXPIRES_AT"
+
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py export --source-store-root "$TRUSTED_HANDOFF_STORE_ROOT" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c27 --consumer-task 27 --store-namespace ai-video-reverse-engineer/ticket-23 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_PRODUCT_C27_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_PRODUCT_C27_NONCE" --sequence "$TRUSTED_PRODUCT_C27_SEQUENCE" --expires-at "$TRUSTED_PRODUCT_C27_EXPIRES_AT" --output-root "$TRUSTED_PRODUCT_C27_STAGE_ROOT/export"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py upload --export-root "$TRUSTED_PRODUCT_C27_STAGE_ROOT/export" --target-store-root "$TRUSTED_PRODUCT_C27_TARGET_STORE_ROOT" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c27 --consumer-task 27 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_PRODUCT_C27_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_PRODUCT_C27_NONCE" --sequence "$TRUSTED_PRODUCT_C27_SEQUENCE" --expires-at "$TRUSTED_PRODUCT_C27_EXPIRES_AT" --upload-receipt "$TRUSTED_PRODUCT_C27_STAGE_ROOT/upload-receipt.json"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py sign-seal --manifest "$TRUSTED_PRODUCT_C27_STAGE_ROOT/export/manifest.json" --upload-receipt "$TRUSTED_PRODUCT_C27_STAGE_ROOT/upload-receipt.json" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c27 --consumer-task 27 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_PRODUCT_C27_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_PRODUCT_C27_NONCE" --sequence "$TRUSTED_PRODUCT_C27_SEQUENCE" --expires-at "$TRUSTED_PRODUCT_C27_EXPIRES_AT" --signing-key "$TRUSTED_HANDOFF_ORCHESTRATOR_SIGNING_KEY" --key-id "$TRUSTED_HANDOFF_ORCHESTRATOR_KEY_ID" --output "$TRUSTED_PRODUCT_C27_STAGE_ROOT/seal.json"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py install-transport --target-store-root "$TRUSTED_PRODUCT_C27_TARGET_STORE_ROOT" --manifest "$TRUSTED_PRODUCT_C27_STAGE_ROOT/export/manifest.json" --seal "$TRUSTED_PRODUCT_C27_STAGE_ROOT/seal.json" --upload-receipt "$TRUSTED_PRODUCT_C27_STAGE_ROOT/upload-receipt.json" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c27 --consumer-task 27 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_PRODUCT_C27_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_PRODUCT_C27_NONCE" --sequence "$TRUSTED_PRODUCT_C27_SEQUENCE" --expires-at "$TRUSTED_PRODUCT_C27_EXPIRES_AT"
+
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py export --source-store-root "$TRUSTED_HANDOFF_STORE_ROOT" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c28 --consumer-task 28 --store-namespace ai-video-reverse-engineer/ticket-23 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_PRODUCT_C28_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_PRODUCT_C28_NONCE" --sequence "$TRUSTED_PRODUCT_C28_SEQUENCE" --expires-at "$TRUSTED_PRODUCT_C28_EXPIRES_AT" --output-root "$TRUSTED_PRODUCT_C28_STAGE_ROOT/export"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py upload --export-root "$TRUSTED_PRODUCT_C28_STAGE_ROOT/export" --target-store-root "$TRUSTED_PRODUCT_C28_TARGET_STORE_ROOT" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c28 --consumer-task 28 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_PRODUCT_C28_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_PRODUCT_C28_NONCE" --sequence "$TRUSTED_PRODUCT_C28_SEQUENCE" --expires-at "$TRUSTED_PRODUCT_C28_EXPIRES_AT" --upload-receipt "$TRUSTED_PRODUCT_C28_STAGE_ROOT/upload-receipt.json"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py sign-seal --manifest "$TRUSTED_PRODUCT_C28_STAGE_ROOT/export/manifest.json" --upload-receipt "$TRUSTED_PRODUCT_C28_STAGE_ROOT/upload-receipt.json" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c28 --consumer-task 28 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_PRODUCT_C28_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_PRODUCT_C28_NONCE" --sequence "$TRUSTED_PRODUCT_C28_SEQUENCE" --expires-at "$TRUSTED_PRODUCT_C28_EXPIRES_AT" --signing-key "$TRUSTED_HANDOFF_ORCHESTRATOR_SIGNING_KEY" --key-id "$TRUSTED_HANDOFF_ORCHESTRATOR_KEY_ID" --output "$TRUSTED_PRODUCT_C28_STAGE_ROOT/seal.json"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py install-transport --target-store-root "$TRUSTED_PRODUCT_C28_TARGET_STORE_ROOT" --manifest "$TRUSTED_PRODUCT_C28_STAGE_ROOT/export/manifest.json" --seal "$TRUSTED_PRODUCT_C28_STAGE_ROOT/seal.json" --upload-receipt "$TRUSTED_PRODUCT_C28_STAGE_ROOT/upload-receipt.json" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c28 --consumer-task 28 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_PRODUCT_C28_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_PRODUCT_C28_NONCE" --sequence "$TRUSTED_PRODUCT_C28_SEQUENCE" --expires-at "$TRUSTED_PRODUCT_C28_EXPIRES_AT"
 ```
 
-编排器把 manifest、upload receipt 和 seal 以只读 job artifacts 返回 producer，producer 对已发布的 local record/pointer 执行 `finalize-publish`；缺目标导入 receipt、签名或固定 trust root 中的 key 即失败：
-
-```bash
-set -euo pipefail
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py finalize-publish \
-  --source-store-root "$TRUSTED_HANDOFF_STORE_ROOT" --handoff-id ticket-23-product-source-v1 \
-  --manifest "$TRUSTED_HANDOFF_MANIFEST_FILE" --upload-receipt "$TRUSTED_HANDOFF_UPLOAD_RECEIPT_FILE" \
-  --seal "$TRUSTED_HANDOFF_SEAL_FILE" \
-  --expected-source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" \
-  --expected-destination-executor-id "$TRUSTED_DESTINATION_EXECUTOR_ID"
-```
-
-最后由 destination executor 在其外部 `$TRUSTED_HANDOFF_STORE_ROOT` 上执行完整消费验证：
-
-```bash
-set -euo pipefail
-TASK22_VERIFY_CACHE="$(mktemp -d)"
-chmod 0700 "$TASK22_VERIFY_CACHE"
-trap 'rm -rf -- "$TASK22_VERIFY_CACHE"' EXIT
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py verify-cache \
-  --cache-root "$TASK22_VERIFY_CACHE" --require-empty --expected-mode 0700
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py fetch \
-  --store-root "$TRUSTED_HANDOFF_STORE_ROOT" --handoff-id ticket-23-product-source-v1 \
-  --seal "$TRUSTED_HANDOFF_SEAL_FILE" --cache-root "$TASK22_VERIFY_CACHE"
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py import \
-  --cache-root "$TASK22_VERIFY_CACHE" --handoff-id ticket-23-product-source-v1 \
-  --seal "$TRUSTED_HANDOFF_SEAL_FILE" \
-  --expected-destination-executor-id "$TRUSTED_DESTINATION_EXECUTOR_ID"
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py finalize \
-  --cache-root "$TASK22_VERIFY_CACHE" --handoff-id ticket-23-product-source-v1 \
-  --expected-kind product-source --expected-producer-task 22 --consumer-task 23
-TASK22_VERIFIED_PRODUCT_COMMIT="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py read \
-  --cache-root "$TASK22_VERIFY_CACHE" --handoff-id ticket-23-product-source-v1 \
-  --expected-kind product-source --expected-producer-task 22 --consumer-task 23 --field producerCommit)"
-printf '%s\n' "$TASK22_VERIFIED_PRODUCT_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
-```
-
-三组命令之间只交付已列 job artifacts，不交付 boundary manifest、FD、store path/inode/mtime 或 shell identity。`TRUSTED_HANDOFF_EXPORT_OUTPUT_ROOT` 与 `TRUSTED_HANDOFF_ORCHESTRATOR_OUTPUT_ROOT` 是编排器预建、空、0700、跨角色 artifact capture 期间持有的 staging roots，交付完成后由编排器清理，路径不入任何 digest；重放/篡改/wrong-executor 测试必须在 `finalize-publish` 或 `import` 阶段稳定拒绝。
+每个 stage root 均由编排器预建为空、0700、no-symlink 绝对根并在交付后清理；四个 target store 可位于不同 executor。任一 install 失败只使对应 consumer transport 不可用，不改写 record/pointer 或其他 consumer transport。
 
 ### Task 23: 构建 Ticket 23 产品专属 dependency containers
 
@@ -735,6 +735,7 @@ printf '%s\n' "$TASK22_VERIFIED_PRODUCT_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
 - Create generated blobs: `.scratch/unified-remix-canvas-generation/acceptance/trust/dependencies/sha256/<aa>/<digest>`
 - Create: `.scratch/unified-remix-canvas-generation/acceptance/test_ticket23_dependency_repositories.py`
 - Modify: `.scratch/unified-remix-canvas-generation/acceptance/README.md`
+- Ephemeral only: 单一 0700 `TASK23_TEMP_PARENT` 下的 handoff/sanitized/repro/toolchain/view/COW/cache/report 子根与 platform measurement；一个 EXIT trap 清理。
 
 **Interfaces:**
 - Consumes: `ticket-23-product-source-v1` handoff 中经过摘要验证的 product container/build record/subject/source，Task 11 sanitized checkout contract，产品内 `backend/requirements.lock` 与 `frontend/package-lock.json` 两个有界稳定输入，以及 Task 18 的 toolchain build record/artifact ref/platform identity；不得读取 Task 22 worktree 或复用 fixture digest。
@@ -751,39 +752,51 @@ TASK23_TOOLCHAIN_REF="$(backend/.venv/bin/python .scratch/unified-remix-canvas-g
   --content-store-root .scratch/unified-remix-canvas-generation/acceptance/trust/toolchains \
   --platform-identity .scratch/unified-remix-canvas-generation/acceptance/fixtures/e2-v2/toolchain/out/platform-identity.json)"
 printf '%s\n' "$TASK23_TOOLCHAIN_REF" | grep -Eq '^sha256:[0-9a-f]{64}$'
-TASK23_HANDOFF_CACHE="$(mktemp -d)"
-TASK23_SANITIZED_CHECKOUT="$(mktemp -d)"
-TASK23_DEP_REPRO_ROOT_A="$(mktemp -d)"
-TASK23_DEP_REPRO_ROOT_B="$(mktemp -d)"
-TASK23_TOOLCHAIN_ROOT="$(mktemp -d)"
-TASK23_PYTHON_VIEW_ROOT="$(mktemp -d)"
-TASK23_NPM_VIEW_ROOT="$(mktemp -d)"
-TASK23_NPM_COW_UPPER="$(mktemp -d)"
-TASK23_UV_CACHE_1="$(mktemp -d)"
-TASK23_UV_CACHE_2="$(mktemp -d)"
-TASK23_REPORT_ROOT="$(mktemp -d)"
-TASK23_PLATFORM_MEASUREMENT="$(mktemp -d)/platform-measurement.json"
+TASK23_TEMP_PARENT="$(mktemp -d)"
+chmod 0700 "$TASK23_TEMP_PARENT"
+trap 'rm -rf -- "$TASK23_TEMP_PARENT"' EXIT
+TASK23_HANDOFF_CACHE="$TASK23_TEMP_PARENT/handoff-cache"
+TASK23_SANITIZED_CHECKOUT="$TASK23_TEMP_PARENT/sanitized-checkout"
+TASK23_DEP_REPRO_ROOT_A="$TASK23_TEMP_PARENT/repro-a"
+TASK23_DEP_REPRO_ROOT_B="$TASK23_TEMP_PARENT/repro-b"
+TASK23_TOOLCHAIN_ROOT="$TASK23_TEMP_PARENT/toolchain"
+TASK23_PYTHON_VIEW_ROOT="$TASK23_TEMP_PARENT/python-view"
+TASK23_NPM_VIEW_ROOT="$TASK23_TEMP_PARENT/npm-view"
+TASK23_NPM_COW_UPPER="$TASK23_TEMP_PARENT/npm-cow-upper"
+TASK23_UV_CACHE_1="$TASK23_TEMP_PARENT/uv-cache-venv"
+TASK23_UV_CACHE_2="$TASK23_TEMP_PARENT/uv-cache-sync"
+TASK23_REPORT_ROOT="$TASK23_TEMP_PARENT/reports"
+TASK23_PLATFORM_MEASUREMENT="$TASK23_TEMP_PARENT/platform-measurement.json"
+mkdir -m 0700 "$TASK23_HANDOFF_CACHE" "$TASK23_SANITIZED_CHECKOUT" "$TASK23_DEP_REPRO_ROOT_A" "$TASK23_DEP_REPRO_ROOT_B" "$TASK23_TOOLCHAIN_ROOT" "$TASK23_PYTHON_VIEW_ROOT" "$TASK23_NPM_VIEW_ROOT" "$TASK23_NPM_COW_UPPER" "$TASK23_UV_CACHE_1" "$TASK23_UV_CACHE_2" "$TASK23_REPORT_ROOT"
 for root in "$TASK23_HANDOFF_CACHE" "$TASK23_SANITIZED_CHECKOUT" "$TASK23_DEP_REPRO_ROOT_A" "$TASK23_DEP_REPRO_ROOT_B" "$TASK23_TOOLCHAIN_ROOT" "$TASK23_PYTHON_VIEW_ROOT" "$TASK23_NPM_VIEW_ROOT" "$TASK23_NPM_COW_UPPER" "$TASK23_UV_CACHE_1" "$TASK23_UV_CACHE_2" "$TASK23_REPORT_ROOT"; do
-  chmod 0700 "$root"
   test -d "$root" && test ! -L "$root" && test -z "$(find "$root" -mindepth 1 -print -quit)"
 done
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/build_ticket23_dependency_repositories.py verify-empty-roots \
+  --parent "$TASK23_TEMP_PARENT" --expected-mode 0700 \
+  --root "$TASK23_HANDOFF_CACHE" --root "$TASK23_SANITIZED_CHECKOUT" \
+  --root "$TASK23_DEP_REPRO_ROOT_A" --root "$TASK23_DEP_REPRO_ROOT_B" \
+  --root "$TASK23_TOOLCHAIN_ROOT" --root "$TASK23_PYTHON_VIEW_ROOT" --root "$TASK23_NPM_VIEW_ROOT" \
+  --root "$TASK23_NPM_COW_UPPER" --root "$TASK23_UV_CACHE_1" --root "$TASK23_UV_CACHE_2" --root "$TASK23_REPORT_ROOT"
 backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py verify-cache \
   --cache-root "$TASK23_HANDOFF_CACHE" --require-empty --expected-mode 0700
 backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py fetch \
   --store-root "$TRUSTED_HANDOFF_STORE_ROOT" --handoff-id ticket-23-product-source-v1 \
-  --seal "$TRUSTED_PRODUCT_HANDOFF_SEAL_FILE" --cache-root "$TASK23_HANDOFF_CACHE"
+  --transport-id ticket-23-product-source-v1-c23 --consumer-task 23 \
+  --expected-destination-executor-id "$TRUSTED_PRODUCT_C23_DESTINATION_EXECUTOR_ID" --cache-root "$TASK23_HANDOFF_CACHE"
 backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py import \
   --cache-root "$TASK23_HANDOFF_CACHE" --handoff-id ticket-23-product-source-v1 \
-  --seal "$TRUSTED_PRODUCT_HANDOFF_SEAL_FILE" \
-  --expected-destination-executor-id "$TRUSTED_DESTINATION_EXECUTOR_ID"
+  --transport-id ticket-23-product-source-v1-c23 --consumer-task 23 \
+  --expected-destination-executor-id "$TRUSTED_PRODUCT_C23_DESTINATION_EXECUTOR_ID"
 backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py finalize \
   --cache-root "$TASK23_HANDOFF_CACHE" --handoff-id ticket-23-product-source-v1 \
-  --expected-kind product-source --expected-producer-task 22 --consumer-task 23
+  --transport-id ticket-23-product-source-v1-c23 --expected-kind product-source --expected-producer-task 22 --consumer-task 23 \
+  --expected-destination-executor-id "$TRUSTED_PRODUCT_C23_DESTINATION_EXECUTOR_ID"
 backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/build_e2_toolchain_fixture.py materialize \
   --artifact-ref "$TASK23_TOOLCHAIN_REF" --output-root "$TASK23_TOOLCHAIN_ROOT" --offline
 backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/build_ticket23_dependency_repositories.py build \
   --product-handoff-cache-root "$TASK23_HANDOFF_CACHE" \
-  --product-handoff-id ticket-23-product-source-v1 --consumer-task 23 \
+  --product-handoff-id ticket-23-product-source-v1 --product-transport-id ticket-23-product-source-v1-c23 --consumer-task 23 \
+  --expected-destination-executor-id "$TRUSTED_PRODUCT_C23_DESTINATION_EXECUTOR_ID" \
   --sanitized-checkout-root "$TASK23_SANITIZED_CHECKOUT" \
   --python-lock backend/requirements.lock --npm-lock frontend/package-lock.json \
   --toolchain-build-record .scratch/unified-remix-canvas-generation/acceptance/fixtures/e2-v2/toolchain/out/build-record.json \
@@ -806,7 +819,7 @@ TASK23_PYTHON_VIEW="$TASK23_PYTHON_VIEW_ROOT/python-find-links"
 TASK23_NPM_VIEW="$TASK23_NPM_VIEW_ROOT/npm-cache-root"
 ```
 
-builder 必须在两个空根分别构建 containers/views，逐 byte/digest 比较后才发布；两个 records 都绑定 product subject/source/container/build-record/proof、两 lock、toolchain artifact/build-record/platform identity 及各自 input/provenance/container/view/install/entrypoint digests。`materialize` 从 published refs 重验；COW/cache 均是当次空根。
+`verify-empty-roots` 用 no-follow owning handle 核对 parent/全部子根的绝对归属、owner/mode、root identity、no-symlink、空初态与无 hard-linked regular entry，任一变化都在 fetch/materialize 前拒绝。builder 必须在两个空根分别构建 containers/views，逐 byte/digest 比较后才发布；两个 records 都绑定 product subject/source/container/build-record/proof、两 lock、toolchain artifact/build-record/platform identity 及各自 input/provenance/container/view/install/entrypoint digests。`materialize` 从 published refs 重验；COW/cache 均是当次空根。
 - [ ] **Step 4:** 运行单一 validation runner；它在任何真实 executor spawn 前调用 `measure_platform`/`compare_platform_identity` 并写 task-local measurement，随后将以下固定 invocation specs 交给 `LinuxContainmentSupervisor`，每个 leaf 都使用无接口 network namespace、继承式 seccomp DNS/socket census 和完整 destroy protocol：backend cwd=`$TASK23_SANITIZED_CHECKOUT`，依次运行 uv venv、uv pip sync、四个顶部“Ticket 23 固定测试身份”所列 pytest node IDs；frontend cwd=`$TASK23_SANITIZED_CHECKOUT/frontend`，依次运行 npm ci、九个顶部已列测试文件/fullName 的包内 Node+Vitest invocation。精确命令：
 
 ```bash
@@ -850,14 +863,15 @@ backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/too
 - Create: `.scratch/unified-remix-canvas-generation/acceptance/trust/git/toonflow-d86cce6b689916ab73f75bc4c1f42a2a7424516c.bundle`
 - Create: `.scratch/unified-remix-canvas-generation/acceptance/trust/product-sources/sha256/<aa>/<digest>`
 - Create: `.scratch/unified-remix-canvas-generation/acceptance/trust/e1-ticket23-sources.json`
+- Create: `.scratch/unified-remix-canvas-generation/acceptance/tools/build_ticket23_e1_sources.py`
 - Create: `.scratch/unified-remix-canvas-generation/acceptance/test_ticket23_e1_sources.py`
 - Ephemeral only: 0700 `TASK25_CACHE_PARENT/handoff-cache` 及 finalized marker；EXIT trap 清理，不跟踪、不跨 Task 复用。
 
 **Interfaces:**
 - Consumes: Tasks 10–11、从 `$TRUSTED_HANDOFF_STORE_ROOT` authenticated fetch 的 `ticket-23-product-source-v1`（producer=22、consumer=25）中 product container/build-record/raw-inspection-proof/boundary/source digests；Toonflow fixed commit/MIT license。
-- Produces: 两个 E1 refs、Toonflow/license 与产品实现/测试/lock blob mappings。
+- Produces: `build_ticket23_e1_sources.py verify-product/import-sources/parse-import-result`、两个 E1 refs、Toonflow/license 与产品实现/测试/lock blob mappings；`parse-import-result` strict parse 完整 stdin 后以 `--field toonflowSourceRef|productSourceRef` 只输出一个已验证 ref。
 
-- [ ] **Step 1:** 写 RED：Toonflow bundle 必含 fixed commit/objects/MIT；product raw Git container 必先通过 Task 11 inspector，E1 映射只绑定 `VerifiedProductRepositorySourceV1` 的 Task 22 commit 与逐 blob digests。
+- [ ] **Step 1:** 写 RED：Toonflow bundle 必含 fixed commit/objects/MIT；product transport 必为 consumer 25 的独立 seal；container/build-record/inspection-proof/boundary/tracked/control/source 七 bindings 必须逐项显式匹配，Task 11 inspector 产出 `VerifiedProductRepositorySourceV1` 前不得导入；E1 mapping 只绑定该 typed source 的 Task 22 commit 与逐 blob digests。错 transport/consumer/destination、七项任一换绑、Task 11 拒绝或 import result 非严格 schema 均零 product-source/E1 写入。
 - [ ] **Step 2:** 运行 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_ticket23_e1_sources.py`；预期真实 inputs RED。
 - [ ] **Step 3:** Toonflow 用包内 Git bundle verify/cat-file；产品只执行下列完整消费命令。`verify-cache` 在 fetch 前验根是当次新建、0700、空、no-symlink 且只有唯一打开 identity；`import/finalize` 逐入口拒绝 symlink、非 regular file、hard-linked regular file、额外 entry 或 root identity 变化；trap 无论成败都删除整个 task-local parent：
 
@@ -875,23 +889,53 @@ backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/too
   --cache-root "$TASK25_HANDOFF_CACHE" --require-empty --expected-mode 0700
 backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py fetch \
   --store-root "$TRUSTED_HANDOFF_STORE_ROOT" --handoff-id ticket-23-product-source-v1 \
-  --seal "$TRUSTED_PRODUCT_HANDOFF_SEAL_FILE" --cache-root "$TASK25_HANDOFF_CACHE"
+  --transport-id ticket-23-product-source-v1-c25 --consumer-task 25 \
+  --expected-destination-executor-id "$TRUSTED_PRODUCT_C25_DESTINATION_EXECUTOR_ID" --cache-root "$TASK25_HANDOFF_CACHE"
 backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py import \
   --cache-root "$TASK25_HANDOFF_CACHE" --handoff-id ticket-23-product-source-v1 \
-  --seal "$TRUSTED_PRODUCT_HANDOFF_SEAL_FILE" \
-  --expected-destination-executor-id "$TRUSTED_DESTINATION_EXECUTOR_ID"
+  --transport-id ticket-23-product-source-v1-c25 --consumer-task 25 \
+  --expected-destination-executor-id "$TRUSTED_PRODUCT_C25_DESTINATION_EXECUTOR_ID"
 backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py finalize \
   --cache-root "$TASK25_HANDOFF_CACHE" --handoff-id ticket-23-product-source-v1 \
-  --expected-kind product-source --expected-producer-task 22 --consumer-task 25
+  --transport-id ticket-23-product-source-v1-c25 --expected-kind product-source --expected-producer-task 22 --consumer-task 25 \
+  --expected-destination-executor-id "$TRUSTED_PRODUCT_C25_DESTINATION_EXECUTOR_ID"
 TASK25_PRODUCT_COMMIT="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py read \
-  --cache-root "$TASK25_HANDOFF_CACHE" --handoff-id ticket-23-product-source-v1 \
-  --expected-kind product-source --expected-producer-task 22 --consumer-task 25 --field producerCommit)"
+  --cache-root "$TASK25_HANDOFF_CACHE" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c25 \
+  --expected-kind product-source --expected-producer-task 22 --consumer-task 25 --expected-destination-executor-id "$TRUSTED_PRODUCT_C25_DESTINATION_EXECUTOR_ID" --field producerCommit)"
 printf '%s\n' "$TASK25_PRODUCT_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+TASK25_CONTAINER_REF="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py read --cache-root "$TASK25_HANDOFF_CACHE" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c25 --consumer-task 25 --expected-destination-executor-id "$TRUSTED_PRODUCT_C25_DESTINATION_EXECUTOR_ID" --field binding.product-source-container)"
+TASK25_BUILD_RECORD_REF="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py read --cache-root "$TASK25_HANDOFF_CACHE" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c25 --consumer-task 25 --expected-destination-executor-id "$TRUSTED_PRODUCT_C25_DESTINATION_EXECUTOR_ID" --field binding.product-source-build-record)"
+TASK25_PROOF_REF="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py read --cache-root "$TASK25_HANDOFF_CACHE" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c25 --consumer-task 25 --expected-destination-executor-id "$TRUSTED_PRODUCT_C25_DESTINATION_EXECUTOR_ID" --field binding.raw-git-inspection-proof)"
+TASK25_BOUNDARY_DIGEST="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py read --cache-root "$TASK25_HANDOFF_CACHE" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c25 --consumer-task 25 --expected-destination-executor-id "$TRUSTED_PRODUCT_C25_DESTINATION_EXECUTOR_ID" --field binding.boundary-topology)"
+TASK25_TRACKED_DIGEST="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py read --cache-root "$TASK25_HANDOFF_CACHE" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c25 --consumer-task 25 --expected-destination-executor-id "$TRUSTED_PRODUCT_C25_DESTINATION_EXECUTOR_ID" --field binding.tracked-checkout)"
+TASK25_CONTROL_DIGEST="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py read --cache-root "$TASK25_HANDOFF_CACHE" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c25 --consumer-task 25 --expected-destination-executor-id "$TRUSTED_PRODUCT_C25_DESTINATION_EXECUTOR_ID" --field binding.control-metadata)"
+TASK25_SOURCE_DIGEST="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py read --cache-root "$TASK25_HANDOFF_CACHE" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c25 --consumer-task 25 --expected-destination-executor-id "$TRUSTED_PRODUCT_C25_DESTINATION_EXECUTOR_ID" --field binding.source)"
+TASK25_VERIFIED_SOURCE="$TASK25_CACHE_PARENT/verified-product-source.json"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/build_ticket23_e1_sources.py verify-product \
+  --handoff-cache-root "$TASK25_HANDOFF_CACHE" --handoff-id ticket-23-product-source-v1 \
+  --transport-id ticket-23-product-source-v1-c25 --consumer-task 25 --expected-destination-executor-id "$TRUSTED_PRODUCT_C25_DESTINATION_EXECUTOR_ID" --expected-commit "$TASK25_PRODUCT_COMMIT" \
+  --container-ref "$TASK25_CONTAINER_REF" --build-record-ref "$TASK25_BUILD_RECORD_REF" --inspection-proof-ref "$TASK25_PROOF_REF" \
+  --boundary-digest "$TASK25_BOUNDARY_DIGEST" --tracked-checkout-digest "$TASK25_TRACKED_DIGEST" \
+  --control-metadata-digest "$TASK25_CONTROL_DIGEST" --source-digest "$TASK25_SOURCE_DIGEST" \
+  --verified-source-output "$TASK25_VERIFIED_SOURCE"
+TASK25_IMPORT_RESULT="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/build_ticket23_e1_sources.py import-sources \
+  --verified-product-source "$TASK25_VERIFIED_SOURCE" \
+  --toonflow-bundle .scratch/unified-remix-canvas-generation/acceptance/trust/git/toonflow-d86cce6b689916ab73f75bc4c1f42a2a7424516c.bundle \
+  --toonflow-commit d86cce6b689916ab73f75bc4c1f42a2a7424516c --toonflow-license MIT \
+  --product-source-store-root .scratch/unified-remix-canvas-generation/acceptance/trust/product-sources \
+  --mapping-output .scratch/unified-remix-canvas-generation/acceptance/trust/e1-ticket23-sources.json)"
+TASK25_TOONFLOW_E1_REF="$(printf '%s' "$TASK25_IMPORT_RESULT" | backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/build_ticket23_e1_sources.py parse-import-result \
+  --expected-schema ticket23-e1-source-import/v1 --expected-product-commit "$TASK25_PRODUCT_COMMIT" \
+  --expected-toonflow-commit d86cce6b689916ab73f75bc4c1f42a2a7424516c --field toonflowSourceRef)"
+TASK25_PRODUCT_E1_REF="$(printf '%s' "$TASK25_IMPORT_RESULT" | backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/build_ticket23_e1_sources.py parse-import-result \
+  --expected-schema ticket23-e1-source-import/v1 --expected-product-commit "$TASK25_PRODUCT_COMMIT" \
+  --expected-toonflow-commit d86cce6b689916ab73f75bc4c1f42a2a7424516c --field productSourceRef)"
+printf '%s\n' "$TASK25_TOONFLOW_E1_REF" "$TASK25_PRODUCT_E1_REF" | grep -Ec '^sha256:[0-9a-f]{64}$' | grep -qx '2'
 ```
 
-`read` 重算 pointer/full-record 与全部 referenced blobs；后续逐项匹配 proof/build-record/boundary/subject/tracked/control/source/container，经 Task 11 inspector 后才导入正式 product-source store。禁止相对/跨 Task cache，禁止将 seal 文件或 cache path 当成 identity。
+`verify-product` 内部只调用 Task 11 `GitMetadataInspector.inspect(container, proof, build_record)` 的正式路径，重算七 bindings 后产出强类型 `VerifiedProductRepositorySourceV1` canonical JSON；`import-sources` 只接收该 typed output，不接收裸 container/path/digest 自报。两次 `parse-import-result` 都重验完整相同 canonical stdout、schema、两个 commit、两个 refs 与 mapping digest；未知字段、额外 stdout 或两次结果不一致均在 refs 被使用前终止。
 - [ ] **Step 4:** 重跑 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_ticket23_e1_sources.py`；预期 commit/license/all blobs 闭合。
-- [ ] **Step 5:** `git add .scratch/unified-remix-canvas-generation/acceptance/trust/{git,product-sources,e1-ticket23-sources.json} .scratch/unified-remix-canvas-generation/acceptance/test_ticket23_e1_sources.py && git commit -m "build: freeze ticket 23 E1 sources"`
+- [ ] **Step 5:** `git add .scratch/unified-remix-canvas-generation/acceptance/trust/{git,product-sources,e1-ticket23-sources.json} .scratch/unified-remix-canvas-generation/acceptance/tools/build_ticket23_e1_sources.py .scratch/unified-remix-canvas-generation/acceptance/test_ticket23_e1_sources.py && git commit -m "build: freeze ticket 23 E1 sources"`
 
 ### Task 26: 固化 allowed-signers、reviewer policy 与八项 criteria
 
@@ -922,33 +966,44 @@ printf '%s\n' "$TASK25_PRODUCT_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
 - Generated Git ref: `refs/tags/trusted-acceptance/ticket-23-policy-v1`
 - Generated external CAS record/blobs: `$TRUSTED_HANDOFF_STORE_ROOT/sha256/<aa>/<remaining-62-hex>` (not tracked)
 - Generated external pointer: `$TRUSTED_HANDOFF_STORE_ROOT/pointers/ticket-23-policy-v1.json` (not tracked)
-- Generated external transfer/upload receipt/seal: orchestrator transport workspace plus target `$TRUSTED_HANDOFF_STORE_ROOT/{transfers,seals}/ticket-23-policy-v1.json` (not tracked)
+- Generated external per-consumer transports: target stores 中 `transfers/ticket-23-policy-v1/{ticket-23-policy-v1-c28,ticket-23-policy-v1-c29}.json`、对应 `seals/` 文件与 ready markers (not tracked)
+- Ephemeral only: 0700 `TASK27_TEMP_PARENT/product-handoff-cache` 及 policy transport stage roots；各自由所属 shell/encoder 清理。
 
 **Interfaces:**
 - Consumes: Tasks 18–26 的 toolchain/platform/supervisor/source/dependency/E1/E4/public-policy digests；authenticated fetch product handoff（producer=22、consumer=27），并核对两 dependency records 绑定同一 product source/proof/locks/toolchain/platform 及 network-proof。
-- Produces: fixed ref；`publish_ticket23_policy_handoff.py` 发布 kind=`policy`、producerTask=`27`、consumerTasks=`[28,29]` 的 handoff，精确绑定 profile/registry/revocation/product-source+raw-proof/Python+npm dependency/toolchain/platform/supervisor/network-proof/reviewer-policy digests；E1/E2/E4 verifier、四 suites、C01–C03 criteria 与 v1 revocation。
+- Produces: fixed ref；`publish_ticket23_policy_handoff.py` 只接收 consumer 27 的 finalized product-handoff cache root，在内部重验 transport/record/proof/container 并构造强类型 `VerifiedProductRepositorySourceV1`，不接收 product store root、handoff ID 或调用方自报 digest。它发布 kind=`policy`、producerTask=`27`、consumerTasks=`[28,29]` 的单一 record，并在 record 中显式绑定 `product-commit`、`product-source`、`network-proof`、`replay-policy` 四个后续晋级字段；编排器再为 Tasks 28/29 分别安装独立 transport。
 
-- [ ] **Step 1:** 写 profile RED 及 publish RED：fixed ref 已被不同 commit 占用、policy pointer 已被不同 record 占用、缺目标 store 导入 receipt/固定 trust-root transport seal、任一精确 binding（含 raw proof/network proof）不符均零 completed publish；相同 ref/record 幂等通过。保留 only-C01–C03、四 pytest、九 Vitest、same source/locks/toolchain/platform、E1+E2+E4 minimum tests。
+- [ ] **Step 1:** 写 profile/publisher RED：Task 27 必须以 transport=`ticket-23-product-source-v1-c27`、consumerTask=27、当前 destination executor 执行 verify-cache→fetch→import→finalize→read；错 transport/consumer/destination、篡改 cache/finalized marker，或试图以 product input 直接传 product store root/handoff ID，均在 policy record write=0 时拒绝。fixed ref/policy pointer 冲突、任一精确 binding 不符也零写；两个 policy consumer 必须有独立 transport/seal，跨 consumer 复用拒绝，byte-identical retry 幂等。
 - [ ] **Step 2:** 运行 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_ticket23_trusted_profile_v2.py .scratch/unified-remix-canvas-generation/acceptance/test_ticket23_policy_handoff.py`；预期 profile/publisher 缺失而 RED。
 - [ ] **Step 3:** 写全部真实 digest，禁止占位/fixture digest；撤销 v1 pointer/artifact，不改 receipt。
-- [ ] **Step 4:** 运行 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_ticket23_trusted_profile_v2.py .scratch/unified-remix-canvas-generation/acceptance/test_ticket23_policy_handoff.py && git diff --exit-code HEAD -- .scratch/unified-remix-canvas-generation/acceptance/matrix-contract.json`；预期 GREEN。publisher 必须从已验证 files/records 构造 fixed bindings，不能接收调用方自报 digest。
-- [ ] **Step 5:** 先执行 `git add .scratch/unified-remix-canvas-generation/acceptance/{profiles/ticket-23.json,trusted-registry.json,trust/revocations.json,tools/publish_ticket23_policy_handoff.py,test_ticket23_trusted_profile_v2.py,test_ticket23_policy_handoff.py} && git commit -m "policy: freeze ticket 23 trusted evidence profile"`。编排器注入与 Task 22 同一严格字段，并额外提供预建空 0700 staging roots `TRUSTED_POLICY_HANDOFF_EXPORT_OUTPUT_ROOT`、`TRUSTED_POLICY_HANDOFF_ORCHESTRATOR_OUTPUT_ROOT`；再在 `set -euo pipefail` 中精确执行：
+- [ ] **Step 4:** 运行 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_ticket23_trusted_profile_v2.py .scratch/unified-remix-canvas-generation/acceptance/test_ticket23_policy_handoff.py && git diff --exit-code HEAD -- .scratch/unified-remix-canvas-generation/acceptance/matrix-contract.json`；预期 GREEN，并覆盖 product c27 全消费链、publisher 参数禁止表与 policy c28/c29 transport 隔离。
+- [ ] **Step 5:** 先提交 policy files，然后在单一 fail-closed harness 中先消费 product c27，再调用 publisher。publisher 只接收 finalized cache root，不存在 `--product-store-root`/`--product-handoff-id` 参数：
 
 ```bash
+set -euo pipefail
+git add .scratch/unified-remix-canvas-generation/acceptance/{profiles/ticket-23.json,trusted-registry.json,trust/revocations.json,tools/publish_ticket23_policy_handoff.py,test_ticket23_trusted_profile_v2.py,test_ticket23_policy_handoff.py}
+git commit -m "policy: freeze ticket 23 trusted evidence profile"
 TASK27_POLICY_COMMIT="$(git rev-parse HEAD)"
-TASK27_TRANSFER_DIR="$TRUSTED_POLICY_HANDOFF_EXPORT_OUTPUT_ROOT"
-test -d "$TASK27_TRANSFER_DIR"
-test ! -L "$TASK27_TRANSFER_DIR"
-test -z "$(find "$TASK27_TRANSFER_DIR" -mindepth 1 -print -quit)"
+TASK27_TEMP_PARENT="$(mktemp -d)"
+chmod 0700 "$TASK27_TEMP_PARENT"
+trap 'rm -rf -- "$TASK27_TEMP_PARENT"' EXIT
+TASK27_PRODUCT_CACHE="$TASK27_TEMP_PARENT/product-handoff-cache"
+mkdir -m 0700 "$TASK27_PRODUCT_CACHE"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py verify-cache --cache-root "$TASK27_PRODUCT_CACHE" --require-empty --expected-mode 0700
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py fetch --store-root "$TRUSTED_HANDOFF_STORE_ROOT" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c27 --consumer-task 27 --expected-destination-executor-id "$TRUSTED_PRODUCT_C27_DESTINATION_EXECUTOR_ID" --cache-root "$TASK27_PRODUCT_CACHE"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py import --cache-root "$TASK27_PRODUCT_CACHE" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c27 --consumer-task 27 --expected-destination-executor-id "$TRUSTED_PRODUCT_C27_DESTINATION_EXECUTOR_ID"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py finalize --cache-root "$TASK27_PRODUCT_CACHE" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c27 --expected-kind product-source --expected-producer-task 22 --consumer-task 27 --expected-destination-executor-id "$TRUSTED_PRODUCT_C27_DESTINATION_EXECUTOR_ID"
+TASK27_PRODUCT_COMMIT="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py read --cache-root "$TASK27_PRODUCT_CACHE" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c27 --expected-kind product-source --expected-producer-task 22 --consumer-task 27 --expected-destination-executor-id "$TRUSTED_PRODUCT_C27_DESTINATION_EXECUTOR_ID" --field producerCommit)"
+printf '%s\n' "$TASK27_PRODUCT_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
 if ! git update-ref refs/tags/trusted-acceptance/ticket-23-policy-v1 "$TASK27_POLICY_COMMIT" 0000000000000000000000000000000000000000; then
   test "$(git rev-parse refs/tags/trusted-acceptance/ticket-23-policy-v1)" = "$TASK27_POLICY_COMMIT"
 fi
 backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/publish_ticket23_policy_handoff.py \
   --store-root "$TRUSTED_HANDOFF_STORE_ROOT" --handoff-id ticket-23-policy-v1 --policy-commit "$TASK27_POLICY_COMMIT" \
+  --product-handoff-cache-root "$TASK27_PRODUCT_CACHE" \
   --profile .scratch/unified-remix-canvas-generation/acceptance/profiles/ticket-23.json \
   --registry .scratch/unified-remix-canvas-generation/acceptance/trusted-registry.json \
   --revocations .scratch/unified-remix-canvas-generation/acceptance/trust/revocations.json \
-  --product-handoff-id ticket-23-product-source-v1 \
   --python-build-record .scratch/unified-remix-canvas-generation/acceptance/fixtures/ticket-23/dependencies/out/python-build-record.json \
   --npm-build-record .scratch/unified-remix-canvas-generation/acceptance/fixtures/ticket-23/dependencies/out/npm-build-record.json \
   --network-proof .scratch/unified-remix-canvas-generation/acceptance/fixtures/ticket-23/dependencies/out/network-proof.json \
@@ -956,70 +1011,24 @@ backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/too
   --platform-identity .scratch/unified-remix-canvas-generation/acceptance/fixtures/e2-v2/toolchain/out/platform-identity.json \
   --reviewer-policy .scratch/unified-remix-canvas-generation/acceptance/trust/reviewer-policy.json \
   --producer-task 27 --consumer-task 28 --consumer-task 29 --publish-local-only
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py export \
-  --source-store-root "$TRUSTED_HANDOFF_STORE_ROOT" --handoff-id ticket-23-policy-v1 \
-  --store-namespace ai-video-reverse-engineer/ticket-23 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" \
-  --destination-executor-id "$TRUSTED_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_HANDOFF_NONCE" \
-  --sequence "$TRUSTED_HANDOFF_SEQUENCE" --expires-at "$TRUSTED_HANDOFF_EXPIRES_AT" \
-  --output-root "$TASK27_TRANSFER_DIR"
 ```
 
-编排器将上述 export 目录以只读绝对路径 `$TRUSTED_POLICY_HANDOFF_EXPORT_ROOT` 交付编排面，仅编排面执行：
+编排器再为 policy consumers 28/29 独立执行全链：
 
 ```bash
 set -euo pipefail
-TASK27_ORCHESTRATOR_OUT="$TRUSTED_POLICY_HANDOFF_ORCHESTRATOR_OUTPUT_ROOT"
-test -d "$TASK27_ORCHESTRATOR_OUT"
-test ! -L "$TASK27_ORCHESTRATOR_OUT"
-test -z "$(find "$TASK27_ORCHESTRATOR_OUT" -mindepth 1 -print -quit)"
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py upload \
-  --export-root "$TRUSTED_POLICY_HANDOFF_EXPORT_ROOT" --target-store-root "$TRUSTED_TARGET_HANDOFF_STORE_ROOT" \
-  --upload-receipt "$TASK27_ORCHESTRATOR_OUT/upload-receipt.json"
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py sign-seal \
-  --manifest "$TRUSTED_POLICY_HANDOFF_EXPORT_ROOT/manifest.json" \
-  --upload-receipt "$TASK27_ORCHESTRATOR_OUT/upload-receipt.json" \
-  --signing-key "$TRUSTED_HANDOFF_ORCHESTRATOR_SIGNING_KEY" \
-  --key-id "$TRUSTED_HANDOFF_ORCHESTRATOR_KEY_ID" \
-  --output "$TASK27_ORCHESTRATOR_OUT/transport-seal.json"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py export --source-store-root "$TRUSTED_HANDOFF_STORE_ROOT" --handoff-id ticket-23-policy-v1 --transport-id ticket-23-policy-v1-c28 --consumer-task 28 --store-namespace ai-video-reverse-engineer/ticket-23 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_POLICY_C28_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_POLICY_C28_NONCE" --sequence "$TRUSTED_POLICY_C28_SEQUENCE" --expires-at "$TRUSTED_POLICY_C28_EXPIRES_AT" --output-root "$TRUSTED_POLICY_C28_STAGE_ROOT/export"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py upload --export-root "$TRUSTED_POLICY_C28_STAGE_ROOT/export" --target-store-root "$TRUSTED_POLICY_C28_TARGET_STORE_ROOT" --handoff-id ticket-23-policy-v1 --transport-id ticket-23-policy-v1-c28 --consumer-task 28 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_POLICY_C28_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_POLICY_C28_NONCE" --sequence "$TRUSTED_POLICY_C28_SEQUENCE" --expires-at "$TRUSTED_POLICY_C28_EXPIRES_AT" --upload-receipt "$TRUSTED_POLICY_C28_STAGE_ROOT/upload-receipt.json"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py sign-seal --manifest "$TRUSTED_POLICY_C28_STAGE_ROOT/export/manifest.json" --upload-receipt "$TRUSTED_POLICY_C28_STAGE_ROOT/upload-receipt.json" --handoff-id ticket-23-policy-v1 --transport-id ticket-23-policy-v1-c28 --consumer-task 28 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_POLICY_C28_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_POLICY_C28_NONCE" --sequence "$TRUSTED_POLICY_C28_SEQUENCE" --expires-at "$TRUSTED_POLICY_C28_EXPIRES_AT" --signing-key "$TRUSTED_HANDOFF_ORCHESTRATOR_SIGNING_KEY" --key-id "$TRUSTED_HANDOFF_ORCHESTRATOR_KEY_ID" --output "$TRUSTED_POLICY_C28_STAGE_ROOT/seal.json"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py install-transport --target-store-root "$TRUSTED_POLICY_C28_TARGET_STORE_ROOT" --manifest "$TRUSTED_POLICY_C28_STAGE_ROOT/export/manifest.json" --seal "$TRUSTED_POLICY_C28_STAGE_ROOT/seal.json" --upload-receipt "$TRUSTED_POLICY_C28_STAGE_ROOT/upload-receipt.json" --handoff-id ticket-23-policy-v1 --transport-id ticket-23-policy-v1-c28 --consumer-task 28 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_POLICY_C28_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_POLICY_C28_NONCE" --sequence "$TRUSTED_POLICY_C28_SEQUENCE" --expires-at "$TRUSTED_POLICY_C28_EXPIRES_AT"
+
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py export --source-store-root "$TRUSTED_HANDOFF_STORE_ROOT" --handoff-id ticket-23-policy-v1 --transport-id ticket-23-policy-v1-c29 --consumer-task 29 --store-namespace ai-video-reverse-engineer/ticket-23 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_POLICY_C29_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_POLICY_C29_NONCE" --sequence "$TRUSTED_POLICY_C29_SEQUENCE" --expires-at "$TRUSTED_POLICY_C29_EXPIRES_AT" --output-root "$TRUSTED_POLICY_C29_STAGE_ROOT/export"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py upload --export-root "$TRUSTED_POLICY_C29_STAGE_ROOT/export" --target-store-root "$TRUSTED_POLICY_C29_TARGET_STORE_ROOT" --handoff-id ticket-23-policy-v1 --transport-id ticket-23-policy-v1-c29 --consumer-task 29 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_POLICY_C29_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_POLICY_C29_NONCE" --sequence "$TRUSTED_POLICY_C29_SEQUENCE" --expires-at "$TRUSTED_POLICY_C29_EXPIRES_AT" --upload-receipt "$TRUSTED_POLICY_C29_STAGE_ROOT/upload-receipt.json"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py sign-seal --manifest "$TRUSTED_POLICY_C29_STAGE_ROOT/export/manifest.json" --upload-receipt "$TRUSTED_POLICY_C29_STAGE_ROOT/upload-receipt.json" --handoff-id ticket-23-policy-v1 --transport-id ticket-23-policy-v1-c29 --consumer-task 29 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_POLICY_C29_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_POLICY_C29_NONCE" --sequence "$TRUSTED_POLICY_C29_SEQUENCE" --expires-at "$TRUSTED_POLICY_C29_EXPIRES_AT" --signing-key "$TRUSTED_HANDOFF_ORCHESTRATOR_SIGNING_KEY" --key-id "$TRUSTED_HANDOFF_ORCHESTRATOR_KEY_ID" --output "$TRUSTED_POLICY_C29_STAGE_ROOT/seal.json"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py install-transport --target-store-root "$TRUSTED_POLICY_C29_TARGET_STORE_ROOT" --manifest "$TRUSTED_POLICY_C29_STAGE_ROOT/export/manifest.json" --seal "$TRUSTED_POLICY_C29_STAGE_ROOT/seal.json" --upload-receipt "$TRUSTED_POLICY_C29_STAGE_ROOT/upload-receipt.json" --handoff-id ticket-23-policy-v1 --transport-id ticket-23-policy-v1-c29 --consumer-task 29 --source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" --destination-executor-id "$TRUSTED_POLICY_C29_DESTINATION_EXECUTOR_ID" --nonce "$TRUSTED_POLICY_C29_NONCE" --sequence "$TRUSTED_POLICY_C29_SEQUENCE" --expires-at "$TRUSTED_POLICY_C29_EXPIRES_AT"
 ```
 
-编排器将 manifest/upload receipt/seal 分别以 `$TRUSTED_POLICY_HANDOFF_MANIFEST_FILE`、`$TRUSTED_POLICY_HANDOFF_UPLOAD_RECEIPT_FILE`、`$TRUSTED_POLICY_HANDOFF_SEAL_FILE` 交付 producer 与 destination executor。producer 先完成目标导入验证；destination 再做独立 fetch/import/finalize/read：
-
-```bash
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py finalize-publish \
-  --source-store-root "$TRUSTED_HANDOFF_STORE_ROOT" --handoff-id ticket-23-policy-v1 \
-  --manifest "$TRUSTED_POLICY_HANDOFF_MANIFEST_FILE" \
-  --upload-receipt "$TRUSTED_POLICY_HANDOFF_UPLOAD_RECEIPT_FILE" --seal "$TRUSTED_POLICY_HANDOFF_SEAL_FILE" \
-  --expected-source-executor-id "$TRUSTED_SOURCE_EXECUTOR_ID" \
-  --expected-destination-executor-id "$TRUSTED_DESTINATION_EXECUTOR_ID"
-```
-
-destination executor 独立执行：
-
-```bash
-set -euo pipefail
-TASK27_VERIFY_CACHE="$(mktemp -d)"
-chmod 0700 "$TASK27_VERIFY_CACHE"
-trap 'rm -rf -- "$TASK27_VERIFY_CACHE"' EXIT
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py verify-cache \
-  --cache-root "$TASK27_VERIFY_CACHE" --require-empty --expected-mode 0700
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py fetch \
-  --store-root "$TRUSTED_HANDOFF_STORE_ROOT" --handoff-id ticket-23-policy-v1 \
-  --seal "$TRUSTED_POLICY_HANDOFF_SEAL_FILE" --cache-root "$TASK27_VERIFY_CACHE"
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py import \
-  --cache-root "$TASK27_VERIFY_CACHE" --handoff-id ticket-23-policy-v1 \
-  --seal "$TRUSTED_POLICY_HANDOFF_SEAL_FILE" \
-  --expected-destination-executor-id "$TRUSTED_DESTINATION_EXECUTOR_ID"
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py finalize \
-  --cache-root "$TASK27_VERIFY_CACHE" --handoff-id ticket-23-policy-v1 \
-  --expected-kind policy --expected-producer-task 27 --consumer-task 28
-TASK27_VERIFIED_POLICY_COMMIT="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py read \
-  --cache-root "$TASK27_VERIFY_CACHE" --handoff-id ticket-23-policy-v1 \
-  --expected-kind policy --expected-producer-task 27 --consumer-task 28 --field producerCommit)"
-printf '%s\n' "$TASK27_VERIFIED_POLICY_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
-```
-
-publish 只在 `finalize-publish` 成功后完成；ref/pointer 已存在但不同即停止。上述三角色是独立 shell；两个编排器 staging roots 为预建空的 0700 绝对根，在 artifact 交付后由编排器清理且不入 digest，destination cache 由 EXIT trap 清理。禁止 shell export、当前 branch、相对 store 或 producer 自签交接。
+两个 stage root 均是编排器预建的空、0700、no-symlink 绝对根；任一 transport 失败不影响另一 transport，但对应 consumer 不得启动。
 
 ### Task 28: 从固定 policy commit collect/register
 
@@ -1044,14 +1053,14 @@ chmod 0700 "$TASK28_POLICY_HANDOFF_CACHE" "$TASK28_PRODUCT_HANDOFF_CACHE"
 trap 'rm -rf -- "$TASK28_POLICY_HANDOFF_CACHE" "$TASK28_PRODUCT_HANDOFF_CACHE"' EXIT
 backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py verify-cache --cache-root "$TASK28_POLICY_HANDOFF_CACHE" --require-empty --expected-mode 0700
 backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py verify-cache --cache-root "$TASK28_PRODUCT_HANDOFF_CACHE" --require-empty --expected-mode 0700
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py fetch --store-root "$TRUSTED_HANDOFF_STORE_ROOT" --handoff-id ticket-23-policy-v1 --seal "$TRUSTED_POLICY_HANDOFF_SEAL_FILE" --cache-root "$TASK28_POLICY_HANDOFF_CACHE"
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py fetch --store-root "$TRUSTED_HANDOFF_STORE_ROOT" --handoff-id ticket-23-product-source-v1 --seal "$TRUSTED_PRODUCT_HANDOFF_SEAL_FILE" --cache-root "$TASK28_PRODUCT_HANDOFF_CACHE"
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py import --cache-root "$TASK28_POLICY_HANDOFF_CACHE" --handoff-id ticket-23-policy-v1 --seal "$TRUSTED_POLICY_HANDOFF_SEAL_FILE" --expected-destination-executor-id "$TRUSTED_DESTINATION_EXECUTOR_ID"
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py import --cache-root "$TASK28_PRODUCT_HANDOFF_CACHE" --handoff-id ticket-23-product-source-v1 --seal "$TRUSTED_PRODUCT_HANDOFF_SEAL_FILE" --expected-destination-executor-id "$TRUSTED_DESTINATION_EXECUTOR_ID"
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py finalize --cache-root "$TASK28_POLICY_HANDOFF_CACHE" --handoff-id ticket-23-policy-v1 --expected-kind policy --expected-producer-task 27 --consumer-task 28
-backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py finalize --cache-root "$TASK28_PRODUCT_HANDOFF_CACHE" --handoff-id ticket-23-product-source-v1 --expected-kind product-source --expected-producer-task 22 --consumer-task 28
-TASK28_POLICY_COMMIT="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py read --cache-root "$TASK28_POLICY_HANDOFF_CACHE" --handoff-id ticket-23-policy-v1 --expected-kind policy --expected-producer-task 27 --consumer-task 28 --field producerCommit)"
-TASK28_PRODUCT_COMMIT="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py read --cache-root "$TASK28_PRODUCT_HANDOFF_CACHE" --handoff-id ticket-23-product-source-v1 --expected-kind product-source --expected-producer-task 22 --consumer-task 28 --field producerCommit)"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py fetch --store-root "$TRUSTED_HANDOFF_STORE_ROOT" --handoff-id ticket-23-policy-v1 --transport-id ticket-23-policy-v1-c28 --consumer-task 28 --expected-destination-executor-id "$TRUSTED_POLICY_C28_DESTINATION_EXECUTOR_ID" --cache-root "$TASK28_POLICY_HANDOFF_CACHE"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py fetch --store-root "$TRUSTED_HANDOFF_STORE_ROOT" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c28 --consumer-task 28 --expected-destination-executor-id "$TRUSTED_PRODUCT_C28_DESTINATION_EXECUTOR_ID" --cache-root "$TASK28_PRODUCT_HANDOFF_CACHE"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py import --cache-root "$TASK28_POLICY_HANDOFF_CACHE" --handoff-id ticket-23-policy-v1 --transport-id ticket-23-policy-v1-c28 --consumer-task 28 --expected-destination-executor-id "$TRUSTED_POLICY_C28_DESTINATION_EXECUTOR_ID"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py import --cache-root "$TASK28_PRODUCT_HANDOFF_CACHE" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c28 --consumer-task 28 --expected-destination-executor-id "$TRUSTED_PRODUCT_C28_DESTINATION_EXECUTOR_ID"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py finalize --cache-root "$TASK28_POLICY_HANDOFF_CACHE" --handoff-id ticket-23-policy-v1 --transport-id ticket-23-policy-v1-c28 --expected-kind policy --expected-producer-task 27 --consumer-task 28 --expected-destination-executor-id "$TRUSTED_POLICY_C28_DESTINATION_EXECUTOR_ID"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py finalize --cache-root "$TASK28_PRODUCT_HANDOFF_CACHE" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c28 --expected-kind product-source --expected-producer-task 22 --consumer-task 28 --expected-destination-executor-id "$TRUSTED_PRODUCT_C28_DESTINATION_EXECUTOR_ID"
+TASK28_POLICY_COMMIT="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py read --cache-root "$TASK28_POLICY_HANDOFF_CACHE" --handoff-id ticket-23-policy-v1 --transport-id ticket-23-policy-v1-c28 --expected-kind policy --expected-producer-task 27 --consumer-task 28 --expected-destination-executor-id "$TRUSTED_POLICY_C28_DESTINATION_EXECUTOR_ID" --field producerCommit)"
+TASK28_PRODUCT_COMMIT="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py read --cache-root "$TASK28_PRODUCT_HANDOFF_CACHE" --handoff-id ticket-23-product-source-v1 --transport-id ticket-23-product-source-v1-c28 --expected-kind product-source --expected-producer-task 22 --consumer-task 28 --expected-destination-executor-id "$TRUSTED_PRODUCT_C28_DESTINATION_EXECUTOR_ID" --field producerCommit)"
 if ! git update-ref refs/tags/trusted-acceptance/ticket-23-policy-v1 "$TASK28_POLICY_COMMIT" 0000000000000000000000000000000000000000; then
   test "$(git rev-parse refs/tags/trusted-acceptance/ticket-23-policy-v1)" = "$TASK28_POLICY_COMMIT"
 fi
@@ -1093,8 +1102,8 @@ E4_REVIEW_ARTIFACT="$(printf '%s' "$E4_REVIEW_RESULT" | backend/.venv/bin/python
 backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/capture_collect_result.py validate-many --cas-root .scratch/unified-remix-canvas-generation/acceptance/evidence "$E1_TOONFLOW_ARTIFACT" "$E1_PRODUCT_ARTIFACT" "$E2_BACKEND_ARTIFACT" "$E2_FRONTEND_ARTIFACT" "$E2_API_ARTIFACT" "$E2_STRUCTURE_ARTIFACT" "$E4_REVIEW_ARTIFACT"
 backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/evidence_bridge.py register-batch \
   --profile ticket-23/v1 --subject "git://product@$TASK28_PRODUCT_COMMIT" --expected-policy-commit "$TASK28_POLICY_COMMIT" \
-  --product-handoff-cache-root "$TASK28_PRODUCT_HANDOFF_CACHE" --product-handoff-id ticket-23-product-source-v1 \
-  --policy-handoff-cache-root "$TASK28_POLICY_HANDOFF_CACHE" --policy-handoff-id ticket-23-policy-v1 \
+  --product-handoff-cache-root "$TASK28_PRODUCT_HANDOFF_CACHE" --product-handoff-id ticket-23-product-source-v1 --product-transport-id ticket-23-product-source-v1-c28 --product-consumer-task 28 --product-expected-destination-executor-id "$TRUSTED_PRODUCT_C28_DESTINATION_EXECUTOR_ID" \
+  --policy-handoff-cache-root "$TASK28_POLICY_HANDOFF_CACHE" --policy-handoff-id ticket-23-policy-v1 --policy-transport-id ticket-23-policy-v1-c28 --policy-consumer-task 28 --policy-expected-destination-executor-id "$TRUSTED_POLICY_C28_DESTINATION_EXECUTOR_ID" \
   --candidate "e1.ticket23.toonflow-source.v1=$E1_TOONFLOW_ARTIFACT" \
   --candidate "e1.ticket23.product-adaptation.v1=$E1_PRODUCT_ARTIFACT" \
   --candidate "e2.ticket23.backend-persistence.v2=$E2_BACKEND_ARTIFACT" \
@@ -1114,22 +1123,24 @@ backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/evi
 - Modify: `.scratch/unified-remix-canvas-generation/acceptance/matrix-contract.json`
 - Modify: `.scratch/unified-remix-canvas-generation/issues/23-align-toonflow-canvas-shell-and-persistence.md`
 - Modify: `.scratch/unified-remix-canvas-generation/acceptance/README.md`
-- Ephemeral only: 0700 `TASK29_CACHE_PARENT/handoff-cache` 及 finalized marker；EXIT trap 清理，不跟踪、不跨 Task 复用。
+- Ephemeral only: 0700 `TASK29_CACHE_PARENT/handoff-cache` 及 `promotion/{snapshot,preflight,result,reconcile-snapshot,reconcile-result}.json`；EXIT trap 清理，不跟踪、不跨 Task 复用。
 
 **Interfaces:**
 - Consumes: Task 28 七个有效 pointers、Task 17 workflow，以及从绝对 `$TRUSTED_HANDOFF_STORE_ROOT` authenticated fetch/import/finalize/read 的 policy handoff（producer=27、consumer=29）与 fixed policy ref；不接受相对路径、Task 28 cache、shell 变量或当前 branch 推断 identity。
 - Produces: 仅 C01–C03 原子 projection/reconciliation；其他 135 项不变。
 
-- [ ] **Step 1:** 写逐项 requirement、criteria reject/missing、revoked/tampered/unreachable、snapshot-race、deny-list tests。
+- [ ] **Step 1:** 写逐项 requirement、criteria reject/missing、revoked/tampered/unreachable、snapshot-race、deny-list tests；覆盖 policy transport 必须为 `ticket-23-policy-v1-c29`/consumer 29/当前 destination executor，错 consumer transport、篡改 finalized cache、七 catalog refs 任一错 subject/悬空/换绑、缺任一显式 product-source/network-proof/replay-policy binding 均在 contract write=0 时拒绝。成功路径断言一次原子投影 C01–C03、投影后新 snapshot 才能 reconcile，且输出 parser 不接受未知字段或伪造 digest。
 - [ ] **Step 2:** 运行 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_ticket23_promotion.py`；预期尚未投影 RED。
-- [ ] **Step 3:** 仅执行下列完整命令重载 policy handoff 与 fixed ref。`verify-cache` 在 fetch 前验根是当次新建、0700、空、no-symlink 且只有唯一打开 identity；`import/finalize` 逐入口拒绝 symlink、非 regular file、hard-linked regular file、额外 entry 或 root identity 变化；trap 无论成败都删除 task-local parent：
+- [ ] **Step 3:** 仅执行下列完整命令重载 policy handoff、读取 fixed bindings/七个 catalog refs，并完成 snapshot→typed preflight→单次原子 promote→新 snapshot→reconcile。`verify-cache` 在 fetch 前验根是当次新建、0700、空、no-symlink 且只有唯一打开 identity；`import/finalize/read` 逐入口拒绝 symlink、非 regular file、hard-linked regular file、额外 entry、root identity 变化或跨 consumer transport；所有 command substitution 都由 strict parser 约束，trap 无论成败都删除 task-local parent：
 
 ```bash
 set -euo pipefail
 TASK29_CACHE_PARENT="$(mktemp -d)"
 chmod 0700 "$TASK29_CACHE_PARENT"
 TASK29_HANDOFF_CACHE="$TASK29_CACHE_PARENT/handoff-cache"
+TASK29_PROMOTION_ROOT="$TASK29_CACHE_PARENT/promotion"
 mkdir -m 0700 "$TASK29_HANDOFF_CACHE"
+mkdir -m 0700 "$TASK29_PROMOTION_ROOT"
 trap 'rm -rf -- "$TASK29_CACHE_PARENT"' EXIT
 test -d "$TASK29_HANDOFF_CACHE"
 test ! -L "$TASK29_HANDOFF_CACHE"
@@ -1138,25 +1149,80 @@ backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/too
   --cache-root "$TASK29_HANDOFF_CACHE" --require-empty --expected-mode 0700
 backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py fetch \
   --store-root "$TRUSTED_HANDOFF_STORE_ROOT" --handoff-id ticket-23-policy-v1 \
-  --seal "$TRUSTED_POLICY_HANDOFF_SEAL_FILE" --cache-root "$TASK29_HANDOFF_CACHE"
+  --transport-id ticket-23-policy-v1-c29 --consumer-task 29 \
+  --expected-destination-executor-id "$TRUSTED_POLICY_C29_DESTINATION_EXECUTOR_ID" \
+  --cache-root "$TASK29_HANDOFF_CACHE"
 backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py import \
   --cache-root "$TASK29_HANDOFF_CACHE" --handoff-id ticket-23-policy-v1 \
-  --seal "$TRUSTED_POLICY_HANDOFF_SEAL_FILE" \
-  --expected-destination-executor-id "$TRUSTED_DESTINATION_EXECUTOR_ID"
+  --transport-id ticket-23-policy-v1-c29 --consumer-task 29 \
+  --expected-destination-executor-id "$TRUSTED_POLICY_C29_DESTINATION_EXECUTOR_ID"
 backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py finalize \
   --cache-root "$TASK29_HANDOFF_CACHE" --handoff-id ticket-23-policy-v1 \
-  --expected-kind policy --expected-producer-task 27 --consumer-task 29
+  --transport-id ticket-23-policy-v1-c29 \
+  --expected-kind policy --expected-producer-task 27 --consumer-task 29 \
+  --expected-destination-executor-id "$TRUSTED_POLICY_C29_DESTINATION_EXECUTOR_ID"
 TASK29_POLICY_COMMIT="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py read \
   --cache-root "$TASK29_HANDOFF_CACHE" --handoff-id ticket-23-policy-v1 \
-  --expected-kind policy --expected-producer-task 27 --consumer-task 29 --field producerCommit)"
+  --transport-id ticket-23-policy-v1-c29 \
+  --expected-kind policy --expected-producer-task 27 --consumer-task 29 --expected-destination-executor-id "$TRUSTED_POLICY_C29_DESTINATION_EXECUTOR_ID" --field producerCommit)"
+TASK29_PRODUCT_COMMIT="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py read --cache-root "$TASK29_HANDOFF_CACHE" --handoff-id ticket-23-policy-v1 --transport-id ticket-23-policy-v1-c29 --expected-kind policy --expected-producer-task 27 --consumer-task 29 --expected-destination-executor-id "$TRUSTED_POLICY_C29_DESTINATION_EXECUTOR_ID" --field binding.product-commit)"
+TASK29_PRODUCT_SOURCE_REF="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py read --cache-root "$TASK29_HANDOFF_CACHE" --handoff-id ticket-23-policy-v1 --transport-id ticket-23-policy-v1-c29 --expected-kind policy --expected-producer-task 27 --consumer-task 29 --expected-destination-executor-id "$TRUSTED_POLICY_C29_DESTINATION_EXECUTOR_ID" --field binding.product-source)"
+TASK29_NETWORK_PROOF_REF="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py read --cache-root "$TASK29_HANDOFF_CACHE" --handoff-id ticket-23-policy-v1 --transport-id ticket-23-policy-v1-c29 --expected-kind policy --expected-producer-task 27 --consumer-task 29 --expected-destination-executor-id "$TRUSTED_POLICY_C29_DESTINATION_EXECUTOR_ID" --field binding.network-proof)"
+TASK29_REPLAY_POLICY_BINDING="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py read --cache-root "$TASK29_HANDOFF_CACHE" --handoff-id ticket-23-policy-v1 --transport-id ticket-23-policy-v1-c29 --expected-kind policy --expected-producer-task 27 --consumer-task 29 --expected-destination-executor-id "$TRUSTED_POLICY_C29_DESTINATION_EXECUTOR_ID" --field binding.replay-policy)"
 printf '%s\n' "$TASK29_POLICY_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+printf '%s\n' "$TASK29_PRODUCT_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+printf '%s\n' "$TASK29_PRODUCT_SOURCE_REF" "$TASK29_NETWORK_PROOF_REF" "$TASK29_REPLAY_POLICY_BINDING" | grep -Ec '^sha256:[0-9a-f]{64}$' | grep -qx '3'
 if ! git update-ref refs/tags/trusted-acceptance/ticket-23-policy-v1 "$TASK29_POLICY_COMMIT" 0000000000000000000000000000000000000000; then
   test "$(git rev-parse refs/tags/trusted-acceptance/ticket-23-policy-v1)" = "$TASK29_POLICY_COMMIT"
 fi
 test "$(git rev-parse refs/tags/trusted-acceptance/ticket-23-policy-v1)" = "$TASK29_POLICY_COMMIT"
+
+TASK29_SUBJECT="git://product@$TASK29_PRODUCT_COMMIT"
+TASK29_E1_TOONFLOW_REF="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/capture_collect_result.py read-catalog-ref --catalog .scratch/unified-remix-canvas-generation/acceptance/evidence-catalog.json --cas-root .scratch/unified-remix-canvas-generation/acceptance/evidence --profile ticket-23/v1 --verifier e1.ticket23.toonflow-source.v1 --subject "$TASK29_SUBJECT")"
+TASK29_E1_PRODUCT_REF="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/capture_collect_result.py read-catalog-ref --catalog .scratch/unified-remix-canvas-generation/acceptance/evidence-catalog.json --cas-root .scratch/unified-remix-canvas-generation/acceptance/evidence --profile ticket-23/v1 --verifier e1.ticket23.product-adaptation.v1 --subject "$TASK29_SUBJECT")"
+TASK29_E2_BACKEND_REF="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/capture_collect_result.py read-catalog-ref --catalog .scratch/unified-remix-canvas-generation/acceptance/evidence-catalog.json --cas-root .scratch/unified-remix-canvas-generation/acceptance/evidence --profile ticket-23/v1 --verifier e2.ticket23.backend-persistence.v2 --subject "$TASK29_SUBJECT")"
+TASK29_E2_FRONTEND_REF="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/capture_collect_result.py read-catalog-ref --catalog .scratch/unified-remix-canvas-generation/acceptance/evidence-catalog.json --cas-root .scratch/unified-remix-canvas-generation/acceptance/evidence --profile ticket-23/v1 --verifier e2.ticket23.frontend-persistence.v2 --subject "$TASK29_SUBJECT")"
+TASK29_E2_API_REF="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/capture_collect_result.py read-catalog-ref --catalog .scratch/unified-remix-canvas-generation/acceptance/evidence-catalog.json --cas-root .scratch/unified-remix-canvas-generation/acceptance/evidence --profile ticket-23/v1 --verifier e2.ticket23.api.v2 --subject "$TASK29_SUBJECT")"
+TASK29_E2_STRUCTURE_REF="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/capture_collect_result.py read-catalog-ref --catalog .scratch/unified-remix-canvas-generation/acceptance/evidence-catalog.json --cas-root .scratch/unified-remix-canvas-generation/acceptance/evidence --profile ticket-23/v1 --verifier e2.ticket23.canvas-structure.v2 --subject "$TASK29_SUBJECT")"
+TASK29_E4_REVIEW_REF="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/tools/capture_collect_result.py read-catalog-ref --catalog .scratch/unified-remix-canvas-generation/acceptance/evidence-catalog.json --cas-root .scratch/unified-remix-canvas-generation/acceptance/evidence --profile ticket-23/v1 --verifier e4.ticket23.canvas-review.v1 --subject "$TASK29_SUBJECT")"
+printf '%s\n' "$TASK29_E1_TOONFLOW_REF" "$TASK29_E1_PRODUCT_REF" "$TASK29_E2_BACKEND_REF" "$TASK29_E2_FRONTEND_REF" "$TASK29_E2_API_REF" "$TASK29_E2_STRUCTURE_REF" "$TASK29_E4_REVIEW_REF" | grep -Ec '^sha256:[0-9a-f]{64}$' | grep -qx '7'
+
+TASK29_PROMOTE_SNAPSHOT="$TASK29_PROMOTION_ROOT/snapshot.json"
+TASK29_PREFLIGHT="$TASK29_PROMOTION_ROOT/preflight.json"
+TASK29_PROMOTE_RESULT="$TASK29_PROMOTION_ROOT/result.json"
+TASK29_RECONCILE_SNAPSHOT="$TASK29_PROMOTION_ROOT/reconcile-snapshot.json"
+TASK29_RECONCILE_RESULT="$TASK29_PROMOTION_ROOT/reconcile-result.json"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/validate_acceptance.py snapshot --operation promote --profile ticket-23/v1 --subject "$TASK29_SUBJECT" --output "$TASK29_PROMOTE_SNAPSHOT"
+TASK29_PROMOTE_SNAPSHOT_DIGEST="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/validate_acceptance.py read-snapshot --input "$TASK29_PROMOTE_SNAPSHOT" --expected-operation promote)"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/validate_acceptance.py preflight-promotion \
+  --profile ticket-23/v1 --subject "$TASK29_SUBJECT" --expected-operation-snapshot "$TASK29_PROMOTE_SNAPSHOT_DIGEST" \
+  --policy-handoff-cache-root "$TASK29_HANDOFF_CACHE" --policy-handoff-id ticket-23-policy-v1 --policy-transport-id ticket-23-policy-v1-c29 --policy-consumer-task 29 --policy-expected-destination-executor-id "$TRUSTED_POLICY_C29_DESTINATION_EXECUTOR_ID" \
+  --expected-policy-commit "$TASK29_POLICY_COMMIT" --product-source-ref "$TASK29_PRODUCT_SOURCE_REF" --network-proof-ref "$TASK29_NETWORK_PROOF_REF" --replay-policy-binding "$TASK29_REPLAY_POLICY_BINDING" \
+  --evidence-ref "e1.ticket23.toonflow-source.v1=$TASK29_E1_TOONFLOW_REF" --evidence-ref "e1.ticket23.product-adaptation.v1=$TASK29_E1_PRODUCT_REF" \
+  --evidence-ref "e2.ticket23.backend-persistence.v2=$TASK29_E2_BACKEND_REF" --evidence-ref "e2.ticket23.frontend-persistence.v2=$TASK29_E2_FRONTEND_REF" \
+  --evidence-ref "e2.ticket23.api.v2=$TASK29_E2_API_REF" --evidence-ref "e2.ticket23.canvas-structure.v2=$TASK29_E2_STRUCTURE_REF" \
+  --evidence-ref "e4.ticket23.canvas-review.v1=$TASK29_E4_REVIEW_REF" --output "$TASK29_PREFLIGHT"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/validate_acceptance.py promote \
+  --validated-preflight "$TASK29_PREFLIGHT" --expected-operation-snapshot "$TASK29_PROMOTE_SNAPSHOT_DIGEST" \
+  --requirement-id C01 --requirement-id C02 --requirement-id C03 --output "$TASK29_PROMOTE_RESULT"
+TASK29_PROMOTION_DIGEST="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/validate_acceptance.py read-result --input "$TASK29_PROMOTE_RESULT" --expected-operation promote --field resultDigest)"
+printf '%s\n' "$TASK29_PROMOTION_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'
+
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/validate_acceptance.py snapshot --operation reconcile --profile ticket-23/v1 --subject "$TASK29_SUBJECT" --output "$TASK29_RECONCILE_SNAPSHOT"
+TASK29_RECONCILE_SNAPSHOT_DIGEST="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/validate_acceptance.py read-snapshot --input "$TASK29_RECONCILE_SNAPSHOT" --expected-operation reconcile)"
+backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/validate_acceptance.py reconcile \
+  --profile ticket-23/v1 --subject "$TASK29_SUBJECT" --expected-operation-snapshot "$TASK29_RECONCILE_SNAPSHOT_DIGEST" --expected-promotion-digest "$TASK29_PROMOTION_DIGEST" \
+  --policy-handoff-cache-root "$TASK29_HANDOFF_CACHE" --policy-handoff-id ticket-23-policy-v1 --policy-transport-id ticket-23-policy-v1-c29 --policy-consumer-task 29 --policy-expected-destination-executor-id "$TRUSTED_POLICY_C29_DESTINATION_EXECUTOR_ID" \
+  --expected-policy-commit "$TASK29_POLICY_COMMIT" --product-source-ref "$TASK29_PRODUCT_SOURCE_REF" --network-proof-ref "$TASK29_NETWORK_PROOF_REF" --replay-policy-binding "$TASK29_REPLAY_POLICY_BINDING" \
+  --evidence-ref "e1.ticket23.toonflow-source.v1=$TASK29_E1_TOONFLOW_REF" --evidence-ref "e1.ticket23.product-adaptation.v1=$TASK29_E1_PRODUCT_REF" \
+  --evidence-ref "e2.ticket23.backend-persistence.v2=$TASK29_E2_BACKEND_REF" --evidence-ref "e2.ticket23.frontend-persistence.v2=$TASK29_E2_FRONTEND_REF" \
+  --evidence-ref "e2.ticket23.api.v2=$TASK29_E2_API_REF" --evidence-ref "e2.ticket23.canvas-structure.v2=$TASK29_E2_STRUCTURE_REF" \
+  --evidence-ref "e4.ticket23.canvas-review.v1=$TASK29_E4_REVIEW_REF" --requirement-id C01 --requirement-id C02 --requirement-id C03 --output "$TASK29_RECONCILE_RESULT"
+TASK29_RECONCILED_DIGEST="$(backend/.venv/bin/python .scratch/unified-remix-canvas-generation/acceptance/validate_acceptance.py read-result --input "$TASK29_RECONCILE_RESULT" --expected-operation reconcile --field resultDigest)"
+printf '%s\n' "$TASK29_RECONCILED_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'
 ```
 
-随后在同一 fail-closed harness 内重验 profile/replay binding、network proof 与七 evidence pointers；仅全部有效才 promote/reconcile。禁止从当前 branch、Task 28 cache、相对路径或未验证 shell 值推断 identity。
+`preflight-promotion` 与 `reconcile` 都必须在自身进程中重开 finalized policy cache、fixed ref、catalog/CAS、profile/registry/revocations、matrix contract，并将命令行显式值与验证后对象逐项等值比较；任何失败都发生在 contract temp file 创建前。`promote` 只接受 typed preflight，不接受七个散装 shell refs；reconcile 强制使用投影后新 snapshot。禁止从当前 branch、Task 28 cache、相对路径或未验证 shell 值推断 identity。
 - [ ] **Step 4:** 运行 `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance`；预期 138 项与其他 135 项不变，失效正确降级。
 - [ ] **Step 5:** `git add .scratch/unified-remix-canvas-generation/acceptance/{matrix-contract.json,README.md,test_ticket23_promotion.py} .scratch/unified-remix-canvas-generation/issues/23-align-toonflow-canvas-shell-and-persistence.md && git commit -m "feat: promote ticket 23 trusted acceptance"`
 
@@ -1212,6 +1278,11 @@ test "$(git rev-parse refs/tags/trusted-acceptance/ticket-23-policy-v1)" = "$TAS
 | 第六轮 Important 1：可执行 transport seal 状态机与固定 trust root | 2、22、27–29 |
 | 第六轮 Important 2：Task 18 toolchain ref 严格提取与全命令消费 | 23、25、29 |
 | 第六轮 Minor：Task 25/29 cache 安全初始化、link 检查与清理 | 2、25、29 |
+| 第七轮 Critical：Task 27 只能消费 consumer 27 finalized product cache | 2、22、27 |
+| 第七轮 Important 1：target transport 原子 no-replace install、fsync 与 byte-identical retry | Global Constraints、固定跨任务接口、2、22、27 |
+| 第七轮 Important 2：每 consumer 独立 transport/seal/nonce/sequence/destination | 2、22–23、25、27–29 |
+| 第七轮 Important 3：Task 25/29 全命令核心与 strict output capture | 16–17、25、29 |
+| 第七轮 Minor：logical topology 字段、provisioner JSON 与单临时父根 | 10–11、22–23 |
 
 ### 自包含接口、依赖拓扑与真实命令
 
@@ -1223,7 +1294,7 @@ test "$(git rev-parse refs/tags/trusted-acceptance/ticket-23-policy-v1)" = "$TAS
 - containment 七方法、消息字段、序号/摘要链、权限、binary identity 与唯一 kernel mechanism 在 Task 13 冻结；Task 14 不能重新选型。
 - Task 3 是唯一 scanner owner；receipt/barrier/collect 只调用该接口，无依赖循环。
 - Task 1 给出 bootstrap hashes；Tasks 18–21/23 有 exact builders/records。Task 23 在 platform compare 后把真实 uv/npm/pytest/Vitest 全部送入 Task 14 containment，无接口 network namespace+census 证明而非只依赖 `--offline`。
-- 跨 Task 只允许已提交 records/CAS 与编排器验证的绝对外部 `$TRUSTED_HANDOFF_STORE_ROOT`；producer `publish-local/export`，编排面 `upload→target import→sign-seal`，producer `finalize-publish`，consumer `fetch→import→finalize→read`。seal 认证根只来自固定 policy/allowed-signers，publish 不在目标导入成功前完成；store path/租约不入 digest，Task-local cache/mktemp 不交接，Task 25/29 明确 0700、空根、no-symlink/no-hardlink 验证与 EXIT cleanup；policy 另与 fixed Git ref 闭合。
+- 跨 Task 只允许已提交 records/CAS 与编排器验证的绝对外部 `$TRUSTED_HANDOFF_STORE_ROOT`；producer 只做一次 `publish-local`，编排面按 consumer 分别执行 `export→upload→sign-seal→install-transport`，consumer 再执行 `verify-cache→fetch→import→finalize→read`。每个 transport 的 manifest/seal/ready marker 在 target durable store 原子 no-replace install 并 fsync；seal 认证根只来自固定 policy/allowed-signers；store path/租约不入 digest，Task-local cache/mktemp 不交接，Tasks 23/25/27/28/29 各用自己的 transport/cache，Task 25/29 明确 0700、空根、no-symlink/no-hardlink 验证与 EXIT cleanup；policy 另与 fixed Git ref 闭合。
 - Review Focus 五项分别由 Tasks 5/17、3/20、14/21、19–20、10–11/22–23/27–29 持有，编号无漂移。
 - 29 个 Task 均为单独实现会话、单独 commit、单独新审查会话；Task 13、27、28 是不可跳过的硬门。
 
