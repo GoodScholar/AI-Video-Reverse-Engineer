@@ -32,6 +32,7 @@ from trusted_evidence.handoffs import (
     _ED_L,
     _ED_Q,
     load_disjoint_signing_domains,
+    verify_policy_transport_source_closure,
 )
 
 
@@ -90,6 +91,17 @@ def _closure(source: TrustedHandoffStoreV1, export_request_ref: str, handoff_id:
     return request, request_bytes, record, pointer, record_bytes, pointer_bytes, refs, blobs
 
 
+def _policy_closure(source: TrustedHandoffStoreV1, export_request_ref: str, handoff_id: str, consumer_task: int, destination_executor_id: str, signing_domains: VerifiedSigningDomainsV1):
+    activated, handoff, _proof, record, pointer, core_request, refs = verify_policy_transport_source_closure(
+        source, export_request_ref, handoff_id, consumer_task, destination_executor_id, signing_domains,
+    )
+    activated_bytes = source.read_blob(export_request_ref)
+    record_bytes = source.read_blob(handoff.core_record_ref)
+    pointer_bytes = source.read_pointer(handoff.core_pointer_name)
+    blobs = tuple(source.read_blob(ref) for ref in refs)
+    return activated, activated_bytes, record, pointer, record_bytes, pointer_bytes, refs, blobs, core_request
+
+
 def verify_export_request(source_store: TrustedHandoffStoreV1, export_request_ref: str, handoff_id: str, consumer_task: int) -> HandoffTransferManifestV1:
     request, request_bytes, _record, _pointer, record_bytes, pointer_bytes, refs, _blobs = _closure(source_store, export_request_ref, handoff_id, consumer_task)
     return HandoffTransferManifestV1(
@@ -101,12 +113,15 @@ def verify_export_request(source_store: TrustedHandoffStoreV1, export_request_re
 
 
 def export(job: TransportJobV1, source_store: TrustedHandoffStoreV1) -> HandoffTransferManifestV1:
-    request, request_bytes, _record, _pointer, record_bytes, pointer_bytes, refs, _blobs = _closure(source_store, job.export_request_ref, job.handoff_id, job.consumer_task)
-    if job.policy_activation_proof_ref is not None:
-        raise ValueError("product transport must not carry a policy activation proof")
+    if job.policy_activation_proof_ref is None:
+        request, request_bytes, record, _pointer, record_bytes, pointer_bytes, refs, _blobs = _closure(source_store, job.export_request_ref, job.handoff_id, job.consumer_task)
+    else:
+        if job.signing_domains is None:
+            raise ValueError("policy transport requires signing domains")
+        request, request_bytes, record, _pointer, record_bytes, pointer_bytes, refs, _blobs, _core_request = _policy_closure(source_store, job.export_request_ref, job.handoff_id, job.consumer_task, job.destination_executor_id, job.signing_domains)
     manifest = HandoffTransferManifestV1(
         "trusted-handoff-transfer/v1", job.export_request_ref, _digest(request_bytes), job.store_namespace,
-        job.handoff_id, job.transport_id, job.consumer_task, request.record_ref, _digest(record_bytes), job.handoff_id,
+        job.handoff_id, job.transport_id, job.consumer_task, record.record_digest, _digest(record_bytes), job.handoff_id,
         _digest(pointer_bytes), job.source_executor_id, job.destination_executor_id, job.nonce, job.sequence,
         job.expires_at, job.policy_activation_proof_ref, job.policy_activation_proof_full_bytes_digest, refs,
     )
@@ -117,13 +132,22 @@ def export(job: TransportJobV1, source_store: TrustedHandoffStoreV1) -> HandoffT
 def upload(job: TransportJobV1, source_store: TrustedHandoffStoreV1, target_store: TrustedHandoffStoreV1, manifest: HandoffTransferManifestV1) -> str:
     if HandoffTransferManifestV1.from_canonical_bytes(_stage_read(job.stage_root, "export-manifest.json")) != manifest:
         raise ValueError("upload manifest does not match exported bytes")
-    request, request_bytes, _record, _pointer, record_bytes, pointer_bytes, refs, blobs = _closure(source_store, job.export_request_ref, job.handoff_id, job.consumer_task)
-    if (manifest.export_request_ref, manifest.record_ref, manifest.record_full_bytes_digest, manifest.pointer_bytes_digest, manifest.blob_refs) != (job.export_request_ref, request.record_ref, _digest(record_bytes), _digest(pointer_bytes), refs):
+    if job.policy_activation_proof_ref is None:
+        request, request_bytes, record, _pointer, record_bytes, pointer_bytes, refs, blobs = _closure(source_store, job.export_request_ref, job.handoff_id, job.consumer_task)
+        core_request = None
+    else:
+        if job.signing_domains is None:
+            raise ValueError("policy transport requires signing domains")
+        request, request_bytes, record, _pointer, record_bytes, pointer_bytes, refs, blobs, core_request = _policy_closure(source_store, job.export_request_ref, job.handoff_id, job.consumer_task, job.destination_executor_id, job.signing_domains)
+    if (manifest.export_request_ref, manifest.record_ref, manifest.record_full_bytes_digest, manifest.pointer_bytes_digest, manifest.blob_refs) != (job.export_request_ref, record.record_digest, _digest(record_bytes), _digest(pointer_bytes), refs):
         raise ValueError("upload manifest closure is mixed")
     for payload in (request_bytes, record_bytes, pointer_bytes, *blobs):
         target_store.put_blob(payload)
     target_store.publish_pointer(job.handoff_id, pointer_bytes)
-    target_store.publish_export_request_ref(job.handoff_id, job.export_request_ref)
+    if core_request is None:
+        target_store.publish_export_request_ref(job.handoff_id, job.export_request_ref)
+    else:
+        target_store.publish_policy_export_request_ref(job.handoff_id, job.export_request_ref)
     receipt = {"manifestDigest": manifest.digest, "schema": "trusted-handoff-upload-receipt/v1"}
     receipt_bytes = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
     _stage_publish(job.stage_root, "upload-receipt.json", receipt_bytes)
@@ -217,7 +241,10 @@ def install_transport(job: TransportJobV1, target_store: TrustedHandoffStoreV1, 
     if HandoffTransferManifestV1.from_canonical_bytes(_stage_read(job.stage_root, "export-manifest.json")) != manifest or TransportSealV1.from_canonical_bytes(_stage_read(job.stage_root, "transport-seal.json")) != seal:
         raise ValueError("install requires exact staged manifest and seal")
     _verify_seal(manifest, seal, signing_domains)
-    _closure(target_store, manifest.export_request_ref, manifest.handoff_id, manifest.consumer_task)
+    if manifest.policy_activation_proof_ref is None:
+        _closure(target_store, manifest.export_request_ref, manifest.handoff_id, manifest.consumer_task)
+    else:
+        _policy_closure(target_store, manifest.export_request_ref, manifest.handoff_id, manifest.consumer_task, manifest.destination_executor_id, signing_domains)
     ready = TransportReadyMarkerV1("trusted-handoff-transport-ready/v1", manifest.store_namespace, manifest.handoff_id, manifest.transport_id, manifest.consumer_task, manifest.source_executor_id, manifest.destination_executor_id, manifest.nonce, manifest.sequence, manifest.digest, _digest(seal.canonical_bytes), manifest.policy_activation_proof_ref, manifest.policy_activation_proof_full_bytes_digest)
     # Ready is deliberately last: any prior no-replace conflict leaves this transport unreadable.
     target_store.publish_transport_replay(manifest)
@@ -230,6 +257,22 @@ def install_transport(job: TransportJobV1, target_store: TrustedHandoffStoreV1, 
 def run_transport(*, source_store: TrustedHandoffStoreV1, target_store: TrustedHandoffStoreV1, stage_root: Path, export_request_ref: str, handoff_id: str, transport_id: str, consumer_task: int, store_namespace: str, source_executor_id: str, destination_executor_id: str, nonce: str, sequence: int, expires_at: str | None, signing_key_fd: int, key_id: str, signing_domains: VerifiedSigningDomainsV1) -> TransportReadyMarkerV1:
     job = TransportJobV1(source_store.root, target_store.root, stage_root, export_request_ref, handoff_id, transport_id, consumer_task, store_namespace, source_executor_id, destination_executor_id, nonce, sequence, expires_at, None, None, signing_key_fd, key_id)
     _closure(source_store, export_request_ref, handoff_id, consumer_task)
+    manifest = export(job, source_store)
+    receipt = upload(job, source_store, target_store, manifest)
+    seal = sign_seal(job, manifest, receipt, signing_domains)
+    return install_transport(job, target_store, manifest, seal, signing_domains)
+
+
+def run_policy_transport(*, source_store: TrustedHandoffStoreV1, target_store: TrustedHandoffStoreV1, stage_root: Path, export_request_ref: str, handoff_id: str, transport_id: str, consumer_task: int, store_namespace: str, source_executor_id: str, destination_executor_id: str, nonce: str, sequence: int, expires_at: str | None, signing_key_fd: int, key_id: str, signing_domains: VerifiedSigningDomainsV1) -> TransportReadyMarkerV1:
+    activated, _bytes, _record, _pointer, _record_bytes, _pointer_bytes, _refs, _blobs, _core = _policy_closure(source_store, export_request_ref, handoff_id, consumer_task, destination_executor_id, signing_domains)
+    job = TransportJobV1(
+        source_store.root, target_store.root, stage_root, export_request_ref, handoff_id,
+        transport_id, consumer_task, store_namespace, source_executor_id,
+        destination_executor_id, nonce, sequence, expires_at,
+        activated.policy_activation_proof_ref,
+        activated.policy_activation_proof_full_bytes_digest, signing_key_fd, key_id,
+        signing_domains=signing_domains,
+    )
     manifest = export(job, source_store)
     receipt = upload(job, source_store, target_store, manifest)
     seal = sign_seal(job, manifest, receipt, signing_domains)
@@ -317,7 +360,13 @@ def main(argv: list[str] | None = None) -> int:
             install_transport(job, TrustedHandoffStoreV1(job.target_store_root), manifest, seal, _domains_from_args(args))
         elif args.command == "run-transport":
             job = _job_from_args(args)
-            run_transport(source_store=TrustedHandoffStoreV1(job.source_store_root), target_store=TrustedHandoffStoreV1(job.target_store_root), stage_root=job.stage_root, export_request_ref=job.export_request_ref, handoff_id=job.handoff_id, transport_id=job.transport_id, consumer_task=job.consumer_task, store_namespace=job.store_namespace, source_executor_id=job.source_executor_id, destination_executor_id=job.destination_executor_id, nonce=job.nonce, sequence=job.sequence, expires_at=job.expires_at, signing_key_fd=job.signing_key_fd, key_id=job.key_id, signing_domains=_domains_from_args(args))
+            source = TrustedHandoffStoreV1(job.source_store_root)
+            try:
+                policy_request_ref = source.read_policy_export_request_ref(job.handoff_id)
+            except ValueError:
+                policy_request_ref = None
+            runner = run_policy_transport if policy_request_ref == job.export_request_ref else run_transport
+            runner(source_store=source, target_store=TrustedHandoffStoreV1(job.target_store_root), stage_root=job.stage_root, export_request_ref=job.export_request_ref, handoff_id=job.handoff_id, transport_id=job.transport_id, consumer_task=job.consumer_task, store_namespace=job.store_namespace, source_executor_id=job.source_executor_id, destination_executor_id=job.destination_executor_id, nonce=job.nonce, sequence=job.sequence, expires_at=job.expires_at, signing_key_fd=job.signing_key_fd, key_id=job.key_id, signing_domains=_domains_from_args(args))
         return 0
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(str(error), file=sys.stderr)

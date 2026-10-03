@@ -8,18 +8,21 @@ from pathlib import Path
 
 import pytest
 
-from trusted_evidence.e2_policy import ProductGitObjectIdV1
+from trusted_evidence.e2_policy import GitObjectIdV1, ProductGitObjectIdV1, canonical_json_bytes
 from trusted_evidence.handoffs import (
     ActivatedPolicyExportRequestV1,
     EmbeddedCanonicalBytesV1,
     HandoffRegistryV1,
     HandoffPointerV1,
     HandoffExportRequestV1,
+    PolicyHandoffPointerV1,
+    PolicyHandoffRecordV1,
     ProductRepositorySourceV1,
     Ticket23ProductSourceHandoffV1,
     TrustedHandoffRecordV1,
     TrustedHandoffStoreV1,
     load_disjoint_signing_domains,
+    verify_transport_closure,
     verify_policy_activation_proof,
 )
 
@@ -494,6 +497,70 @@ def _test_transport_public_key(seed: bytes) -> bytes:
     return (result[1] | ((result[0] & 1) << 255)).to_bytes(32, "little")
 
 
+def _test_ed25519_signature(seed: bytes, message: bytes) -> str:
+    """Independent RFC 8032 signer used only to construct the activation fixture."""
+    q, d = 2**255 - 19, (-121665 * pow(121666, 2**255 - 21, 2**255 - 19)) % (2**255 - 19)
+    base_y = (4 * pow(5, q - 2, q)) % q
+    base_x = pow(((base_y * base_y - 1) * pow((d * base_y * base_y + 1) % q, q - 2, q)) % q, (q + 3) // 8, q)
+    if base_x & 1:
+        base_x = q - base_x
+
+    def add(left, right):
+        x1, y1 = left; x2, y2 = right
+        return (((x1 * y2 + x2 * y1) * pow((1 + d * x1 * x2 * y1 * y2) % q, q - 2, q)) % q, ((y1 * y2 + x1 * x2) * pow((1 - d * x1 * x2 * y1 * y2) % q, q - 2, q)) % q)
+
+    def mul(point, scalar):
+        result = (0, 1)
+        while scalar:
+            if scalar & 1:
+                result = add(result, point)
+            point = add(point, point); scalar >>= 1
+        return result
+
+    hashed = hashlib.sha512(seed).digest()
+    scalar = int.from_bytes(hashed[:32], "little") & ((1 << 254) - 8) | (1 << 254)
+    public = _test_transport_public_key(seed)
+    nonce = int.from_bytes(hashlib.sha512(hashed[32:] + message).digest(), "little") % (2**252 + 27742317777372353535851937790883648493)
+    point = mul((base_x, base_y), nonce)
+    encoded_r = (point[1] | ((point[0] & 1) << 255)).to_bytes(32, "little")
+    challenge = int.from_bytes(hashlib.sha512(encoded_r + public + message).digest(), "little") % (2**252 + 27742317777372353535851937790883648493)
+    return (encoded_r + ((nonce + challenge * scalar) % (2**252 + 27742317777372353535851937790883648493)).to_bytes(32, "little")).hex()
+
+
+def _policy_transport_fixture(tmp_path):
+    from trusted_evidence.handoffs import Ticket23PolicyHandoffV1
+
+    source_root = (tmp_path / "policy-source").resolve(); source_root.mkdir(mode=0o700)
+    source = TrustedHandoffStoreV1(source_root)
+    commit = GitObjectIdV1("sha256", "c" * 64)
+    payload_ref = source.put_blob(b"policy payload")
+    record = PolicyHandoffRecordV1("trusted-policy-handoff-record/v1", "ticket-23-policy-v1", "policy", 27, commit, (28,), (("policy-payload", payload_ref),))
+    pointer = PolicyHandoffPointerV1("trusted-policy-handoff-pointer/v1", record.handoff_id, record.record_digest, record.record_digest, 27, commit)
+    core_request = HandoffExportRequestV1("trusted-handoff-export-request/v1", record.handoff_id, record.record_digest, record.record_digest, "sha256:" + hashlib.sha256(pointer.canonical_bytes).hexdigest(), (28,), record.binding_set_digest)
+    core_request_ref = "sha256:" + hashlib.sha256(core_request.canonical_bytes).hexdigest()
+    activation_seed = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+    transport_seed = bytes.fromhex("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb")
+    domains = _domains(transport=_transport_registry(_test_transport_public_key(transport_seed)), activation=_activation_registry(_test_transport_public_key(activation_seed)))
+    digest = lambda char: "sha256:" + char * 64
+    def embedded(value):
+        wire = canonical_json_bytes(value)
+        return {"canonicalBytesB64": base64.b64encode(wire).decode("ascii"), "digest": "sha256:" + hashlib.sha256(wire).hexdigest(), "encoding": "base64"}
+    intent = {"activationMarkerDigest": None, "completionRecordDigest": digest("a"), "completionRecordRef": digest("b"), "entryDigest": digest("c"), "exportRequestRef": core_request_ref, "fixedRef": "refs/tags/trusted-acceptance/ticket-23-policy-v1", "fixedRefMustBeAbsent": True, "operationId": "policy-operation-28", "pendingTransition": "ACTIVATE", "pointerDigest": "sha256:" + hashlib.sha256(pointer.canonical_bytes).hexdigest(), "policyCommit": commit.to_wire(), "previousEntryDigest": digest("d"), "recordRef": record.record_digest, "schema": "trusted-policy-publish-transaction/v1", "stagedPayloadDigest": digest("e"), "state": "HANDOFF_INSTALLED", "targetHeadRef": "refs/heads/main"}
+    encoded_intent = embedded(intent)
+    marker = {"activationIntentDigest": encoded_intent["digest"], "exportRequestRef": core_request_ref, "fixedRef": "refs/tags/trusted-acceptance/ticket-23-policy-v1", "operationId": "policy-operation-28", "pointerDigest": "sha256:" + hashlib.sha256(pointer.canonical_bytes).hexdigest(), "policyCommit": commit.to_wire(), "recordRef": record.record_digest, "schema": "trusted-policy-activation/v1"}
+    encoded_marker = embedded(marker)
+    activated = {"activationMarkerDigest": encoded_marker["digest"], "completionRecordDigest": digest("a"), "completionRecordRef": digest("b"), "entryDigest": digest("f"), "exportRequestRef": core_request_ref, "fixedRef": "refs/tags/trusted-acceptance/ticket-23-policy-v1", "fixedRefMustBeAbsent": True, "operationId": "policy-operation-28", "pendingTransition": None, "pointerDigest": "sha256:" + hashlib.sha256(pointer.canonical_bytes).hexdigest(), "policyCommit": commit.to_wire(), "previousEntryDigest": encoded_intent["digest"], "recordRef": record.record_digest, "schema": "trusted-policy-publish-transaction/v1", "stagedPayloadDigest": digest("e"), "state": "ACTIVATED", "targetHeadRef": "refs/heads/main"}
+    unsigned = {"activateIntent": encoded_intent, "activatedEntry": embedded(activated), "activationMarker": encoded_marker, "activationTrustRootDigest": domains.canonical_digest, "brokerKeyId": "activation-fixed", "completionRecordDigest": digest("a"), "completionRecordRef": digest("b"), "fixedRef": "refs/tags/trusted-acceptance/ticket-23-policy-v1", "fixedRefValue": commit.to_wire(), "operationId": "policy-operation-28", "policyCommit": commit.to_wire(), "policyCoreExportRequestFullBytesDigest": core_request_ref, "policyCoreExportRequestRef": core_request_ref, "policyPointerBytesDigest": "sha256:" + hashlib.sha256(pointer.canonical_bytes).hexdigest(), "policyPointerName": record.handoff_id, "policyRecordFullBytesDigest": record.record_digest, "policyRecordRef": record.record_digest, "profileDigest": digest("1"), "schema": "trusted-policy-activation-proof/v1", "signatureAlgorithm": "ssh-ed25519", "signatureDomain": "ai-video-reverse-engineer/policy-activation/v1", "signingKeyPurpose": "policy-activation", "state": "ACTIVATED", "targetHeadRef": "refs/heads/main", "targetHeadValue": commit.to_wire(), "toolchainBuildRecordRef": digest("2"), "trustedGitExecutableDigest": digest("3"), "trustedGitViewDigest": digest("4")}
+    signature = _test_ed25519_signature(activation_seed, b"ai-video-reverse-engineer/policy-activation/v1\0" + canonical_json_bytes(unsigned))
+    proof_bytes = canonical_json_bytes({**unsigned, "brokerSignature": signature})
+    proof_ref = "sha256:" + hashlib.sha256(proof_bytes).hexdigest()
+    handoff = Ticket23PolicyHandoffV1("trusted-ticket23-policy-handoff/v1", record.record_digest, record.record_digest, record.handoff_id, "sha256:" + hashlib.sha256(pointer.canonical_bytes).hexdigest(), core_request_ref, core_request_ref, proof_ref, proof_ref)
+    handoff_ref = "sha256:" + hashlib.sha256(handoff.canonical_bytes).hexdigest()
+    request = ActivatedPolicyExportRequestV1("trusted-activated-policy-export-request/v1", record.handoff_id, handoff_ref, handoff_ref, core_request_ref, core_request_ref, proof_ref, proof_ref, (28,))
+    request_ref = HandoffRegistryV1(source).publish_policy_local(record, pointer, core_request, handoff, request, proof_bytes, (b"policy payload",))
+    return source, record, request_ref, transport_seed, domains
+
+
 def test_run_transport_creates_distinct_sealed_ready_closures_for_two_consumers(tmp_path):
     """Dropping per-consumer seal/ready bindings must make this real transport test fail."""
     from tools.trusted_handoff_orchestrator import run_transport
@@ -636,3 +703,126 @@ def test_policy_record_pointer_uses_general_git_oid_and_full_bytes_digest():
             "trusted-policy-handoff-record/v1", "ticket-23-policy-v1", "policy", 27,
             ProductGitObjectIdV1("sha1", "e" * 40), (28,), (("policy-payload", "sha256:" + "d" * 64),),
         )
+
+
+def test_policy_transport_requires_a_complete_activated_closure_before_ready(tmp_path):
+    """Removing any durable policy proof binding must prevent a ready policy transport."""
+    from tools.trusted_handoff_orchestrator import run_policy_transport
+
+    source_root = (tmp_path / "policy-source").resolve()
+    target_root = (tmp_path / "policy-target").resolve()
+    stage_root = (tmp_path / "policy-stage").resolve()
+    for root in (source_root, target_root, stage_root):
+        root.mkdir(mode=0o700)
+    source = TrustedHandoffStoreV1(source_root)
+    commit = GitObjectIdV1("sha256", "c" * 64)
+    payload_ref = source.put_blob(b"policy payload")
+    record = PolicyHandoffRecordV1(
+        "trusted-policy-handoff-record/v1", "ticket-23-policy-v1", "policy", 27,
+        commit, (28,), (("policy-payload", payload_ref),),
+    )
+    pointer = PolicyHandoffPointerV1(
+        "trusted-policy-handoff-pointer/v1", record.handoff_id, record.record_digest,
+        record.record_digest, 27, commit,
+    )
+
+    # The runner must refuse this real store before it can publish a ready
+    # marker: an activated policy request without a durable proof is not a
+    # transportable policy closure.
+    source.put_blob(record.canonical_bytes)
+    source.publish_pointer(record.handoff_id, pointer.canonical_bytes)
+    with pytest.raises(ValueError, match="policy"):
+        run_policy_transport(
+            source_store=source,
+            target_store=TrustedHandoffStoreV1(target_root),
+            stage_root=stage_root,
+            export_request_ref=record.record_digest,
+            handoff_id=record.handoff_id,
+            transport_id="ticket-23-policy-v1-c28",
+            consumer_task=28,
+            store_namespace="ai-video-reverse-engineer/ticket-23",
+            source_executor_id="policy-source",
+            destination_executor_id="executor-28",
+            nonce="policy-nonce-28",
+            sequence=1,
+            expires_at=None,
+            signing_key_fd=-1,
+            key_id="transport-fixed",
+            signing_domains=_domains(),
+        )
+    assert not (target_root / "transports" / record.handoff_id).exists()
+
+
+def test_policy_transport_runs_the_product_stages_then_finalizes_and_reads(tmp_path):
+    """Bypassing the shared seal/ready stages or proof verification breaks this policy handoff."""
+    from tools.trusted_handoff_orchestrator import run_policy_transport
+
+    source, record, request_ref, transport_seed, domains = _policy_transport_fixture(tmp_path)
+    target_root = (tmp_path / "policy-target").resolve(); target_root.mkdir(mode=0o700)
+    stage_root = (tmp_path / "policy-stage").resolve(); stage_root.mkdir(mode=0o700)
+    key_path = tmp_path / "policy-transport-key"; key_path.write_bytes(transport_seed); key_path.chmod(0o400)
+    key_fd = os.open(key_path, os.O_RDONLY)
+    try:
+        ready = run_policy_transport(
+            source_store=source, target_store=TrustedHandoffStoreV1(target_root), stage_root=stage_root,
+            export_request_ref=request_ref, handoff_id=record.handoff_id,
+            transport_id="ticket-23-policy-v1-c28", consumer_task=28,
+            store_namespace="ai-video-reverse-engineer/ticket-23", source_executor_id="policy-source",
+            destination_executor_id="executor-28", nonce="policy-nonce-28", sequence=1,
+            expires_at=None, signing_key_fd=key_fd, key_id="transport-fixed", signing_domains=domains,
+        )
+    finally:
+        os.close(key_fd)
+    assert ready.policy_activation_proof_ref is not None
+    assert (target_root / "transports" / record.handoff_id / "ticket-23-policy-v1-c28" / "ready.json").is_file()
+    cache_root = (tmp_path / "policy-cache").resolve(); cache_root.mkdir(mode=0o700)
+    consumer = HandoffRegistryV1(TrustedHandoffStoreV1(cache_root))
+    consumer.fetch(TrustedHandoffStoreV1(target_root), request_ref, record.handoff_id, consumer_task=28, transport_id="ticket-23-policy-v1-c28", expected_destination_executor_id="executor-28", signing_domains=domains)
+    consumer.import_(record.handoff_id, consumer_task=28)
+    consumer.finalize(record.handoff_id, expected_kind="policy", expected_producer_task=27, consumer_task=28, expected_destination_executor_id="executor-28", signing_domains=domains)
+    assert consumer.read(record.handoff_id, consumer_task=28, field="producerCommit.hex", expected_destination_executor_id="executor-28", signing_domains=domains) == record.producer_commit.hex
+    wrong_cache = (tmp_path / "wrong-policy-cache").resolve(); wrong_cache.mkdir(mode=0o700)
+    with pytest.raises(ValueError):
+        HandoffRegistryV1(TrustedHandoffStoreV1(wrong_cache)).fetch(TrustedHandoffStoreV1(target_root), request_ref, record.handoff_id, consumer_task=28, transport_id="ticket-23-policy-v1-c28", expected_destination_executor_id="executor-other", signing_domains=domains)
+    changed_stage = (tmp_path / "changed-policy-stage").resolve(); changed_stage.mkdir(mode=0o700)
+    key_fd = os.open(key_path, os.O_RDONLY)
+    try:
+        with pytest.raises(ValueError):
+            run_policy_transport(
+                source_store=source, target_store=TrustedHandoffStoreV1(target_root), stage_root=changed_stage,
+                export_request_ref=request_ref, handoff_id=record.handoff_id,
+                transport_id="ticket-23-policy-v1-c28", consumer_task=28,
+                store_namespace="ai-video-reverse-engineer/ticket-23", source_executor_id="policy-source",
+                destination_executor_id="executor-28", nonce="changed-policy-nonce", sequence=1,
+                expires_at=None, signing_key_fd=key_fd, key_id="transport-fixed", signing_domains=domains,
+            )
+    finally:
+        os.close(key_fd)
+
+
+@pytest.mark.parametrize("location", ("activated-request", "policy-handoff", "activation-proof", "manifest", "seal", "ready"))
+def test_policy_transport_rejects_proof_binding_tamper_at_every_durable_location(tmp_path, location):
+    """Changing a proof ref/digest carrier must fail before policy use at every closure location."""
+    from tools.trusted_handoff_orchestrator import run_policy_transport
+
+    source, record, request_ref, transport_seed, domains = _policy_transport_fixture(tmp_path)
+    target_root = (tmp_path / "target").resolve(); target_root.mkdir(mode=0o700)
+    stage_root = (tmp_path / "stage").resolve(); stage_root.mkdir(mode=0o700)
+    key_path = tmp_path / "key"; key_path.write_bytes(transport_seed); key_path.chmod(0o400)
+    key_fd = os.open(key_path, os.O_RDONLY)
+    try:
+        run_policy_transport(source_store=source, target_store=TrustedHandoffStoreV1(target_root), stage_root=stage_root, export_request_ref=request_ref, handoff_id=record.handoff_id, transport_id="ticket-23-policy-v1-c28", consumer_task=28, store_namespace="ai-video-reverse-engineer/ticket-23", source_executor_id="policy-source", destination_executor_id="executor-28", nonce="policy-nonce-28", sequence=1, expires_at=None, signing_key_fd=key_fd, key_id="transport-fixed", signing_domains=domains)
+    finally:
+        os.close(key_fd)
+    target = TrustedHandoffStoreV1(target_root)
+    if location in {"activated-request", "policy-handoff", "activation-proof"}:
+        activated = ActivatedPolicyExportRequestV1.from_canonical_bytes(target.read_blob(request_ref))
+        ref = {"activated-request": request_ref, "policy-handoff": activated.policy_handoff_ref, "activation-proof": activated.policy_activation_proof_ref}[location]
+        target._blob_path(ref).write_bytes(b"tampered policy closure")
+    else:
+        path = target_root / "transports" / record.handoff_id / "ticket-23-policy-v1-c28" / f"{location}.json"
+        if location == "manifest":
+            path = path.with_name("manifest.json")
+        path.write_bytes(b"tampered policy closure")
+    with pytest.raises(ValueError):
+        verify_transport_closure(target, record.handoff_id, "ticket-23-policy-v1-c28", 28, "executor-28", domains)

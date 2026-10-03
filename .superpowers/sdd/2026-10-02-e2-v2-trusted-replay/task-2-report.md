@@ -137,3 +137,22 @@ binding spec 没有重列下列类型；补充授权明确由实施计划第 99�
 
 - 修改：`.scratch/unified-remix-canvas-generation/acceptance/trusted_evidence/handoffs.py`、`.scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py`、`.scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_handoffs.py`。
 - 新增：`.scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py`。
+
+## C.2b — policy transport bridge
+
+### RED / GREEN
+
+- RED：新增真实临时 store 的 policy transport 用例后，定向命令因 `ImportError: cannot import name 'run_policy_transport'` 失败，直接覆盖缺失 runner。
+- GREEN：完整 policy source closure 经既有 `export -> upload -> sign-seal -> install-transport` 生成 seal/ready，并由 consumer 的 `fetch -> import -> finalize -> read` 离线复验。
+- 篡改矩阵：activated request、policy handoff、activation proof、manifest、seal、ready 六个 durable 位置的破坏均在 `verify_transport_closure` 前失败；错误 destination 与同 ID 不同 nonce 的重试也拒绝。
+
+### 实现与验证
+
+- policy closure 重算 record/pointer/core request/proof/handoff/activated request 的 refs、full-byte digests、消费者与 activation signature/commit/HEAD/fixed-ref/completion/profile/toolchain/trusted-Git/trust-root 绑定。proof ref/digest 贯穿 handoff、activated request、job、manifest、seal、ready。
+- policy `run-transport` 仅在 closure 验证后构造带 proof 的 `TransportJobV1`，复用 product 的四个 transport 阶段；consumer 在 finalize/read 前重验 ready、seal、manifest 和 policy activation closure。
+- `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_handoffs.py .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_e2_policy_v2.py`：`49 passed in 10.89s`。
+- `backend/.venv/bin/python -m py_compile .../handoffs.py .../trusted_handoff_store.py .../trusted_handoff_orchestrator.py` 与 `git diff --check`：exit 0。
+
+### 范围
+
+- 未进入 D/E/F；broker-auth 启动能力仍由 slice E 负责。

@@ -186,6 +186,10 @@ class PolicyHandoffRecordV1:
     def record_digest(self) -> str:
         return _digest(self.canonical_bytes)
 
+    @property
+    def binding_set_digest(self) -> str:
+        return _digest(canonical_json_bytes(self.to_wire()["bindings"]))
+
     @classmethod
     def from_canonical_bytes(cls, payload: bytes) -> "PolicyHandoffRecordV1":
         raw = _strict_object(payload, {"bindings", "consumerTasks", "handoffId", "kind", "producerCommit", "producerTask", "schema"})
@@ -409,6 +413,23 @@ class TrustedHandoffStoreV1:
         except (UnicodeDecodeError, ValueError) as error:
             raise ValueError("export request ref is invalid") from error
 
+    def publish_policy_export_request_ref(self, handoff_id: str, request_ref: str) -> bool:
+        if handoff_id != "ticket-23-policy-v1":
+            raise ValueError("invalid policy export request name")
+        _require_digest(request_ref, "policy export request ref")
+        return self._publish(self.root / "policy-export-requests" / f"{handoff_id}.ref", (request_ref + "\n").encode("ascii"))
+
+    def read_policy_export_request_ref(self, handoff_id: str) -> str:
+        if handoff_id != "ticket-23-policy-v1":
+            raise ValueError("invalid policy export request name")
+        path = self.root / "policy-export-requests" / f"{handoff_id}.ref"
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("policy export request is missing or unsafe")
+        try:
+            return _require_digest(path.read_text(encoding="ascii").removesuffix("\n"), "policy export request ref")
+        except (UnicodeDecodeError, ValueError) as error:
+            raise ValueError("policy export request ref is invalid") from error
+
     def _transport_path(self, handoff_id: str, transport_id: str, name: str) -> Path:
         if not all(isinstance(value, str) and value and "/" not in value for value in (handoff_id, transport_id, name)):
             raise ValueError("transport path identity is invalid")
@@ -503,6 +524,7 @@ class TransportJobV1:
     key_id: str
     signing_key_purpose: str = "transport-seal"
     signature_domain: str = "ai-video-reverse-engineer/transport-seal/v1"
+    signing_domains: "VerifiedSigningDomainsV1 | None" = None
 
     def __post_init__(self) -> None:
         for path in (self.source_store_root, self.target_store_root, self.stage_root):
@@ -709,6 +731,34 @@ class HandoffRegistryV1:
         self.store.put_blob(record.canonical_bytes)
         self.store.publish_pointer(record.handoff_id, pointer.canonical_bytes)
 
+    def publish_policy_local(
+        self,
+        record: PolicyHandoffRecordV1,
+        pointer: PolicyHandoffPointerV1,
+        core_request: HandoffExportRequestV1,
+        policy_handoff: "Ticket23PolicyHandoffV1",
+        activated_request: "ActivatedPolicyExportRequestV1",
+        activation_proof_bytes: bytes,
+        blobs: tuple[bytes, ...] = (),
+    ) -> str:
+        """Publish the policy closure before its activated request pointer, no replace."""
+        if pointer.handoff_id != record.handoff_id or pointer.record_ref != record.record_digest or pointer.producer_commit != record.producer_commit:
+            raise ValueError("policy pointer does not bind record")
+        for blob in blobs:
+            self.store.put_blob(blob)
+        for _, ref in record.bindings:
+            self.store.read_blob(ref)
+        record_ref = self.store.put_blob(record.canonical_bytes)
+        core_ref = self.store.put_blob(core_request.canonical_bytes)
+        proof_ref = self.store.put_blob(activation_proof_bytes)
+        handoff_ref = self.store.put_blob(policy_handoff.canonical_bytes)
+        activated_ref = self.store.put_blob(activated_request.canonical_bytes)
+        if (record_ref, core_ref, proof_ref, handoff_ref) != (policy_handoff.core_record_ref, policy_handoff.core_export_request_ref, policy_handoff.policy_activation_proof_ref, activated_request.policy_handoff_ref):
+            raise ValueError("policy publication closure refs are mixed")
+        self.store.publish_pointer(record.handoff_id, pointer.canonical_bytes)
+        self.store.publish_policy_export_request_ref(record.handoff_id, activated_ref)
+        return activated_ref
+
     def publish_export_request(self, request: HandoffExportRequestV1) -> str:
         record, pointer, record_bytes, pointer_bytes = self._closure(self.store, request.record_ref, request.handoff_id)
         if request.record_full_bytes_digest != _digest(record_bytes) or request.pointer_bytes_digest != _digest(pointer_bytes):
@@ -727,6 +777,20 @@ class HandoffRegistryV1:
             transport = verify_transport_closure(source_store, handoff_id, transport_id, consumer_task, expected_destination_executor_id, signing_domains)
             if export_request_ref != transport[0].export_request_ref:
                 raise ValueError("fetch request does not match transport manifest")
+            if transport[0].policy_activation_proof_ref is not None:
+                manifest_value, seal_value, ready_value = transport
+                activated, handoff, _proof, _record, pointer, _core, refs = verify_policy_transport_source_closure(source_store, export_request_ref, handoff_id, consumer_task, expected_destination_executor_id, signing_domains)
+                for ref in refs:
+                    self.store.put_blob(source_store.read_blob(ref))
+                self.store.publish_pointer(handoff_id, source_store.read_pointer(handoff.core_pointer_name))
+                self.store.publish_policy_export_request_ref(handoff_id, export_request_ref)
+                self.store.publish_transport_file(handoff_id, transport_id, "manifest.json", manifest_value.canonical_bytes)
+                self.store.publish_transport_file(handoff_id, transport_id, "seal.json", seal_value.canonical_bytes)
+                self.store.publish_transport_file(handoff_id, transport_id, "ready.json", ready_value.canonical_bytes)
+                self.store.publish_transport_replay(manifest_value)
+                fetch = canonical_json_bytes({"consumerTask": consumer_task, "destinationExecutorId": expected_destination_executor_id, "handoffId": handoff_id, "pointerBytesDigest": handoff.core_pointer_bytes_digest, "recordRef": handoff.core_record_ref, "requestRef": export_request_ref, "schema": "trusted-handoff-fetch/v1", "transportId": transport_id})
+                self.store._publish(self.store.root / "fetches" / f"{handoff_id}-{consumer_task}.json", fetch)
+                return
         request_bytes = source_store.read_blob(export_request_ref)
         request = HandoffExportRequestV1.from_canonical_bytes(request_bytes)
         if request.handoff_id != handoff_id or consumer_task not in request.consumer_tasks:
@@ -753,10 +817,22 @@ class HandoffRegistryV1:
 
     def import_(self, handoff_id: str, *, consumer_task: int) -> None:
         manifest = self._read_fetch_manifest(handoff_id, consumer_task)
-        request = HandoffExportRequestV1.from_canonical_bytes(self.store.read_blob(manifest["requestRef"]))
-        if request.handoff_id != handoff_id or consumer_task not in request.consumer_tasks:
-            raise ValueError("fetched request is not authorized")
-        record, _, _, _ = self._closure(self.store, request.record_ref, handoff_id)
+        request_bytes = self.store.read_blob(manifest["requestRef"])
+        try:
+            request = HandoffExportRequestV1.from_canonical_bytes(request_bytes)
+        except ValueError:
+            activated = ActivatedPolicyExportRequestV1.from_canonical_bytes(request_bytes)
+            if activated.handoff_id != handoff_id or consumer_task not in activated.consumer_tasks:
+                raise ValueError("fetched policy request is not authorized")
+            handoff = Ticket23PolicyHandoffV1.from_canonical_bytes(self.store.read_blob(activated.policy_handoff_ref))
+            record_bytes = self.store.read_blob(handoff.core_record_ref)
+            record = PolicyHandoffRecordV1.from_canonical_bytes(record_bytes)
+            if handoff.core_record_full_bytes_digest != _digest(record_bytes):
+                raise ValueError("fetched policy record is mixed")
+        else:
+            if request.handoff_id != handoff_id or consumer_task not in request.consumer_tasks:
+                raise ValueError("fetched request is not authorized")
+            record, _, _, _ = self._closure(self.store, request.record_ref, handoff_id)
         for _, ref in record.bindings:
             self.store.read_blob(ref)
         self.store._publish(self.store.root / "imports" / f"{handoff_id}-{consumer_task}.json", canonical_json_bytes({"consumerTask": consumer_task, "destinationExecutorId": manifest["destinationExecutorId"], "handoffId": handoff_id, "requestRef": manifest["requestRef"], "schema": "trusted-handoff-import/v1", "transportId": manifest["transportId"]}))
@@ -767,7 +843,10 @@ class HandoffRegistryV1:
         if not isinstance(transport_id, str) or not isinstance(expected_destination_executor_id, str) or signing_domains is None or imported["destinationExecutorId"] != expected_destination_executor_id:
             raise ValueError("not finalized: transport seal and ready marker are required")
         manifest, _seal, ready = verify_transport_closure(self.store, handoff_id, transport_id, consumer_task, expected_destination_executor_id, signing_domains)
-        record, _pointer, _record_bytes, _pointer_bytes = self._closure(self.store, manifest.record_ref, handoff_id)
+        if manifest.policy_activation_proof_ref is None:
+            record, _pointer, _record_bytes, _pointer_bytes = self._closure(self.store, manifest.record_ref, handoff_id)
+        else:
+            _activated, _handoff, _proof, record, _pointer, _core, _refs = verify_policy_transport_source_closure(self.store, manifest.export_request_ref, handoff_id, consumer_task, expected_destination_executor_id, signing_domains)
         if record.kind != expected_kind or record.producer_task != expected_producer_task:
             raise ValueError("finalized handoff kind or producer is invalid")
         final = canonical_json_bytes({"consumerTask": consumer_task, "handoffId": handoff_id, "readyDigest": _digest(ready.canonical_bytes), "schema": "trusted-handoff-finalized/v1", "transportId": transport_id})
@@ -779,8 +858,12 @@ class HandoffRegistryV1:
         if not isinstance(imported["transportId"], str) or not isinstance(expected_destination_executor_id, str) or signing_domains is None:
             raise ValueError("read requires authenticated transport verification")
         verify_transport_closure(self.store, handoff_id, imported["transportId"], consumer_task, expected_destination_executor_id, signing_domains)
-        request = HandoffExportRequestV1.from_canonical_bytes(self.store.read_blob(imported["requestRef"]))
-        record, _pointer, _record_bytes, _pointer_bytes = self._closure(self.store, request.record_ref, handoff_id)
+        request_bytes = self.store.read_blob(imported["requestRef"])
+        try:
+            request = HandoffExportRequestV1.from_canonical_bytes(request_bytes)
+            record, _pointer, _record_bytes, _pointer_bytes = self._closure(self.store, request.record_ref, handoff_id)
+        except ValueError:
+            _activated, _handoff, _proof, record, _pointer, _core, _refs = verify_policy_transport_source_closure(self.store, imported["requestRef"], handoff_id, consumer_task, expected_destination_executor_id, signing_domains)
         if field == "producerCommit.hex":
             return record.producer_commit.hex
         if field == "producerCommit.algorithm":
@@ -1162,9 +1245,15 @@ def verify_transport_closure(store: TrustedHandoffStoreV1, handoff_id: str, tran
         raise ValueError("transport seal signature is invalid")
     if manifest.expires_at is not None and datetime.fromisoformat(manifest.expires_at.replace("Z", "+00:00")) <= datetime.now(timezone.utc):
         raise ValueError("transport has expired")
-    # The current portable record is product-only; proof fields must stay absent.
-    if manifest.policy_activation_proof_ref is not None or manifest.policy_activation_proof_full_bytes_digest is not None:
-        raise ValueError("product transport carries an unexpected policy proof")
+    if (manifest.policy_activation_proof_ref is None) != (manifest.policy_activation_proof_full_bytes_digest is None):
+        raise ValueError("transport policy proof fields are incomplete")
+    if manifest.policy_activation_proof_ref is not None:
+        activated, handoff, _proof, record, _pointer, _core_request, refs = verify_policy_transport_source_closure(
+            store, manifest.export_request_ref, handoff_id, consumer_task, expected_destination_executor_id, signing_domains,
+        )
+        if (manifest.export_request_full_bytes_digest, manifest.record_ref, manifest.record_full_bytes_digest, manifest.pointer_bytes_digest, manifest.policy_activation_proof_ref, manifest.policy_activation_proof_full_bytes_digest, manifest.blob_refs) != (_digest(store.read_blob(manifest.export_request_ref)), handoff.core_record_ref, _digest(store.read_blob(handoff.core_record_ref)), _digest(store.read_pointer(handoff.core_pointer_name)), activated.policy_activation_proof_ref, activated.policy_activation_proof_full_bytes_digest, refs):
+            raise ValueError("policy transport manifest closure is invalid")
+        return manifest, seal, ready
     request_bytes = store.read_blob(manifest.export_request_ref)
     request = HandoffExportRequestV1.from_canonical_bytes(request_bytes)
     if _digest(request_bytes) != manifest.export_request_full_bytes_digest or request.handoff_id != handoff_id or consumer_task not in request.consumer_tasks or request.record_ref != manifest.record_ref:
@@ -1361,6 +1450,53 @@ def verify_policy_activation_proof(proof_bytes: bytes, signing_domains: Verified
         if key in expected_transport and expected_transport[key] != expected:
             raise ValueError("expected transport proof binding is invalid")
     return VerifiedPolicyActivationV1(proof_ref, proof_ref, proof.policy_commit, proof.operation_id)
+
+
+def verify_policy_transport_source_closure(
+    store: TrustedHandoffStoreV1,
+    activated_request_ref: str,
+    handoff_id: str,
+    consumer_task: int,
+    destination_executor_id: str,
+    signing_domains: VerifiedSigningDomainsV1,
+) -> tuple[ActivatedPolicyExportRequestV1, Ticket23PolicyHandoffV1, PolicyActivationProofV1, PolicyHandoffRecordV1, PolicyHandoffPointerV1, HandoffExportRequestV1, tuple[str, ...]]:
+    """Load the durable policy closure and bind it to one transport consumer."""
+    if handoff_id != "ticket-23-policy-v1" or store.read_policy_export_request_ref(handoff_id) != activated_request_ref:
+        raise ValueError("policy activated export request is not the source-store activation point")
+    activated_bytes = store.read_blob(activated_request_ref)
+    activated = ActivatedPolicyExportRequestV1.from_canonical_bytes(activated_bytes)
+    if activated.handoff_id != handoff_id or consumer_task not in activated.consumer_tasks or activated.policy_handoff_ref != activated.policy_handoff_full_bytes_digest or activated.core_export_request_ref != activated.core_export_request_full_bytes_digest:
+        raise ValueError("policy activated export request closure is invalid")
+    handoff_bytes = store.read_blob(activated.policy_handoff_ref)
+    handoff = Ticket23PolicyHandoffV1.from_canonical_bytes(handoff_bytes)
+    proof_bytes = store.read_blob(activated.policy_activation_proof_ref)
+    proof = PolicyActivationProofV1.from_canonical_bytes(proof_bytes)
+    if _digest(handoff_bytes) != activated.policy_handoff_full_bytes_digest or _digest(proof_bytes) != activated.policy_activation_proof_full_bytes_digest:
+        raise ValueError("policy activated closure bytes are mixed")
+    if (handoff.core_export_request_ref, handoff.core_export_request_full_bytes_digest, handoff.policy_activation_proof_ref, handoff.policy_activation_proof_full_bytes_digest) != (activated.core_export_request_ref, activated.core_export_request_full_bytes_digest, activated.policy_activation_proof_ref, activated.policy_activation_proof_full_bytes_digest):
+        raise ValueError("policy handoff and activated request are mixed")
+    record_bytes = store.read_blob(handoff.core_record_ref)
+    record = PolicyHandoffRecordV1.from_canonical_bytes(record_bytes)
+    pointer_bytes = store.read_pointer(handoff.core_pointer_name)
+    pointer = PolicyHandoffPointerV1.from_canonical_bytes(pointer_bytes)
+    core_request_bytes = store.read_blob(handoff.core_export_request_ref)
+    core_request = HandoffExportRequestV1.from_canonical_bytes(core_request_bytes)
+    if (record.handoff_id != handoff_id or pointer.handoff_id != handoff_id or pointer.record_ref != handoff.core_record_ref or pointer.record_digest != _digest(record_bytes) or pointer.producer_commit != record.producer_commit or _digest(record_bytes) != handoff.core_record_full_bytes_digest or _digest(pointer_bytes) != handoff.core_pointer_bytes_digest):
+        raise ValueError("policy record and pointer closure is mixed")
+    if (core_request.handoff_id != handoff_id or core_request.record_ref != handoff.core_record_ref or core_request.record_full_bytes_digest != _digest(record_bytes) or core_request.pointer_bytes_digest != _digest(pointer_bytes) or core_request.consumer_tasks != record.consumer_tasks or core_request.binding_set_digest != record.binding_set_digest or consumer_task not in core_request.consumer_tasks):
+        raise ValueError("policy core export request closure is invalid")
+    verified = verify_policy_activation_proof(proof_bytes, signing_domains, {
+        "consumerTask": consumer_task,
+        "destinationExecutorId": destination_executor_id,
+        "policyActivationProofRef": activated.policy_activation_proof_ref,
+        "policyActivationProofFullBytesDigest": activated.policy_activation_proof_full_bytes_digest,
+    })
+    if (verified.policy_commit != record.producer_commit or proof.policy_record_ref != handoff.core_record_ref or proof.policy_record_full_bytes_digest != _digest(record_bytes) or proof.policy_pointer_name != handoff.core_pointer_name or proof.policy_pointer_bytes_digest != _digest(pointer_bytes) or proof.policy_core_export_request_ref != handoff.core_export_request_ref or proof.policy_core_export_request_full_bytes_digest != _digest(core_request_bytes)):
+        raise ValueError("policy activation proof does not bind the durable core closure")
+    refs = tuple(sorted({activated_request_ref, activated.policy_handoff_ref, activated.policy_activation_proof_ref, handoff.core_export_request_ref, handoff.core_record_ref, *(ref for _, ref in record.bindings)}))
+    if any(store.read_blob(ref) is None for ref in refs):
+        raise ValueError("policy closure blob is missing")
+    return activated, handoff, proof, record, pointer, core_request, refs
 
 
 def verify_registration_broker_startup_challenge(*_args: object, **_kwargs: object) -> None:
