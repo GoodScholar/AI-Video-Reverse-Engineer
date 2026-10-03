@@ -56,6 +56,7 @@ from trusted_evidence.e2_policy import (
     RegistrationBrokerAuthPrivateKeySlotV1,
     RegistrationBrokerAuthGovernanceV1,
     RegistrationBrokerStateMacCapabilityV1,
+    RegistrationExpectedReceiveContextV1,
     RegistrationRecoveryLeaseV1,
     RegistrationRecoveryLeaseIdentityPreimageV1,
     RegistrationWorkerSessionFamilyAuthorizationV1,
@@ -1430,7 +1431,7 @@ def test_e2_receive_once_fails_closed_when_msg_cmsg_cloexec_is_unavailable():
     if hasattr(socket, "MSG_CMSG_CLOEXEC"):
         pytest.skip("platform can exercise the SCM_RIGHTS green path")
     with pytest.raises(ValueError, match="MSG_CMSG_CLOEXEC unavailable"):
-        RegistrationRecoveryCapabilityV1.receive_once(object(), DIGEST_C, {})
+        RegistrationRecoveryCapabilityV1.receive_once(object(), object())
 
 
 def _fd_digest(value):
@@ -1505,41 +1506,9 @@ def test_e2_rebuilds_socket_identity_and_rejects_non_seqpacket_control_fd():
 )
 def test_e2_linux_recvmsg_accepts_only_a_real_exact_register_closure(tmp_path):
     """Linux-only: the real recvmsg gate consumes exactly one signed 14-FD closure."""
-    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    control, control_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    opened = []
-    signer = None
+    sender, receiver, opened, control, control_peer, signer, expected = _linux_delivery(tmp_path, "register")
     try:
-        control.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
-        for ordinal in range(13):
-            source = tmp_path / f"input-{ordinal}"
-            source.write_bytes(f"input-{ordinal}".encode())
-            opened.append(os.open(source, os.O_RDONLY | os.O_CLOEXEC))
-        public = bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
-        public_digest = "sha256:" + hashlib.sha256(public).hexdigest()
-        key = RegistrationBrokerAuthKeyRegistrationV1(
-            "trusted-registration-broker-auth-key-registration/v1", "broker-fixed",
-            "registration-broker-auth", "ai-video-reverse-engineer/registration-broker-envelope/v1",
-            "ai-video-reverse-engineer/registration-broker-lease/v1",
-            "ai-video-reverse-engineer/registration-broker-startup-challenge/v1", "raw-ed25519-32",
-            public_digest, public_digest, None, public_digest, public_digest, DIGEST_A, "active", 1, None,
-        )
-        seed_path = tmp_path / "broker-seed"
-        seed_path.write_bytes(bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"))
-        seed_fd = os.open(seed_path, os.O_RDONLY)
-        try:
-            signer = RegistrationBrokerAuthPrivateKeySlotV1.load_from_readonly_fd(seed_fd, key, public)
-        finally:
-            os.close(seed_fd)
-        descriptors = tuple(
-            replace(item, observable_fields=FdObservableIdentityV1.from_open_fd(fd))
-            for item, fd in zip(_unsigned_envelope().fd_descriptors[:-1], opened)
-        ) + (replace(_unsigned_envelope().fd_descriptors[-1], observable_fields=FdObservableIdentityV1.from_open_fd(control.fileno())),)
-        envelope = CapabilityEnvelopeV1.create(
-            _unsigned_envelope(fd_descriptors=descriptors, broker_auth_public_key_digest=public_digest), signer
-        )
-        sender.sendmsg([envelope.canonical_bytes], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [*opened, control.fileno()]))])
-        capability = RegistrationRecoveryCapabilityV1.receive_once(receiver, DIGEST_C, {"broker-fixed": public})
+        capability = RegistrationRecoveryCapabilityV1.receive_once(receiver, expected)
         received = capability.take_once()
         assert len(received) == 14
         with pytest.raises(ValueError, match="already consumed"):
@@ -1552,6 +1521,228 @@ def test_e2_linux_recvmsg_accepts_only_a_real_exact_register_closure(tmp_path):
         for fd in opened:
             os.close(fd)
         sender.close()
+        control.close()
+        control_peer.close()
+
+
+def _expected_receive_context(governance, lease, **overrides):
+    values = dict(
+        worker_mode="register", worker_process_identity_digest=DIGEST_C,
+        worker_executable_digest=DIGEST_B, worker_pidfd_identity_digest=DIGEST_A,
+        worker_input_digest=_worker_input().canonical_digest, worker_session_id="session-e2",
+        operation_id="operation-e2", lifecycle_nonce="lifecycle-e2", worker_sequence=1,
+        broker_session_nonce="broker-session-e2", lease=lease, broker_auth_sign_sequence=2,
+        governance=governance,
+    )
+    values.update(overrides)
+    return RegistrationExpectedReceiveContextV1(**values)
+
+
+def _test_broker_signer(tmp_path):
+    seed = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+    public = bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+    governance, registration = _broker_governance("broker-fixed", public)
+    key_path = tmp_path / "broker-seed"
+    key_path.write_bytes(seed)
+    descriptor = os.open(key_path, os.O_RDONLY)
+    try:
+        return governance, RegistrationBrokerAuthPrivateKeySlotV1.load_from_readonly_fd(descriptor, registration, public)
+    finally:
+        os.close(descriptor)
+
+
+def _test_receive_lease(governance, signer):
+    template = RegistrationRecoveryLeaseV1(
+        "trusted-registration-recovery-lease/v1", "ai-video-reverse-engineer", "operation-e2",
+        "lifecycle-e2", DIGEST_A, 1, DIGEST_A, "transaction-root", DIGEST_B, DIGEST_C,
+        DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A, DIGEST_B, DIGEST_C,
+        governance.registry.generation, governance.registry.canonical_digest,
+        governance.revocations.canonical_digest, DIGEST_B, governance.allowed_signers_digest,
+        "broker-fixed", DIGEST_B, DIGEST_A, DIGEST_B, DIGEST_C, 1, 3, DIGEST_A,
+        "OPEN", "a" * 128, "b" * 64,
+    )
+    lease = replace(template, lease_identity_digest=template.identity_preimage().lease_identity_digest)
+    return replace(
+        lease,
+        broker_signature_hex=signer.sign(
+            "ai-video-reverse-engineer/registration-broker-lease/v1", canonical_json_bytes(lease._unsigned_wire()),
+        ),
+    )
+
+
+def _signed_receive_envelope(governance, signer, lease, mode="register", **overrides):
+    values = dict(
+        broker_lease_identity_digest=lease.lease_identity_digest,
+        broker_auth_public_key_digest=signer.public_key_digest,
+        broker_auth_registry_generation=governance.registry.generation,
+        broker_auth_registry_digest=governance.registry.canonical_digest,
+        broker_auth_revocation_digest=governance.revocations.canonical_digest,
+        broker_auth_allowed_signers_digest=governance.allowed_signers_digest,
+    )
+    values.update(overrides)
+    return CapabilityEnvelopeV1.create(_unsigned_envelope(mode, **values), signer)
+
+
+def test_e2_expected_receive_context_rejects_old_or_cross_bound_signed_envelopes(tmp_path):
+    """Removing any expected-context comparison would accept a valid stale capability."""
+    governance, signer = _test_broker_signer(tmp_path)
+    try:
+        lease = _test_receive_lease(governance, signer)
+        expected = _expected_receive_context(governance, lease)
+        signed = _signed_receive_envelope(governance, signer, lease)
+        expected.verify_envelope(signed)
+        for changed in (
+            {"worker_mode": "recover"}, {"operation_id": "old-operation"},
+            {"lifecycle_nonce": "old-lifecycle"}, {"worker_session_id": "old-session"},
+            {"broker_session_nonce": "old-broker-session"}, {"worker_sequence": 2},
+            {"broker_lease_identity_digest": DIGEST_B},
+        ):
+            with pytest.raises(ValueError, match="expected receive context"):
+                mode = changed.get("worker_mode", "register")
+                values = {key: value for key, value in changed.items() if key != "worker_mode"}
+                candidate = _signed_receive_envelope(governance, signer, lease, mode, **values)
+                expected.verify_envelope(candidate)
+        with pytest.raises(ValueError, match="expected receive context"):
+            _expected_receive_context(governance, lease, broker_auth_sign_sequence=3).verify_envelope(signed)
+        for changed_lease in (
+            {"session_family_authorization_digest": DIGEST_B},
+            {"broker_auth_lease_request_digest": DIGEST_C},
+        ):
+            other_lease = replace(lease, **changed_lease)
+            other_lease = replace(
+                other_lease, lease_identity_digest=other_lease.identity_preimage().lease_identity_digest,
+            )
+            other_lease = replace(
+                other_lease,
+                broker_signature_hex=signer.sign(
+                    "ai-video-reverse-engineer/registration-broker-lease/v1",
+                    canonical_json_bytes(other_lease._unsigned_wire()),
+                ),
+            )
+            with pytest.raises(ValueError, match="expected receive context"):
+                _expected_receive_context(governance, other_lease).verify_envelope(signed)
+        other_governance, _ = _broker_governance("other-broker", signer._public)
+        with pytest.raises(ValueError, match="expected receive context"):
+            _expected_receive_context(other_governance, lease).verify_envelope(signed)
+    finally:
+        signer.close()
+
+
+def _linux_delivery(tmp_path, mode, fault=None, expected_overrides=None):
+    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    control, control_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    opened = []
+    governance, signer = _test_broker_signer(tmp_path)
+    lease = _test_receive_lease(governance, signer)
+    try:
+        control.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+        closure = _unsigned_envelope(mode).fd_descriptors
+        for ordinal in range(len(closure) - 1):
+            source = tmp_path / f"{mode}-input-{ordinal}"
+            source.write_bytes(f"{mode}-input-{ordinal}".encode())
+            opened.append(os.open(source, os.O_RDONLY | os.O_CLOEXEC))
+        descriptors = tuple(
+            replace(item, observable_fields=FdObservableIdentityV1.from_open_fd(fd))
+            for item, fd in zip(closure[:-1], opened)
+        ) + (replace(closure[-1], observable_fields=FdObservableIdentityV1.from_open_fd(control.fileno())),)
+        sent = [*opened, control.fileno()]
+        if fault == "missing":
+            sent.pop()
+        elif fault == "extra":
+            sent.append(opened[0])
+        elif fault == "reordered":
+            sent.reverse()
+        elif fault == "duplicate":
+            descriptors = tuple((
+                replace(item, observable_fields=descriptors[0].observable_fields) if index == 1 else item
+            ) for index, item in enumerate(descriptors))
+            sent[1] = sent[0]
+        envelope = _signed_receive_envelope(governance, signer, lease, mode, fd_descriptors=descriptors)
+        sender.sendmsg([envelope.canonical_bytes], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", sent))])
+        expected = _expected_receive_context(governance, lease, worker_mode=mode, **(expected_overrides or {}))
+        return sender, receiver, opened, control, control_peer, signer, expected
+    except Exception:
+        signer.close()
+        for fd in opened:
+            os.close(fd)
+        sender.close()
+        receiver.close()
+        control.close()
+        control_peer.close()
+        raise
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or not hasattr(socket, "MSG_CMSG_CLOEXEC") or not hasattr(socket, "SO_PASSCRED"),
+    reason="requires Linux SCM_RIGHTS, MSG_CMSG_CLOEXEC, and SO_PASSCRED",
+)
+def test_e2_linux_recvmsg_accepts_a_real_exact_recover_closure(tmp_path):
+    sender, receiver, opened, control, control_peer, signer, expected = _linux_delivery(tmp_path, "recover")
+    try:
+        capability = RegistrationRecoveryCapabilityV1.receive_once(receiver, expected)
+        received = capability.take_once()
+        assert len(received) == 20
+        for fd in received:
+            os.close(fd)
+    finally:
+        signer.close()
+        for fd in opened:
+            os.close(fd)
+        sender.close()
+        control.close()
+        control_peer.close()
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or not hasattr(socket, "MSG_CMSG_CLOEXEC") or not hasattr(socket, "SO_PASSCRED"),
+    reason="requires Linux SCM_RIGHTS, MSG_CMSG_CLOEXEC, and SO_PASSCRED",
+)
+@pytest.mark.parametrize("mode", ("register", "recover"))
+@pytest.mark.parametrize("fault", ("missing", "extra", "duplicate", "reordered", "wrong-context"))
+def test_e2_linux_recvmsg_rejects_invalid_real_fd_closures(tmp_path, mode, fault):
+    overrides = {"operation_id": "old-operation"} if fault == "wrong-context" else None
+    sender, receiver, opened, control, control_peer, signer, expected = _linux_delivery(
+        tmp_path, mode, None if fault == "wrong-context" else fault, overrides,
+    )
+    try:
+        with pytest.raises(ValueError):
+            RegistrationRecoveryCapabilityV1.receive_once(receiver, expected)
+    finally:
+        signer.close()
+        for fd in opened:
+            os.close(fd)
+        sender.close()
+        receiver.close()
+        control.close()
+        control_peer.close()
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or not hasattr(socket, "MSG_CMSG_CLOEXEC") or not hasattr(socket, "SO_PASSCRED"),
+    reason="requires Linux SCM_RIGHTS, MSG_CMSG_CLOEXEC, and SO_PASSCRED",
+)
+def test_e2_linux_recvmsg_closes_every_received_fd_after_validation_failure(tmp_path, monkeypatch):
+    sender, receiver, opened, control, control_peer, signer, expected = _linux_delivery(tmp_path, "register")
+    received = []
+
+    def reject_after_receive(_descriptors, fds):
+        received.extend(fds)
+        raise ValueError("forced receive failure")
+
+    monkeypatch.setattr(RegistrationRecoveryCapabilityV1, "_verify_received_closure", reject_after_receive)
+    try:
+        with pytest.raises(ValueError, match="forced receive failure"):
+            RegistrationRecoveryCapabilityV1.receive_once(receiver, expected)
+        assert len(received) == 14
+        for fd in received:
+            with pytest.raises(OSError):
+                os.fstat(fd)
+    finally:
+        signer.close()
+        for fd in opened:
+            os.close(fd)
+        sender.close()
+        receiver.close()
         control.close()
         control_peer.close()
 

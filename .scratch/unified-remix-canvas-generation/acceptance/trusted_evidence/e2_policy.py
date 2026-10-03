@@ -2777,6 +2777,72 @@ class CapabilityEnvelopeV1:
         return cls(unsigned, signature)
 
 
+@dataclass(frozen=True, slots=True)
+class RegistrationExpectedReceiveContextV1:
+    """The worker's immutable authority for one broker capability delivery."""
+    worker_mode: str; worker_process_identity_digest: str; worker_executable_digest: str; worker_pidfd_identity_digest: str; worker_input_digest: str; worker_session_id: str; operation_id: str; lifecycle_nonce: str; worker_sequence: int; broker_session_nonce: str; lease: RegistrationRecoveryLeaseV1; broker_auth_sign_sequence: int; governance: RegistrationBrokerAuthGovernanceV1
+
+    def __post_init__(self) -> None:
+        if self.worker_mode not in {"register", "recover"} or type(self.lease) is not RegistrationRecoveryLeaseV1 or type(self.governance) is not RegistrationBrokerAuthGovernanceV1:
+            raise ValueError("expected receive context is invalid")
+        for field in ("worker_process_identity_digest", "worker_executable_digest", "worker_pidfd_identity_digest", "worker_input_digest"):
+            _require_digest(getattr(self, field), field)
+        for field in ("worker_session_id", "operation_id", "lifecycle_nonce", "broker_session_nonce"):
+            _require_text(getattr(self, field), field)
+        for field in ("worker_sequence", "broker_auth_sign_sequence"):
+            _u64(getattr(self, field), field, positive=True)
+        if (self.operation_id, self.lifecycle_nonce) != (self.lease.operation_id, self.lease.lifecycle_nonce) or not self.lease.broker_auth_lease_issued_sequence <= self.broker_auth_sign_sequence <= self.lease.broker_auth_lease_expiry_sequence:
+            raise ValueError("expected receive context lease sequence is invalid")
+
+    def verify_envelope(self, envelope: CapabilityEnvelopeV1) -> None:
+        if type(envelope) is not CapabilityEnvelopeV1:
+            raise ValueError("expected receive context envelope is invalid")
+        unsigned = envelope.unsigned
+        expected = (
+            self.worker_mode, self.worker_process_identity_digest, self.worker_executable_digest,
+            self.worker_pidfd_identity_digest, self.worker_input_digest, self.worker_session_id,
+            self.operation_id, self.lifecycle_nonce, self.worker_sequence, self.broker_session_nonce,
+            self.lease.lease_identity_digest, self.lease.broker_auth_lease_issued_sequence,
+            self.lease.broker_auth_lease_expiry_sequence, self.broker_auth_sign_sequence,
+        )
+        actual = (
+            unsigned.worker_mode, unsigned.worker_process_identity_digest, unsigned.worker_executable_digest,
+            unsigned.worker_pidfd_identity_digest, unsigned.worker_input_digest, unsigned.worker_session_id,
+            unsigned.operation_id, unsigned.lifecycle_nonce, unsigned.worker_sequence, unsigned.broker_session_nonce,
+            unsigned.broker_lease_identity_digest, unsigned.broker_auth_lease_issued_sequence,
+            unsigned.broker_auth_lease_expiry_sequence, unsigned.broker_auth_sign_sequence,
+        )
+        governance = self.governance
+        if expected != actual or (
+            unsigned.broker_auth_registry_generation, unsigned.broker_auth_registry_digest,
+            unsigned.broker_auth_revocation_digest, unsigned.broker_auth_allowed_signers_digest,
+        ) != (
+            governance.registry.generation, governance.registry.canonical_digest,
+            governance.revocations.canonical_digest, governance.allowed_signers_digest,
+        ) or (
+            self.lease.broker_auth_registry_generation, self.lease.broker_auth_registry_digest,
+            self.lease.broker_auth_revocation_digest, self.lease.broker_auth_allowed_signers_digest,
+            self.lease.broker_auth_key_id, self.lease.broker_auth_lease_issued_sequence,
+            self.lease.broker_auth_lease_expiry_sequence,
+        ) != (
+            governance.registry.generation, governance.registry.canonical_digest,
+            governance.revocations.canonical_digest, governance.allowed_signers_digest,
+            unsigned.broker_auth_key_id, unsigned.broker_auth_lease_issued_sequence,
+            unsigned.broker_auth_lease_expiry_sequence,
+        ):
+            raise ValueError("capability envelope does not match expected receive context")
+        key = governance.registry.key(unsigned.broker_auth_key_id)
+        if (
+            key.state != "active" or key.purpose != _BROKER_AUTH_PURPOSE
+            or governance.revocations.revoked_at(key.key_id) is not None
+            or key.public_key_digest != unsigned.broker_auth_public_key_digest
+            or unsigned.broker_auth_sign_sequence < key.effective_lease_sequence
+        ):
+            raise ValueError("capability envelope does not match expected receive context")
+        self.lease.verify_signature(governance, unsigned.broker_auth_sign_sequence)
+        envelope.verify(governance.allowed_signers)
+
+
 class RegistrationRecoveryCapabilityV1:
     """Worker-only one-shot ownership of received descriptors; no path recovery."""
     __slots__ = ("envelope", "_ordered_fds", "_consumed")
@@ -2787,22 +2853,26 @@ class RegistrationRecoveryCapabilityV1:
         self.envelope, self._ordered_fds, self._consumed = envelope, ordered_fds, False
 
     @classmethod
-    def receive_once(cls, authenticated_seqpacket_fd: object, self_process_identity: str, pinned_broker_allowed_signers: Mapping[str, bytes]) -> "RegistrationRecoveryCapabilityV1":
+    def receive_once(cls, authenticated_seqpacket_fd: object, expected_context: RegistrationExpectedReceiveContextV1) -> "RegistrationRecoveryCapabilityV1":
         if not hasattr(socket, "MSG_CMSG_CLOEXEC"):
             raise ValueError("MSG_CMSG_CLOEXEC unavailable")
         if not isinstance(authenticated_seqpacket_fd, socket.socket): raise ValueError("authenticated seqpacket socket is required")
-        _require_digest(self_process_identity, "self_process_identity")
+        if type(expected_context) is not RegistrationExpectedReceiveContextV1:
+            raise ValueError("expected receive context is invalid")
         received: list[int] = []
         try:
             message, ancillary, flags, _address = authenticated_seqpacket_fd.recvmsg(1024 * 1024, socket.CMSG_SPACE(20 * 4), socket.MSG_CMSG_CLOEXEC)
-            if flags & socket.MSG_CTRUNC: raise ValueError("SCM_RIGHTS message is truncated")
-            if len(ancillary) != 1 or ancillary[0][0:2] != (socket.SOL_SOCKET, socket.SCM_RIGHTS): raise ValueError("SCM_RIGHTS message is invalid")
+            if flags & (socket.MSG_CTRUNC | getattr(socket, "MSG_TRUNC", 0)): raise ValueError("SCM_RIGHTS message is truncated")
             import array
-            values = array.array("i"); values.frombytes(ancillary[0][2][:len(ancillary[0][2]) - len(ancillary[0][2]) % values.itemsize]); received = list(values)
-            envelope = CapabilityEnvelopeV1.from_canonical_bytes(message); envelope.verify(pinned_broker_allowed_signers)
-            if envelope.unsigned.worker_process_identity_digest != self_process_identity: raise ValueError("capability process identity is invalid")
-            if len(received) != len(envelope.unsigned.fd_descriptors): raise ValueError("SCM_RIGHTS FD closure count is invalid")
-            for descriptor, fd in zip(envelope.unsigned.fd_descriptors, received): cls._verify_observable_fd(fd, descriptor.observable_fields)
+            for level, kind, payload in ancillary:
+                if (level, kind) == (socket.SOL_SOCKET, socket.SCM_RIGHTS):
+                    usable = len(payload) - len(payload) % array.array("i").itemsize
+                    values = array.array("i"); values.frombytes(payload[:usable]); received.extend(values)
+                    if usable != len(payload): raise ValueError("SCM_RIGHTS FD payload is invalid")
+            if len(ancillary) != 1 or ancillary[0][0:2] != (socket.SOL_SOCKET, socket.SCM_RIGHTS): raise ValueError("SCM_RIGHTS message is invalid")
+            envelope = CapabilityEnvelopeV1.from_canonical_bytes(message)
+            expected_context.verify_envelope(envelope)
+            cls._verify_received_closure(envelope.unsigned.fd_descriptors, received)
             capability = cls(cls._TOKEN, envelope, tuple(received)); received = []
             authenticated_seqpacket_fd.close()
             return capability
@@ -2811,6 +2881,23 @@ class RegistrationRecoveryCapabilityV1:
                 try: os.close(fd)
                 except OSError: pass
             raise
+
+    @classmethod
+    def _verify_received_closure(cls, descriptors: tuple[FdDescriptorV1, ...], received: list[int]) -> None:
+        if len(received) != len(descriptors):
+            raise ValueError("SCM_RIGHTS FD closure count is invalid")
+        identities: set[tuple[str, object, object]] = set()
+        for descriptor, fd in zip(descriptors, received):
+            cls._verify_observable_fd(fd, descriptor.observable_fields)
+            observed = descriptor.observable_fields
+            identity = (
+                ("regular", observed.device, observed.inode)
+                if observed.file_type == "regular"
+                else ("control", observed.socket_identity_digest, observed.file_type)
+            )
+            if identity in identities:
+                raise ValueError("SCM_RIGHTS FD closure contains a duplicate underlying identity")
+            identities.add(identity)
 
     @staticmethod
     def _verify_observable_fd(fd: int, expected: FdObservableIdentityV1) -> None:
