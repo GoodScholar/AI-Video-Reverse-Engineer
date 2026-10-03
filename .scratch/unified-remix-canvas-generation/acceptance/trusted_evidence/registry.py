@@ -36,18 +36,62 @@ _SUBJECT_REPOSITORY = "git://product/repository"
 # governed by _IMPLEMENTATION_TYPES and are never upgraded by this module.
 APPROVED_V2_SCHEMA_IDS = frozenset(
     {
+        "trusted-acceptance-handoff-pointer/v1",
+        "trusted-acceptance-handoff/v1",
+        "trusted-activated-policy-export-request/v1",
         "trusted-allowed-task-outputs/v1",
+        "trusted-broker-lifecycle-proof/v1",
         "trusted-handoff-export-request/v1",
+        "trusted-handoff-fetch/v1",
+        "trusted-handoff-finalized/v1",
+        "trusted-handoff-import/v1",
+        "trusted-handoff-store-lease/v1",
         "trusted-handoff-transport-ready/v1",
+        "trusted-handoff-transport-replay/v1",
         "trusted-handoff-transport-seal/v1",
         "trusted-handoff-transfer/v1",
+        "trusted-policy-activation/v1",
         "trusted-policy-activation-proof/v1",
+        "trusted-policy-publish-transaction/v1",
+        "trusted-product-source-budget/v1",
+        "trusted-registration-broker-auth-envelope-sign-payload/v1",
+        "trusted-registration-broker-auth-key-registration/v1",
+        "trusted-registration-broker-auth-lease-issue-payload/v1",
+        "trusted-registration-broker-auth-lease-issue-request/v1",
+        "trusted-registration-broker-auth-revoke-payload/v1",
+        "trusted-registration-broker-auth-rotate-payload/v1",
+        "trusted-registration-broker-auth-sequence-entry/v1",
+        "trusted-registration-broker-auth-sequence-journal/v1",
+        "trusted-registration-broker-auth-sequence-state/v1",
         "trusted-registration-broker-auth-registry/v1",
         "trusted-registration-broker-auth-revocations/v1",
         "trusted-registration-capability-envelope/v1",
+        "trusted-registration-forward-only-recovery-authority/v1",
+        "trusted-registration-journal-entry/v1",
+        "trusted-registration-mutation-receipt/v1",
+        "trusted-registration-mutation-request/v1",
+        "trusted-registration-pre-state/v1",
+        "trusted-registration-quarantine-object-set/v1",
         "trusted-registration-recovery-lease-identity-preimage/v1",
+        "trusted-registration-recovery-lease/v1",
+        "trusted-registration-repository-recovery-binding/v1",
+        "trusted-registration-transaction-intent/v1",
+        "trusted-registration-transaction-state/v1",
+        "trusted-registration-worker-input/v1",
+        "trusted-registration-worker-session-family-authorization/v1",
+        "trusted-staged-candidate-set/v1",
+        "trusted-task-completion-record/v1",
+        "trusted-task-output-policy/v1",
+        "trusted-ticket23-policy-handoff/v1",
     }
 )
+
+
+def require_approved_v2_schema_id(schema_id: object) -> str:
+    """Reject anything outside the frozen Task 2 persistent-wire contract."""
+    if not isinstance(schema_id, str) or schema_id not in APPROVED_V2_SCHEMA_IDS:
+        raise PolicyError("E2_SCHEMA_UNAPPROVED", "schema ID is not approved for Task 2")
+    return schema_id
 
 
 class PolicyError(ValueError):
