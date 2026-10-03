@@ -133,15 +133,106 @@ def test_bootstrap_consumes_private_snapshots_after_an_audited_source_path_is_re
     uv = _current_uv_artifact(manifest)
     source = root / "artifacts" / uv["filename"]
 
-    def replace_source_path() -> None:
+    original_entries = verifier._all_entries
+    calls = 0
+
+    def replace_source_path(*args, **kwargs):
+        nonlocal calls
+        result = original_entries(*args, **kwargs)
+        calls += 1
+        if calls != 2:
+            return result
         forged = tmp_path / "forged.tar.gz"
         _write_tar(forged, {"forged/uv": b"#!/bin/sh\necho forged\n"})
         os.replace(forged, source)
+        return result
 
-    executable, _ = verifier.verify(root / "manifest.json", after_snapshots=replace_source_path)
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(verifier, "_all_entries", replace_source_path)
+    try:
+        executable, _ = verifier.verify(root / "manifest.json")
+    finally:
+        monkeypatch.undo()
 
     assert executable.is_file()
     assert source.read_bytes() != (BOOTSTRAP / "artifacts" / uv["filename"]).read_bytes()
+
+
+def test_snapshot_copy_stops_an_append_before_exceeding_the_compressed_budget(tmp_path, monkeypatch):
+    """Catches a source growing after fstat and being copied past the compressed-byte limit."""
+    verifier = _verifier()
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"a")
+    snapshot_dir = tmp_path / "snapshot"
+    real_fdopen = verifier.os.fdopen
+    appended = False
+
+    def controlled_fdopen(descriptor, mode, *args, **kwargs):
+        handle = real_fdopen(descriptor, mode, *args, **kwargs)
+        if mode != "rb":
+            return handle
+
+        class AppendingReader:
+            def __enter__(self):
+                handle.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return handle.__exit__(*exc)
+
+            def __getattr__(self, name):
+                return getattr(handle, name)
+
+            def read(self, size=-1):
+                nonlocal appended
+                chunk = handle.read(size)
+                if not appended:
+                    source.write_bytes(source.read_bytes() + b"bc")
+                    appended = True
+                return chunk
+
+        return AppendingReader()
+
+    def controlled_mkdtemp(**_kwargs):
+        snapshot_dir.mkdir()
+        return str(snapshot_dir)
+
+    monkeypatch.setattr(verifier.os, "fdopen", controlled_fdopen)
+    monkeypatch.setattr(verifier.tempfile, "mkdtemp", controlled_mkdtemp)
+    with pytest.raises(verifier.BootstrapError, match="compressed budget"):
+        verifier._snapshot_file(source, label="artifact", maximum=2)
+    assert not snapshot_dir.exists()
+
+
+def test_verify_cleans_executable_on_version_failure(tmp_path, monkeypatch):
+    """Catches a failed version check leaking the private executable directory."""
+    verifier = _verifier()
+    root = _copy_bootstrap(tmp_path)
+    manifest = _manifest(root)
+    _current_uv_artifact(manifest)["versionOutput"] = "forged uv version"
+    _write_manifest(root, manifest)
+    created: list[Path] = []
+    real_mkdtemp = verifier.tempfile.mkdtemp
+
+    def record_mkdtemp(**kwargs):
+        path = Path(real_mkdtemp(**kwargs))
+        created.append(path)
+        return str(path)
+
+    monkeypatch.setattr(verifier.tempfile, "mkdtemp", record_mkdtemp)
+    with pytest.raises(verifier.BootstrapError, match="version/build identity"):
+        verifier.verify(root / "manifest.json")
+    assert created
+    assert all(not path.exists() for path in created)
+
+
+def test_verify_does_not_expose_a_public_race_test_hook(tmp_path):
+    """Catches test-only source replacement callbacks becoming a production verifier interface."""
+    verifier = _verifier()
+    root = _copy_bootstrap(tmp_path)
+
+    with pytest.raises(TypeError):
+        verifier.verify(root / "manifest.json", after_snapshots=lambda: None)
 
 
 def test_wheel_budget_and_record_rows_fail_closed(tmp_path):

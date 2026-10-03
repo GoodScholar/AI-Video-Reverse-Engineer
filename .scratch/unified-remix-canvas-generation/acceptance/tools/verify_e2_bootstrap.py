@@ -141,8 +141,12 @@ def _snapshot_file(path: Path, *, label: str, maximum: int) -> tuple[ArtifactSna
             snapshot = ArtifactSnapshot(directory, target)
             target_descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             digest = hashlib.sha256()
+            copied_bytes = 0
             with os.fdopen(target_descriptor, "wb") as copied:
                 while chunk := handle.read(1024 * 1024):
+                    copied_bytes += len(chunk)
+                    if copied_bytes > maximum:
+                        raise BootstrapError(f"{label} compressed budget exceeded: {path.name}")
                     digest.update(chunk)
                     copied.write(chunk)
             after = os.fstat(handle.fileno())
@@ -408,6 +412,14 @@ def _extract_uv(snapshot: ArtifactSnapshot, limits: ArchiveLimits = DEFAULT_LIMI
         raise
 
 
+def _cleanup_executable(executable: Path) -> None:
+    executable.unlink(missing_ok=True)
+    try:
+        executable.parent.rmdir()
+    except OSError:
+        pass
+
+
 def _uv_environment() -> dict[str, str]:
     return {
         "LC_ALL": "C",
@@ -424,7 +436,7 @@ def _verify_version(executable: Path, expected: str) -> None:
         raise BootstrapError("uv version/build identity does not match manifest")
 
 
-def verify(manifest_path: Path, *, after_snapshots=None) -> tuple[Path, str]:
+def verify(manifest_path: Path) -> tuple[Path, str]:
     root = manifest_path.parent
     raw_manifest = _regular_bytes(manifest_path, label="manifest")
     try:
@@ -434,12 +446,11 @@ def verify(manifest_path: Path, *, after_snapshots=None) -> tuple[Path, str]:
     if not isinstance(manifest, dict) or manifest.get("schemaVersion") != "BootstrapArtifactsV1":
         raise BootstrapError("manifest schemaVersion must be BootstrapArtifactsV1")
     snapshots: list[ArtifactSnapshot] = []
+    executable: Path | None = None
     try:
         selected = _host_platform()
         checked_uv = _all_entries(root, manifest, "uvArchives", UV_ARCHIVES, snapshots, kind="uv")
         checked_wheels = _all_entries(root, manifest, "zstandardWheels", WHEELS, snapshots, kind="zstandard")
-        if after_snapshots is not None:
-            after_snapshots()
         uv, uv_snapshot = checked_uv[selected]
         config = manifest.get("emptyConfig")
         if not isinstance(config, dict) or config.get("filename") != "uv-empty.toml" or config.get("sha256") != EMPTY_CONFIG_SHA256:
@@ -454,6 +465,10 @@ def verify(manifest_path: Path, *, after_snapshots=None) -> tuple[Path, str]:
         executable = _extract_uv(uv_snapshot)
         _verify_version(executable, uv.get("versionOutput", ""))
         return executable, _sha256(raw_manifest)
+    except BaseException:
+        if executable is not None:
+            _cleanup_executable(executable)
+        raise
     finally:
         for snapshot in snapshots:
             snapshot.cleanup()
