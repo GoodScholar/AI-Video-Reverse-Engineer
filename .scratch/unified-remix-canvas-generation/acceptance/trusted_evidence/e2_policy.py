@@ -13,10 +13,12 @@ import json
 import os
 import re
 import stat
+import subprocess
 import unicodedata
 import fcntl
 import socket
 from collections.abc import Mapping
+from pathlib import Path
 from types import MappingProxyType
 
 
@@ -475,6 +477,209 @@ class AllowedTaskOutputsV1(_SelfDigestRecord):
         if raw[_SELF_DIGEST] != result.canonical_digest:
             raise ValueError("allowed task outputs self digest is invalid")
         return result
+
+
+def _task_output_policy(policy_bytes: bytes) -> dict[str, object]:
+    """Decode the fixed Task 28/29 policy without accepting caller extensions."""
+    raw = _strict_object(policy_bytes, {"protectedPaths", "schema", "task29ContractPath", "tasks"}, "task output policy")
+    if raw["schema"] != "trusted-task-output-policy/v1" or not isinstance(raw["protectedPaths"], list) or not isinstance(raw["tasks"], list):
+        raise ValueError("task output policy shape is invalid")
+    task29_contract_path = _relative_path(raw["task29ContractPath"], "Task 29 contract path")
+
+    protected: list[tuple[str, str]] = []
+    for item in raw["protectedPaths"]:
+        if not isinstance(item, dict) or set(item) != {"repositoryRelativePath", "role"} or item["role"] != "protected":
+            raise ValueError("protected path policy is invalid")
+        protected.append((_relative_path(item["repositoryRelativePath"], "protected path"), item["role"]))
+    if not protected or protected != sorted(protected) or len(set(protected)) != len(protected):
+        raise ValueError("protected paths must be non-empty and ordered")
+
+    tasks: list[dict[str, object]] = []
+    for task in raw["tasks"]:
+        if not isinstance(task, dict) or set(task) != {"phase", "sourceDirtyInputs", "task", "transitions"}:
+            raise ValueError("task output policy task is invalid")
+        if type(task["task"]) is not int or _PHASES.get(task["task"]) != task["phase"] or not isinstance(task["sourceDirtyInputs"], list) or not isinstance(task["transitions"], list):
+            raise ValueError("task output policy task identity is invalid")
+        dirty: list[tuple[str, str]] = []
+        for item in task["sourceDirtyInputs"]:
+            if not isinstance(item, dict) or set(item) != {"repositoryRelativePath", "role"}:
+                raise ValueError("source dirty policy is invalid")
+            dirty.append((_relative_path(item["repositoryRelativePath"], "source dirty path"), _require_text(item["role"], "source dirty role")))
+        transitions: list[tuple[str, str, tuple[tuple[str, str], ...]]] = []
+        for item in task["transitions"]:
+            if not isinstance(item, dict):
+                raise ValueError("transition policy is invalid")
+            if set(item) == {"allowedTransitions", "repositoryRelativePath", "role"} and isinstance(item["allowedTransitions"], list):
+                path = _relative_path(item["repositoryRelativePath"], "transition path")
+                options_wire = item["allowedTransitions"]
+            elif task["task"] == 29 and set(item) == {"allowedTransition", "precondition", "role"} and item["role"] == "contract":
+                path = task29_contract_path
+                options_wire = [{"allowedTransition": item["allowedTransition"], "precondition": item["precondition"]}]
+            else:
+                raise ValueError("transition policy is invalid")
+            allowed: list[tuple[str, str]] = []
+            for option in options_wire:
+                if not isinstance(option, dict) or set(option) != {"allowedTransition", "precondition"}:
+                    raise ValueError("transition policy option is invalid")
+                allowed.append((_require_text(option["precondition"], "transition precondition"), _require_text(option["allowedTransition"], "allowed transition")))
+            options = tuple(allowed)
+            if not options or len(set(options)) != len(options):
+                raise ValueError("transition policy options must be unique")
+            transitions.append((path, _require_text(item["role"], "transition role"), options))
+        if dirty != sorted(dirty) or len(set(dirty)) != len(dirty) or transitions != sorted(transitions) or len({item[0] for item in transitions}) != len(transitions):
+            raise ValueError("task output policy entries must be uniquely ordered")
+        tasks.append({"phase": task["phase"], "task": task["task"], "sourceDirtyInputs": tuple(dirty), "transitions": tuple(transitions)})
+    if tuple(item["task"] for item in tasks) != (28, 29):
+        raise ValueError("task output policy must freeze Task 28 and Task 29")
+    return {"protectedPaths": tuple(protected), "tasks": tuple(tasks)}
+
+
+def _git_read(repository: Path, *arguments: str) -> bytes:
+    try:
+        result = subprocess.run(("git", *arguments), cwd=repository, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError("Git repository inspection failed") from error
+    return result.stdout
+
+
+def _repository_regular_file(repository: Path, relative_path: str, *, required: bool) -> Path | None:
+    current = repository
+    for component in relative_path.split("/"):
+        current = current / component
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            if required:
+                raise ValueError("required repository path is absent")
+            return None
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError("repository path contains a symlink")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("repository path is not a regular file")
+    return current
+
+
+def _file_digest(path: Path) -> str:
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _git_blob_digest(repository: Path, base_commit: GitObjectIdV1, relative_path: str) -> str | None:
+    result = subprocess.run(
+        ("git", "cat-file", "-e", f"{base_commit.hex}:{relative_path}"), cwd=repository,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        return None
+    return "sha256:" + hashlib.sha256(_git_read(repository, "show", f"{base_commit.hex}:{relative_path}")).hexdigest()
+
+
+def _git_worktree_changes(repository: Path) -> dict[str, str]:
+    raw = _git_read(repository, "diff", "--name-status", "-z", "-M")
+    values = raw.split(b"\0")
+    changes: dict[str, str] = {}
+    position = 0
+    while position < len(values) - 1:
+        status = values[position].decode("utf-8")
+        position += 1
+        if status.startswith(("R", "C")):
+            raise ValueError("renames and copies are forbidden")
+        if position >= len(values) or status not in {"M", "A", "D", "T"}:
+            raise ValueError("worktree change is invalid")
+        path = values[position].decode("utf-8")
+        position += 1
+        _relative_path(path, "Git worktree path")
+        if status != "M":
+            raise ValueError("deletes and type changes are forbidden")
+        if path in changes:
+            raise ValueError("duplicate Git worktree path")
+        changes[path] = "modified"
+    for raw_path in _git_read(repository, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0")[:-1]:
+        path = raw_path.decode("utf-8")
+        _relative_path(path, "Git untracked path")
+        if path in changes:
+            raise ValueError("worktree path is both tracked and untracked")
+        changes[path] = "untracked"
+    return changes
+
+
+def validate_task_output_repository_state(
+    repository_root: str | Path,
+    allowed_outputs: AllowedTaskOutputsV1,
+    policy_bytes: bytes,
+    candidate_paths: Mapping[str, str | Path],
+    *,
+    expected_allowed_outputs_digest: str,
+) -> None:
+    """Validate Task 28/29's real Git pre-state without mutating it.
+
+    The caller supplies only already-held candidate paths.  Every mutable
+    repository value is checked against the immutable manifest and canonical
+    policy; no current observation can widen either authority.
+    """
+    repository = Path(repository_root)
+    if not repository.is_absolute() or repository.is_symlink() or not repository.is_dir():
+        raise ValueError("repository root must be an absolute non-symlink directory")
+    _require_digest(expected_allowed_outputs_digest, "expected_allowed_outputs_digest")
+    if allowed_outputs.canonical_digest != expected_allowed_outputs_digest:
+        raise ValueError("allowed task outputs were refreshed or substituted")
+    policy = _task_output_policy(policy_bytes)
+    if allowed_outputs.task_output_policy_digest != "sha256:" + hashlib.sha256(policy_bytes).hexdigest() or allowed_outputs.protected_paths_digest != canonical_digest([{"repositoryRelativePath": path, "role": role} for path, role in policy["protectedPaths"]]):
+        raise ValueError("task output policy digest is not bound to the manifest")
+    task_policy = next((item for item in policy["tasks"] if item["task"] == allowed_outputs.task_id), None)
+    if task_policy is None or task_policy["phase"] != allowed_outputs.phase:
+        raise ValueError("task output phase is not allowed by policy")
+    planned_dirty = tuple(item.repository_relative_path for item in allowed_outputs.source_dirty_inputs)
+    planned_transitions = tuple((item.repository_relative_path, item.output_kind, item.precondition, item.allowed_transition) for item in allowed_outputs.transitions)
+    allowed_transitions = {path: (role, options) for path, role, options in task_policy["transitions"]}
+    if planned_dirty != tuple(item[0] for item in task_policy["sourceDirtyInputs"]) or set(item[0] for item in planned_transitions) != set(allowed_transitions) or any(allowed_transitions[path][0] != role or (precondition, transition) not in allowed_transitions[path][1] for path, role, precondition, transition in planned_transitions):
+        raise ValueError("manifest paths or transitions exceed frozen policy")
+    protected_paths = {item[0] for item in policy["protectedPaths"]}
+    if protected_paths & (set(planned_dirty) | {item[0] for item in planned_transitions}):
+        raise ValueError("protected paths cannot be mutable manifest paths")
+    if _git_read(repository, "rev-parse", "--verify", "HEAD").decode("ascii").strip() != allowed_outputs.base_commit.hex:
+        raise ValueError("repository HEAD is not the fixed base commit")
+    if subprocess.run(("git", "diff", "--cached", "--quiet"), cwd=repository).returncode != 0 or _git_read(repository, "ls-files", "-u"):
+        raise ValueError("staged or unmerged index changes are forbidden")
+    changes = _git_worktree_changes(repository)
+    if set(changes) != set(planned_dirty):
+        raise ValueError("worktree changes are not exactly the manifest source dirty set")
+    for allowance in allowed_outputs.source_dirty_inputs:
+        if changes[allowance.repository_relative_path] != allowance.expected_status:
+            raise ValueError("source dirty status changed")
+        source = _repository_regular_file(repository, allowance.repository_relative_path, required=True)
+        if _file_digest(source) != allowance.expected_content_digest:
+            raise ValueError("source dirty content changed")
+    if allowed_outputs.task_id == 28:
+        if set(candidate_paths) != set(allowed_outputs.candidate_refs):
+            raise ValueError("candidate path set is not closed")
+        held = {item.candidate_ref: item for item in allowed_outputs.staged_candidates}
+        for ref in allowed_outputs.candidate_refs:
+            path = Path(candidate_paths[ref])
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("candidate is not a regular held file")
+            metadata = path.stat()
+            identity = held.get(ref)
+            if identity is None or (metadata.st_dev, metadata.st_ino, metadata.st_size, _file_digest(path)) != (identity.device, identity.inode, identity.byte_length, identity.content_digest):
+                raise ValueError("candidate identity drifted")
+    elif candidate_paths:
+        raise ValueError("Task 29 must not receive candidate files")
+    for transition in allowed_outputs.transitions:
+        current = _repository_regular_file(repository, transition.repository_relative_path, required=False)
+        base_digest = _git_blob_digest(repository, allowed_outputs.base_commit, transition.repository_relative_path)
+        if transition.allowed_transition == "create-or-resume-exact-cas":
+            if current is not None or base_digest is not None:
+                raise ValueError("new candidate CAS must be absent")
+        elif transition.allowed_transition == "retain-exact-cas":
+            if current is None or base_digest != transition.expected_pre_digest or _file_digest(current) != base_digest:
+                raise ValueError("retained candidate CAS drifted from fixed base bytes")
+        elif transition.precondition == "must-not-exist":
+            if current is not None or base_digest is not None:
+                raise ValueError("create output must be absent")
+        elif transition.precondition == "equals-base-bytes":
+            if current is None or base_digest != transition.expected_pre_digest or _file_digest(current) != base_digest:
+                raise ValueError("base-byte output precondition failed")
+        else:
+            raise ValueError("unsupported output transition")
 
 
 @dataclass(frozen=True, slots=True)
