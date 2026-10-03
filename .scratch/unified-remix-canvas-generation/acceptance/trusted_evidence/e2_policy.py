@@ -2234,3 +2234,439 @@ class RegistrationRecoveryLeaseV1:
         revoked_at = revocations.revoked_at(self.broker_auth_key_id)
         if revoked_at is not None and current_sequence >= revoked_at:
             raise ValueError("lease signing key is globally revoked")
+
+
+# E.3 is intentionally a portable, in-memory broker boundary.  It specifies
+# exactly what Task 14 must validate before it reaches a repository syscall;
+# it does not open a repository, spawn a worker, or implement a socket runtime.
+_MUTATION_PHASES = {"PREPARED", "WRITING_CAS", "WRITING_AUDIT", "CATALOG_COMMITTING", "ACTIVATED", "FAILED_BLOCKED"}
+_MUTATION_ACTIONS = {
+    "persist-intent", "install-cas", "write-audit", "rename-catalog",
+    "fsync-catalog-parent", "append-terminal", "safe-cleanup",
+}
+_MUTATION_RESULTS = {"EXECUTED", "NOT_EXECUTED", "ALREADY_EXACT"}
+_FORWARD_ONLY_ACTIONS = ("fsync-catalog-parent", "append-terminal")
+
+
+class RegistrationMutationChannelBindingV1:
+    """Worker-local, non-serializable sequence state for one received channel."""
+
+    __slots__ = (
+        "operation_id", "lease_identity_digest", "lifecycle_nonce", "worker_session_id",
+        "worker_process_identity_digest", "worker_sequence", "broker_session_nonce",
+        "control_socket_identity_digest", "channel_binding_digest", "_next_sequence",
+    )
+    _TOKEN = object()
+
+    def __init__(self, token: object, envelope: CapabilityEnvelopeUnsignedV1, control_socket_identity_digest: str) -> None:
+        if token is not self._TOKEN:
+            raise TypeError("mutation channel bindings are created from a received capability envelope")
+        self.operation_id = envelope.operation_id
+        self.lease_identity_digest = envelope.broker_lease_identity_digest
+        self.lifecycle_nonce = envelope.lifecycle_nonce
+        self.worker_session_id = envelope.worker_session_id
+        self.worker_process_identity_digest = envelope.worker_process_identity_digest
+        self.worker_sequence = envelope.worker_sequence
+        self.broker_session_nonce = envelope.broker_session_nonce
+        self.control_socket_identity_digest = control_socket_identity_digest
+        self.channel_binding_digest = canonical_digest({
+            "brokerSessionNonce": self.broker_session_nonce,
+            "controlSocketIdentityDigest": control_socket_identity_digest,
+            "leaseIdentityDigest": self.lease_identity_digest,
+            "lifecycleNonce": self.lifecycle_nonce,
+            "operationId": self.operation_id,
+            "workerProcessIdentityDigest": self.worker_process_identity_digest,
+            "workerSequence": self.worker_sequence,
+            "workerSessionId": self.worker_session_id,
+        })
+        self._next_sequence = 0
+
+    @classmethod
+    def create(cls, envelope: CapabilityEnvelopeUnsignedV1, control_socket_identity_digest: str) -> "RegistrationMutationChannelBindingV1":
+        if type(envelope) is not CapabilityEnvelopeUnsignedV1:
+            raise TypeError("mutation channel binding requires an unsigned capability envelope")
+        _require_digest(control_socket_identity_digest, "control_socket_identity_digest")
+        return cls(cls._TOKEN, envelope, control_socket_identity_digest)
+
+    def _consume_next_sequence(self) -> int:
+        sequence = self._next_sequence
+        self._next_sequence += 1
+        return sequence
+
+    def __copy__(self):
+        raise TypeError("mutation channel bindings are non-copyable")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("mutation channel bindings are non-copyable")
+
+    def __reduce__(self):
+        raise TypeError("mutation channel bindings are non-serializable")
+
+
+@dataclass(frozen=True, slots=True)
+class RegistrationMutationSenderEvidenceV1:
+    """Task 14 supplied, already-authenticated sender facts; never worker input."""
+
+    channel_binding_digest: str
+    worker_process_identity_digest: str
+    operation_id: str
+    worker_session_id: str
+    worker_sequence: int
+
+    def __post_init__(self) -> None:
+        for field in ("channel_binding_digest", "worker_process_identity_digest"):
+            _require_digest(getattr(self, field), field)
+        for field in ("operation_id", "worker_session_id"):
+            _require_text(getattr(self, field), field)
+        _u64(self.worker_sequence, "worker_sequence", positive=True)
+
+    @classmethod
+    def from_binding(cls, binding: RegistrationMutationChannelBindingV1) -> "RegistrationMutationSenderEvidenceV1":
+        if type(binding) is not RegistrationMutationChannelBindingV1:
+            raise TypeError("sender evidence requires a mutation channel binding")
+        return cls(binding.channel_binding_digest, binding.worker_process_identity_digest, binding.operation_id, binding.worker_session_id, binding.worker_sequence)
+
+
+@dataclass(frozen=True, slots=True)
+class RegistrationMutationRequestV1:
+    schema: str
+    operation_id: str
+    lifecycle_nonce: str
+    worker_session_id: str
+    worker_process_identity_digest: str
+    worker_sequence: int
+    mutation_sequence: int
+    channel_binding_digest: str
+    expected_registration_state_digest: str
+    expected_transition_digest: str
+    expected_phase: str
+    action: str
+    payload_digest: str
+
+    def __post_init__(self) -> None:
+        if self.schema != "trusted-registration-mutation-request/v1" or self.expected_phase not in _MUTATION_PHASES or self.action not in _MUTATION_ACTIONS:
+            raise ValueError("registration mutation request identity is invalid")
+        for field in ("operation_id", "lifecycle_nonce", "worker_session_id"):
+            _require_text(getattr(self, field), field)
+        for field in ("worker_process_identity_digest", "channel_binding_digest", "expected_registration_state_digest", "expected_transition_digest", "payload_digest"):
+            _require_digest(getattr(self, field), field)
+        _u64(self.worker_sequence, "worker_sequence", positive=True)
+        _u64(self.mutation_sequence, "mutation_sequence")
+
+    def _unsigned_wire(self) -> dict[str, object]:
+        return {
+            "action": self.action, "channelBindingDigest": self.channel_binding_digest,
+            "expectedPhase": self.expected_phase, "expectedRegistrationStateDigest": self.expected_registration_state_digest,
+            "expectedTransitionDigest": self.expected_transition_digest, "lifecycleNonce": self.lifecycle_nonce,
+            "mutationSequence": self.mutation_sequence, "operationId": self.operation_id,
+            "payloadDigest": self.payload_digest, "schema": self.schema,
+            "workerProcessIdentityDigest": self.worker_process_identity_digest,
+            "workerSequence": self.worker_sequence, "workerSessionId": self.worker_session_id,
+        }
+
+    @property
+    def request_digest(self) -> str:
+        return canonical_digest(self._unsigned_wire())
+
+    def to_wire(self) -> dict[str, object]:
+        return {**self._unsigned_wire(), "requestDigest": self.request_digest}
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_wire())
+
+    @classmethod
+    def create(cls, channel_binding: RegistrationMutationChannelBindingV1, expected_state: object, transition: object, expected_phase: str, action: str, payload_digest: str) -> "RegistrationMutationRequestV1":
+        if type(channel_binding) is not RegistrationMutationChannelBindingV1:
+            raise TypeError("mutation request requires a worker mutation channel binding")
+        state_digest = expected_state if isinstance(expected_state, str) else getattr(expected_state, "canonical_digest", None)
+        transition_digest = transition if isinstance(transition, str) else getattr(transition, "canonical_digest", None)
+        _require_digest(state_digest, "expected_state")
+        _require_digest(transition_digest, "transition")
+        _require_digest(payload_digest, "payload_digest")
+        if expected_phase not in _MUTATION_PHASES or action not in _MUTATION_ACTIONS:
+            raise ValueError("registration mutation request phase or action is invalid")
+        return cls(
+            "trusted-registration-mutation-request/v1", channel_binding.operation_id,
+            channel_binding.lifecycle_nonce, channel_binding.worker_session_id,
+            channel_binding.worker_process_identity_digest, channel_binding.worker_sequence,
+            channel_binding._consume_next_sequence(), channel_binding.channel_binding_digest,
+            state_digest, transition_digest, expected_phase, action, payload_digest,
+        )
+
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "RegistrationMutationRequestV1":
+        fields = {"action", "channelBindingDigest", "expectedPhase", "expectedRegistrationStateDigest", "expectedTransitionDigest", "lifecycleNonce", "mutationSequence", "operationId", "payloadDigest", "requestDigest", "schema", "workerProcessIdentityDigest", "workerSequence", "workerSessionId"}
+        raw = _strict_object(payload, fields, "registration mutation request")
+        result = cls(raw["schema"], raw["operationId"], raw["lifecycleNonce"], raw["workerSessionId"], raw["workerProcessIdentityDigest"], raw["workerSequence"], raw["mutationSequence"], raw["channelBindingDigest"], raw["expectedRegistrationStateDigest"], raw["expectedTransitionDigest"], raw["expectedPhase"], raw["action"], raw["payloadDigest"])
+        if raw["requestDigest"] != result.request_digest:
+            raise ValueError("registration mutation request digest is invalid")
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class BrokerMutationReceiptV1:
+    schema: str
+    operation_id: str
+    worker_session_id: str
+    worker_sequence: int
+    mutation_sequence: int
+    request_digest: str
+    result: str
+    resulting_registration_state_digest: str
+    broker_audit_mac: str
+
+    def __post_init__(self) -> None:
+        if self.schema != "trusted-registration-mutation-receipt/v1" or self.result not in _MUTATION_RESULTS:
+            raise ValueError("broker mutation receipt identity is invalid")
+        for field in ("operation_id", "worker_session_id"):
+            _require_text(getattr(self, field), field)
+        for field in ("request_digest", "resulting_registration_state_digest"):
+            _require_digest(getattr(self, field), field)
+        _u64(self.worker_sequence, "worker_sequence", positive=True)
+        _u64(self.mutation_sequence, "mutation_sequence")
+        _mac(self.broker_audit_mac, "broker_audit_mac")
+
+    def _unsigned_wire(self) -> dict[str, object]:
+        return {"mutationSequence": self.mutation_sequence, "operationId": self.operation_id, "requestDigest": self.request_digest, "result": self.result, "resultingRegistrationStateDigest": self.resulting_registration_state_digest, "schema": self.schema, "workerSequence": self.worker_sequence, "workerSessionId": self.worker_session_id}
+
+    @property
+    def canonical_digest(self) -> str:
+        return canonical_digest(self._unsigned_wire())
+
+    def _mac_payload(self) -> bytes:
+        return canonical_json_bytes({**self._unsigned_wire(), "canonicalDigest": self.canonical_digest})
+
+    def to_wire(self) -> dict[str, object]:
+        return {**self._unsigned_wire(), "brokerAuditMac": self.broker_audit_mac, "canonicalDigest": self.canonical_digest}
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_wire())
+
+    @classmethod
+    def create_after_result(cls, request: RegistrationMutationRequestV1, result: str, resulting_registration_state_digest: str, audit_key: bytes) -> "BrokerMutationReceiptV1":
+        if type(request) is not RegistrationMutationRequestV1 or result not in _MUTATION_RESULTS or not isinstance(audit_key, bytes) or len(audit_key) < 16:
+            raise ValueError("broker receipt inputs are invalid")
+        unsigned = cls("trusted-registration-mutation-receipt/v1", request.operation_id, request.worker_session_id, request.worker_sequence, request.mutation_sequence, request.request_digest, result, resulting_registration_state_digest, "0" * 64)
+        mac = hmac.new(audit_key, unsigned._mac_payload(), hashlib.sha256).hexdigest()
+        return cls(unsigned.schema, unsigned.operation_id, unsigned.worker_session_id, unsigned.worker_sequence, unsigned.mutation_sequence, unsigned.request_digest, unsigned.result, unsigned.resulting_registration_state_digest, mac)
+
+    def verify_audit_mac(self, audit_key: bytes) -> None:
+        if not isinstance(audit_key, bytes) or len(audit_key) < 16 or not hmac.compare_digest(self.broker_audit_mac, hmac.new(audit_key, self._mac_payload(), hashlib.sha256).hexdigest()):
+            raise ValueError("broker mutation receipt audit MAC is invalid")
+
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "BrokerMutationReceiptV1":
+        fields = {"brokerAuditMac", "canonicalDigest", "mutationSequence", "operationId", "requestDigest", "result", "resultingRegistrationStateDigest", "schema", "workerSequence", "workerSessionId"}
+        raw = _strict_object(payload, fields, "broker mutation receipt")
+        result = cls(raw["schema"], raw["operationId"], raw["workerSessionId"], raw["workerSequence"], raw["mutationSequence"], raw["requestDigest"], raw["result"], raw["resultingRegistrationStateDigest"], raw["brokerAuditMac"])
+        if raw["canonicalDigest"] != result.canonical_digest:
+            raise ValueError("broker mutation receipt digest is invalid")
+        return result
+
+
+class RegistrationBrokerMutationVerifierV1:
+    """Single-session verifier called before Task 14 invokes a repository action."""
+
+    __slots__ = ("_binding", "_state_digest", "_transition_digest", "_phase", "_audit_key", "_next_sequence")
+    _TOKEN = object()
+
+    def __init__(self, token: object, binding: RegistrationMutationChannelBindingV1, state: str, transition: str, phase: str, audit_key: bytes) -> None:
+        if token is not self._TOKEN:
+            raise TypeError("broker mutation verifiers are created from an authenticated channel")
+        self._binding, self._state_digest, self._transition_digest, self._phase, self._audit_key, self._next_sequence = binding, state, transition, phase, audit_key, 0
+
+    @classmethod
+    def create(cls, binding: RegistrationMutationChannelBindingV1, *, initial_state_digest: str, initial_transition_digest: str, initial_phase: str, audit_key: bytes) -> "RegistrationBrokerMutationVerifierV1":
+        if type(binding) is not RegistrationMutationChannelBindingV1 or initial_phase not in _MUTATION_PHASES or not isinstance(audit_key, bytes) or len(audit_key) < 16:
+            raise ValueError("broker mutation verifier inputs are invalid")
+        _require_digest(initial_state_digest, "initial_state_digest")
+        _require_digest(initial_transition_digest, "initial_transition_digest")
+        return cls(cls._TOKEN, binding, initial_state_digest, initial_transition_digest, initial_phase, audit_key)
+
+    def _verify_before_repository_syscall(self, request: RegistrationMutationRequestV1, sender: RegistrationMutationSenderEvidenceV1) -> None:
+        if type(request) is not RegistrationMutationRequestV1 or type(sender) is not RegistrationMutationSenderEvidenceV1:
+            raise ValueError("mutation request or sender evidence is invalid")
+        binding = self._binding
+        if (sender.channel_binding_digest, sender.worker_process_identity_digest, sender.operation_id, sender.worker_session_id, sender.worker_sequence) != (binding.channel_binding_digest, binding.worker_process_identity_digest, binding.operation_id, binding.worker_session_id, binding.worker_sequence):
+            raise ValueError("actual sender does not match authenticated mutation channel")
+        if (request.operation_id, request.lifecycle_nonce, request.worker_session_id, request.worker_process_identity_digest, request.worker_sequence, request.channel_binding_digest) != (binding.operation_id, binding.lifecycle_nonce, binding.worker_session_id, binding.worker_process_identity_digest, binding.worker_sequence, binding.channel_binding_digest):
+            raise ValueError("mutation request does not match authenticated channel/session")
+        if request.mutation_sequence != self._next_sequence:
+            raise ValueError("mutation sequence is not the next single-use sequence")
+        if (request.expected_registration_state_digest, request.expected_transition_digest, request.expected_phase) != (self._state_digest, self._transition_digest, self._phase):
+            raise ValueError("mutation request expected state is stale or rebound")
+
+    def dispatch(self, request: RegistrationMutationRequestV1, sender: RegistrationMutationSenderEvidenceV1, repository_action) -> BrokerMutationReceiptV1:
+        self._verify_before_repository_syscall(request, sender)
+        # Consume after all pure checks but before the callback: a retried packet
+        # cannot become valid if a caller crashes while performing the action.
+        self._next_sequence += 1
+        outcome = repository_action()
+        if not isinstance(outcome, tuple) or len(outcome) != 2:
+            raise ValueError("repository action result must be (result, state digest)")
+        result, state_digest = outcome
+        receipt = BrokerMutationReceiptV1.create_after_result(request, result, state_digest, self._audit_key)
+        self._state_digest = state_digest
+        return receipt
+
+
+class RegistrationForwardOnlyRecoveryAuthorityV1:
+    """Root-broker-only capability for the two post-rename durability steps."""
+
+    __slots__ = (
+        "operation_id", "lease_identity_digest", "lease_request_digest", "broker_auth_key_id",
+        "broker_auth_key_registration_digest", "rename_sequence", "rename_head_digest",
+        "rename_policy_digest", "registration_transaction_intent_digest", "expected_catalog_digest",
+        "catalog_parent_identity_digest", "registration_journal_identity_digest", "allowed_actions",
+        "_canonical_digest", "_broker_state_mac",
+    )
+    _TOKEN = object()
+
+    def __init__(self, token: object, *, operation_id: str, lease_identity_digest: str, lease_request_digest: str, broker_auth_key_id: str, broker_auth_key_registration_digest: str, rename_sequence: int, rename_head_digest: str, rename_policy_digest: str, registration_transaction_intent_digest: str, expected_catalog_digest: str, catalog_parent_identity_digest: str, registration_journal_identity_digest: str, allowed_actions: tuple[str, ...], broker_state_mac: str) -> None:
+        if token is not self._TOKEN:
+            raise TypeError("forward-only authorities are root-broker capabilities")
+        _require_text(operation_id, "operation_id"); _require_text(broker_auth_key_id, "broker_auth_key_id")
+        for value, field in ((lease_identity_digest, "lease_identity_digest"), (lease_request_digest, "lease_request_digest"), (broker_auth_key_registration_digest, "broker_auth_key_registration_digest"), (rename_head_digest, "rename_head_digest"), (rename_policy_digest, "rename_policy_digest"), (registration_transaction_intent_digest, "registration_transaction_intent_digest"), (expected_catalog_digest, "expected_catalog_digest"), (catalog_parent_identity_digest, "catalog_parent_identity_digest"), (registration_journal_identity_digest, "registration_journal_identity_digest")):
+            _require_digest(value, field)
+        _u64(rename_sequence, "rename_sequence", positive=True)
+        if tuple(allowed_actions) != _FORWARD_ONLY_ACTIONS:
+            raise ValueError("forward-only authority actions must be the exact fixed pair")
+        self.operation_id, self.lease_identity_digest, self.lease_request_digest = operation_id, lease_identity_digest, lease_request_digest
+        self.broker_auth_key_id, self.broker_auth_key_registration_digest = broker_auth_key_id, broker_auth_key_registration_digest
+        self.rename_sequence, self.rename_head_digest, self.rename_policy_digest = rename_sequence, rename_head_digest, rename_policy_digest
+        self.registration_transaction_intent_digest, self.expected_catalog_digest = registration_transaction_intent_digest, expected_catalog_digest
+        self.catalog_parent_identity_digest, self.registration_journal_identity_digest = catalog_parent_identity_digest, registration_journal_identity_digest
+        self.allowed_actions = _FORWARD_ONLY_ACTIONS
+        self._canonical_digest = canonical_digest(self._unsigned_wire())
+        _mac(broker_state_mac, "broker_state_mac")
+        self._broker_state_mac = broker_state_mac
+
+    def _unsigned_wire(self) -> dict[str, object]:
+        return {"allowedActions": list(_FORWARD_ONLY_ACTIONS), "brokerAuthKeyId": self.broker_auth_key_id, "brokerAuthKeyRegistrationDigest": self.broker_auth_key_registration_digest, "catalogParentIdentityDigest": self.catalog_parent_identity_digest, "expectedCatalogDigest": self.expected_catalog_digest, "leaseIdentityDigest": self.lease_identity_digest, "leaseRequestDigest": self.lease_request_digest, "operationId": self.operation_id, "registrationJournalIdentityDigest": self.registration_journal_identity_digest, "registrationTransactionIntentDigest": self.registration_transaction_intent_digest, "renameHeadDigest": self.rename_head_digest, "renamePolicyDigest": self.rename_policy_digest, "renameSequence": self.rename_sequence, "schema": "trusted-registration-forward-only-recovery-authority/v1"}
+
+    @property
+    def canonical_digest(self) -> str:
+        return self._canonical_digest
+
+    @classmethod
+    def create(cls, state_mac_key: bytes, *, operation_id: str, lease_identity_digest: str, lease_request_digest: str, broker_auth_key_id: str, broker_auth_key_registration_digest: str, rename_sequence: int, rename_head_digest: str, rename_policy_digest: str, registration_transaction_intent_digest: str, expected_catalog_digest: str, catalog_parent_identity_digest: str, registration_journal_identity_digest: str, allowed_actions: tuple[str, ...] = _FORWARD_ONLY_ACTIONS) -> "RegistrationForwardOnlyRecoveryAuthorityV1":
+        if not isinstance(state_mac_key, bytes) or len(state_mac_key) < 16:
+            raise ValueError("forward-only authority state MAC key is invalid")
+        provisional = cls(cls._TOKEN, operation_id=operation_id, lease_identity_digest=lease_identity_digest, lease_request_digest=lease_request_digest, broker_auth_key_id=broker_auth_key_id, broker_auth_key_registration_digest=broker_auth_key_registration_digest, rename_sequence=rename_sequence, rename_head_digest=rename_head_digest, rename_policy_digest=rename_policy_digest, registration_transaction_intent_digest=registration_transaction_intent_digest, expected_catalog_digest=expected_catalog_digest, catalog_parent_identity_digest=catalog_parent_identity_digest, registration_journal_identity_digest=registration_journal_identity_digest, allowed_actions=allowed_actions, broker_state_mac="0" * 64)
+        mac = hmac.new(state_mac_key, canonical_json_bytes({**provisional._unsigned_wire(), "canonicalDigest": provisional.canonical_digest}), hashlib.sha256).hexdigest()
+        return cls(cls._TOKEN, operation_id=operation_id, lease_identity_digest=lease_identity_digest, lease_request_digest=lease_request_digest, broker_auth_key_id=broker_auth_key_id, broker_auth_key_registration_digest=broker_auth_key_registration_digest, rename_sequence=rename_sequence, rename_head_digest=rename_head_digest, rename_policy_digest=rename_policy_digest, registration_transaction_intent_digest=registration_transaction_intent_digest, expected_catalog_digest=expected_catalog_digest, catalog_parent_identity_digest=catalog_parent_identity_digest, registration_journal_identity_digest=registration_journal_identity_digest, allowed_actions=allowed_actions, broker_state_mac=mac)
+
+    def verify_state_mac(self, state_mac_key: bytes) -> None:
+        if not isinstance(state_mac_key, bytes) or len(state_mac_key) < 16:
+            raise ValueError("forward-only authority state MAC key is invalid")
+        expected = hmac.new(state_mac_key, canonical_json_bytes({**self._unsigned_wire(), "canonicalDigest": self.canonical_digest}), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(self._broker_state_mac, expected):
+            raise ValueError("forward-only authority state MAC is invalid")
+
+    def __copy__(self):
+        raise TypeError("forward-only authorities are non-copyable")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("forward-only authorities are non-copyable")
+
+    def __reduce__(self):
+        raise TypeError("forward-only authorities are non-serializable")
+
+
+def verify_registration_forward_only_recovery(
+    authority: RegistrationForwardOnlyRecoveryAuthorityV1,
+    state_mac_key: bytes,
+    journal: BrokerAuthSequenceJournalV1,
+    state: BrokerAuthSequenceStateV1,
+    payloads: Mapping[str, BrokerAuthSequenceEventPayloadV1],
+    *,
+    registry: RegistrationBrokerAuthRegistryV1,
+    revocations: RegistrationBrokerAuthRevocationsV1,
+    operation_id: str,
+    lease_identity_digest: str,
+    lease_request_digest: str,
+    registration_transaction_intent_digest: str,
+    catalog_digest: str,
+    catalog_parent_identity_digest: str,
+    registration_journal_identity_digest: str,
+    action: str,
+    resolved_issue_lease_identity_digests: Mapping[str, str] | None = None,
+) -> None:
+    """Fail closed unless the authenticated broker chain permits one fixed tail action.
+
+    The caller supplies only broker-owned journal/state/policy views.  This
+    verifier never receives a worker capability, a repository path, or an
+    action callback, so it cannot itself perform a mutation.
+    """
+    if type(authority) is not RegistrationForwardOnlyRecoveryAuthorityV1:
+        raise ValueError("forward-only authority is invalid")
+    if type(journal) is not BrokerAuthSequenceJournalV1 or type(state) is not BrokerAuthSequenceStateV1:
+        raise ValueError("forward-only broker chain is invalid")
+    if type(registry) is not RegistrationBrokerAuthRegistryV1 or type(revocations) is not RegistrationBrokerAuthRevocationsV1:
+        raise ValueError("forward-only broker policy is invalid")
+    authority.verify_state_mac(state_mac_key)
+    if action not in _FORWARD_ONLY_ACTIONS:
+        raise ValueError("forward-only action is not authorized")
+    if (operation_id, lease_identity_digest, lease_request_digest, registration_transaction_intent_digest, catalog_digest, catalog_parent_identity_digest, registration_journal_identity_digest) != (
+        authority.operation_id, authority.lease_identity_digest, authority.lease_request_digest,
+        authority.registration_transaction_intent_digest, authority.expected_catalog_digest,
+        authority.catalog_parent_identity_digest, authority.registration_journal_identity_digest,
+    ):
+        raise ValueError("forward-only recovery identities changed")
+    journal.validate_state(state, payloads)
+    if state.current_sequence < authority.rename_sequence or state.broker_auth_registry_digest != registry.canonical_digest or state.broker_auth_revocation_digest != revocations.canonical_digest or revocations.registry_digest != registry.canonical_digest:
+        raise ValueError("forward-only broker state is not current")
+    bound_key = registry.key(authority.broker_auth_key_id)
+    if bound_key.canonical_digest != authority.broker_auth_key_registration_digest:
+        raise ValueError("forward-only authority key registration changed")
+    rename_entry = next((entry for entry in journal.entries if entry.sequence == authority.rename_sequence), None)
+    if rename_entry is None or (rename_entry.canonical_digest, rename_entry.post_policy_digest) != (authority.rename_head_digest, authority.rename_policy_digest):
+        raise ValueError("forward-only rename head is not an authenticated ancestor")
+
+    bound_key_revokes = 0
+    for entry in journal.entries:
+        if entry.sequence <= authority.rename_sequence:
+            continue
+        payload = payloads.get(entry.event_payload_ref)
+        if payload is None:
+            raise ValueError("forward-only chain payload is absent")
+        if isinstance(payload, BrokerAuthLeaseIssueEventPayloadV1):
+            if resolved_issue_lease_identity_digests is None:
+                raise ValueError("post-rename issue lease identity is unavailable")
+            derived_identity = resolved_issue_lease_identity_digests.get(entry.event_payload_ref)
+            _require_digest(derived_identity, "post-rename issue lease identity")
+            if (
+                payload.operation_id == authority.operation_id
+                or derived_identity == authority.lease_identity_digest
+                or payload.lease_request_digest == authority.lease_request_digest
+                or payload.broker_auth_key_id == authority.broker_auth_key_id
+            ):
+                raise ValueError("post-rename issue is not unrelated to forward-only authority")
+        elif isinstance(payload, BrokerAuthEnvelopeSignEventPayloadV1):
+            if (
+                payload.operation_id == authority.operation_id
+                or payload.lease_identity_digest == authority.lease_identity_digest
+                or payload.lease_request_digest == authority.lease_request_digest
+                or payload.broker_auth_key_id == authority.broker_auth_key_id
+            ):
+                raise ValueError("post-rename signing is not unrelated to forward-only authority")
+        elif isinstance(payload, BrokerAuthRotatePolicyEventPayloadV1):
+            try:
+                next_bound_key = payload.next_registry.key(authority.broker_auth_key_id)
+            except ValueError as error:
+                raise ValueError("post-rename rotation removed authority key") from error
+            if next_bound_key.canonical_digest != authority.broker_auth_key_registration_digest:
+                raise ValueError("post-rename rotation changed authority key registration")
+        elif isinstance(payload, BrokerAuthRevokePolicyEventPayloadV1):
+            if payload.revoked_key_id == authority.broker_auth_key_id:
+                bound_key_revokes += 1
+                if bound_key_revokes > 1:
+                    raise ValueError("authority key is revoked more than once")
+        else:
+            raise ValueError("post-rename event has an unknown type")
+
+    current_revocation = revocations.revoked_at(authority.broker_auth_key_id)
+    if (current_revocation is None and bound_key_revokes != 0) or (current_revocation is not None and bound_key_revokes != 1):
+        raise ValueError("forward-only key revocation is not represented exactly once")

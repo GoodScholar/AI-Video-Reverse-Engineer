@@ -54,6 +54,13 @@ from trusted_evidence.e2_policy import (
     CapabilityEnvelopeUnsignedV1,
     CapabilityEnvelopeV1,
     RegistrationRecoveryCapabilityV1,
+    RegistrationMutationChannelBindingV1,
+    RegistrationMutationRequestV1,
+    RegistrationMutationSenderEvidenceV1,
+    RegistrationBrokerMutationVerifierV1,
+    BrokerMutationReceiptV1,
+    RegistrationForwardOnlyRecoveryAuthorityV1,
+    verify_registration_forward_only_recovery,
 )
 from trusted_evidence.handoffs import PolicyActivationMarkerV1
 
@@ -722,3 +729,203 @@ def test_e2_receive_once_fails_closed_when_msg_cmsg_cloexec_is_unavailable():
         pytest.skip("platform can exercise the SCM_RIGHTS green path")
     with pytest.raises(ValueError, match="MSG_CMSG_CLOEXEC unavailable"):
         RegistrationRecoveryCapabilityV1.receive_once(object(), DIGEST_C, {})
+
+
+# E.3 deliberately exercises the portable contract only.  It must not grow a
+# worker write path, a broker receipt key in the request, or any Linux runtime.
+def test_e3_mutation_request_receipt_and_single_use_broker_verifier():
+    binding = RegistrationMutationChannelBindingV1.create(_unsigned_envelope(), DIGEST_A)
+    sender = RegistrationMutationSenderEvidenceV1.from_binding(binding)
+    request = RegistrationMutationRequestV1.create(
+        binding, DIGEST_A, DIGEST_B, "PREPARED", "persist-intent", DIGEST_C
+    )
+    assert RegistrationMutationRequestV1.from_canonical_bytes(request.canonical_bytes) == request
+    assert "mac" not in request.canonical_bytes.decode("utf-8").lower()
+    assert "secret" not in request.canonical_bytes.decode("utf-8").lower()
+
+    calls = 0
+    verifier = RegistrationBrokerMutationVerifierV1.create(
+        binding, initial_state_digest=DIGEST_A, initial_transition_digest=DIGEST_B,
+        initial_phase="PREPARED", audit_key=b"e3 broker audit key is root-only!!",
+    )
+
+    def execute():
+        nonlocal calls
+        calls += 1
+        return "EXECUTED", DIGEST_C
+
+    receipt = verifier.dispatch(request, sender, execute)
+    assert calls == 1
+    assert receipt.result == "EXECUTED"
+    receipt.verify_audit_mac(b"e3 broker audit key is root-only!!")
+    assert BrokerMutationReceiptV1.from_canonical_bytes(receipt.canonical_bytes) == receipt
+
+    for replay in (request, request):
+        with pytest.raises(ValueError):
+            verifier.dispatch(replay, sender, execute)
+        assert calls == 1
+
+    forged = BrokerMutationReceiptV1(
+        receipt.schema, receipt.operation_id, receipt.worker_session_id,
+        receipt.worker_sequence, receipt.mutation_sequence, receipt.request_digest,
+        receipt.result, receipt.resulting_registration_state_digest,
+        "0" * 64,
+    )
+    with pytest.raises(ValueError):
+        forged.verify_audit_mac(b"e3 broker audit key is root-only!!")
+
+
+def test_e3_verifier_rejects_bound_identity_state_and_sequence_drift_before_action():
+    binding = RegistrationMutationChannelBindingV1.create(_unsigned_envelope(), DIGEST_A)
+    sender = RegistrationMutationSenderEvidenceV1.from_binding(binding)
+    request = RegistrationMutationRequestV1.create(
+        binding, DIGEST_A, DIGEST_B, "PREPARED", "persist-intent", DIGEST_C
+    )
+
+    def assert_rejected(candidate, evidence=sender):
+        calls = 0
+        verifier = RegistrationBrokerMutationVerifierV1.create(
+            binding, initial_state_digest=DIGEST_A, initial_transition_digest=DIGEST_B,
+            initial_phase="PREPARED", audit_key=b"e3 broker audit key is root-only!!",
+        )
+
+        def execute():
+            nonlocal calls
+            calls += 1
+            return "EXECUTED", DIGEST_C
+
+        with pytest.raises(ValueError):
+            verifier.dispatch(candidate, evidence, execute)
+        assert calls == 0
+
+    assert_rejected(RegistrationMutationRequestV1.create(
+        RegistrationMutationChannelBindingV1.create(_unsigned_envelope(worker_session_id="old-session"), DIGEST_A),
+        DIGEST_A, DIGEST_B, "PREPARED", "persist-intent", DIGEST_C,
+    ))
+    assert_rejected(RegistrationMutationRequestV1.create(
+        binding, DIGEST_A, DIGEST_B, "WRITING_CAS", "persist-intent", DIGEST_C,
+    ))
+    assert_rejected(RegistrationMutationRequestV1.create(
+        binding, DIGEST_A, DIGEST_C, "PREPARED", "persist-intent", DIGEST_C,
+    ))
+    assert_rejected(RegistrationMutationRequestV1.create(
+        binding, DIGEST_A, DIGEST_B, "PREPARED", "persist-intent", DIGEST_A,
+    ))
+    assert_rejected(request, RegistrationMutationSenderEvidenceV1(
+        binding.channel_binding_digest, DIGEST_B, binding.operation_id,
+        binding.worker_session_id, binding.worker_sequence,
+    ))
+
+
+def test_e3_forward_only_authority_is_root_only_and_exactly_two_actions():
+    authority = RegistrationForwardOnlyRecoveryAuthorityV1.create(
+        b"e3 broker audit key is root-only!!", operation_id="operation-e2",
+        lease_identity_digest=DIGEST_A, lease_request_digest=DIGEST_B,
+        broker_auth_key_id="broker-fixed", broker_auth_key_registration_digest=DIGEST_C,
+        rename_sequence=2, rename_head_digest=DIGEST_A, rename_policy_digest=DIGEST_B,
+        registration_transaction_intent_digest=DIGEST_C, expected_catalog_digest=DIGEST_A,
+        catalog_parent_identity_digest=DIGEST_B, registration_journal_identity_digest=DIGEST_C,
+    )
+    assert authority.allowed_actions == ("fsync-catalog-parent", "append-terminal")
+    authority.verify_state_mac(b"e3 broker audit key is root-only!!")
+    with pytest.raises(TypeError):
+        copy.copy(authority)
+    with pytest.raises(TypeError):
+        pickle.dumps(authority)
+    assert not hasattr(authority, "to_wire")
+    with pytest.raises(ValueError):
+        RegistrationForwardOnlyRecoveryAuthorityV1.create(
+            b"e3 broker audit key is root-only!!", operation_id="operation-e2",
+            lease_identity_digest=DIGEST_A, lease_request_digest=DIGEST_B,
+            broker_auth_key_id="broker-fixed", broker_auth_key_registration_digest=DIGEST_C,
+            rename_sequence=2, rename_head_digest=DIGEST_A, rename_policy_digest=DIGEST_B,
+            registration_transaction_intent_digest=DIGEST_C, expected_catalog_digest=DIGEST_A,
+            catalog_parent_identity_digest=DIGEST_B, registration_journal_identity_digest=DIGEST_C,
+            allowed_actions=("fsync-catalog-parent", "append-terminal", "rename-catalog"),
+        )
+
+
+def test_e3_forward_only_recovery_requires_rename_head_as_authenticated_ancestor():
+    key = RegistrationBrokerAuthKeyRegistrationV1(
+        "trusted-registration-broker-auth-key-registration/v1", "broker-fixed",
+        "registration-broker-auth", "ai-video-reverse-engineer/registration-broker-envelope/v1",
+        "ai-video-reverse-engineer/registration-broker-lease/v1",
+        "ai-video-reverse-engineer/registration-broker-startup-challenge/v1",
+        "raw-ed25519-32", DIGEST_A, DIGEST_A, None, DIGEST_A, DIGEST_A, DIGEST_B,
+        "active", 1, None,
+    )
+    registry = RegistrationBrokerAuthRegistryV1(
+        "trusted-registration-broker-auth-registry/v1", 1, None, "broker-fixed", (key,)
+    )
+    revocations = RegistrationBrokerAuthRevocationsV1(
+        "trusted-registration-broker-auth-revocations/v1", registry.canonical_digest, ()
+    )
+    request = BrokerAuthLeaseIssueRequestV1(
+        "trusted-registration-broker-auth-lease-issue-request/v1", "other-operation", "life",
+        DIGEST_A, "broker-fixed", 0, DIGEST_A, registry.canonical_digest,
+        revocations.canonical_digest, DIGEST_B, DIGEST_C, 2,
+    )
+    payload = BrokerAuthLeaseIssueEventPayloadV1(
+        "trusted-registration-broker-auth-lease-issue-payload/v1", "issue-lease", DIGEST_A,
+        request, request.request_digest, "other-operation", "broker-fixed", 1, 2, 3,
+        DIGEST_B, DIGEST_B,
+    )
+    entry = BrokerAuthSequenceJournalEntryV1(
+        "trusted-registration-broker-auth-sequence-entry/v1", 1, None, DIGEST_A, "issue-lease",
+        DIGEST_C, len(payload.canonical_bytes), payload.canonical_digest, DIGEST_B, DIGEST_B,
+        registry.canonical_digest, revocations.canonical_digest, "broker-fixed", "a" * 64,
+    )
+    journal = BrokerAuthSequenceJournalV1(
+        "trusted-registration-broker-auth-sequence-journal/v1", DIGEST_A, 1, (entry,), "b" * 64
+    )
+    state = BrokerAuthSequenceStateV1(
+        "trusted-registration-broker-auth-sequence-state/v1", DIGEST_A, 1, entry.canonical_digest,
+        DIGEST_C, payload.canonical_digest, DIGEST_B, registry.canonical_digest,
+        revocations.canonical_digest, "c" * 64,
+    )
+    authority = RegistrationForwardOnlyRecoveryAuthorityV1.create(
+        b"e3 broker audit key is root-only!!", operation_id="operation-e2",
+        lease_identity_digest=DIGEST_A, lease_request_digest=DIGEST_B,
+        broker_auth_key_id="broker-fixed", broker_auth_key_registration_digest=key.canonical_digest,
+        rename_sequence=1, rename_head_digest=entry.canonical_digest, rename_policy_digest=DIGEST_B,
+        registration_transaction_intent_digest=DIGEST_C, expected_catalog_digest=DIGEST_A,
+        catalog_parent_identity_digest=DIGEST_B, registration_journal_identity_digest=DIGEST_C,
+    )
+    verify_registration_forward_only_recovery(
+        authority, b"e3 broker audit key is root-only!!", journal, state, {DIGEST_C: payload},
+        registry=registry, revocations=revocations, operation_id="operation-e2",
+        lease_identity_digest=DIGEST_A, lease_request_digest=DIGEST_B,
+        registration_transaction_intent_digest=DIGEST_C, catalog_digest=DIGEST_A,
+        catalog_parent_identity_digest=DIGEST_B, registration_journal_identity_digest=DIGEST_C,
+        action="append-terminal",
+    )
+    with pytest.raises(ValueError):
+        verify_registration_forward_only_recovery(
+            authority, b"e3 broker audit key is root-only!!", journal, state, {DIGEST_C: payload},
+            registry=registry, revocations=revocations, operation_id="operation-e2",
+            lease_identity_digest=DIGEST_A, lease_request_digest=DIGEST_B,
+            registration_transaction_intent_digest=DIGEST_C, catalog_digest=DIGEST_A,
+            catalog_parent_identity_digest=DIGEST_B, registration_journal_identity_digest=DIGEST_C,
+            action="rename-catalog",
+        )
+    with pytest.raises(ValueError):
+        verify_registration_forward_only_recovery(
+            authority, b"e3 broker audit key is root-only!!", journal, state, {DIGEST_C: payload},
+            registry=registry, revocations=revocations, operation_id="operation-e2",
+            lease_identity_digest=DIGEST_A, lease_request_digest=DIGEST_B,
+            registration_transaction_intent_digest=DIGEST_C, catalog_digest=DIGEST_A,
+            catalog_parent_identity_digest=DIGEST_B, registration_journal_identity_digest=DIGEST_A,
+            action="append-terminal",
+        )
+
+
+def test_e3_invalid_local_request_does_not_consume_the_worker_sequence():
+    binding = RegistrationMutationChannelBindingV1.create(_unsigned_envelope(), DIGEST_A)
+    with pytest.raises(ValueError):
+        RegistrationMutationRequestV1.create(
+            binding, DIGEST_A, DIGEST_B, "PREPARED", "unknown-action", DIGEST_C
+        )
+    request = RegistrationMutationRequestV1.create(
+        binding, DIGEST_A, DIGEST_B, "PREPARED", "persist-intent", DIGEST_C
+    )
+    assert request.mutation_sequence == 0
