@@ -1,5 +1,8 @@
 import hashlib
 import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -142,3 +145,17 @@ def test_export_request_has_closed_sorted_consumers_and_full_record_binding():
     assert request.canonical_bytes == b'{"bindingSetDigest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","consumerTasks":[23,28],"handoffId":"ticket-23-product-v1","pointerBytesDigest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","recordFullBytesDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","recordRef":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","schema":"trusted-handoff-export-request/v1"}'
     with pytest.raises(ValueError):
         HandoffExportRequestV1("trusted-handoff-export-request/v1", "ticket-23-product-v1", DIGEST, DIGEST, "sha256:" + "b" * 64, (28, 23), "sha256:" + "c" * 64)
+
+
+def test_handoff_cli_fails_closed_before_finalize_and_for_reserved_producer(tmp_path):
+    """Lifecycle read and privileged producer publication must not be ambient shortcuts."""
+    root = tmp_path / "store"
+    root.mkdir(mode=0o700)
+    environment = {**os.environ, "TRUSTED_HANDOFF_STORE_ROOT": str(root), "PYTHONPATH": str(Path(__file__).parent)}
+    cli = Path(__file__).parent / "tools" / "trusted_handoff_store.py"
+    read = subprocess.run([sys.executable, str(cli), "read", "ticket-23-product-v1"], env=environment, capture_output=True)
+    publish = subprocess.run([sys.executable, str(cli), "publish-local", "--producer-task", "22"], env=environment, capture_output=True)
+    assert read.returncode != 0
+    assert publish.returncode != 0
+    assert b"not finalized" in read.stderr
+    assert b"reserved producer" in publish.stderr
