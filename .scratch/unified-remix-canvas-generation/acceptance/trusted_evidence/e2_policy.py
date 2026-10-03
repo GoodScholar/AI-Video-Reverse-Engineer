@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 import hashlib
 import hmac
 import json
+import base64
 import os
 import re
 import stat
@@ -1781,6 +1782,113 @@ def verify_registration_broker_governance(
             raise ValueError("broker allowed signer is invalid")
 
 
+class RegistrationBrokerStateMacCapabilityV1:
+    """Root-only state-MAC material, injected separately from Ed25519 signing."""
+
+    __slots__ = ("injected_fd_identity_digest", "_key", "_closed")
+    _TOKEN = object()
+
+    def __init__(self, token: object, key: bytes, identity: str) -> None:
+        if token is not self._TOKEN:
+            raise TypeError("state-MAC capabilities must be loaded from an already-open read-only FD")
+        self._key, self.injected_fd_identity_digest, self._closed = key, identity, False
+
+    @classmethod
+    def load_from_readonly_fd(cls, descriptor: int) -> "RegistrationBrokerStateMacCapabilityV1":
+        if type(descriptor) is not int:
+            raise ValueError("state-MAC FD is invalid")
+        try:
+            flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+            info = os.fstat(descriptor)
+            if flags & os.O_ACCMODE != os.O_RDONLY or not stat.S_ISREG(info.st_mode):
+                raise ValueError("state-MAC FD must be read-only regular file")
+            copied = os.dup(descriptor)
+            try:
+                os.lseek(copied, 0, os.SEEK_SET)
+                key = os.read(copied, 33)
+            finally:
+                os.close(copied)
+        except OSError as error:
+            raise ValueError("state-MAC FD is invalid") from error
+        if len(key) != 32:
+            raise ValueError("state-MAC key must be exactly 32 bytes")
+        return cls(cls._TOKEN, key, canonical_digest({"device": info.st_dev, "inode": info.st_ino, "stateMacKeyDigest": "sha256:" + hashlib.sha256(key).hexdigest()}))
+
+    def mac(self, payload: bytes) -> str:
+        if self._closed or not isinstance(payload, bytes):
+            raise ValueError("state-MAC capability is closed or payload is invalid")
+        return hmac.new(self._key, payload, hashlib.sha256).hexdigest()
+
+    def verify(self, payload: bytes, mac: str) -> None:
+        if not hmac.compare_digest(self.mac(payload), _mac(mac, "broker_state_mac")):
+            raise ValueError("broker state MAC is invalid")
+
+    def close(self) -> None:
+        self._key = b""
+        self._closed = True
+
+    def __copy__(self):
+        raise TypeError("state-MAC capabilities are non-copyable")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("state-MAC capabilities are non-copyable")
+
+    def __reduce__(self):
+        raise TypeError("state-MAC capabilities are non-serializable")
+
+
+class RegistrationBrokerAuthGovernanceV1:
+    """Canonical broker governance closure used by every lease authority API."""
+
+    __slots__ = ("registry", "revocations", "allowed_signers", "allowed_signers_digest")
+    _TOKEN = object()
+
+    def __init__(self, token: object, registry: RegistrationBrokerAuthRegistryV1, revocations: RegistrationBrokerAuthRevocationsV1, allowed_signers: Mapping[str, bytes], allowed_signers_digest: str) -> None:
+        if token is not self._TOKEN:
+            raise TypeError("broker governance must be constructed from canonical governance bytes")
+        self.registry, self.revocations = registry, revocations
+        self.allowed_signers, self.allowed_signers_digest = MappingProxyType(dict(allowed_signers)), allowed_signers_digest
+
+    @classmethod
+    def from_canonical_bytes(
+        cls, registry_bytes: bytes, revocations_bytes: bytes, allowed_signers_bytes: bytes,
+    ) -> "RegistrationBrokerAuthGovernanceV1":
+        registry = RegistrationBrokerAuthRegistryV1.from_canonical_bytes(registry_bytes)
+        revocations = RegistrationBrokerAuthRevocationsV1.from_canonical_bytes(revocations_bytes)
+        raw = _broker_from_bytes(allowed_signers_bytes, {"keys"}, "broker auth allowed signers")
+        if canonical_json_bytes(raw) != allowed_signers_bytes or not isinstance(raw["keys"], list):
+            raise ValueError("broker allowed signers must be canonical bytes")
+        values: dict[str, bytes] = {}
+        names: list[bytes] = []
+        for entry in raw["keys"]:
+            fields = {"keyId", "purpose", "signatureDomain", "rawPublicKey", "resolvedPublicKey", "wrapperIdentity"}
+            if not isinstance(entry, dict) or set(entry) != fields or entry["purpose"] != _BROKER_AUTH_PURPOSE or entry["signatureDomain"] != _BROKER_ENVELOPE_DOMAIN:
+                raise ValueError("broker allowed signer entry is invalid")
+            key_id = _require_text(entry["keyId"], "keyId")
+            try:
+                raw_key = base64.b64decode(entry["rawPublicKey"], validate=True)
+                leaf_key = base64.b64decode(entry["resolvedPublicKey"], validate=True)
+            except (TypeError, ValueError) as error:
+                raise ValueError("broker allowed signer public key is invalid") from error
+            if len(raw_key) != 32 or len(leaf_key) != 32 or base64.b64encode(raw_key).decode("ascii") != entry["rawPublicKey"] or base64.b64encode(leaf_key).decode("ascii") != entry["resolvedPublicKey"]:
+                raise ValueError("broker allowed signer public key is invalid")
+            key = registry.key(key_id)
+            entry_digest = canonical_digest(entry)
+            if (
+                key.allowed_signers_entry_digest != entry_digest
+                or key.public_key_digest != "sha256:" + hashlib.sha256(raw_key).hexdigest()
+                or key.resolved_leaf_public_key_digest != "sha256:" + hashlib.sha256(leaf_key).hexdigest()
+                or key.certificate_wrapper_digest != "sha256:" + hashlib.sha256(_require_text(entry["wrapperIdentity"], "wrapperIdentity").encode("utf-8")).hexdigest()
+            ):
+                raise ValueError("broker allowed signer does not close registry identity")
+            values[key_id] = leaf_key
+            names.append(key_id.encode("utf-8"))
+        if names != sorted(names) or len(values) != len(names):
+            raise ValueError("broker allowed signer keys must be unique and ordered")
+        verify_registration_broker_governance(registry, revocations, values)
+        return cls(cls._TOKEN, registry, revocations, values, "sha256:" + hashlib.sha256(allowed_signers_bytes).hexdigest())
+
+
 def _verify_broker_signed_record(
     registry: RegistrationBrokerAuthRegistryV1,
     revocations: RegistrationBrokerAuthRevocationsV1,
@@ -2297,10 +2405,6 @@ class RegistrationBrokerAuthPrivateKeySlotV1:
             raise ValueError("private key signing domain is invalid")
         return _ed_sign(self._seed, domain.encode("utf-8") + b"\0" + payload).hex()
 
-    def state_mac(self, payload: bytes) -> str:
-        self._require_open()
-        return hmac.new(self._seed, payload, hashlib.sha256).hexdigest()
-
     def close(self) -> None:
         self._seed = b""; self._closed = True
 
@@ -2314,16 +2418,15 @@ class RegistrationBrokerAuthPrivateKeySlotV1:
         raise TypeError("private key slots are non-serializable")
 
 
-def verify_registration_broker_startup_challenge(registry: RegistrationBrokerAuthRegistryV1, revocations: RegistrationBrokerAuthRevocationsV1, allowed_signers: Mapping[str, bytes], slot: RegistrationBrokerAuthPrivateKeySlotV1, nonce: str) -> str:
+def verify_registration_broker_startup_challenge(governance: RegistrationBrokerAuthGovernanceV1, slot: RegistrationBrokerAuthPrivateKeySlotV1, nonce: str) -> str:
     """Sign and independently verify the exact startup challenge before child creation."""
-    if type(slot) is not RegistrationBrokerAuthPrivateKeySlotV1:
+    if type(governance) is not RegistrationBrokerAuthGovernanceV1 or type(slot) is not RegistrationBrokerAuthPrivateKeySlotV1:
         raise ValueError("broker startup trust closure is invalid")
-    verify_registration_broker_governance(registry, revocations, allowed_signers)
     _require_text(nonce, "nonce")
-    active = registry.key(registry.active_key_id)
-    if active.state != "active" or revocations.revoked_at(active.key_id) is not None or (slot.key_id, slot.purpose, slot.signature_domain, slot.challenge_domain, slot.public_key_digest) != (active.key_id, _BROKER_AUTH_PURPOSE, _BROKER_ENVELOPE_DOMAIN, _BROKER_CHALLENGE_DOMAIN, active.public_key_digest):
+    active = governance.registry.key(governance.registry.active_key_id)
+    if active.state != "active" or governance.revocations.revoked_at(active.key_id) is not None or (slot.key_id, slot.purpose, slot.signature_domain, slot.challenge_domain, slot.public_key_digest) != (active.key_id, _BROKER_AUTH_PURPOSE, _BROKER_ENVELOPE_DOMAIN, _BROKER_CHALLENGE_DOMAIN, active.public_key_digest):
         raise ValueError("broker startup key closure is invalid")
-    message = canonical_json_bytes({"keyId": active.key_id, "nonce": nonce, "registryDigest": registry.canonical_digest})
+    message = canonical_json_bytes({"keyId": active.key_id, "nonce": nonce, "registryDigest": governance.registry.canonical_digest})
     signature = slot.sign(_BROKER_CHALLENGE_DOMAIN, message)
     from .handoffs import _ed25519_verify
     if not _ed25519_verify(slot._public, _BROKER_CHALLENGE_DOMAIN.encode("utf-8") + b"\0" + message, bytes.fromhex(signature)):
@@ -2798,10 +2901,12 @@ class RegistrationRecoveryLeaseV1:
             self.profile_identity_digest,
         )
 
-    def verify_signature(self, registry: RegistrationBrokerAuthRegistryV1, revocations: RegistrationBrokerAuthRevocationsV1, allowed_signers: Mapping[str, bytes], current_sequence: int) -> None:
+    def verify_signature(self, governance: RegistrationBrokerAuthGovernanceV1, current_sequence: int) -> None:
         """Verify the public lease signature and its frozen trust-state facts."""
-        verify_registration_broker_governance(registry, revocations, allowed_signers)
-        if (registry.generation, registry.canonical_digest, revocations.canonical_digest, revocations.registry_digest) != (self.broker_auth_registry_generation, self.broker_auth_registry_digest, self.broker_auth_revocation_digest, registry.canonical_digest):
+        if type(governance) is not RegistrationBrokerAuthGovernanceV1:
+            raise ValueError("lease governance is invalid")
+        registry, revocations, allowed_signers = governance.registry, governance.revocations, governance.allowed_signers
+        if (registry.generation, registry.canonical_digest, revocations.canonical_digest, revocations.registry_digest, governance.allowed_signers_digest) != (self.broker_auth_registry_generation, self.broker_auth_registry_digest, self.broker_auth_revocation_digest, registry.canonical_digest, self.broker_auth_allowed_signers_digest):
             raise ValueError("lease trust state changed")
         key = registry.key(self.broker_auth_key_id)
         if key.state not in {"active", "retiring"} or self.broker_auth_lease_issued_sequence < key.effective_lease_sequence or (key.retire_after_lease_sequence is not None and self.broker_auth_lease_issued_sequence > key.retire_after_lease_sequence):
@@ -2851,53 +2956,50 @@ class BrokerAuthAuthoritativeIssuerV1:
     __slots__ = (
         "_registry", "_revocations", "_state", "_entries", "_payloads", "_journal",
         "_root_identity_digest", "_allowed_signers_digest", "_signer", "_allowed_signers",
-        "_event_ids",
+        "_governance", "_state_mac", "_frozen_profile_ttl_sequences", "_event_ids",
     )
 
     def __init__(
         self,
-        registry: RegistrationBrokerAuthRegistryV1,
-        revocations: RegistrationBrokerAuthRevocationsV1,
+        governance: RegistrationBrokerAuthGovernanceV1,
         state: BrokerAuthSequenceStateV1,
         root_identity_digest: str,
-        allowed_signers_digest: str,
         signer: RegistrationBrokerAuthPrivateKeySlotV1,
-        allowed_signers: Mapping[str, bytes],
+        state_mac: RegistrationBrokerStateMacCapabilityV1,
+        frozen_profile_ttl_sequences: int,
     ) -> None:
-        self._registry, self._revocations, self._state = registry, revocations, state
+        self._governance, self._registry, self._revocations, self._state = governance, governance.registry, governance.revocations, state
         self._entries: tuple[BrokerAuthSequenceJournalEntryV1, ...] = ()
         self._payloads: dict[str, BrokerAuthSequenceEventPayloadV1] = {}
         self._journal: BrokerAuthSequenceJournalV1 | None = None
-        self._root_identity_digest, self._allowed_signers_digest = root_identity_digest, allowed_signers_digest
-        self._signer, self._allowed_signers, self._event_ids = signer, dict(allowed_signers), set()
+        self._root_identity_digest, self._allowed_signers_digest = root_identity_digest, governance.allowed_signers_digest
+        self._signer, self._allowed_signers, self._state_mac = signer, dict(governance.allowed_signers), state_mac
+        self._frozen_profile_ttl_sequences, self._event_ids = _u64(frozen_profile_ttl_sequences, "frozen_profile_ttl_sequences", positive=True), set()
 
     @classmethod
     def create(
         cls,
-        registry: RegistrationBrokerAuthRegistryV1,
-        revocations: RegistrationBrokerAuthRevocationsV1,
+        governance: RegistrationBrokerAuthGovernanceV1,
         root_identity_digest: str,
         policy_digest: str,
-        allowed_signers_digest: str,
         signer: RegistrationBrokerAuthPrivateKeySlotV1,
-        allowed_signers: Mapping[str, bytes],
+        state_mac: RegistrationBrokerStateMacCapabilityV1,
+        frozen_profile_ttl_sequences: int,
     ) -> "BrokerAuthAuthoritativeIssuerV1":
-        if type(registry) is not RegistrationBrokerAuthRegistryV1 or type(revocations) is not RegistrationBrokerAuthRevocationsV1 or type(signer) is not RegistrationBrokerAuthPrivateKeySlotV1:
+        if type(governance) is not RegistrationBrokerAuthGovernanceV1 or type(signer) is not RegistrationBrokerAuthPrivateKeySlotV1 or type(state_mac) is not RegistrationBrokerStateMacCapabilityV1:
             raise ValueError("broker issuer trust inputs are invalid")
-        for value, field in ((root_identity_digest, "root_identity_digest"), (policy_digest, "policy_digest"), (allowed_signers_digest, "allowed_signers_digest")):
+        for value, field in ((root_identity_digest, "root_identity_digest"), (policy_digest, "policy_digest")):
             _require_digest(value, field)
-        if revocations.registry_digest != registry.canonical_digest:
-            raise ValueError("broker issuer revocations do not close registry")
         provisional = BrokerAuthSequenceStateV1(
             "trusted-registration-broker-auth-sequence-state/v1", root_identity_digest, 0,
-            None, None, None, policy_digest, registry.canonical_digest,
-            revocations.canonical_digest, "0" * 64,
+            None, None, None, policy_digest, governance.registry.canonical_digest,
+            governance.revocations.canonical_digest, "0" * 64,
         )
         state = replace(
             provisional,
-            broker_state_mac_hex=signer.state_mac(canonical_json_bytes(provisional._unsigned_wire())),
+            broker_state_mac_hex=state_mac.mac(canonical_json_bytes(provisional._unsigned_wire())),
         )
-        issuer = cls(registry, revocations, state, root_identity_digest, allowed_signers_digest, signer, allowed_signers)
+        issuer = cls(governance, state, root_identity_digest, signer, state_mac, frozen_profile_ttl_sequences)
         issuer._require_active_signer()
         return issuer
 
@@ -2921,15 +3023,15 @@ class BrokerAuthAuthoritativeIssuerV1:
     def payloads(self) -> dict[str, BrokerAuthSequenceEventPayloadV1]:
         return dict(self._payloads)
 
-    def replace_signer(self, signer: RegistrationBrokerAuthPrivateKeySlotV1, allowed_signers: Mapping[str, bytes]) -> None:
-        if type(signer) is not RegistrationBrokerAuthPrivateKeySlotV1:
+    def replace_signer(self, signer: RegistrationBrokerAuthPrivateKeySlotV1, governance: RegistrationBrokerAuthGovernanceV1) -> None:
+        if type(signer) is not RegistrationBrokerAuthPrivateKeySlotV1 or type(governance) is not RegistrationBrokerAuthGovernanceV1:
             raise ValueError("broker signer is invalid")
-        previous_signer, previous_allowed = self._signer, self._allowed_signers
-        self._signer, self._allowed_signers = signer, dict(allowed_signers)
+        previous_signer, previous_allowed, previous_digest, previous_governance = self._signer, self._allowed_signers, self._allowed_signers_digest, self._governance
+        self._signer, self._allowed_signers, self._allowed_signers_digest, self._governance = signer, dict(governance.allowed_signers), governance.allowed_signers_digest, governance
         try:
             self._require_active_signer()
         except Exception:
-            self._signer, self._allowed_signers = previous_signer, previous_allowed
+            self._signer, self._allowed_signers, self._allowed_signers_digest, self._governance = previous_signer, previous_allowed, previous_digest, previous_governance
             raise
 
     def _require_active_signer(self) -> RegistrationBrokerAuthKeyRegistrationV1:
@@ -2981,7 +3083,7 @@ class BrokerAuthAuthoritativeIssuerV1:
         )
         entry = replace(
             provisional_entry,
-            broker_state_mac_hex=self._signer.state_mac(canonical_json_bytes(provisional_entry._unsigned_wire())),
+            broker_state_mac_hex=self._state_mac.mac(canonical_json_bytes(provisional_entry._unsigned_wire())),
         )
         provisional_state = BrokerAuthSequenceStateV1(
             "trusted-registration-broker-auth-sequence-state/v1", self._root_identity_digest,
@@ -2991,7 +3093,7 @@ class BrokerAuthAuthoritativeIssuerV1:
         )
         state = replace(
             provisional_state,
-            broker_state_mac_hex=self._signer.state_mac(canonical_json_bytes(provisional_state._unsigned_wire())),
+            broker_state_mac_hex=self._state_mac.mac(canonical_json_bytes(provisional_state._unsigned_wire())),
         )
         entries = (*self._entries, entry)
         provisional_journal = BrokerAuthSequenceJournalV1(
@@ -3000,7 +3102,7 @@ class BrokerAuthAuthoritativeIssuerV1:
         )
         journal = replace(
             provisional_journal,
-            broker_state_mac_hex=self._signer.state_mac(canonical_json_bytes(provisional_journal._unsigned_wire())),
+            broker_state_mac_hex=self._state_mac.mac(canonical_json_bytes(provisional_journal._unsigned_wire())),
         )
         payloads = MappingProxyType({**self._payloads, payload.canonical_digest: payload})
         journal.validate_state(state, payloads)
@@ -3021,7 +3123,6 @@ class BrokerAuthAuthoritativeIssuerV1:
         request: BrokerAuthLeaseIssueRequestV1,
         family: RegistrationWorkerSessionFamilyAuthorizationV1,
         lease_template: RegistrationRecoveryLeaseV1,
-        event_id_digest: str,
     ) -> BrokerAuthLeaseIssuanceResultV1:
         if type(request) is not BrokerAuthLeaseIssueRequestV1 or type(family) is not RegistrationWorkerSessionFamilyAuthorizationV1 or type(lease_template) is not RegistrationRecoveryLeaseV1:
             raise ValueError("broker lease issue inputs are invalid")
@@ -3031,9 +3132,12 @@ class BrokerAuthAuthoritativeIssuerV1:
             raise ValueError("broker lease request does not match authoritative pre-state")
         if family.broker_auth_key_id != key.key_id or family.broker_auth_key_registration_digest != key.canonical_digest:
             raise ValueError("broker lease family authorization is not active")
-        if (lease_template.operation_id, lease_template.lifecycle_nonce, lease_template.session_family_authorization_digest, lease_template.broker_auth_lease_request_digest) != (request.operation_id, request.lifecycle_nonce, family.canonical_digest, request.request_digest):
+        if request.lease_ttl_sequences != self._frozen_profile_ttl_sequences:
+            raise ValueError("broker lease request TTL differs from frozen profile")
+        if (lease_template.operation_id, lease_template.lifecycle_nonce, lease_template.session_family_authorization_digest, lease_template.broker_auth_lease_request_digest, lease_template.transaction_parent_identity_digest, lease_template.transaction_root_identity_digest, lease_template.operation_directory_identity_digest, lease_template.repository_identity_digest, lease_template.repository_boundary_identity_digest, lease_template.trusted_toolchain_build_record_digest, lease_template.trusted_recovery_launcher_digest, lease_template.executor_identity_digest, lease_template.profile_identity_digest) != (request.operation_id, request.lifecycle_nonce, family.canonical_digest, request.request_digest, family.transaction_parent_identity_digest, family.transaction_root_identity_digest, family.operation_directory_identity_digest, family.repository_identity_digest, family.repository_boundary_identity_digest, family.trusted_toolchain_build_record_digest, family.trusted_recovery_launcher_digest, family.executor_identity_digest, family.profile_identity_digest):
             raise ValueError("broker lease template does not bind request")
         sequence = self._next_sequence()
+        event_id_digest = "sha256:" + hashlib.sha256(b"ai-video-reverse-engineer/registration-broker-lease-issue-event/v1\0" + request.request_digest.encode("ascii")).hexdigest()
         payload = BrokerAuthLeaseIssueEventPayloadV1(
             "trusted-registration-broker-auth-lease-issue-payload/v1", "issue-lease", event_id_digest,
             request, request.request_digest, request.operation_id, key.key_id, sequence,
@@ -3056,8 +3160,8 @@ class BrokerAuthAuthoritativeIssuerV1:
         )
         lease = replace(lease, lease_identity_digest=lease.identity_preimage().lease_identity_digest)
         lease = replace(lease, broker_signature_hex=self._signer.sign(_BROKER_LEASE_DOMAIN, canonical_json_bytes(lease._unsigned_wire())))
-        lease = replace(lease, broker_mac=self._signer.state_mac(canonical_json_bytes(lease._unsigned_wire())))
-        lease.verify_signature(self._registry, self._revocations, self._allowed_signers, sequence)
+        lease = replace(lease, broker_mac=self._state_mac.mac(canonical_json_bytes(lease._unsigned_wire())))
+        lease.verify_signature(self._governance, sequence)
         result = BrokerAuthLeaseIssuanceResultV1(transition.payload, transition.entry, transition.state, transition.journal, transition.payloads, lease)
         self._commit(result, self._registry, self._revocations)
         return result
@@ -3453,19 +3557,17 @@ class RegistrationForwardOnlyRecoveryAuthorityV1:
         return self._canonical_digest
 
     @classmethod
-    def create(cls, state_mac_key: bytes, *, operation_id: str, lease_identity_digest: str, lease_request_digest: str, broker_auth_key_id: str, broker_auth_key_registration_digest: str, rename_sequence: int, rename_head_digest: str, rename_policy_digest: str, registration_transaction_intent_digest: str, expected_catalog_digest: str, catalog_parent_identity_digest: str, registration_journal_identity_digest: str, allowed_actions: tuple[str, ...] = _FORWARD_ONLY_ACTIONS) -> "RegistrationForwardOnlyRecoveryAuthorityV1":
-        if not isinstance(state_mac_key, bytes) or len(state_mac_key) < 16:
+    def create(cls, state_mac: RegistrationBrokerStateMacCapabilityV1, *, operation_id: str, lease_identity_digest: str, lease_request_digest: str, broker_auth_key_id: str, broker_auth_key_registration_digest: str, rename_sequence: int, rename_head_digest: str, rename_policy_digest: str, registration_transaction_intent_digest: str, expected_catalog_digest: str, catalog_parent_identity_digest: str, registration_journal_identity_digest: str, allowed_actions: tuple[str, ...] = _FORWARD_ONLY_ACTIONS) -> "RegistrationForwardOnlyRecoveryAuthorityV1":
+        if type(state_mac) is not RegistrationBrokerStateMacCapabilityV1:
             raise ValueError("forward-only authority state MAC key is invalid")
         provisional = cls(cls._TOKEN, operation_id=operation_id, lease_identity_digest=lease_identity_digest, lease_request_digest=lease_request_digest, broker_auth_key_id=broker_auth_key_id, broker_auth_key_registration_digest=broker_auth_key_registration_digest, rename_sequence=rename_sequence, rename_head_digest=rename_head_digest, rename_policy_digest=rename_policy_digest, registration_transaction_intent_digest=registration_transaction_intent_digest, expected_catalog_digest=expected_catalog_digest, catalog_parent_identity_digest=catalog_parent_identity_digest, registration_journal_identity_digest=registration_journal_identity_digest, allowed_actions=allowed_actions, broker_state_mac="0" * 64)
-        mac = hmac.new(state_mac_key, canonical_json_bytes({**provisional._unsigned_wire(), "canonicalDigest": provisional.canonical_digest}), hashlib.sha256).hexdigest()
+        mac = state_mac.mac(canonical_json_bytes({**provisional._unsigned_wire(), "canonicalDigest": provisional.canonical_digest}))
         return cls(cls._TOKEN, operation_id=operation_id, lease_identity_digest=lease_identity_digest, lease_request_digest=lease_request_digest, broker_auth_key_id=broker_auth_key_id, broker_auth_key_registration_digest=broker_auth_key_registration_digest, rename_sequence=rename_sequence, rename_head_digest=rename_head_digest, rename_policy_digest=rename_policy_digest, registration_transaction_intent_digest=registration_transaction_intent_digest, expected_catalog_digest=expected_catalog_digest, catalog_parent_identity_digest=catalog_parent_identity_digest, registration_journal_identity_digest=registration_journal_identity_digest, allowed_actions=allowed_actions, broker_state_mac=mac)
 
-    def verify_state_mac(self, state_mac_key: bytes) -> None:
-        if not isinstance(state_mac_key, bytes) or len(state_mac_key) < 16:
+    def verify_state_mac(self, state_mac: RegistrationBrokerStateMacCapabilityV1) -> None:
+        if type(state_mac) is not RegistrationBrokerStateMacCapabilityV1:
             raise ValueError("forward-only authority state MAC key is invalid")
-        expected = hmac.new(state_mac_key, canonical_json_bytes({**self._unsigned_wire(), "canonicalDigest": self.canonical_digest}), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(self._broker_state_mac, expected):
-            raise ValueError("forward-only authority state MAC is invalid")
+        state_mac.verify(canonical_json_bytes({**self._unsigned_wire(), "canonicalDigest": self.canonical_digest}), self._broker_state_mac)
 
     def __copy__(self):
         raise TypeError("forward-only authorities are non-copyable")
@@ -3479,7 +3581,7 @@ class RegistrationForwardOnlyRecoveryAuthorityV1:
 
 def verify_registration_forward_only_recovery(
     authority: RegistrationForwardOnlyRecoveryAuthorityV1,
-    state_mac_key: bytes,
+    state_mac: RegistrationBrokerStateMacCapabilityV1,
     journal: BrokerAuthSequenceJournalV1,
     state: BrokerAuthSequenceStateV1,
     payloads: Mapping[str, BrokerAuthSequenceEventPayloadV1],
@@ -3508,7 +3610,7 @@ def verify_registration_forward_only_recovery(
         raise ValueError("forward-only broker chain is invalid")
     if type(registry) is not RegistrationBrokerAuthRegistryV1 or type(revocations) is not RegistrationBrokerAuthRevocationsV1:
         raise ValueError("forward-only broker policy is invalid")
-    authority.verify_state_mac(state_mac_key)
+    authority.verify_state_mac(state_mac)
     if action not in _FORWARD_ONLY_ACTIONS:
         raise ValueError("forward-only action is not authorized")
     if (operation_id, lease_identity_digest, lease_request_digest, registration_transaction_intent_digest, catalog_digest, catalog_parent_identity_digest, registration_journal_identity_digest) != (
