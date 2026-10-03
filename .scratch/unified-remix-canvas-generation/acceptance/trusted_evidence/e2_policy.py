@@ -18,6 +18,7 @@ import sys
 import unicodedata
 import fcntl
 import socket
+import weakref
 from collections.abc import Mapping
 from types import MappingProxyType
 
@@ -2521,6 +2522,12 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
                 or payload_ref != payload.full_bytes_digest
             ):
                 raise ValueError("broker auth payload map is not content addressed")
+        entry_payload_refs = tuple(entry.event_payload_ref for entry in self.entries)
+        if (
+            len(set(entry_payload_refs)) != len(entry_payload_refs)
+            or set(payloads) != set(entry_payload_refs)
+        ):
+            raise ValueError("broker auth payload map does not exactly close journal entries")
 
         current_governance = baseline.governance
         current_registry = current_governance.registry
@@ -2612,6 +2619,11 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
                     raise ValueError("broker auth rotation removed the prior active key") from error
                 if (
                     payload.effective_lease_sequence != entry.sequence
+                    or entry.broker_auth_key_id != prior_active.key_id
+                    or prior_active.state != "active"
+                    or current_revocations.revoked_at(prior_active.key_id) is not None
+                    or not isinstance(current_governance.allowed_signers.get(prior_active.key_id), bytes)
+                    or "sha256:" + hashlib.sha256(current_governance.allowed_signers[prior_active.key_id]).hexdigest() != prior_active.public_key_digest
                     or payload.previous_registry_digest != current_registry.canonical_digest
                     or payload.previous_revocations_digest != current_revocations.canonical_digest
                     or payload.next_registry.generation != current_registry.generation + 1
@@ -2626,10 +2638,16 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
                     raise ValueError("broker auth rotation does not preserve replay pre-state")
                 next_governance, next_registry, next_revocations, next_policy = payload.next_governance, payload.next_registry, payload.next_revocations, payload.post_policy_digest
             else:
+                active_key = current_registry.key(current_registry.active_key_id)
                 previous_entries = {item.key_id: item for item in current_revocations.entries}
                 next_entries = {item.key_id: item for item in payload.next_revocations.entries}
                 if (
                     payload.revoked_at_broker_sequence != entry.sequence
+                    or entry.broker_auth_key_id != active_key.key_id
+                    or active_key.state != "active"
+                    or current_revocations.revoked_at(active_key.key_id) is not None
+                    or not isinstance(current_governance.allowed_signers.get(active_key.key_id), bytes)
+                    or "sha256:" + hashlib.sha256(current_governance.allowed_signers[active_key.key_id]).hexdigest() != active_key.public_key_digest
                     or payload.unchanged_registry_digest != current_registry.canonical_digest
                     or payload.previous_revocations_digest != current_revocations.canonical_digest
                     or payload.next_revocations.registry_digest != current_registry.canonical_digest
@@ -2950,15 +2968,12 @@ class FdOpenProvenanceV1(_SelfDigestRecord):
         return result
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class FdObservableIdentityV1(_SelfDigestRecord):
     file_type: str; access_mode: str; status_flags: tuple[str, ...]; fd_flags: tuple[str, ...]; device: int | None; inode: int | None; byte_length: int | None; content_digest: str | None; mount_identity_digest: str | None; socket_options: tuple[str, ...]; socket_identity_digest: str | None; identity_digest: str
-    _construction_origin: object = field(init=False, compare=False, repr=False, default=None)
-    _BROKER_TOKEN = object()
-    _DECODED_TOKEN = object()
 
     def __post_init__(self) -> None:
-        if self._construction_origin not in (self._BROKER_TOKEN, self._DECODED_TOKEN):
+        if not _fd_record_is_constructed(self):
             raise TypeError("FD observable identity must be constructed by a trusted producer")
         if (self.file_type, self.access_mode) not in {("regular", "read-only"), ("socket-seqpacket", "bidirectional-control"), ("socket-stream", "bidirectional-control")} or tuple(self.fd_flags) != ("FD_CLOEXEC",):
             raise ValueError("FD observable identity is invalid")
@@ -2975,21 +2990,9 @@ class FdObservableIdentityV1(_SelfDigestRecord):
         _require_digest(self.identity_digest, "identity_digest")
         object.__setattr__(self, "status_flags", tuple(self.status_flags)); object.__setattr__(self, "fd_flags", tuple(self.fd_flags)); object.__setattr__(self, "socket_options", tuple(self.socket_options))
 
-    @classmethod
-    def _construct(cls, origin: object, *values: object) -> "FdObservableIdentityV1":
-        if origin not in (cls._BROKER_TOKEN, cls._DECODED_TOKEN):
-            raise TypeError("FD observable identity construction token is invalid")
-        result = object.__new__(cls)
-        for name, value in zip(cls.__dataclass_fields__, values):
-            if name != "_construction_origin":
-                object.__setattr__(result, name, value)
-        object.__setattr__(result, "_construction_origin", origin)
-        result.__post_init__()
-        return result
-
     @property
     def _is_broker_produced(self) -> bool:
-        return self._construction_origin is self._BROKER_TOKEN
+        return _fd_record_is_broker_produced(self)
 
     def __copy__(self):
         raise TypeError("FD observable identities are non-copyable")
@@ -3006,104 +3009,12 @@ class FdObservableIdentityV1(_SelfDigestRecord):
     def _unsigned_wire(self) -> dict[str, object]: return {**self._identity_wire(), "identityDigest": self.identity_digest}
     def to_wire(self) -> dict[str, object]: return {**self._unsigned_wire(), "canonicalDigest": self.canonical_digest}
 
-    @classmethod
-    def _from_open_fd(
-        cls,
-        fd: int,
-        *,
-        expected_byte_length: int | None,
-        maximum_byte_length: int | None,
-    ) -> "FdObservableIdentityV1":
-        """Rebuild only observable FD facts; broker-open provenance remains unobservable."""
-        try:
-            if not isinstance(fd, int) or fd < 0:
-                raise ValueError("received FD is invalid")
-            if not fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC:
-                raise ValueError("received FD lacks FD_CLOEXEC")
-            flags, info = fcntl.fcntl(fd, fcntl.F_GETFL), os.fstat(fd)
-            fd_flags = ("FD_CLOEXEC",)
-            if stat.S_ISREG(info.st_mode):
-                if flags & os.O_ACCMODE != os.O_RDONLY:
-                    raise ValueError("received regular FD state is invalid")
-                if expected_byte_length is None or maximum_byte_length is None:
-                    raise ValueError("regular FD observation requires an explicit frozen budget")
-                expected_length = _u64(expected_byte_length, "expected_byte_length")
-                maximum_length = _u64(maximum_byte_length, "maximum_byte_length")
-                initial_identity = (
-                    info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
-                )
-                if info.st_size != expected_length:
-                    raise ValueError("received regular FD length differs from its descriptor")
-                if expected_length > maximum_length:
-                    raise ValueError("received regular FD exceeds its frozen role budget")
-                filesystem_id = getattr(os.fstatvfs(fd), "f_fsid", None)
-                if not isinstance(filesystem_id, int):
-                    raise ValueError("received regular FD mount identity is unavailable")
-                digest = hashlib.sha256()
-                offset = 0
-                remaining = expected_length
-                while remaining:
-                    chunk = os.pread(fd, min(_FD_HASH_CHUNK_BYTES, remaining), offset)
-                    if not chunk:
-                        raise ValueError("received regular FD changed while hashing")
-                    digest.update(chunk)
-                    offset += len(chunk)
-                    remaining -= len(chunk)
-                if os.pread(fd, 1, expected_length):
-                    raise ValueError("received regular FD changed while hashing")
-                after = os.fstat(fd)
-                if (
-                    (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != initial_identity
-                    or not stat.S_ISREG(after.st_mode)
-                    or not fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
-                    or fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY
-                    or getattr(os.fstatvfs(fd), "f_fsid", None) != filesystem_id
-                ):
-                    raise ValueError("received regular FD changed while hashing")
-                content_digest = "sha256:" + digest.hexdigest()
-                mount_identity_digest = canonical_digest({"filesystemId": filesystem_id, "kind": "fstatvfs-fsid/v1"})
-                wire = {"accessMode": "read-only", "byteLength": info.st_size, "contentDigest": content_digest, "device": info.st_dev, "fdFlags": list(fd_flags), "fileType": "regular", "inode": info.st_ino, "mountIdentityDigest": mount_identity_digest, "socketIdentityDigest": None, "socketOptions": [], "statusFlags": ["O_RDONLY"]}
-                return cls._construct(cls._BROKER_TOKEN, "regular", "read-only", ("O_RDONLY",), fd_flags, info.st_dev, info.st_ino, info.st_size, content_digest, mount_identity_digest, (), None, canonical_digest(wire))
-            if not stat.S_ISSOCK(info.st_mode) or flags != os.O_RDWR:
-                raise ValueError("received control FD state is invalid")
-            probe = socket.socket(fileno=os.dup(fd))
-            try:
-                socket_type = probe.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
-                family = probe.family
-                if socket_type == socket.SOCK_SEQPACKET:
-                    if family != socket.AF_UNIX or not hasattr(socket, "SO_PASSCRED") or probe.getsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED) != 1:
-                        raise ValueError("received control FD state is invalid")
-                    file_type, options = "socket-seqpacket", ("SO_PASSCRED=1", "SO_TYPE=SOCK_SEQPACKET")
-                elif socket_type == socket.SOCK_STREAM:
-                    file_type, options = "socket-stream", ("SO_TYPE=SOCK_STREAM",)
-                else:
-                    raise ValueError("received control FD state is invalid")
-            finally:
-                probe.close()
-            socket_identity_digest = canonical_digest({"family": family, "inode": info.st_ino, "socketType": socket_type})
-            wire = {"accessMode": "bidirectional-control", "byteLength": None, "contentDigest": None, "device": None, "fdFlags": list(fd_flags), "fileType": file_type, "inode": None, "mountIdentityDigest": None, "socketIdentityDigest": socket_identity_digest, "socketOptions": list(options), "statusFlags": []}
-            return cls._construct(cls._BROKER_TOKEN, file_type, "bidirectional-control", (), fd_flags, None, None, None, None, None, options, socket_identity_digest, canonical_digest(wire))
-        except OSError as error:
-            raise ValueError("received FD cannot be observed") from error
-
-    @classmethod
-    def _from_wire(cls, raw: object) -> "FdObservableIdentityV1":
-        fields = {"accessMode", "byteLength", "canonicalDigest", "contentDigest", "device", "fdFlags", "fileType", "identityDigest", "inode", "mountIdentityDigest", "socketIdentityDigest", "socketOptions", "statusFlags"}
-        if not isinstance(raw, dict) or set(raw) != fields or any(not isinstance(raw[key], list) for key in ("fdFlags", "socketOptions", "statusFlags")): raise ValueError("FD observable wire is invalid")
-        result = cls._construct(cls._DECODED_TOKEN, raw["fileType"], raw["accessMode"], tuple(raw["statusFlags"]), tuple(raw["fdFlags"]), raw["device"], raw["inode"], raw["byteLength"], raw["contentDigest"], raw["mountIdentityDigest"], tuple(raw["socketOptions"]), raw["socketIdentityDigest"], raw["identityDigest"])
-        if raw["canonicalDigest"] != result.canonical_digest: raise ValueError("FD observable digest is invalid")
-        return result
-
-
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class FdDescriptorV1(_SelfDigestRecord):
     role: str; ordinal: int; logical_name: str; cardinality: str; provenance_fields: FdOpenProvenanceV1; observable_fields: FdObservableIdentityV1
-    _construction_origin: object = field(init=False, compare=False, repr=False, default=None)
-    _BROKER_TOKEN = object()
-    _DECODED_TOKEN = object()
 
     def __post_init__(self) -> None:
-        if self._construction_origin not in (self._BROKER_TOKEN, self._DECODED_TOKEN):
+        if not _fd_record_is_constructed(self):
             raise TypeError("FD descriptor must be constructed by a trusted producer")
         if self.role not in _FD_ROLES or self.cardinality != "exactly-one" or not isinstance(self.logical_name, str) or not self.logical_name or type(self.provenance_fields) is not FdOpenProvenanceV1 or type(self.observable_fields) is not FdObservableIdentityV1:
             raise ValueError("FD descriptor is invalid")
@@ -3118,21 +3029,9 @@ class FdDescriptorV1(_SelfDigestRecord):
         if not control and self.observable_fields.byte_length > _fd_role_profile_budget(self.role):
             raise ValueError("FD descriptor exceeds its frozen role/profile budget")
 
-    @classmethod
-    def _construct(cls, origin: object, *values: object) -> "FdDescriptorV1":
-        if origin not in (cls._BROKER_TOKEN, cls._DECODED_TOKEN):
-            raise TypeError("FD descriptor construction token is invalid")
-        result = object.__new__(cls)
-        for name, value in zip(cls.__dataclass_fields__, values):
-            if name != "_construction_origin":
-                object.__setattr__(result, name, value)
-        object.__setattr__(result, "_construction_origin", origin)
-        result.__post_init__()
-        return result
-
     @property
     def _is_broker_produced(self) -> bool:
-        return self._construction_origin is self._BROKER_TOKEN and self.observable_fields._is_broker_produced
+        return _fd_record_is_broker_produced(self) and self.observable_fields._is_broker_produced
 
     def __copy__(self):
         raise TypeError("FD descriptors are non-copyable")
@@ -3143,46 +3042,150 @@ class FdDescriptorV1(_SelfDigestRecord):
     def __reduce__(self):
         raise TypeError("FD descriptors are non-serializable")
 
-    @classmethod
-    def from_open_fd(
-        cls,
-        fd: int,
-        *,
-        role: str,
-        ordinal: int,
-        logical_name: str,
-        provenance_fields: FdOpenProvenanceV1,
-    ) -> "FdDescriptorV1":
-        """Build the only public FD producer descriptor under its frozen role budget."""
+    def _unsigned_wire(self) -> dict[str, object]:
+        return {"cardinality": self.cardinality, "logicalName": self.logical_name, "observableFields": self.observable_fields.to_wire(), "ordinal": self.ordinal, "provenanceFields": self.provenance_fields.to_wire(), "role": self.role}
+
+
+def _install_fd_origin_bound_apis():
+    """Install constructor closures without exposing a broker construction token.
+
+    The side table deliberately holds origin by object identity rather than an
+    instance attribute, so supported APIs cannot copy a producer mark into a
+    manually assembled record.  Python reflection remains outside the Task 2
+    portable boundary; Task 14 supplies process isolation for that threat.
+    """
+    origins: dict[int, tuple[weakref.ReferenceType[object], bool]] = {}
+
+    def remember(value: object, broker_produced: bool) -> None:
+        identity = id(value)
+        def forget(reference: weakref.ReferenceType[object]) -> None:
+            current = origins.get(identity)
+            if current is not None and current[0] is reference:
+                origins.pop(identity, None)
+        origins[identity] = (weakref.ref(value, forget), broker_produced)
+
+    def origin(value: object) -> tuple[bool, bool]:
+        current = origins.get(id(value))
+        if current is None or current[0]() is not value:
+            return False, False
+        return True, current[1]
+
+    def observable(broker_produced: bool, *values: object) -> FdObservableIdentityV1:
+        result = object.__new__(FdObservableIdentityV1)
+        for name, value in zip(FdObservableIdentityV1.__dataclass_fields__, values):
+            object.__setattr__(result, name, value)
+        remember(result, broker_produced)
+        result.__post_init__()
+        return result
+
+    def descriptor(broker_produced: bool, *values: object) -> FdDescriptorV1:
+        result = object.__new__(FdDescriptorV1)
+        for name, value in zip(FdDescriptorV1.__dataclass_fields__, values):
+            object.__setattr__(result, name, value)
+        remember(result, broker_produced)
+        result.__post_init__()
+        return result
+
+    def observable_from_open(cls, fd: int, *, expected_byte_length: int | None, maximum_byte_length: int | None) -> FdObservableIdentityV1:
+        try:
+            if not isinstance(fd, int) or fd < 0:
+                raise ValueError("received FD is invalid")
+            if not fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC:
+                raise ValueError("received FD lacks FD_CLOEXEC")
+            flags, info = fcntl.fcntl(fd, fcntl.F_GETFL), os.fstat(fd)
+            fd_flags = ("FD_CLOEXEC",)
+            if stat.S_ISREG(info.st_mode):
+                if flags & os.O_ACCMODE != os.O_RDONLY:
+                    raise ValueError("received regular FD state is invalid")
+                if expected_byte_length is None or maximum_byte_length is None:
+                    raise ValueError("regular FD observation requires an explicit frozen budget")
+                expected_length = _u64(expected_byte_length, "expected_byte_length")
+                maximum_length = _u64(maximum_byte_length, "maximum_byte_length")
+                initial_identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                if info.st_size != expected_length:
+                    raise ValueError("received regular FD length differs from its descriptor")
+                if expected_length > maximum_length:
+                    raise ValueError("received regular FD exceeds its frozen role budget")
+                filesystem_id = getattr(os.fstatvfs(fd), "f_fsid", None)
+                if not isinstance(filesystem_id, int):
+                    raise ValueError("received regular FD mount identity is unavailable")
+                digest, offset, remaining = hashlib.sha256(), 0, expected_length
+                while remaining:
+                    chunk = os.pread(fd, min(_FD_HASH_CHUNK_BYTES, remaining), offset)
+                    if not chunk:
+                        raise ValueError("received regular FD changed while hashing")
+                    digest.update(chunk); offset += len(chunk); remaining -= len(chunk)
+                if os.pread(fd, 1, expected_length):
+                    raise ValueError("received regular FD changed while hashing")
+                after = os.fstat(fd)
+                if ((after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != initial_identity or not stat.S_ISREG(after.st_mode) or not fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC or fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY or getattr(os.fstatvfs(fd), "f_fsid", None) != filesystem_id):
+                    raise ValueError("received regular FD changed while hashing")
+                content_digest = "sha256:" + digest.hexdigest()
+                mount_identity_digest = canonical_digest({"filesystemId": filesystem_id, "kind": "fstatvfs-fsid/v1"})
+                wire = {"accessMode": "read-only", "byteLength": info.st_size, "contentDigest": content_digest, "device": info.st_dev, "fdFlags": list(fd_flags), "fileType": "regular", "inode": info.st_ino, "mountIdentityDigest": mount_identity_digest, "socketIdentityDigest": None, "socketOptions": [], "statusFlags": ["O_RDONLY"]}
+                return observable(True, "regular", "read-only", ("O_RDONLY",), fd_flags, info.st_dev, info.st_ino, info.st_size, content_digest, mount_identity_digest, (), None, canonical_digest(wire))
+            if not stat.S_ISSOCK(info.st_mode) or flags != os.O_RDWR:
+                raise ValueError("received control FD state is invalid")
+            probe = socket.socket(fileno=os.dup(fd))
+            try:
+                socket_type, family = probe.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE), probe.family
+                if socket_type == socket.SOCK_SEQPACKET:
+                    if family != socket.AF_UNIX or not hasattr(socket, "SO_PASSCRED") or probe.getsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED) != 1:
+                        raise ValueError("received control FD state is invalid")
+                    file_type, options = "socket-seqpacket", ("SO_PASSCRED=1", "SO_TYPE=SOCK_SEQPACKET")
+                elif socket_type == socket.SOCK_STREAM:
+                    file_type, options = "socket-stream", ("SO_TYPE=SOCK_STREAM",)
+                else:
+                    raise ValueError("received control FD state is invalid")
+            finally:
+                probe.close()
+            socket_identity_digest = canonical_digest({"family": family, "inode": info.st_ino, "socketType": socket_type})
+            wire = {"accessMode": "bidirectional-control", "byteLength": None, "contentDigest": None, "device": None, "fdFlags": list(fd_flags), "fileType": file_type, "inode": None, "mountIdentityDigest": None, "socketIdentityDigest": socket_identity_digest, "socketOptions": list(options), "statusFlags": []}
+            return observable(True, file_type, "bidirectional-control", (), fd_flags, None, None, None, None, None, options, socket_identity_digest, canonical_digest(wire))
+        except OSError as error:
+            raise ValueError("received FD cannot be observed") from error
+
+    def observable_from_wire(cls, raw: object) -> FdObservableIdentityV1:
+        fields = {"accessMode", "byteLength", "canonicalDigest", "contentDigest", "device", "fdFlags", "fileType", "identityDigest", "inode", "mountIdentityDigest", "socketIdentityDigest", "socketOptions", "statusFlags"}
+        if not isinstance(raw, dict) or set(raw) != fields or any(not isinstance(raw[key], list) for key in ("fdFlags", "socketOptions", "statusFlags")):
+            raise ValueError("FD observable wire is invalid")
+        result = observable(False, raw["fileType"], raw["accessMode"], tuple(raw["statusFlags"]), tuple(raw["fdFlags"]), raw["device"], raw["inode"], raw["byteLength"], raw["contentDigest"], raw["mountIdentityDigest"], tuple(raw["socketOptions"]), raw["socketIdentityDigest"], raw["identityDigest"])
+        if raw["canonicalDigest"] != result.canonical_digest:
+            raise ValueError("FD observable digest is invalid")
+        return result
+
+    def descriptor_from_open(cls, fd: int, *, role: str, ordinal: int, logical_name: str, provenance_fields: FdOpenProvenanceV1) -> FdDescriptorV1:
         if role == "broker-control":
-            observable = FdObservableIdentityV1._from_open_fd(
-                fd, expected_byte_length=None, maximum_byte_length=None,
-            )
+            observed = observable_from_open(FdObservableIdentityV1, fd, expected_byte_length=None, maximum_byte_length=None)
         else:
-            maximum = _fd_role_profile_budget(role)
             try:
                 info = os.fstat(fd)
             except OSError as error:
                 raise ValueError("received FD cannot be observed") from error
-            if not stat.S_ISREG(info.st_mode):
-                raise ValueError("received regular FD state is invalid")
-            if info.st_size > maximum:
+            maximum = _fd_role_profile_budget(role)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > maximum:
                 raise ValueError("received regular FD exceeds its frozen role budget")
-            observable = FdObservableIdentityV1._from_open_fd(
-                fd, expected_byte_length=info.st_size, maximum_byte_length=maximum,
-            )
-        return cls._construct(cls._BROKER_TOKEN, role, ordinal, logical_name, "exactly-one", provenance_fields, observable)
+            observed = observable_from_open(FdObservableIdentityV1, fd, expected_byte_length=info.st_size, maximum_byte_length=maximum)
+        return descriptor(True, role, ordinal, logical_name, "exactly-one", provenance_fields, observed)
 
-    def _unsigned_wire(self) -> dict[str, object]:
-        return {"cardinality": self.cardinality, "logicalName": self.logical_name, "observableFields": self.observable_fields.to_wire(), "ordinal": self.ordinal, "provenanceFields": self.provenance_fields.to_wire(), "role": self.role}
-
-    @classmethod
-    def _from_wire(cls, raw: object) -> "FdDescriptorV1":
+    def descriptor_from_wire(cls, raw: object) -> FdDescriptorV1:
         fields = {"canonicalDigest", "cardinality", "logicalName", "observableFields", "ordinal", "provenanceFields", "role"}
-        if not isinstance(raw, dict) or set(raw) != fields: raise ValueError("FD descriptor wire is invalid")
-        result = cls._construct(cls._DECODED_TOKEN, raw["role"], raw["ordinal"], raw["logicalName"], raw["cardinality"], FdOpenProvenanceV1._from_wire(raw["provenanceFields"]), FdObservableIdentityV1._from_wire(raw["observableFields"]))
-        if raw["canonicalDigest"] != result.canonical_digest: raise ValueError("FD descriptor digest is invalid")
+        if not isinstance(raw, dict) or set(raw) != fields:
+            raise ValueError("FD descriptor wire is invalid")
+        result = descriptor(False, raw["role"], raw["ordinal"], raw["logicalName"], raw["cardinality"], FdOpenProvenanceV1._from_wire(raw["provenanceFields"]), observable_from_wire(FdObservableIdentityV1, raw["observableFields"]))
+        if raw["canonicalDigest"] != result.canonical_digest:
+            raise ValueError("FD descriptor digest is invalid")
         return result
+
+    FdObservableIdentityV1._from_open_fd = classmethod(observable_from_open)
+    FdObservableIdentityV1._from_wire = classmethod(observable_from_wire)
+    FdDescriptorV1.from_open_fd = classmethod(descriptor_from_open)
+    FdDescriptorV1._from_wire = classmethod(descriptor_from_wire)
+    return lambda value: origin(value)[0], lambda value: origin(value)[1]
+
+
+_fd_record_is_constructed, _fd_record_is_broker_produced = _install_fd_origin_bound_apis()
+del _install_fd_origin_bound_apis
 
 
 def _validate_fd_closure(worker_mode: str, descriptors: object) -> tuple[FdDescriptorV1, ...]:
@@ -3198,6 +3201,12 @@ def _validate_fd_closure(worker_mode: str, descriptors: object) -> tuple[FdDescr
         elif descriptor.provenance_fields.approved_root_role != root_role or descriptor.provenance_fields.broker_open_policy != "openat2-beneath-no-symlinks":
             raise ValueError("regular FD closure root is invalid")
     return values
+
+
+def _require_broker_produced_fd_closure(descriptors: tuple[FdDescriptorV1, ...]) -> None:
+    """Keep decoded worker wire records from becoming broker signing input."""
+    if not all(descriptor._is_broker_produced for descriptor in descriptors):
+        raise ValueError("capability envelope FD descriptors must be broker-produced")
 
 
 @dataclass(frozen=True, slots=True)
@@ -3243,6 +3252,7 @@ class CapabilityEnvelopeV1:
             raise TypeError("capability envelope must be signed by a broker private-key slot")
         if (broker_signer.key_id, broker_signer.signature_domain, broker_signer.public_key_digest) != (unsigned_envelope.broker_auth_key_id, _ENVELOPE_DOMAIN, unsigned_envelope.broker_auth_public_key_digest):
             raise ValueError("broker signer does not close capability envelope")
+        _require_broker_produced_fd_closure(unsigned_envelope.fd_descriptors)
         return cls(unsigned_envelope, broker_signer.sign(_ENVELOPE_DOMAIN, unsigned_envelope.canonical_bytes))
 
     @property
