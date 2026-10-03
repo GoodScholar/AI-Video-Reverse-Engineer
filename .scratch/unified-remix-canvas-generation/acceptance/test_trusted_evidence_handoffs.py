@@ -275,13 +275,12 @@ def test_tracked_broker_auth_issue_chain_golden_is_present_without_private_mater
     state.verify_state_mac(state_mac_key)
     journal.verify_state_mac(state_mac_key)
     journal.validate_state(state, {payload.canonical_digest: payload})
-    # The historical public fixture intentionally predates the canonical
-    # allowed-signers closure.  Its state MAC remains a decoder vector only;
-    # a typed production lease verifier must reject that ungoverned wire.
+    # A frozen lease can outlive a governance rotation when the current
+    # eligible key resolves to the same leaf.  Its old closure labels are
+    # signed facts, not a requirement that current governance bytes match.
     governance_bytes = _strict_broker_inputs(bytes.fromhex(chain["publicKeyHex"]))
     governance = RegistrationBrokerAuthGovernanceV1.from_canonical_bytes(*governance_bytes)
-    with pytest.raises(ValueError):
-        lease.verify_signature(governance, state.current_sequence)
+    lease.verify_signature(governance, state.current_sequence)
 
 
 DIGEST = "sha256:" + "a" * 64

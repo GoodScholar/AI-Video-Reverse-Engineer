@@ -17,6 +17,7 @@ import pytest
 from trusted_evidence.e2_policy import (
     AcceptanceOperationSnapshotV1,
     AllowedTaskOutputsV1,
+    canonical_digest,
     canonical_json_bytes,
     GitObjectIdV1,
     NamedDigest,
@@ -130,6 +131,15 @@ def _state_mac_capability(tmp_path, key: bytes):
         return RegistrationBrokerStateMacCapabilityV1.load_from_readonly_fd(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _broker_policy_digest(registry, revocations):
+    """Hand-derived v1 policy-state binding used to test broker replay."""
+    return canonical_digest({
+        "registryDigest": registry.canonical_digest,
+        "revocationsDigest": revocations.canonical_digest,
+        "schema": "trusted-registration-broker-auth-policy-state/v1",
+    })
 
 
 def _binding(**overrides):
@@ -1133,16 +1143,17 @@ def test_authoritative_broker_issuer_commits_a_verified_issue_chain_and_preserve
         ("register", "recover"), "register-to-recover", DIGEST_C, DIGEST_A, DIGEST_B,
         DIGEST_C, DIGEST_A,
     )
+    policy_digest = _broker_policy_digest(registry, revocations)
     request = BrokerAuthLeaseIssueRequestV1(
         "trusted-registration-broker-auth-lease-issue-request/v1", "op-issuer", "lifecycle-issuer",
         family.canonical_digest, "broker-fixed", 0, DIGEST_A, registry.canonical_digest,
-        revocations.canonical_digest, DIGEST_B, governance.allowed_signers_digest, 2,
+        revocations.canonical_digest, policy_digest, governance.allowed_signers_digest, 2,
     )
     template = RegistrationRecoveryLeaseV1(
         "trusted-registration-recovery-lease/v1", "ai-video-reverse-engineer", "op-issuer", "lifecycle-issuer",
         family.canonical_digest, 1, DIGEST_A, "transaction-root", DIGEST_B, DIGEST_C, DIGEST_A,
         DIGEST_B, DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A, 1, registry.canonical_digest,
-        revocations.canonical_digest, DIGEST_B, governance.allowed_signers_digest, "broker-fixed", request.request_digest,
+        revocations.canonical_digest, policy_digest, governance.allowed_signers_digest, "broker-fixed", request.request_digest,
         DIGEST_A, DIGEST_B, DIGEST_C, 1, 3, DIGEST_A, "OPEN", "a" * 128, "b" * 64,
     )
     key_file = tmp_path / "broker-key"
@@ -1154,8 +1165,12 @@ def test_authoritative_broker_issuer_commits_a_verified_issue_chain_and_preserve
         os.close(descriptor)
     try:
         state_mac = _state_mac_capability(tmp_path, b"state-mac-key-is-independent-32!!!"[:32])
+        with pytest.raises(ValueError):
+            BrokerAuthAuthoritativeIssuerV1.create(
+                governance, DIGEST_A, DIGEST_A, signer, state_mac, 2,
+            )
         issuer = BrokerAuthAuthoritativeIssuerV1.create(
-            governance, DIGEST_A, DIGEST_B, signer, state_mac, 2
+            governance, DIGEST_A, policy_digest, signer, state_mac, 2
         )
         before = issuer.state
         with pytest.raises(ValueError):
@@ -1164,6 +1179,9 @@ def test_authoritative_broker_issuer_commits_a_verified_issue_chain_and_preserve
 
         with pytest.raises(ValueError):
             issuer.issue_lease(replace(request, lease_ttl_sequences=3), family, template)
+        with pytest.raises(ValueError):
+            issuer.issue_lease(request, family, replace(template, state="RECLAIMED", next_recovery_sequence=999))
+        assert issuer.state == before and issuer.entries == () and issuer.payloads == {}
         with pytest.raises(ValueError):
             issuer.issue_lease(request, family, replace(template, executor_identity_digest=DIGEST_A))
         issued = issuer.issue_lease(request, family, template)
@@ -1222,8 +1240,28 @@ def test_authoritative_broker_issuer_rotates_and_revokes_without_partial_state(t
     try:
         state_mac = _state_mac_capability(tmp_path, b"state-mac-key-is-independent-32!!!"[:32])
         issuer = BrokerAuthAuthoritativeIssuerV1.create(
-            governance, DIGEST_A, DIGEST_B, old_signer, state_mac, 2,
+            governance, DIGEST_A, _broker_policy_digest(registry, revocations), old_signer, state_mac, 2,
         )
+        family = RegistrationWorkerSessionFamilyAuthorizationV1(
+            "trusted-registration-worker-session-family-authorization/v1", "op-retiring", DIGEST_A,
+            DIGEST_B, DIGEST_C, DIGEST_A, DIGEST_B, "old", old_key.canonical_digest,
+            ("register", "recover"), "register-to-recover", DIGEST_C, DIGEST_A, DIGEST_B,
+            DIGEST_C, DIGEST_A,
+        )
+        policy_digest = _broker_policy_digest(registry, revocations)
+        request = BrokerAuthLeaseIssueRequestV1(
+            "trusted-registration-broker-auth-lease-issue-request/v1", "op-retiring", "lifecycle-retiring",
+            family.canonical_digest, "old", 0, DIGEST_A, registry.canonical_digest,
+            revocations.canonical_digest, policy_digest, governance.allowed_signers_digest, 2,
+        )
+        template = RegistrationRecoveryLeaseV1(
+            "trusted-registration-recovery-lease/v1", "ai-video-reverse-engineer", "op-retiring", "lifecycle-retiring",
+            family.canonical_digest, 1, DIGEST_A, "transaction-root", DIGEST_B, DIGEST_C, DIGEST_A,
+            DIGEST_B, DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A, registry.generation, registry.canonical_digest,
+            revocations.canonical_digest, policy_digest, governance.allowed_signers_digest, "old", request.request_digest,
+            DIGEST_A, DIGEST_B, DIGEST_C, 1, 3, DIGEST_A, "OPEN", "a" * 128, "b" * 64,
+        )
+        issued = issuer.issue_lease(request, family, template)
         def next_governance():
             entries = []
             for key_id, public in (("new", publics[1]), ("old", publics[0])):
@@ -1231,20 +1269,24 @@ def test_authoritative_broker_issuer_rotates_and_revokes_without_partial_state(t
                 entries.append({"keyId": key_id, "purpose": "registration-broker-auth", "rawPublicKey": encoded, "resolvedPublicKey": encoded, "signatureDomain": "ai-video-reverse-engineer/registration-broker-envelope/v1", "wrapperIdentity": "test-broker-wrapper-v1"})
             allowed = {"keys": entries}
             allowed_bytes = canonical_json_bytes(allowed)
-            def registered(entry, state, retire_after):
+            def registered(entry, state, effective_sequence, retire_after):
                 digest = "sha256:" + hashlib.sha256(base64.b64decode(entry["rawPublicKey"])).hexdigest()
-                return RegistrationBrokerAuthKeyRegistrationV1("trusted-registration-broker-auth-key-registration/v1", entry["keyId"], "registration-broker-auth", "ai-video-reverse-engineer/registration-broker-envelope/v1", "ai-video-reverse-engineer/registration-broker-lease/v1", "ai-video-reverse-engineer/registration-broker-startup-challenge/v1", "raw-ed25519-32", digest, digest, "sha256:" + hashlib.sha256(b"test-broker-wrapper-v1").hexdigest(), digest, digest, "sha256:" + hashlib.sha256(canonical_json_bytes(entry)).hexdigest(), state, 1, retire_after)
-            new_key, retired_old = registered(entries[0], "active", None), registered(entries[1], "retiring", 2)
+                return RegistrationBrokerAuthKeyRegistrationV1("trusted-registration-broker-auth-key-registration/v1", entry["keyId"], "registration-broker-auth", "ai-video-reverse-engineer/registration-broker-envelope/v1", "ai-video-reverse-engineer/registration-broker-lease/v1", "ai-video-reverse-engineer/registration-broker-startup-challenge/v1", "raw-ed25519-32", digest, digest, "sha256:" + hashlib.sha256(b"test-broker-wrapper-v1").hexdigest(), digest, digest, "sha256:" + hashlib.sha256(canonical_json_bytes(entry)).hexdigest(), state, effective_sequence, retire_after)
+            new_key, retired_old = registered(entries[0], "active", 2, None), registered(entries[1], "retiring", 1, 2)
             next_registry = RegistrationBrokerAuthRegistryV1("trusted-registration-broker-auth-registry/v1", 2, registry.canonical_digest, "new", (new_key, retired_old))
             next_revocations = RegistrationBrokerAuthRevocationsV1("trusted-registration-broker-auth-revocations/v1", next_registry.canonical_digest, ())
             return RegistrationBrokerAuthGovernanceV1.from_canonical_bytes(next_registry.canonical_bytes, next_revocations.canonical_bytes, allowed_bytes), new_key, next_registry, next_revocations
         next_governance_value, new_key, next_registry, next_revocations = next_governance()
         before = issuer.state
+        next_policy_digest = _broker_policy_digest(next_registry, next_revocations)
         with pytest.raises(ValueError):
             issuer.rotate_registry(next_registry, revocations, DIGEST_A, DIGEST_C)
-        assert issuer.state == before and issuer.entries == ()
-        rotated = issuer.rotate_registry(next_registry, next_revocations, DIGEST_A, DIGEST_C)
-        assert rotated.entry.sequence == rotated.payload.effective_lease_sequence == 1
+        assert issuer.state == before and issuer.entries == (issued.entry,)
+        with pytest.raises(ValueError):
+            issuer.rotate_registry(next_registry, next_revocations, DIGEST_A, DIGEST_C)
+        assert issuer.state == before and issuer.entries == (issued.entry,)
+        rotated = issuer.rotate_registry(next_registry, next_revocations, DIGEST_A, next_policy_digest)
+        assert rotated.entry.sequence == rotated.payload.effective_lease_sequence == 2
         assert issuer.registry == next_registry and issuer.revocations == next_revocations
 
         new_path = tmp_path / "new-key"; new_path.write_bytes(seeds[1])
@@ -1255,16 +1297,55 @@ def test_authoritative_broker_issuer_rotates_and_revokes_without_partial_state(t
             os.close(descriptor)
         issuer.replace_signer(new_signer, next_governance_value)
 
+        recovery_lease = replace(issued.lease, state="RECOVERY_RUNNING", next_recovery_sequence=2)
+        recovery_lease = replace(
+            recovery_lease,
+            broker_signature_hex=old_signer.sign(
+                "ai-video-reverse-engineer/registration-broker-lease/v1",
+                canonical_json_bytes(recovery_lease._unsigned_wire()),
+            ),
+        )
+        recovery_lease.verify_signature(next_governance_value, issuer.state.current_sequence)
+        unsigned_recovery = _unsigned_envelope(
+            "recover", broker_lease_identity_digest=recovery_lease.lease_identity_digest,
+            operation_id=recovery_lease.operation_id, lifecycle_nonce=recovery_lease.lifecycle_nonce,
+            worker_sequence=2, broker_auth_key_id="old", broker_auth_public_key_digest=old_signer.public_key_digest,
+            broker_auth_registry_generation=next_registry.generation,
+            broker_auth_registry_digest=next_registry.canonical_digest,
+            broker_auth_revocation_digest=next_revocations.canonical_digest,
+            broker_auth_allowed_signers_digest=next_governance_value.allowed_signers_digest,
+            broker_auth_lease_issued_sequence=recovery_lease.broker_auth_lease_issued_sequence,
+            broker_auth_lease_expiry_sequence=recovery_lease.broker_auth_lease_expiry_sequence,
+            broker_auth_sign_sequence=3,
+        )
+        signed_recovery = issuer.sign_recovery_envelope(
+            recovery_lease, unsigned_recovery, old_signer, DIGEST_C,
+        )
+        assert signed_recovery.transition.payload.broker_auth_key_id == "old"
+        assert signed_recovery.envelope.unsigned == unsigned_recovery
+        RegistrationExpectedReceiveContextV1(
+            "recover", DIGEST_C, DIGEST_B, DIGEST_A, _worker_input().canonical_digest,
+            "session-e2", "op-retiring", "lifecycle-retiring", 2, "broker-session-e2",
+            recovery_lease, 3, next_governance_value,
+        ).verify_envelope(signed_recovery.envelope)
+        stable = issuer.state
+        with pytest.raises(ValueError):
+            issuer.sign_recovery_envelope(recovery_lease, unsigned_recovery, new_signer, DIGEST_B)
+        assert issuer.state == stable
+
         stale = issuer.state
         with pytest.raises(ValueError):
             issuer.revoke_key("not-registered", next_revocations, DIGEST_B, DIGEST_A)
         assert issuer.state == stale and issuer.revocations == next_revocations
         revoked = RegistrationBrokerAuthRevocationsV1(
             "trusted-registration-broker-auth-revocations/v1", next_registry.canonical_digest,
-            (RegistrationBrokerAuthRevocationEntryV1("old", 2, DIGEST_A),),
+            (RegistrationBrokerAuthRevocationEntryV1("old", 4, DIGEST_A),),
         )
-        result = issuer.revoke_key("old", revoked, DIGEST_B, DIGEST_A)
-        assert result.entry.sequence == result.payload.revoked_at_broker_sequence == 2
+        with pytest.raises(ValueError):
+            issuer.revoke_key("old", revoked, DIGEST_B, DIGEST_A)
+        assert issuer.state == stale and issuer.revocations == next_revocations
+        result = issuer.revoke_key("old", revoked, DIGEST_B, _broker_policy_digest(next_registry, revoked))
+        assert result.entry.sequence == result.payload.revoked_at_broker_sequence == 4
         assert issuer.revocations == revoked
     finally:
         state_mac.close()
@@ -1647,6 +1728,30 @@ def test_e2_expected_receive_context_rejects_old_or_cross_bound_signed_envelopes
                 expected.verify_envelope(candidate)
         with pytest.raises(ValueError, match="expected receive context"):
             _expected_receive_context(governance, lease, broker_auth_sign_sequence=3).verify_envelope(signed)
+        terminal_lease = replace(lease, state="RECLAIMED", next_recovery_sequence=777)
+        terminal_lease = replace(
+            terminal_lease,
+            broker_signature_hex=signer.sign(
+                "ai-video-reverse-engineer/registration-broker-lease/v1",
+                canonical_json_bytes(terminal_lease._unsigned_wire()),
+            ),
+        )
+        terminal_envelope = _signed_receive_envelope(
+            governance, signer, terminal_lease, worker_sequence=777,
+        )
+        with pytest.raises(ValueError, match="expected receive context"):
+            _expected_receive_context(
+                governance, terminal_lease, worker_sequence=777,
+            ).verify_envelope(terminal_envelope)
+        for unexpected_sequence in (2, 777):
+            with pytest.raises(ValueError, match="expected receive context"):
+                _expected_receive_context(
+                    governance, lease, worker_sequence=unexpected_sequence,
+                ).verify_envelope(
+                    _signed_receive_envelope(
+                        governance, signer, lease, worker_sequence=unexpected_sequence,
+                    )
+                )
         for changed_lease in (
             {"session_family_authorization_digest": DIGEST_B},
             {"broker_auth_lease_request_digest": DIGEST_C},
@@ -1677,6 +1782,17 @@ def _linux_delivery(tmp_path, mode, fault=None, envelope_overrides=None):
     opened = []
     governance, signer = _test_broker_signer(tmp_path)
     lease = _test_receive_lease(governance, signer)
+    worker_sequence = 1
+    if mode == "recover":
+        worker_sequence = 2
+        lease = replace(lease, state="RECOVERY_RUNNING", next_recovery_sequence=worker_sequence)
+        lease = replace(
+            lease,
+            broker_signature_hex=signer.sign(
+                "ai-video-reverse-engineer/registration-broker-lease/v1",
+                canonical_json_bytes(lease._unsigned_wire()),
+            ),
+        )
     try:
         control.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
         closure = _unsigned_envelope(mode).fd_descriptors
@@ -1701,11 +1817,13 @@ def _linux_delivery(tmp_path, mode, fault=None, envelope_overrides=None):
             ) for index, item in enumerate(descriptors))
             sent[1] = sent[0]
         envelope = _signed_receive_envelope(
-            governance, signer, lease, mode, fd_descriptors=descriptors,
+            governance, signer, lease, mode, worker_sequence=worker_sequence, fd_descriptors=descriptors,
             **(envelope_overrides or {}),
         )
         sender.sendmsg([envelope.canonical_bytes], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", sent))])
-        expected = _expected_receive_context(governance, lease, worker_mode=mode)
+        expected = _expected_receive_context(
+            governance, lease, worker_mode=mode, worker_sequence=worker_sequence,
+        )
         return sender, receiver, opened, control, control_peer, signer, expected
     except Exception:
         signer.close()

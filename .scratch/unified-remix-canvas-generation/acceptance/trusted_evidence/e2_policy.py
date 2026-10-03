@@ -2130,6 +2130,31 @@ class BrokerAuthLeaseIssueRequestV1(_SelfDigestRecord):
         return item
 
 
+def _broker_auth_policy_digest_from_digests(registry_digest: str, revocations_digest: str) -> str:
+    """Versioned canonical preimage for the complete broker-auth policy state."""
+    _require_digest(registry_digest, "registry_digest")
+    _require_digest(revocations_digest, "revocations_digest")
+    return canonical_digest({
+        "registryDigest": registry_digest,
+        "revocationsDigest": revocations_digest,
+        "schema": "trusted-registration-broker-auth-policy-state/v1",
+    })
+
+
+def _broker_auth_policy_digest(
+    registry: "RegistrationBrokerAuthRegistryV1",
+    revocations: "RegistrationBrokerAuthRevocationsV1",
+) -> str:
+    """Derive the only broker-auth policy label from its complete governance state."""
+    if (
+        type(registry) is not RegistrationBrokerAuthRegistryV1
+        or type(revocations) is not RegistrationBrokerAuthRevocationsV1
+        or revocations.registry_digest != registry.canonical_digest
+    ):
+        raise ValueError("broker auth policy governance is invalid")
+    return _broker_auth_policy_digest_from_digests(registry.canonical_digest, revocations.canonical_digest)
+
+
 @dataclass(frozen=True, slots=True)
 class BrokerAuthLeaseIssueEventPayloadV1(_SelfDigestRecord):
     schema: str; event_kind: str; event_id_digest: str; lease_request: BrokerAuthLeaseIssueRequestV1; lease_request_digest: str; operation_id: str; broker_auth_key_id: str; issued_sequence: int; lease_ttl_sequences: int; expiry_sequence: int; pre_policy_digest: str; post_policy_digest: str
@@ -2144,6 +2169,8 @@ class BrokerAuthLeaseIssueEventPayloadV1(_SelfDigestRecord):
         _u64(self.issued_sequence, "issued_sequence", positive=True); _u64(self.expiry_sequence, "expiry_sequence", positive=True)
         if self.expiry_sequence != _checked_add(self.issued_sequence, self.lease_ttl_sequences) or self.pre_policy_digest != self.post_policy_digest:
             raise ValueError("broker auth issue payload sequence or policy is invalid")
+        if self.pre_policy_digest != self.lease_request.expected_policy_digest:
+            raise ValueError("broker auth issue payload policy does not bind request")
 
     def _unsigned_wire(self) -> dict[str, object]:
         return {"brokerAuthKeyId": self.broker_auth_key_id, "eventIdDigest": self.event_id_digest, "eventKind": self.event_kind, "expirySequence": self.expiry_sequence, "issuedSequence": self.issued_sequence, "leaseRequest": self.lease_request.to_wire(), "leaseRequestDigest": self.lease_request_digest, "leaseTtlSequences": self.lease_ttl_sequences, "operationId": self.operation_id, "postPolicyDigest": self.post_policy_digest, "prePolicyDigest": self.pre_policy_digest, "schema": self.schema}
@@ -2195,7 +2222,7 @@ class BrokerAuthRotatePolicyEventPayloadV1(_SelfDigestRecord):
         for field in ("event_id_digest", "previous_registry_digest", "previous_revocations_digest", "pre_policy_digest", "post_policy_digest"):
             _require_digest(getattr(self, field), field)
         _require_text(self.activated_key_id, "activated_key_id"); _require_text(self.retiring_key_id, "retiring_key_id"); _u64(self.effective_lease_sequence, "effective_lease_sequence", positive=True)
-        if self.next_registry.previous_registry_digest != self.previous_registry_digest or self.next_registry.active_key_id != self.activated_key_id or self.next_registry.key(self.retiring_key_id).state != "retiring" or self.next_registry.key(self.activated_key_id).effective_lease_sequence != self.effective_lease_sequence or self.next_revocations.registry_digest != self.next_registry.canonical_digest or self.pre_policy_digest == self.post_policy_digest:
+        if self.next_registry.previous_registry_digest != self.previous_registry_digest or self.next_registry.active_key_id != self.activated_key_id or self.next_registry.key(self.retiring_key_id).state != "retiring" or self.next_registry.key(self.activated_key_id).effective_lease_sequence != self.effective_lease_sequence or self.next_revocations.registry_digest != self.next_registry.canonical_digest or self.pre_policy_digest == self.post_policy_digest or self.post_policy_digest != _broker_auth_policy_digest(self.next_registry, self.next_revocations):
             raise ValueError("broker auth rotate closure is invalid")
 
     def _unsigned_wire(self) -> dict[str, object]:
@@ -2223,7 +2250,7 @@ class BrokerAuthRevokePolicyEventPayloadV1(_SelfDigestRecord):
         for field in ("event_id_digest", "unchanged_registry_digest", "previous_revocations_digest", "pre_policy_digest", "post_policy_digest"):
             _require_digest(getattr(self, field), field)
         _require_text(self.revoked_key_id, "revoked_key_id"); _u64(self.revoked_at_broker_sequence, "revoked_at_broker_sequence", positive=True)
-        if self.next_revocations.registry_digest != self.unchanged_registry_digest or self.next_revocations.revoked_at(self.revoked_key_id) != self.revoked_at_broker_sequence or self.pre_policy_digest == self.post_policy_digest:
+        if self.next_revocations.registry_digest != self.unchanged_registry_digest or self.next_revocations.revoked_at(self.revoked_key_id) != self.revoked_at_broker_sequence or self.pre_policy_digest == self.post_policy_digest or self.post_policy_digest != _broker_auth_policy_digest_from_digests(self.unchanged_registry_digest, self.next_revocations.canonical_digest):
             raise ValueError("broker auth revoke closure is invalid")
 
     def _unsigned_wire(self) -> dict[str, object]:
@@ -2383,6 +2410,8 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
                 if payload.issued_sequence != entry.sequence or entry.broker_auth_key_id != payload.broker_auth_key_id:
                     raise ValueError("broker auth issue sequence is invalid")
                 registry, revocations = payload.lease_request.expected_registry_digest, payload.lease_request.expected_revocation_digest
+                if payload.pre_policy_digest != payload.lease_request.expected_policy_digest:
+                    raise ValueError("broker auth issue policy is not bound to request")
             elif isinstance(payload, BrokerAuthEnvelopeSignEventPayloadV1):
                 if payload.sign_sequence != entry.sequence or entry.broker_auth_key_id != payload.broker_auth_key_id:
                     raise ValueError("broker auth signing sequence is invalid")
@@ -2391,10 +2420,14 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
                 if payload.effective_lease_sequence != entry.sequence:
                     raise ValueError("broker auth rotate sequence is invalid")
                 registry, revocations = payload.next_registry.canonical_digest, payload.next_revocations.canonical_digest
+                if payload.post_policy_digest != _broker_auth_policy_digest(payload.next_registry, payload.next_revocations):
+                    raise ValueError("broker auth rotate policy is not derived from governance")
             else:
                 if payload.revoked_at_broker_sequence != entry.sequence:
                     raise ValueError("broker auth revoke sequence is invalid")
                 registry, revocations = payload.unchanged_registry_digest, payload.next_revocations.canonical_digest
+                if payload.post_policy_digest != _broker_auth_policy_digest_from_digests(registry, revocations):
+                    raise ValueError("broker auth revoke policy is not derived from governance")
             if (entry.post_broker_auth_registry_digest, entry.post_broker_auth_revocation_digest) != (registry, revocations):
                 raise ValueError("broker auth post-policy state is invalid")
             prior_policy, prior_registry, prior_revocations = entry.post_policy_digest, registry, revocations
@@ -2880,6 +2913,20 @@ class RegistrationExpectedReceiveContextV1:
             _u64(getattr(self, field), field, positive=True)
         if (self.operation_id, self.lifecycle_nonce) != (self.lease.operation_id, self.lease.lifecycle_nonce) or not self.lease.broker_auth_lease_issued_sequence <= self.broker_auth_sign_sequence <= self.lease.broker_auth_lease_expiry_sequence:
             raise ValueError("expected receive context lease sequence is invalid")
+        if self.worker_mode == "register":
+            valid_worker_state = (
+                self.lease.state == "OPEN"
+                and self.lease.next_recovery_sequence == 1
+                and self.worker_sequence == 1
+            )
+        else:
+            valid_worker_state = (
+                self.lease.state == "RECOVERY_RUNNING"
+                and self.lease.next_recovery_sequence > 1
+                and self.worker_sequence == self.lease.next_recovery_sequence
+            )
+        if not valid_worker_state:
+            raise ValueError("expected receive context lease worker state is invalid")
 
     def verify_envelope(self, envelope: CapabilityEnvelopeV1) -> None:
         if type(envelope) is not CapabilityEnvelopeV1:
@@ -2907,23 +2954,20 @@ class RegistrationExpectedReceiveContextV1:
             governance.registry.generation, governance.registry.canonical_digest,
             governance.revocations.canonical_digest, governance.allowed_signers_digest,
         ) or (
-            self.lease.broker_auth_registry_generation, self.lease.broker_auth_registry_digest,
-            self.lease.broker_auth_revocation_digest, self.lease.broker_auth_allowed_signers_digest,
             self.lease.broker_auth_key_id, self.lease.broker_auth_lease_issued_sequence,
             self.lease.broker_auth_lease_expiry_sequence,
         ) != (
-            governance.registry.generation, governance.registry.canonical_digest,
-            governance.revocations.canonical_digest, governance.allowed_signers_digest,
             unsigned.broker_auth_key_id, unsigned.broker_auth_lease_issued_sequence,
             unsigned.broker_auth_lease_expiry_sequence,
         ):
             raise ValueError("capability envelope does not match expected receive context")
         key = governance.registry.key(unsigned.broker_auth_key_id)
         if (
-            key.state != "active" or key.purpose != _BROKER_AUTH_PURPOSE
+            key.state not in {"active", "retiring"} or key.purpose != _BROKER_AUTH_PURPOSE
             or governance.revocations.revoked_at(key.key_id) is not None
             or key.public_key_digest != unsigned.broker_auth_public_key_digest
-            or unsigned.broker_auth_sign_sequence < key.effective_lease_sequence
+            or self.lease.broker_auth_lease_issued_sequence < key.effective_lease_sequence
+            or (key.retire_after_lease_sequence is not None and self.lease.broker_auth_lease_issued_sequence > key.retire_after_lease_sequence)
         ):
             raise ValueError("capability envelope does not match expected receive context")
         self.lease.verify_signature(governance, unsigned.broker_auth_sign_sequence)
@@ -3080,10 +3124,8 @@ class RegistrationRecoveryLeaseV1:
         if type(governance) is not RegistrationBrokerAuthGovernanceV1:
             raise ValueError("lease governance is invalid")
         registry, revocations, allowed_signers = governance.registry, governance.revocations, governance.allowed_signers
-        if (registry.generation, registry.canonical_digest, revocations.canonical_digest, revocations.registry_digest, governance.allowed_signers_digest) != (self.broker_auth_registry_generation, self.broker_auth_registry_digest, self.broker_auth_revocation_digest, registry.canonical_digest, self.broker_auth_allowed_signers_digest):
-            raise ValueError("lease trust state changed")
         key = registry.key(self.broker_auth_key_id)
-        if key.state not in {"active", "retiring"} or self.broker_auth_lease_issued_sequence < key.effective_lease_sequence or (key.retire_after_lease_sequence is not None and self.broker_auth_lease_issued_sequence > key.retire_after_lease_sequence):
+        if key.state not in {"active", "retiring"} or key.purpose != _BROKER_AUTH_PURPOSE or self.broker_auth_lease_issued_sequence < key.effective_lease_sequence or (key.retire_after_lease_sequence is not None and self.broker_auth_lease_issued_sequence > key.retire_after_lease_sequence):
             raise ValueError("lease signing key is not eligible")
         public_key = allowed_signers.get(key.key_id)
         if not isinstance(public_key, bytes) or len(public_key) != 32 or "sha256:" + hashlib.sha256(public_key).hexdigest() != key.public_key_digest:
@@ -3097,7 +3139,7 @@ class RegistrationRecoveryLeaseV1:
 
     def assert_valid_at(self, current_sequence: int, revocations: RegistrationBrokerAuthRevocationsV1) -> None:
         _u64(current_sequence, "current_sequence")
-        if type(revocations) is not RegistrationBrokerAuthRevocationsV1 or revocations.canonical_digest != self.broker_auth_revocation_digest or current_sequence > self.broker_auth_lease_expiry_sequence:
+        if type(revocations) is not RegistrationBrokerAuthRevocationsV1 or current_sequence < self.broker_auth_lease_issued_sequence or current_sequence > self.broker_auth_lease_expiry_sequence:
             raise ValueError("lease is expired or revocation state changed")
         revoked_at = revocations.revoked_at(self.broker_auth_key_id)
         if revoked_at is not None and current_sequence >= revoked_at:
@@ -3118,6 +3160,12 @@ class BrokerAuthStateTransitionResultV1:
 @dataclass(frozen=True, slots=True)
 class BrokerAuthLeaseIssuanceResultV1(BrokerAuthStateTransitionResultV1):
     lease: RegistrationRecoveryLeaseV1
+
+
+@dataclass(frozen=True, slots=True)
+class BrokerAuthSignedEnvelopeResultV1:
+    transition: BrokerAuthStateTransitionResultV1
+    envelope: CapabilityEnvelopeV1
 
 
 class BrokerAuthAuthoritativeIssuerV1:
@@ -3164,6 +3212,8 @@ class BrokerAuthAuthoritativeIssuerV1:
             raise ValueError("broker issuer trust inputs are invalid")
         for value, field in ((root_identity_digest, "root_identity_digest"), (policy_digest, "policy_digest")):
             _require_digest(value, field)
+        if policy_digest != _broker_auth_policy_digest(governance.registry, governance.revocations):
+            raise ValueError("broker issuer policy digest is not derived from governance")
         provisional = BrokerAuthSequenceStateV1(
             "trusted-registration-broker-auth-sequence-state/v1", root_identity_digest, 0,
             None, None, None, policy_digest, governance.registry.canonical_digest,
@@ -3227,9 +3277,18 @@ class BrokerAuthAuthoritativeIssuerV1:
         payload: BrokerAuthSequenceEventPayloadV1,
         next_registry: RegistrationBrokerAuthRegistryV1,
         next_revocations: RegistrationBrokerAuthRevocationsV1,
+        event_signer_key: RegistrationBrokerAuthKeyRegistrationV1 | None = None,
     ) -> BrokerAuthStateTransitionResultV1:
-        signer_key = self._require_active_signer()
-        if payload.event_id_digest in self._event_ids or payload.pre_policy_digest != self._state.current_policy_digest:
+        active_key = self._require_active_signer()
+        signer_key = active_key if event_signer_key is None else event_signer_key
+        if type(signer_key) is not RegistrationBrokerAuthKeyRegistrationV1:
+            raise ValueError("broker event signer is invalid")
+        if (
+            payload.event_id_digest in self._event_ids
+            or payload.pre_policy_digest != self._state.current_policy_digest
+            or self._state.current_policy_digest != _broker_auth_policy_digest(self._registry, self._revocations)
+            or payload.post_policy_digest != _broker_auth_policy_digest(next_registry, next_revocations)
+        ):
             raise ValueError("broker event is replayed or has the wrong pre-state")
         sequence = self._next_sequence()
         if isinstance(payload, BrokerAuthLeaseIssueEventPayloadV1):
@@ -3310,6 +3369,8 @@ class BrokerAuthAuthoritativeIssuerV1:
             raise ValueError("broker lease request TTL differs from frozen profile")
         if (lease_template.operation_id, lease_template.lifecycle_nonce, lease_template.session_family_authorization_digest, lease_template.broker_auth_lease_request_digest, lease_template.transaction_parent_identity_digest, lease_template.transaction_root_identity_digest, lease_template.operation_directory_identity_digest, lease_template.repository_identity_digest, lease_template.repository_boundary_identity_digest, lease_template.trusted_toolchain_build_record_digest, lease_template.trusted_recovery_launcher_digest, lease_template.executor_identity_digest, lease_template.profile_identity_digest) != (request.operation_id, request.lifecycle_nonce, family.canonical_digest, request.request_digest, family.transaction_parent_identity_digest, family.transaction_root_identity_digest, family.operation_directory_identity_digest, family.repository_identity_digest, family.repository_boundary_identity_digest, family.trusted_toolchain_build_record_digest, family.trusted_recovery_launcher_digest, family.executor_identity_digest, family.profile_identity_digest):
             raise ValueError("broker lease template does not bind request")
+        if (lease_template.state, lease_template.next_recovery_sequence) != ("OPEN", 1):
+            raise ValueError("broker lease template is not an initial OPEN lease")
         sequence = self._next_sequence()
         event_id_digest = "sha256:" + hashlib.sha256(b"ai-video-reverse-engineer/registration-broker-lease-issue-event/v1\0" + request.request_digest.encode("ascii")).hexdigest()
         payload = BrokerAuthLeaseIssueEventPayloadV1(
@@ -3330,7 +3391,8 @@ class BrokerAuthAuthoritativeIssuerV1:
             broker_auth_issue_entry_digest=transition.entry.canonical_digest,
             broker_auth_sequence_head_digest=transition.state.head_entry_digest,
             broker_auth_lease_issued_sequence=sequence,
-            broker_auth_lease_expiry_sequence=payload.expiry_sequence, lease_identity_digest="sha256:" + "0" * 64,
+            broker_auth_lease_expiry_sequence=payload.expiry_sequence,
+            state="OPEN", next_recovery_sequence=1, lease_identity_digest="sha256:" + "0" * 64,
         )
         lease = replace(lease, lease_identity_digest=lease.identity_preimage().lease_identity_digest)
         lease = replace(lease, broker_signature_hex=self._signer.sign(_BROKER_LEASE_DOMAIN, canonical_json_bytes(lease._unsigned_wire())))
@@ -3349,6 +3411,8 @@ class BrokerAuthAuthoritativeIssuerV1:
     ) -> BrokerAuthStateTransitionResultV1:
         if type(next_registry) is not RegistrationBrokerAuthRegistryV1 or type(next_revocations) is not RegistrationBrokerAuthRevocationsV1:
             raise ValueError("broker rotation inputs are invalid")
+        if post_policy_digest != _broker_auth_policy_digest(next_registry, next_revocations):
+            raise ValueError("broker rotation policy digest is not derived from governance")
         sequence = self._next_sequence()
         payload = BrokerAuthRotatePolicyEventPayloadV1(
             "trusted-registration-broker-auth-rotate-payload/v1", "rotate-registry", event_id_digest,
@@ -3390,6 +3454,74 @@ class BrokerAuthAuthoritativeIssuerV1:
         self._commit(result, self._registry, self._revocations)
         return result
 
+    def sign_recovery_envelope(
+        self,
+        lease: RegistrationRecoveryLeaseV1,
+        unsigned_envelope: CapabilityEnvelopeUnsignedV1,
+        lease_signer: RegistrationBrokerAuthPrivateKeySlotV1,
+        event_id_digest: str,
+    ) -> BrokerAuthSignedEnvelopeResultV1:
+        """Record and sign one recover envelope using the frozen lease signer."""
+        if (
+            type(lease) is not RegistrationRecoveryLeaseV1
+            or type(unsigned_envelope) is not CapabilityEnvelopeUnsignedV1
+            or type(lease_signer) is not RegistrationBrokerAuthPrivateKeySlotV1
+        ):
+            raise ValueError("broker recovery envelope inputs are invalid")
+        _require_digest(event_id_digest, "event_id_digest")
+        self._require_active_signer()
+        sequence = self._next_sequence()
+        lease.verify_signature(self._governance, self._state.current_sequence)
+        if (
+            lease.state != "RECOVERY_RUNNING"
+            or lease.next_recovery_sequence <= 1
+            or unsigned_envelope.worker_mode != "recover"
+            or unsigned_envelope.worker_sequence != lease.next_recovery_sequence
+            or unsigned_envelope.broker_auth_sign_sequence != sequence
+            or unsigned_envelope.broker_lease_identity_digest != lease.lease_identity_digest
+            or unsigned_envelope.operation_id != lease.operation_id
+            or unsigned_envelope.lifecycle_nonce != lease.lifecycle_nonce
+            or unsigned_envelope.broker_auth_key_id != lease.broker_auth_key_id
+            or unsigned_envelope.broker_auth_lease_issued_sequence != lease.broker_auth_lease_issued_sequence
+            or unsigned_envelope.broker_auth_lease_expiry_sequence != lease.broker_auth_lease_expiry_sequence
+            or (
+                unsigned_envelope.broker_auth_registry_generation,
+                unsigned_envelope.broker_auth_registry_digest,
+                unsigned_envelope.broker_auth_revocation_digest,
+                unsigned_envelope.broker_auth_allowed_signers_digest,
+            ) != (
+                self._registry.generation,
+                self._registry.canonical_digest,
+                self._revocations.canonical_digest,
+                self._allowed_signers_digest,
+            )
+        ):
+            raise ValueError("broker recovery envelope does not close lease and current governance")
+        key = self._registry.key(lease.broker_auth_key_id)
+        public = self._allowed_signers.get(key.key_id)
+        if (
+            key.state not in {"active", "retiring"}
+            or key.purpose != _BROKER_AUTH_PURPOSE
+            or self._revocations.revoked_at(key.key_id) is not None
+            or not isinstance(public, bytes)
+            or len(public) != 32
+            or key.public_key_digest != lease_signer.public_key_digest
+            or "sha256:" + hashlib.sha256(public).hexdigest() != lease_signer.public_key_digest
+            or (lease_signer.key_id, lease_signer.purpose, lease_signer.signature_domain) != (key.key_id, _BROKER_AUTH_PURPOSE, _ENVELOPE_DOMAIN)
+        ):
+            raise ValueError("broker recovery envelope signer is not the eligible lease key")
+        payload = BrokerAuthEnvelopeSignEventPayloadV1(
+            "trusted-registration-broker-auth-envelope-sign-payload/v1", "sign-envelope",
+            event_id_digest, lease.operation_id, lease.lease_identity_digest,
+            lease.broker_auth_lease_request_digest, unsigned_envelope.canonical_digest,
+            key.key_id, sequence, self._state.current_policy_digest,
+            self._state.current_policy_digest,
+        )
+        transition = self._transition(payload, self._registry, self._revocations, key)
+        envelope = CapabilityEnvelopeV1.create(unsigned_envelope, lease_signer)
+        self._commit(transition, self._registry, self._revocations)
+        return BrokerAuthSignedEnvelopeResultV1(transition, envelope)
+
     def revoke_key(
         self,
         revoked_key_id: str,
@@ -3401,6 +3533,8 @@ class BrokerAuthAuthoritativeIssuerV1:
         self._registry.key(revoked_key_id)
         if type(next_revocations) is not RegistrationBrokerAuthRevocationsV1:
             raise ValueError("broker revocation inputs are invalid")
+        if post_policy_digest != _broker_auth_policy_digest_from_digests(self._registry.canonical_digest, next_revocations.canonical_digest):
+            raise ValueError("broker revocation policy digest is not derived from governance")
         sequence = self._next_sequence()
         prior = {item.key_id: item for item in self._revocations.entries}
         following = {item.key_id: item for item in next_revocations.entries}
