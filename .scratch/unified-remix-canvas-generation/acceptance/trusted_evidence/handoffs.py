@@ -91,6 +91,32 @@ class HandoffPointerV1:
 
 
 @dataclass(frozen=True, slots=True)
+class HandoffExportRequestV1:
+    schema: str
+    handoff_id: str
+    record_ref: str
+    record_full_bytes_digest: str
+    pointer_bytes_digest: str
+    consumer_tasks: tuple[int, ...]
+    binding_set_digest: str
+
+    def __post_init__(self) -> None:
+        if self.schema != "trusted-handoff-export-request/v1" or not self.handoff_id:
+            raise ValueError("invalid handoff export request")
+        for field in ("record_ref", "record_full_bytes_digest", "pointer_bytes_digest", "binding_set_digest"):
+            _require_digest(getattr(self, field), field)
+        if not self.consumer_tasks or tuple(sorted(self.consumer_tasks)) != self.consumer_tasks or len(set(self.consumer_tasks)) != len(self.consumer_tasks) or any(not isinstance(task, int) or task <= 0 for task in self.consumer_tasks):
+            raise ValueError("consumerTasks must be sorted unique positive integers")
+
+    def to_wire(self) -> dict[str, object]:
+        return {"bindingSetDigest": self.binding_set_digest, "consumerTasks": list(self.consumer_tasks), "handoffId": self.handoff_id, "pointerBytesDigest": self.pointer_bytes_digest, "recordFullBytesDigest": self.record_full_bytes_digest, "recordRef": self.record_ref, "schema": self.schema}
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_wire())
+
+
+@dataclass(frozen=True, slots=True)
 class ProductRepositorySourceV1:
     subject_repository: str
     subject_commit: ProductGitObjectIdV1

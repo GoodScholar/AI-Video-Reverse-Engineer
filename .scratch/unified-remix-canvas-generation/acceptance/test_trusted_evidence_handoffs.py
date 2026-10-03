@@ -6,6 +6,7 @@ import pytest
 from trusted_evidence.e2_policy import ProductGitObjectIdV1
 from trusted_evidence.handoffs import (
     HandoffPointerV1,
+    HandoffExportRequestV1,
     ProductRepositorySourceV1,
     Ticket23ProductSourceHandoffV1,
     TrustedHandoffRecordV1,
@@ -125,3 +126,19 @@ def test_handoff_store_rejects_nonabsolute_or_symlink_root(tmp_path, monkeypatch
     monkeypatch.setenv("TRUSTED_HANDOFF_STORE_ROOT", str(link))
     with pytest.raises(ValueError):
         TrustedHandoffStoreV1.open_from_environment()
+
+
+def test_export_request_has_closed_sorted_consumers_and_full_record_binding():
+    """Changing a consumer or a pointer byte changes the export authorization."""
+    request = HandoffExportRequestV1(
+        schema="trusted-handoff-export-request/v1",
+        handoff_id="ticket-23-product-v1",
+        record_ref=DIGEST,
+        record_full_bytes_digest=DIGEST,
+        pointer_bytes_digest="sha256:" + "b" * 64,
+        consumer_tasks=(23, 28),
+        binding_set_digest="sha256:" + "c" * 64,
+    )
+    assert request.canonical_bytes == b'{"bindingSetDigest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","consumerTasks":[23,28],"handoffId":"ticket-23-product-v1","pointerBytesDigest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","recordFullBytesDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","recordRef":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","schema":"trusted-handoff-export-request/v1"}'
+    with pytest.raises(ValueError):
+        HandoffExportRequestV1("trusted-handoff-export-request/v1", "ticket-23-product-v1", DIGEST, DIGEST, "sha256:" + "b" * 64, (28, 23), "sha256:" + "c" * 64)
