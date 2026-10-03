@@ -155,6 +155,16 @@ def _broker_policy_digest(registry, revocations):
     })
 
 
+def _family_closure_fields(family):
+    return (
+        base64.b64encode(family.canonical_bytes).decode("ascii"),
+        family.canonical_digest,
+        family.full_bytes_digest,
+        family.full_bytes_digest,
+        len(family.canonical_bytes),
+    )
+
+
 def test_authoritative_issuer_rejects_cross_generation_signer_replacement(tmp_path):
     """A signer replacement must close over the issuer's exact governance generation."""
     seed = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
@@ -1065,6 +1075,7 @@ def test_broker_auth_issue_chain_is_prestate_only_and_contiguous_without_writes(
     payload = BrokerAuthLeaseIssueEventPayloadV1(
         "trusted-registration-broker-auth-lease-issue-payload/v1", "issue-lease", DIGEST_A,
         request, request.request_digest, "op-1", "broker-fixed", 1, 2, 3, policy_digest, policy_digest,
+        *_family_closure_fields(family),
     )
     entry = BrokerAuthSequenceJournalEntryV1(
         "trusted-registration-broker-auth-sequence-entry/v1", 1, None, DIGEST_A, "issue-lease",
@@ -1200,6 +1211,7 @@ def test_broker_sequence_payload_and_entry_reject_the_fixed_256_kib_budget_befor
             "trusted-registration-broker-auth-lease-issue-payload/v1", "issue-lease", DIGEST_A,
             request, request.request_digest, oversized_text, "broker-fixed", 1, 2, 3,
             policy_digest, policy_digest,
+            *_family_closure_fields(family),
         ),
         "sign": lambda: BrokerAuthEnvelopeSignEventPayloadV1(
             "trusted-registration-broker-auth-envelope-sign-payload/v1", "sign-envelope",
@@ -2283,6 +2295,87 @@ def _test_receive_lease(governance, signer):
     )
 
 
+def test_startup_replays_only_the_authority_current_closure_and_rejects_legacy_family(tmp_path):
+    """A detached replay or family-less payload must never authorize startup."""
+    governance, signer = _test_broker_signer(tmp_path)
+    state_mac = _state_mac_capability(tmp_path, b"state-mac-key-is-independent-32!!!"[:32])
+    try:
+        registry, revocations = governance.registry, governance.revocations
+        policy_digest = _broker_policy_digest(registry, revocations)
+        family = RegistrationWorkerSessionFamilyAuthorizationV1(
+            "trusted-registration-worker-session-family-authorization/v1", "startup-op", DIGEST_A,
+            DIGEST_B, DIGEST_C, DIGEST_A, DIGEST_B, "broker-fixed", registry.key("broker-fixed").canonical_digest,
+            ("register", "recover"), "register-to-recover", DIGEST_C, DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A,
+        )
+        request = BrokerAuthLeaseIssueRequestV1(
+            "trusted-registration-broker-auth-lease-issue-request/v1", "startup-op", "startup-life",
+            family.canonical_digest, "broker-fixed", 0, DIGEST_A, registry.canonical_digest,
+            revocations.canonical_digest, policy_digest, governance.allowed_signers_digest, 2,
+        )
+        template = RegistrationRecoveryLeaseV1(
+            "trusted-registration-recovery-lease/v1", "ai-video-reverse-engineer", "startup-op", "startup-life",
+            family.canonical_digest, 1, DIGEST_A, "transaction-root", DIGEST_B, DIGEST_C, DIGEST_A,
+            DIGEST_B, DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A, registry.generation, registry.canonical_digest,
+            revocations.canonical_digest, policy_digest, governance.allowed_signers_digest, "broker-fixed", request.request_digest,
+            DIGEST_A, DIGEST_B, DIGEST_C, 1, 3, DIGEST_A, "OPEN", "a" * 128, "b" * 64,
+        )
+        issuer = BrokerAuthAuthoritativeIssuerV1.create(governance, DIGEST_A, policy_digest, signer, state_mac, 2)
+        issued = issuer.issue_lease(request, family, template)
+
+        legacy_wire = json.loads(issued.payload.canonical_bytes)
+        legacy_wire.pop("sessionFamilyAuthorizationCanonicalBytesB64")
+        legacy_wire["canonicalDigest"] = DIGEST_C
+        with pytest.raises(ValueError, match="family|digest|canonical"):
+            BrokerAuthLeaseIssueEventPayloadV1.from_canonical_bytes(canonical_json_bytes(legacy_wire))
+        for field, forged in (
+            ("sessionFamilyAuthorizationCanonicalDigest", DIGEST_C),
+            ("sessionFamilyAuthorizationCanonicalBytesRef", DIGEST_C),
+            ("sessionFamilyAuthorizationCanonicalBytesDigest", DIGEST_C),
+            ("sessionFamilyAuthorizationCanonicalBytesLength", len(family.canonical_bytes) + 1),
+            ("sessionFamilyAuthorizationCanonicalBytesB64", base64.b64encode(b"not-a-family").decode("ascii")),
+        ):
+            malformed_wire = json.loads(issued.payload.canonical_bytes)
+            malformed_wire[field] = forged
+            malformed_wire["canonicalDigest"] = canonical_digest({
+                key: value for key, value in malformed_wire.items() if key != "canonicalDigest"
+            })
+            with pytest.raises(ValueError, match="family"):
+                BrokerAuthLeaseIssueEventPayloadV1.from_canonical_bytes(canonical_json_bytes(malformed_wire))
+        with pytest.raises(ValueError, match="canonical"):
+            BrokerAuthLeaseIssueEventPayloadV1.from_canonical_bytes(issued.payload.canonical_bytes + b"\n")
+
+        first_signature = verify_registration_broker_startup_challenge(issuer, "startup-nonce")
+        with pytest.raises(ValueError, match="trust closure"):
+            verify_registration_broker_startup_challenge(issued.journal, "startup-nonce")
+
+        second_family = replace(family, operation_id="startup-op-2")
+        second_request = BrokerAuthLeaseIssueRequestV1(
+            "trusted-registration-broker-auth-lease-issue-request/v1", "startup-op-2", "startup-life-2",
+            second_family.canonical_digest, "broker-fixed", 1, issuer.state.head_entry_digest,
+            registry.canonical_digest, revocations.canonical_digest, policy_digest,
+            governance.allowed_signers_digest, 2,
+        )
+        second_template = replace(
+            template, operation_id="startup-op-2", lifecycle_nonce="startup-life-2",
+            session_family_authorization_digest=second_family.canonical_digest,
+            broker_auth_lease_request_digest=second_request.request_digest,
+        )
+        issuer.issue_lease(second_request, second_family, second_template)
+        assert verify_registration_broker_startup_challenge(issuer, "startup-nonce") != first_signature
+
+        revoked = RegistrationBrokerAuthRevocationsV1(
+            "trusted-registration-broker-auth-revocations/v1", registry.canonical_digest,
+            (RegistrationBrokerAuthRevocationEntryV1("broker-fixed", 3, DIGEST_B),),
+        )
+        issuer.revoke_key("broker-fixed", revoked, DIGEST_B, _broker_policy_digest(registry, revoked))
+        assert issuer.state.broker_auth_revocation_digest == revoked.canonical_digest
+        with pytest.raises(ValueError, match="startup key closure"):
+            verify_registration_broker_startup_challenge(issuer, "startup-nonce")
+    finally:
+        state_mac.close()
+        signer.close()
+
+
 def test_broker_slot_cannot_be_used_as_a_raw_envelope_signer_or_direct_constructor(tmp_path):
     """Removing either issuer boundary would re-enable decoded FD signing."""
     governance, signer = _test_broker_signer(tmp_path)
@@ -2405,13 +2498,13 @@ def test_authoritative_issuer_signs_only_the_exact_issued_initial_envelope(tmp_p
         )
         issuer = BrokerAuthAuthoritativeIssuerV1.create(governance, DIGEST_A, policy_digest, signer, state_mac, 2)
         issued = issuer.issue_lease(request, family, template)
-        replay = issued.journal.validate_state(
+        issued.journal.validate_state(
             issued.state, issued.payloads,
             BrokerAuthSequenceReplayBaselineV1(DIGEST_A, governance, policy_digest), state_mac,
         )
-        assert verify_registration_broker_startup_challenge(replay, signer, "startup-after-sequence-one")
+        assert verify_registration_broker_startup_challenge(issuer, "startup-after-sequence-one")
         with pytest.raises(ValueError, match="trust closure"):
-            verify_registration_broker_startup_challenge(governance, signer, "unreachable")
+            verify_registration_broker_startup_challenge(governance, "unreachable")
         unsigned = _unsigned_envelope(
             broker_lease_identity_digest=issued.lease.lease_identity_digest,
             operation_id=issued.lease.operation_id, lifecycle_nonce=issued.lease.lifecycle_nonce,
@@ -2822,15 +2915,21 @@ def test_e3_forward_only_recovery_authenticates_every_broker_state_record_before
     governance, key = _broker_governance("broker-fixed", bytes(32))
     registry, revocations = governance.registry, governance.revocations
     policy_digest = _broker_policy_digest(registry, revocations)
+    family = RegistrationWorkerSessionFamilyAuthorizationV1(
+        "trusted-registration-worker-session-family-authorization/v1", "other-operation", DIGEST_A,
+        DIGEST_B, DIGEST_C, DIGEST_A, DIGEST_B, "broker-fixed", key.canonical_digest,
+        ("register", "recover"), "register-to-recover", DIGEST_C, DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A,
+    )
     request = BrokerAuthLeaseIssueRequestV1(
         "trusted-registration-broker-auth-lease-issue-request/v1", "other-operation", "life",
-        DIGEST_A, "broker-fixed", 0, DIGEST_A, registry.canonical_digest,
+        family.canonical_digest, "broker-fixed", 0, DIGEST_A, registry.canonical_digest,
         revocations.canonical_digest, policy_digest, governance.allowed_signers_digest, 2,
     )
     payload = BrokerAuthLeaseIssueEventPayloadV1(
         "trusted-registration-broker-auth-lease-issue-payload/v1", "issue-lease", DIGEST_A,
         request, request.request_digest, "other-operation", "broker-fixed", 1, 2, 3,
         policy_digest, policy_digest,
+        *_family_closure_fields(family),
     )
     entry = BrokerAuthSequenceJournalEntryV1(
         "trusted-registration-broker-auth-sequence-entry/v1", 1, None, DIGEST_A, "issue-lease",

@@ -1513,9 +1513,9 @@ def test_broker_startup_challenge_uses_fixed_ed25519_vector_and_rejects_without_
             broker_state_mac_hex=state_mac.mac(canonical_json_bytes(provisional_state._unsigned_wire())),
         )
         # A MACed baseline state is not a startup authority: it has no journal
-        # replay result and sequence zero cannot be elevated to key-effective 1.
+        # owned by a current issuer and sequence zero cannot be elevated to key-effective 1.
         with pytest.raises(ValueError, match="trust closure"):
-            verify_registration_broker_startup_challenge(governance, slot, baseline)
+            verify_registration_broker_startup_challenge(governance, "unreachable")
         effects = {"childExec": 0, "repositoryWrites": 0, "fsyncs": 0}
         future_key = replace(key, effective_lease_sequence=2)
         future_registry = replace(governance.registry, keys=(future_key,))
@@ -1541,10 +1541,10 @@ def test_broker_startup_challenge_uses_fixed_ed25519_vector_and_rejects_without_
             broker_state_mac_hex=state_mac.mac(canonical_json_bytes(future_state._unsigned_wire())),
         )
         with pytest.raises(ValueError, match="trust closure"):
-            verify_registration_broker_startup_challenge(future_governance, slot, future_baseline)
+            verify_registration_broker_startup_challenge(future_governance, "unreachable")
         slot.close()
         with pytest.raises(ValueError, match="trust closure"):
-            verify_registration_broker_startup_challenge(governance, slot, baseline)
+            verify_registration_broker_startup_challenge(governance, "unreachable")
         assert effects == {"childExec": 0, "repositoryWrites": 0, "fsyncs": 0}
     finally:
         if state_mac is not None:
