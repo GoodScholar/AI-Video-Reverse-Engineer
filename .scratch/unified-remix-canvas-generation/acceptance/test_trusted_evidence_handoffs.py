@@ -457,6 +457,114 @@ def _store_lease(root: Path, *, project_id: str = "ai-video-reverse-engineer") -
     }).decode("utf-8")
 
 
+def _orchestrator_store_lease(root: Path, *, executor_id: str, role: str, project_id: str = "ai-video-reverse-engineer") -> bytes:
+    """Literal role-bound broker lease fixture for one orchestrator store."""
+    identity = root.stat()
+    return canonical_json_bytes({
+        "executorId": executor_id,
+        "projectId": project_id,
+        "role": role,
+        "rootDevice": identity.st_dev,
+        "rootInode": identity.st_ino,
+        "schema": "trusted-handoff-store-lease/v2",
+    })
+
+
+def test_orchestrator_store_lease_binds_the_exact_project_executor_role_and_root(tmp_path):
+    """Dropping any role-bound lease check would authorize a swapped orchestrator store."""
+    source_root = (tmp_path / "source-store").resolve()
+    target_root = (tmp_path / "target-store").resolve()
+    source_root.mkdir(mode=0o700)
+    target_root.mkdir(mode=0o700)
+    source_lease = _orchestrator_store_lease(source_root, executor_id="source-executor", role="source")
+    target_lease = _orchestrator_store_lease(target_root, executor_id="target-executor", role="target")
+
+    source = TrustedHandoffStoreV1.open_from_role_bound_lease(
+        source_root, source_lease, expected_executor_id="source-executor", expected_role="source",
+    )
+    target = TrustedHandoffStoreV1.open_from_role_bound_lease(
+        target_root, target_lease, expected_executor_id="target-executor", expected_role="target",
+    )
+    try:
+        assert source.root == source_root
+        assert target.root == target_root
+    finally:
+        source.close()
+        target.close()
+
+    for root, lease, executor_id, role in (
+        (source_root, _orchestrator_store_lease(source_root, executor_id="source-executor", role="source", project_id="other-project"), "source-executor", "source"),
+        (source_root, source_lease, "target-executor", "source"),
+        (source_root, source_lease, "source-executor", "target"),
+        (source_root, target_lease, "source-executor", "source"),
+        (target_root, source_lease, "target-executor", "target"),
+    ):
+        with pytest.raises(ValueError, match="lease"):
+            TrustedHandoffStoreV1.open_from_role_bound_lease(
+                root, lease, expected_executor_id=executor_id, expected_role=role,
+            )
+
+    original_source = tmp_path / "original-source-store"
+    source_root.rename(original_source)
+    source_root.mkdir(mode=0o700)
+    with pytest.raises(ValueError, match="lease"):
+        TrustedHandoffStoreV1.open_from_role_bound_lease(
+            source_root, source_lease, expected_executor_id="source-executor", expected_role="source",
+        )
+
+
+def test_orchestrator_cli_rejects_an_unleased_source_before_reading_request(tmp_path):
+    """Removing the source lease gate would reach a missing request instead of failing closed."""
+    source_root = (tmp_path / "source-store").resolve()
+    source_root.mkdir(mode=0o700)
+    cli = ACCEPTANCE_ROOT / "tools" / "trusted_handoff_orchestrator.py"
+    result = subprocess.run([
+        sys.executable, str(cli), "verify-export-request",
+        "--source-store-root", str(source_root),
+        "--source-executor-id", "source-executor",
+        "--export-request-ref", "sha256:" + "a" * 64,
+        "--handoff-id", "ticket-23-product-v1",
+        "--consumer-task", "23",
+    ], env={**os.environ, "PYTHONPATH": str(ACCEPTANCE_ROOT)}, capture_output=True, check=False)
+
+    assert result.returncode == 2
+    assert b"lease" in result.stderr
+
+
+def test_orchestrator_cli_rejects_an_unleased_target_before_reading_staged_transport(tmp_path):
+    """Opening staged transport before the target lease would expose an unapproved write path."""
+    source_root = (tmp_path / "source-store").resolve()
+    target_root = (tmp_path / "target-store").resolve()
+    stage_root = (tmp_path / "stage").resolve()
+    for root in (source_root, target_root, stage_root):
+        root.mkdir(mode=0o700)
+    source_lease_path = tmp_path / "source-lease.json"
+    source_lease_path.write_bytes(_orchestrator_store_lease(source_root, executor_id="source-executor", role="source"))
+    source_lease_path.chmod(0o400)
+    cli = ACCEPTANCE_ROOT / "tools" / "trusted_handoff_orchestrator.py"
+    trust = ACCEPTANCE_ROOT / "trust"
+    result = subprocess.run([
+        sys.executable, str(cli), "install-transport",
+        "--source-store-root", str(source_root), "--source-store-lease", str(source_lease_path),
+        "--target-store-root", str(target_root), "--stage-root", str(stage_root),
+        "--export-request-ref", "sha256:" + "a" * 64, "--handoff-id", "ticket-23-product-v1",
+        "--transport-id", "ticket-23-product-v1-c23", "--consumer-task", "23",
+        "--store-namespace", "ai-video-reverse-engineer/ticket-23",
+        "--source-executor-id", "source-executor", "--destination-executor-id", "target-executor",
+        "--nonce", "nonce", "--sequence", "1", "--key-id", "transport-production-v1",
+        "--signing-key-purpose", "transport-seal",
+        "--signature-domain", "ai-video-reverse-engineer/transport-seal/v1",
+        "--transport-registry", str(trust / "handoff-transport-registry.json"),
+        "--activation-registry", str(trust / "policy-activation-registry.json"),
+        "--broker-auth-registry", str(trust / "registration-broker-auth-registry.json"),
+        "--broker-auth-revocations", str(trust / "registration-broker-auth-revocations.json"),
+        "--broker-auth-allowed-signers", str(trust / "registration-broker-auth-allowed-signers"),
+    ], env={**os.environ, "PYTHONPATH": str(ACCEPTANCE_ROOT)}, capture_output=True, check=False)
+
+    assert result.returncode == 2
+    assert b"target handoff store role lease is required" in result.stderr
+
+
 def test_handoff_store_environment_requires_a_matching_project_lease(tmp_path, monkeypatch):
     """Removing or rebinding the broker lease must reject before a store capability is issued."""
     root = (tmp_path / "leased-store").resolve()
@@ -1448,7 +1556,7 @@ def _policy_transport_fixture(tmp_path):
 
 
 def test_run_transport_creates_distinct_sealed_ready_closures_for_two_consumers(tmp_path, monkeypatch):
-    """Dropping per-consumer seal/ready bindings must make this real transport test fail."""
+    """Dropping lease roles or per-consumer seal/ready bindings must fail this four-stage transport."""
     from tools import trusted_handoff_orchestrator as orchestrator
 
     observed_public_jobs = []
@@ -1489,6 +1597,13 @@ def test_run_transport_creates_distinct_sealed_ready_closures_for_two_consumers(
     producer = HandoffRegistryV1(source)
     producer.publish_local(record, pointer, (source_document.canonical_bytes,))
     request_ref = producer.publish_export_request(request)
+    source.close()
+    source = TrustedHandoffStoreV1.open_from_role_bound_lease(
+        source_root,
+        _orchestrator_store_lease(source_root, executor_id="source-executor", role="source"),
+        expected_executor_id="source-executor",
+        expected_role="source",
+    )
     seed = bytes.fromhex("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb")
     key_path = tmp_path / "transport-private-key"
     key_path.write_bytes(seed)
@@ -1505,9 +1620,15 @@ def test_run_transport_creates_distinct_sealed_ready_closures_for_two_consumers(
             stage_root = (tmp_path / f"stage-{consumer}").resolve()
             target_root.mkdir(mode=0o700)
             stage_root.mkdir(mode=0o700)
+            target = TrustedHandoffStoreV1.open_from_role_bound_lease(
+                target_root,
+                _orchestrator_store_lease(target_root, executor_id=destination, role="target"),
+                expected_executor_id=destination,
+                expected_role="target",
+            )
             results.append(orchestrator.run_transport(
                 source_store=source,
-                target_store=TrustedHandoffStoreV1(target_root),
+                target_store=target,
                 stage_root=stage_root,
                 export_request_ref=request_ref,
                 handoff_id=record.handoff_id,
@@ -1530,8 +1651,14 @@ def test_run_transport_creates_distinct_sealed_ready_closures_for_two_consumers(
         assert ready_a != ready_b
         assert results[0].transport_id != results[1].transport_id
         assert results[0].nonce != results[1].nonce
+        target_23_root = (tmp_path / "target-23").resolve()
         assert orchestrator.run_transport(
-            source_store=source, target_store=TrustedHandoffStoreV1((tmp_path / "target-23").resolve()),
+            source_store=source, target_store=TrustedHandoffStoreV1.open_from_role_bound_lease(
+                target_23_root,
+                _orchestrator_store_lease(target_23_root, executor_id="executor-23", role="target"),
+                expected_executor_id="executor-23",
+                expected_role="target",
+            ),
             stage_root=(tmp_path / "stage-23").resolve(), export_request_ref=request_ref, handoff_id=record.handoff_id,
             transport_id="ticket-23-product-v1-c23", consumer_task=23,
             store_namespace="ai-video-reverse-engineer/ticket-23", source_executor_id="source-executor",
@@ -1542,7 +1669,12 @@ def test_run_transport_creates_distinct_sealed_ready_closures_for_two_consumers(
         replay_stage.mkdir(mode=0o700)
         with pytest.raises(ValueError):
             orchestrator.run_transport(
-                source_store=source, target_store=TrustedHandoffStoreV1((tmp_path / "target-23").resolve()),
+                source_store=source, target_store=TrustedHandoffStoreV1.open_from_role_bound_lease(
+                    target_23_root,
+                    _orchestrator_store_lease(target_23_root, executor_id="executor-23", role="target"),
+                    expected_executor_id="executor-23",
+                    expected_role="target",
+                ),
                 stage_root=replay_stage, export_request_ref=request_ref, handoff_id=record.handoff_id,
                 transport_id="ticket-23-product-v1-c23-replay", consumer_task=23,
                 store_namespace="ai-video-reverse-engineer/ticket-23", source_executor_id="source-executor",
@@ -1668,6 +1800,8 @@ def test_transport_cli_exposes_only_fd_keyed_public_stages():
         command_help = subprocess.run([sys.executable, str(cli), command, "--help"], env={**os.environ, "PYTHONPATH": str(Path(__file__).parent)}, capture_output=True, check=False)
         assert command_help.returncode == 0
         assert (b"--signing-key-fd" in command_help.stdout) is (command in {"sign-seal", "run-transport"})
+        assert b"--source-store-lease" in command_help.stdout
+        assert (b"--target-store-lease" in command_help.stdout) is (command != "export")
 
 
 def test_transport_runner_requires_an_explicit_signing_identity():

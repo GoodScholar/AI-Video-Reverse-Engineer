@@ -284,10 +284,34 @@ def _add_domains_arguments(parser: argparse.ArgumentParser) -> None:
         parser.add_argument(f"--{name}", required=True)
 
 
+def _role_lease_bytes(args: argparse.Namespace, role: str) -> bytes:
+    lease_path = getattr(args, f"{role}_store_lease", None)
+    if lease_path is not None:
+        path = Path(lease_path)
+        if not path.is_absolute() or path.is_symlink() or not path.is_file():
+            raise ValueError(f"{role} handoff store lease path is invalid")
+        return path.read_bytes()
+    lease = os.environ.get(f"TRUSTED_HANDOFF_{role.upper()}_STORE_LEASE")
+    if lease is None:
+        raise ValueError(f"{role} handoff store role lease is required")
+    return lease.encode("utf-8")
+
+
+def _role_store(args: argparse.Namespace, role: str) -> TrustedHandoffStoreV1:
+    return TrustedHandoffStoreV1.open_from_role_bound_lease(
+        Path(getattr(args, f"{role}_store_root")),
+        _role_lease_bytes(args, role),
+        expected_executor_id=getattr(args, "source_executor_id" if role == "source" else "destination_executor_id"),
+        expected_role=role,
+    )
+
+
 def _add_job_arguments(parser: argparse.ArgumentParser, *, target: bool, signing: bool) -> None:
     parser.add_argument("--source-store-root", required=True)
+    parser.add_argument("--source-store-lease")
     if target:
         parser.add_argument("--target-store-root", required=True)
+        parser.add_argument("--target-store-lease")
     parser.add_argument("--stage-root", required=True)
     parser.add_argument("--export-request-ref", required=True)
     parser.add_argument("--handoff-id", required=True)
@@ -317,7 +341,7 @@ def main(argv: list[str] | None = None) -> int:
     domains = commands.add_parser("verify-signing-domains")
     _add_domains_arguments(domains)
     request = commands.add_parser("verify-export-request")
-    request.add_argument("--source-store-root", required=True); request.add_argument("--export-request-ref", required=True); request.add_argument("--handoff-id", required=True); request.add_argument("--consumer-task", type=int, action="append", required=True)
+    request.add_argument("--source-store-root", required=True); request.add_argument("--source-store-lease"); request.add_argument("--source-executor-id", required=True); request.add_argument("--export-request-ref", required=True); request.add_argument("--handoff-id", required=True); request.add_argument("--consumer-task", type=int, action="append", required=True)
     export_parser = commands.add_parser("export")
     _add_job_arguments(export_parser, target=False, signing=False); _add_domains_arguments(export_parser)
     upload_parser = commands.add_parser("upload")
@@ -333,34 +357,41 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "verify-signing-domains":
             _domains_from_args(args)
         elif args.command == "verify-export-request":
-            source = TrustedHandoffStoreV1(Path(args.source_store_root))
+            source = _role_store(args, "source")
             for consumer_task in args.consumer_task:
                 verify_export_request(source, args.export_request_ref, args.handoff_id, consumer_task)
         elif args.command == "export":
             job = _job_from_args(args)
-            export(job, TrustedHandoffStoreV1(job.source_store_root), _domains_from_args(args))
+            export(job, _role_store(args, "source"), _domains_from_args(args))
         elif args.command == "upload":
             job = _job_from_args(args)
+            source = _role_store(args, "source")
+            target = _role_store(args, "target")
             manifest = HandoffTransferManifestV1.from_canonical_bytes(_stage_read(job.stage_root, "export-manifest.json"))
-            upload(job, TrustedHandoffStoreV1(job.source_store_root), TrustedHandoffStoreV1(job.target_store_root), manifest, _domains_from_args(args))
+            upload(job, source, target, manifest, _domains_from_args(args))
         elif args.command == "sign-seal":
             job = _job_from_args(args)
+            _role_store(args, "source").close()
+            _role_store(args, "target").close()
             manifest = HandoffTransferManifestV1.from_canonical_bytes(_stage_read(job.stage_root, "export-manifest.json"))
             sign_seal(job, manifest, manifest.digest, signing_key_fd=args.signing_key_fd, signing_domains=_domains_from_args(args))
         elif args.command == "install-transport":
             job = _job_from_args(args)
+            _role_store(args, "source").close()
+            target = _role_store(args, "target")
             manifest = HandoffTransferManifestV1.from_canonical_bytes(_stage_read(job.stage_root, "export-manifest.json"))
             seal = TransportSealV1.from_canonical_bytes(_stage_read(job.stage_root, "transport-seal.json"))
-            install_transport(job, TrustedHandoffStoreV1(job.target_store_root), manifest, seal, _domains_from_args(args))
+            install_transport(job, target, manifest, seal, _domains_from_args(args))
         elif args.command == "run-transport":
             job = _job_from_args(args)
-            source = TrustedHandoffStoreV1(job.source_store_root)
+            source = _role_store(args, "source")
+            target = _role_store(args, "target")
             try:
                 policy_request_ref = source.read_policy_export_request_ref(job.handoff_id)
             except ValueError:
                 policy_request_ref = None
             runner = run_policy_transport if policy_request_ref == job.export_request_ref else run_transport
-            runner(source_store=source, target_store=TrustedHandoffStoreV1(job.target_store_root), stage_root=job.stage_root, export_request_ref=job.export_request_ref, handoff_id=job.handoff_id, transport_id=job.transport_id, consumer_task=job.consumer_task, store_namespace=job.store_namespace, source_executor_id=job.source_executor_id, destination_executor_id=job.destination_executor_id, nonce=job.nonce, sequence=job.sequence, expires_at=job.expires_at, signing_key_fd=args.signing_key_fd, key_id=job.key_id, signing_key_purpose=job.signing_key_purpose, signature_domain=job.signature_domain, signing_domains=_domains_from_args(args))
+            runner(source_store=source, target_store=target, stage_root=job.stage_root, export_request_ref=job.export_request_ref, handoff_id=job.handoff_id, transport_id=job.transport_id, consumer_task=job.consumer_task, store_namespace=job.store_namespace, source_executor_id=job.source_executor_id, destination_executor_id=job.destination_executor_id, nonce=job.nonce, sequence=job.sequence, expires_at=job.expires_at, signing_key_fd=args.signing_key_fd, key_id=job.key_id, signing_key_purpose=job.signing_key_purpose, signature_domain=job.signature_domain, signing_domains=_domains_from_args(args))
         return 0
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(str(error), file=sys.stderr)

@@ -382,19 +382,57 @@ class TrustedHandoffStoreV1:
             lease = os.environ.get("TRUSTED_HANDOFF_STORE_LEASE")
             if lease is None:
                 raise ValueError("handoff store project lease is required")
-            raw_lease = _strict_object(lease.encode("utf-8"), {"projectId", "rootDevice", "rootInode", "schema"})
-            if raw_lease["schema"] != "trusted-handoff-store-lease/v1" or raw_lease["projectId"] != "ai-video-reverse-engineer":
-                raise ValueError("handoff store project lease is invalid")
-            if any(type(raw_lease[field]) is not int or raw_lease[field] < 0 for field in ("rootDevice", "rootInode")):
-                raise ValueError("handoff store project lease is invalid")
-            info = os.fstat(store._root_fd)
-            if (raw_lease["rootDevice"], raw_lease["rootInode"]) != (info.st_dev, info.st_ino):
-                raise ValueError("handoff store project lease does not bind root")
+            cls._verify_lease(store, lease.encode("utf-8"), {"projectId", "rootDevice", "rootInode", "schema"}, "trusted-handoff-store-lease/v1")
             store._verify_binding()
             return store
         except Exception:
             store.close()
             raise
+
+    @classmethod
+    def open_from_role_bound_lease(
+        cls,
+        root: Path,
+        lease_bytes: bytes,
+        *,
+        expected_executor_id: str,
+        expected_role: str,
+    ) -> "TrustedHandoffStoreV1":
+        """Open one orchestrator store only for its leased executor and role."""
+        if not isinstance(lease_bytes, bytes) or not isinstance(expected_executor_id, str) or not expected_executor_id or expected_role not in {"source", "target"}:
+            raise ValueError("handoff store role lease is invalid")
+        store = cls(root)
+        try:
+            raw_lease = cls._verify_lease(
+                store,
+                lease_bytes,
+                {"executorId", "projectId", "role", "rootDevice", "rootInode", "schema"},
+                "trusted-handoff-store-lease/v2",
+            )
+            if raw_lease["executorId"] != expected_executor_id or raw_lease["role"] != expected_role:
+                raise ValueError("handoff store role lease does not bind executor and role")
+            store._verify_binding()
+            return store
+        except Exception:
+            store.close()
+            raise
+
+    @staticmethod
+    def _verify_lease(
+        store: "TrustedHandoffStoreV1",
+        lease_bytes: bytes,
+        fields: set[str],
+        schema: str,
+    ) -> dict[str, object]:
+        raw_lease = _strict_object(lease_bytes, fields)
+        if raw_lease["schema"] != schema or raw_lease["projectId"] != "ai-video-reverse-engineer":
+            raise ValueError("handoff store project lease is invalid")
+        if any(type(raw_lease[field]) is not int or raw_lease[field] < 0 for field in ("rootDevice", "rootInode")):
+            raise ValueError("handoff store project lease is invalid")
+        info = os.fstat(store._root_fd)
+        if (raw_lease["rootDevice"], raw_lease["rootInode"]) != (info.st_dev, info.st_ino):
+            raise ValueError("handoff store project lease does not bind root")
+        return raw_lease
 
     def __copy__(self):
         raise TypeError("handoff store capability cannot be copied")
