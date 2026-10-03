@@ -92,6 +92,12 @@ from trusted_evidence.handoffs import PolicyActivationMarkerV1
 DIGEST_A = "sha256:" + "a" * 64
 DIGEST_B = "sha256:" + "b" * 64
 DIGEST_C = "sha256:" + "c" * 64
+_TEST_BROKER_SEED = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+
+
+def _test_signature(seed: bytes, domain: str, payload: bytes) -> str:
+    """Test-only raw crypto; production slots intentionally expose no generic signer."""
+    return _ed_sign(seed, domain.encode("utf-8") + b"\0" + payload).hex()
 
 
 def _broker_governance(key_id: str, public: bytes):
@@ -1288,7 +1294,7 @@ def test_signed_lease_wire_is_canonical_and_respects_expiry_and_global_revocatio
         finally:
             os.close(descriptor)
         try:
-            lease = replace(lease, broker_signature_hex=signer.sign("ai-video-reverse-engineer/registration-broker-lease/v1", json.dumps(lease._unsigned_wire(), ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")))
+            lease = replace(lease, broker_signature_hex=_test_signature(seed, "ai-video-reverse-engineer/registration-broker-lease/v1", json.dumps(lease._unsigned_wire(), ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")))
         finally:
             signer.close()
     assert RegistrationRecoveryLeaseV1.from_canonical_bytes(lease.canonical_bytes) == lease
@@ -1412,22 +1418,32 @@ def test_authoritative_broker_issuer_commits_a_verified_issue_chain_and_preserve
         assert issued.lease.broker_auth_lease_request_digest == request.request_digest
         assert issued.lease.lease_identity_digest == issued.lease.identity_preimage().lease_identity_digest
 
-        signed = issuer.sign_envelope(
-            "op-issuer", issued.lease.lease_identity_digest, request.request_digest, DIGEST_B, DIGEST_C
+        unsigned = _unsigned_envelope(
+            broker_lease_identity_digest=issued.lease.lease_identity_digest,
+            operation_id=issued.lease.operation_id, lifecycle_nonce=issued.lease.lifecycle_nonce,
+            broker_auth_key_id=issued.lease.broker_auth_key_id,
+            broker_auth_public_key_digest=signer.public_key_digest,
+            broker_auth_registry_generation=registry.generation,
+            broker_auth_registry_digest=registry.canonical_digest,
+            broker_auth_revocation_digest=revocations.canonical_digest,
+            broker_auth_allowed_signers_digest=governance.allowed_signers_digest,
+            broker_auth_lease_issued_sequence=issued.lease.broker_auth_lease_issued_sequence,
+            broker_auth_lease_expiry_sequence=issued.lease.broker_auth_lease_expiry_sequence,
+            broker_auth_sign_sequence=2,
         )
-        assert signed.entry.sequence == signed.payload.sign_sequence == signed.state.current_sequence == 2
-        signed.journal.validate_state(
-            signed.state, signed.payloads,
-            BrokerAuthSequenceReplayBaselineV1(DIGEST_A, governance, policy_digest),
-        )
+        stable = issuer.state
+        assert not hasattr(issuer, "sign_envelope")
+        with pytest.raises(ValueError, match="broker-produced"):
+            issuer.sign_initial_envelope(issued.lease, unsigned, DIGEST_C)
+        assert issuer.state == stable
 
         stable = issuer.state
         with pytest.raises(ValueError):
             issuer.issue_lease(request, family, template)
-        assert issuer.state == stable and len(issuer.entries) == 2
+        assert issuer.state == stable and len(issuer.entries) == 1
         with pytest.raises(ValueError):
             issuer.issue_lease(replace(request, expected_current_sequence=1, expected_current_head_digest=stable.head_entry_digest), family, template)
-        assert issuer.state == stable and len(issuer.entries) == 2
+        assert issuer.state == stable and len(issuer.entries) == 1
     finally:
         state_mac.close()
         signer.close()
@@ -1590,8 +1606,8 @@ def test_authoritative_broker_issuer_rotates_and_revokes_without_partial_state(t
         recovery_lease = replace(issued.lease, state="RECOVERY_RUNNING", next_recovery_sequence=2)
         recovery_lease = replace(
             recovery_lease,
-            broker_signature_hex=old_signer.sign(
-                "ai-video-reverse-engineer/registration-broker-lease/v1",
+            broker_signature_hex=_test_signature(
+                seeds[0], "ai-video-reverse-engineer/registration-broker-lease/v1",
                 canonical_json_bytes(recovery_lease._unsigned_wire()),
             ),
         )
@@ -1638,8 +1654,7 @@ def test_authoritative_broker_issuer_rotates_and_revokes_without_partial_state(t
         new_template = replace(template, operation_id="op-after-rotation", lifecycle_nonce="lifecycle-after-rotation", session_family_authorization_digest=new_family.canonical_digest, broker_auth_lease_request_digest=new_request.request_digest)
         post_rotation = issuer.issue_lease(new_request, new_family, new_template)
         assert post_rotation.lease.broker_auth_key_id == "new"
-        signed_new = issuer.sign_envelope(post_rotation.lease.operation_id, post_rotation.lease.lease_identity_digest, new_request.request_digest, DIGEST_B, "sha256:" + "d" * 64)
-        signed_new.journal.validate_state(signed_new.state, signed_new.payloads, BrokerAuthSequenceReplayBaselineV1(DIGEST_A, governance, policy_digest))
+        assert not hasattr(issuer, "sign_envelope")
 
         stale = issuer.state
         with pytest.raises(ValueError):
@@ -1662,7 +1677,7 @@ def test_authoritative_broker_issuer_rotates_and_revokes_without_partial_state(t
             (*revoked.entries, RegistrationBrokerAuthRevocationEntryV1("new", revocation_sequence + 1, DIGEST_B)),
         )
         second_revoke = issuer.revoke_key(
-            "new", revoked_active, DIGEST_C, _broker_policy_digest(next_registry, revoked_active),
+            "new", revoked_active, "sha256:" + "d" * 64, _broker_policy_digest(next_registry, revoked_active),
         )
         assert_replay_rejects_forged_event_signer(second_revoke, "old")
     finally:
@@ -1872,8 +1887,6 @@ def test_e2_signed_wire_has_one_lowercase_signature_and_no_unsigned_signature_fi
         # Strict decoding is deliberately permitted for worker-side wire
         # verification, but decoded records must never re-enter a live broker
         # signing path.
-        with pytest.raises(ValueError, match="broker-produced"):
-            CapabilityEnvelopeV1.create(unsigned, signer)
         signed = _decoded_signed_envelope(unsigned, signer)
         assert CapabilityEnvelopeV1.from_canonical_bytes(signed.canonical_bytes) == signed
         signed.verify({"broker-fixed": public})
@@ -1905,10 +1918,8 @@ def test_e2_signed_wire_has_one_lowercase_signature_and_no_unsigned_signature_fi
             CapabilityEnvelopeV1.from_canonical_bytes(b" " + signed.canonical_bytes)
     finally:
         signer.close()
-    # A signer is deliberately required; no caller supplied signature or public
-    # key may turn unsigned bytes into an authority-bearing wire value.
-    with pytest.raises((TypeError, ValueError)):
-        CapabilityEnvelopeV1.create(unsigned, object())
+    with pytest.raises(TypeError, match="issued or decoded"):
+        CapabilityEnvelopeV1(object(), unsigned, "0" * 128)
 
 
 def test_e2_receive_once_fails_closed_when_msg_cmsg_cloexec_is_unavailable():
@@ -2212,18 +2223,172 @@ def _test_receive_lease(governance, signer):
     lease = replace(template, lease_identity_digest=template.identity_preimage().lease_identity_digest)
     return replace(
         lease,
-        broker_signature_hex=signer.sign(
-            "ai-video-reverse-engineer/registration-broker-lease/v1", canonical_json_bytes(lease._unsigned_wire()),
+        broker_signature_hex=_test_signature(
+            _TEST_BROKER_SEED, "ai-video-reverse-engineer/registration-broker-lease/v1",
+            canonical_json_bytes(lease._unsigned_wire()),
         ),
     )
+
+
+def test_broker_slot_cannot_be_used_as_a_raw_envelope_signer_or_direct_constructor(tmp_path):
+    """Removing either issuer boundary would re-enable decoded FD signing."""
+    governance, signer = _test_broker_signer(tmp_path)
+    try:
+        unsigned = _unsigned_envelope(
+            broker_auth_public_key_digest=signer.public_key_digest,
+            broker_auth_registry_digest=governance.registry.canonical_digest,
+            broker_auth_revocation_digest=governance.revocations.canonical_digest,
+            broker_auth_allowed_signers_digest=governance.allowed_signers_digest,
+        )
+        assert not hasattr(signer, "sign")
+        with pytest.raises(TypeError, match="issued or decoded"):
+            CapabilityEnvelopeV1(object(), unsigned, "0" * 128)
+    finally:
+        signer.close()
+
+
+def test_authoritative_issuer_rejects_a_future_effective_active_key_at_sequence_one(tmp_path):
+    """Dropping the event-sequence eligibility check admits a valid-MAC future key."""
+    governance, signer = _test_broker_signer(tmp_path)
+    state_mac = _state_mac_capability(tmp_path, b"state-mac-key-is-independent-32!!!"[:32])
+    try:
+        future_key = replace(governance.registry.key("broker-fixed"), effective_lease_sequence=2)
+        future_registry = replace(governance.registry, keys=(future_key,))
+        future_governance = RegistrationBrokerAuthGovernanceV1.from_canonical_bytes(
+            future_registry.canonical_bytes,
+            RegistrationBrokerAuthRevocationsV1(
+                "trusted-registration-broker-auth-revocations/v1", future_registry.canonical_digest, (),
+            ).canonical_bytes,
+            governance.allowed_signers_canonical_bytes,
+        )
+        with pytest.raises(ValueError, match="effective"):
+            BrokerAuthAuthoritativeIssuerV1.create(
+                future_governance, DIGEST_A,
+                _broker_policy_digest(future_governance.registry, future_governance.revocations),
+                signer, state_mac, 2,
+            )
+    finally:
+        state_mac.close()
+        signer.close()
+
+
+def test_replay_rejects_a_valid_mac_revoke_signed_by_a_future_effective_active_key(tmp_path):
+    """Removing replay eligibility admits a future key even when every MAC verifies."""
+    governance, _ = _broker_governance(
+        "broker-fixed", bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"),
+    )
+    future_key = replace(governance.registry.key("broker-fixed"), effective_lease_sequence=2)
+    future_registry = replace(governance.registry, keys=(future_key,))
+    future_revocations = RegistrationBrokerAuthRevocationsV1(
+        "trusted-registration-broker-auth-revocations/v1", future_registry.canonical_digest, (),
+    )
+    future_governance = RegistrationBrokerAuthGovernanceV1.from_canonical_bytes(
+        future_registry.canonical_bytes, future_revocations.canonical_bytes, governance.allowed_signers_canonical_bytes,
+    )
+    state_mac = _state_mac_capability(tmp_path, b"state-mac-key-is-independent-32!!!"[:32])
+    try:
+        post_revocations = RegistrationBrokerAuthRevocationsV1(
+            "trusted-registration-broker-auth-revocations/v1", future_registry.canonical_digest,
+            (RegistrationBrokerAuthRevocationEntryV1("broker-fixed", 1, DIGEST_B),),
+        )
+        pre_policy = _broker_policy_digest(future_registry, future_revocations)
+        post_policy = _broker_policy_digest(future_registry, post_revocations)
+        payload = BrokerAuthRevokePolicyEventPayloadV1(
+            "trusted-registration-broker-auth-revoke-payload/v1", "revoke-key", DIGEST_A,
+            future_registry.canonical_digest, future_revocations.canonical_digest, post_revocations,
+            "broker-fixed", 1, pre_policy, post_policy,
+        )
+        provisional_entry = BrokerAuthSequenceJournalEntryV1(
+            "trusted-registration-broker-auth-sequence-entry/v1", 1, None, payload.event_id_digest,
+            payload.event_kind, payload.full_bytes_digest, len(payload.canonical_bytes), payload.full_bytes_digest,
+            pre_policy, post_policy, future_registry.canonical_digest, post_revocations.canonical_digest,
+            "broker-fixed", "0" * 64,
+        )
+        entry = replace(provisional_entry, broker_state_mac_hex=state_mac.mac(canonical_json_bytes(provisional_entry._unsigned_wire())))
+        provisional_state = BrokerAuthSequenceStateV1(
+            "trusted-registration-broker-auth-sequence-state/v1", DIGEST_A, 1, entry.canonical_digest,
+            payload.full_bytes_digest, payload.full_bytes_digest, post_policy, future_registry.canonical_digest,
+            post_revocations.canonical_digest, "0" * 64,
+        )
+        state = replace(provisional_state, broker_state_mac_hex=state_mac.mac(canonical_json_bytes(provisional_state._unsigned_wire())))
+        provisional_journal = BrokerAuthSequenceJournalV1(
+            "trusted-registration-broker-auth-sequence-journal/v1", DIGEST_A, 1, (entry,), "0" * 64,
+        )
+        journal = replace(provisional_journal, broker_state_mac_hex=state_mac.mac(canonical_json_bytes(provisional_journal._unsigned_wire())))
+        with pytest.raises(ValueError, match="revocation"):
+            journal.validate_state(
+                state, {payload.full_bytes_digest: payload},
+                BrokerAuthSequenceReplayBaselineV1(DIGEST_A, future_governance, pre_policy),
+            )
+    finally:
+        state_mac.close()
+
+
+def test_authoritative_issuer_signs_only_the_exact_issued_initial_envelope(tmp_path):
+    """Removing lease, unsigned, or FD-origin binding must reject before state commits."""
+    if sys.platform != "linux":
+        return
+    governance, signer = _test_broker_signer(tmp_path)
+    state_mac = _state_mac_capability(tmp_path, b"state-mac-key-is-independent-32!!!"[:32])
+    try:
+        registry, revocations = governance.registry, governance.revocations
+        family = RegistrationWorkerSessionFamilyAuthorizationV1(
+            "trusted-registration-worker-session-family-authorization/v1", "op-initial", DIGEST_A,
+            DIGEST_B, DIGEST_C, DIGEST_A, DIGEST_B, "broker-fixed", registry.key("broker-fixed").canonical_digest,
+            ("register", "recover"), "register-to-recover", DIGEST_C, DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A,
+        )
+        policy_digest = _broker_policy_digest(registry, revocations)
+        request = BrokerAuthLeaseIssueRequestV1(
+            "trusted-registration-broker-auth-lease-issue-request/v1", "op-initial", "lifecycle-initial",
+            family.canonical_digest, "broker-fixed", 0, DIGEST_A, registry.canonical_digest,
+            revocations.canonical_digest, policy_digest, governance.allowed_signers_digest, 2,
+        )
+        template = RegistrationRecoveryLeaseV1(
+            "trusted-registration-recovery-lease/v1", "ai-video-reverse-engineer", "op-initial", "lifecycle-initial",
+            family.canonical_digest, 1, DIGEST_A, "transaction-root", DIGEST_B, DIGEST_C, DIGEST_A,
+            DIGEST_B, DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A, registry.generation, registry.canonical_digest,
+            revocations.canonical_digest, policy_digest, governance.allowed_signers_digest, "broker-fixed", request.request_digest,
+            DIGEST_A, DIGEST_B, DIGEST_C, 1, 3, DIGEST_A, "OPEN", "a" * 128, "b" * 64,
+        )
+        issuer = BrokerAuthAuthoritativeIssuerV1.create(governance, DIGEST_A, policy_digest, signer, state_mac, 2)
+        issued = issuer.issue_lease(request, family, template)
+        unsigned = _unsigned_envelope(
+            broker_lease_identity_digest=issued.lease.lease_identity_digest,
+            operation_id=issued.lease.operation_id, lifecycle_nonce=issued.lease.lifecycle_nonce,
+            broker_auth_key_id=issued.lease.broker_auth_key_id,
+            broker_auth_public_key_digest=signer.public_key_digest,
+            broker_auth_registry_generation=registry.generation,
+            broker_auth_registry_digest=registry.canonical_digest,
+            broker_auth_revocation_digest=revocations.canonical_digest,
+            broker_auth_allowed_signers_digest=governance.allowed_signers_digest,
+            broker_auth_lease_issued_sequence=issued.lease.broker_auth_lease_issued_sequence,
+            broker_auth_lease_expiry_sequence=issued.lease.broker_auth_lease_expiry_sequence,
+            broker_auth_sign_sequence=2,
+            fd_descriptors=_broker_produced_closure(tmp_path),
+        )
+        signed = issuer.sign_initial_envelope(issued.lease, unsigned, DIGEST_B)
+        assert signed.transition.entry.sequence == 2
+        assert signed.transition.payload.unsigned_envelope_digest == unsigned.canonical_digest
+        RegistrationExpectedReceiveContextV1(
+            "register", DIGEST_C, DIGEST_B, DIGEST_A, _worker_input().canonical_digest,
+            "session-e2", "op-initial", "lifecycle-initial", 1, "broker-session-e2",
+            issued.lease, 2, governance,
+        ).verify_envelope(signed.envelope)
+        stable = issuer.state
+        with pytest.raises(ValueError):
+            issuer.sign_initial_envelope(issued.lease, unsigned, DIGEST_C)
+        assert issuer.state == stable
+    finally:
+        state_mac.close()
+        signer.close()
 
 
 def _decoded_signed_envelope(unsigned, signer):
     """Exercise the worker decode path without treating decoded records as live input."""
     return CapabilityEnvelopeV1.from_canonical_bytes(canonical_json_bytes({
         **unsigned.to_wire(),
-        "brokerSignatureHex": signer.sign(
-            "ai-video-reverse-engineer/registration-broker-envelope/v1", unsigned.canonical_bytes,
+        "brokerSignatureHex": _test_signature(
+            _TEST_BROKER_SEED, "ai-video-reverse-engineer/registration-broker-envelope/v1", unsigned.canonical_bytes,
         ),
     }))
 
@@ -2238,9 +2403,7 @@ def _signed_receive_envelope(governance, signer, lease, mode="register", **overr
         broker_auth_allowed_signers_digest=governance.allowed_signers_digest,
     )
     values.update(overrides)
-    if "fd_descriptors" not in values:
-        return _decoded_signed_envelope(_unsigned_envelope(mode, **values), signer)
-    return CapabilityEnvelopeV1.create(_unsigned_envelope(mode, **values), signer)
+    return _decoded_signed_envelope(_unsigned_envelope(mode, **values), signer)
 
 
 def test_e2_expected_receive_context_rejects_old_or_cross_bound_signed_envelopes(tmp_path):
@@ -2267,8 +2430,8 @@ def test_e2_expected_receive_context_rejects_old_or_cross_bound_signed_envelopes
         terminal_lease = replace(lease, state="RECLAIMED", next_recovery_sequence=777)
         terminal_lease = replace(
             terminal_lease,
-            broker_signature_hex=signer.sign(
-                "ai-video-reverse-engineer/registration-broker-lease/v1",
+            broker_signature_hex=_test_signature(
+                _TEST_BROKER_SEED, "ai-video-reverse-engineer/registration-broker-lease/v1",
                 canonical_json_bytes(terminal_lease._unsigned_wire()),
             ),
         )
@@ -2298,8 +2461,8 @@ def test_e2_expected_receive_context_rejects_old_or_cross_bound_signed_envelopes
             )
             other_lease = replace(
                 other_lease,
-                broker_signature_hex=signer.sign(
-                    "ai-video-reverse-engineer/registration-broker-lease/v1",
+                broker_signature_hex=_test_signature(
+                    _TEST_BROKER_SEED, "ai-video-reverse-engineer/registration-broker-lease/v1",
                     canonical_json_bytes(other_lease._unsigned_wire()),
                 ),
             )
@@ -2324,8 +2487,8 @@ def _linux_delivery(tmp_path, mode, fault=None, envelope_overrides=None):
         lease = replace(lease, state="RECOVERY_RUNNING", next_recovery_sequence=worker_sequence)
         lease = replace(
             lease,
-            broker_signature_hex=signer.sign(
-                "ai-video-reverse-engineer/registration-broker-lease/v1",
+            broker_signature_hex=_test_signature(
+                _TEST_BROKER_SEED, "ai-video-reverse-engineer/registration-broker-lease/v1",
                 canonical_json_bytes(lease._unsigned_wire()),
             ),
         )

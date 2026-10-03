@@ -18,6 +18,7 @@ import sys
 import unicodedata
 import fcntl
 import socket
+import time
 import weakref
 from collections.abc import Mapping
 from types import MappingProxyType
@@ -27,6 +28,8 @@ _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _HEX = re.compile(r"^[0-9a-f]+$")
 _MAX_BROKER_AUTH_SEQUENCE_PAYLOAD_BYTES = 256 * 1024
 _FD_HASH_CHUNK_BYTES = 64 * 1024
+_FD_TIMESTAMP_SETTLE_NS = 20_000_000
+_FD_TIMESTAMP_SETTLE_TIMEOUT_NS = 250_000_000
 
 
 def _require_digest(value: object, field: str) -> str:
@@ -39,6 +42,19 @@ def _require_text(value: object, field: str) -> str:
     if not isinstance(value, str) or not value or unicodedata.normalize("NFC", value) != value:
         raise ValueError(f"{field} must be a non-empty NFC string")
     return value
+
+
+def _await_fd_timestamp_settle(fd: int, identity: tuple[int, int, int, int, int]) -> None:
+    """Start hashing only after a same-length write must advance observable time."""
+    deadline = time.monotonic_ns() + _FD_TIMESTAMP_SETTLE_TIMEOUT_NS
+    latest_timestamp = max(identity[3:])
+    while time.time_ns() - latest_timestamp < _FD_TIMESTAMP_SETTLE_NS:
+        if time.monotonic_ns() >= deadline:
+            raise ValueError("received regular FD timestamp observation is unavailable")
+        time.sleep(0.001)
+    current = os.fstat(fd)
+    if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns) != identity:
+        raise ValueError("received regular FD changed before hashing")
 
 
 def _without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -2244,6 +2260,30 @@ def _broker_auth_policy_digest(
     return _broker_auth_policy_digest_from_digests(registry.canonical_digest, revocations.canonical_digest)
 
 
+def _broker_auth_key_is_eligible(
+    key: "RegistrationBrokerAuthKeyRegistrationV1",
+    revocations: "RegistrationBrokerAuthRevocationsV1",
+    allowed_signers: Mapping[str, bytes],
+    event_sequence: int,
+    allowed_states: frozenset[str],
+) -> bool:
+    """One pre-state signer rule for live issuance and deterministic replay."""
+    try:
+        _u64(event_sequence, "event_sequence", positive=True)
+    except ValueError:
+        return False
+    public = allowed_signers.get(key.key_id)
+    return (
+        key.state in allowed_states
+        and key.purpose == _BROKER_AUTH_PURPOSE
+        and key.effective_lease_sequence <= event_sequence
+        and revocations.revoked_at(key.key_id) is None
+        and isinstance(public, bytes)
+        and len(public) == 32
+        and "sha256:" + hashlib.sha256(public).hexdigest() == key.public_key_digest
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class BrokerAuthLeaseIssueEventPayloadV1(_SelfDigestRecord):
     schema: str; event_kind: str; event_id_digest: str; lease_request: BrokerAuthLeaseIssueRequestV1; lease_request_digest: str; operation_id: str; broker_auth_key_id: str; issued_sequence: int; lease_ttl_sequences: int; expiry_sequence: int; pre_policy_digest: str; post_policy_digest: str
@@ -2577,7 +2617,10 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
                     payload.issued_sequence != entry.sequence
                     or entry.broker_auth_key_id != active_key.key_id
                     or payload.broker_auth_key_id != active_key.key_id
-                    or current_revocations.revoked_at(active_key.key_id) is not None
+                    or not _broker_auth_key_is_eligible(
+                        active_key, current_revocations, current_governance.allowed_signers,
+                        entry.sequence, frozenset({"active"}),
+                    )
                     or (
                         payload.lease_request.expected_current_sequence,
                         payload.lease_request.expected_current_head_digest,
@@ -2603,10 +2646,10 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
                 if (
                     payload.sign_sequence != entry.sequence
                     or entry.broker_auth_key_id != payload.broker_auth_key_id
-                    or signer_key.state not in {"active", "retiring"}
-                    or current_revocations.revoked_at(signer_key.key_id) is not None
-                    or not isinstance(current_governance.allowed_signers.get(signer_key.key_id), bytes)
-                    or "sha256:" + hashlib.sha256(current_governance.allowed_signers[signer_key.key_id]).hexdigest() != signer_key.public_key_digest
+                    or not _broker_auth_key_is_eligible(
+                        signer_key, current_revocations, current_governance.allowed_signers,
+                        entry.sequence, frozenset({"active", "retiring"}),
+                    )
                     or payload.post_policy_digest != current_policy
                 ):
                     raise ValueError("broker auth signing does not preserve replay pre-state")
@@ -2620,10 +2663,10 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
                 if (
                     payload.effective_lease_sequence != entry.sequence
                     or entry.broker_auth_key_id != prior_active.key_id
-                    or prior_active.state != "active"
-                    or current_revocations.revoked_at(prior_active.key_id) is not None
-                    or not isinstance(current_governance.allowed_signers.get(prior_active.key_id), bytes)
-                    or "sha256:" + hashlib.sha256(current_governance.allowed_signers[prior_active.key_id]).hexdigest() != prior_active.public_key_digest
+                    or not _broker_auth_key_is_eligible(
+                        prior_active, current_revocations, current_governance.allowed_signers,
+                        entry.sequence, frozenset({"active"}),
+                    )
                     or payload.previous_registry_digest != current_registry.canonical_digest
                     or payload.previous_revocations_digest != current_revocations.canonical_digest
                     or payload.next_registry.generation != current_registry.generation + 1
@@ -2644,10 +2687,10 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
                 if (
                     payload.revoked_at_broker_sequence != entry.sequence
                     or entry.broker_auth_key_id != active_key.key_id
-                    or active_key.state != "active"
-                    or current_revocations.revoked_at(active_key.key_id) is not None
-                    or not isinstance(current_governance.allowed_signers.get(active_key.key_id), bytes)
-                    or "sha256:" + hashlib.sha256(current_governance.allowed_signers[active_key.key_id]).hexdigest() != active_key.public_key_digest
+                    or not _broker_auth_key_is_eligible(
+                        active_key, current_revocations, current_governance.allowed_signers,
+                        entry.sequence, frozenset({"active"}),
+                    )
                     or payload.unchanged_registry_digest != current_registry.canonical_digest
                     or payload.previous_revocations_digest != current_revocations.canonical_digest
                     or payload.next_revocations.registry_digest != current_registry.canonical_digest
@@ -2774,11 +2817,20 @@ class RegistrationBrokerAuthPrivateKeySlotV1:
         if self._closed:
             raise ValueError("private key slot is closed")
 
-    def sign(self, domain: str, payload: bytes) -> str:
+    def _sign_bytes(self, domain: str, payload: bytes) -> str:
         self._require_open()
-        if domain not in {self.signature_domain, self.lease_signature_domain, self.challenge_domain} or not isinstance(payload, bytes):
-            raise ValueError("private key signing domain is invalid")
+        if not isinstance(payload, bytes):
+            raise ValueError("private key signing payload is invalid")
         return _ed_sign(self._seed, domain.encode("utf-8") + b"\0" + payload).hex()
+
+    def _sign_lease(self, payload: bytes) -> str:
+        return self._sign_bytes(self.lease_signature_domain, payload)
+
+    def _sign_envelope(self, payload: bytes) -> str:
+        return self._sign_bytes(self.signature_domain, payload)
+
+    def _sign_challenge(self, payload: bytes) -> str:
+        return self._sign_bytes(self.challenge_domain, payload)
 
     def close(self) -> None:
         self._seed = b""; self._closed = True
@@ -2802,7 +2854,7 @@ def verify_registration_broker_startup_challenge(governance: RegistrationBrokerA
     if active.state != "active" or governance.revocations.revoked_at(active.key_id) is not None or (slot.key_id, slot.purpose, slot.signature_domain, slot.challenge_domain, slot.public_key_digest) != (active.key_id, _BROKER_AUTH_PURPOSE, _BROKER_ENVELOPE_DOMAIN, _BROKER_CHALLENGE_DOMAIN, active.public_key_digest):
         raise ValueError("broker startup key closure is invalid")
     message = canonical_json_bytes({"keyId": active.key_id, "nonce": nonce, "registryDigest": governance.registry.canonical_digest})
-    signature = slot.sign(_BROKER_CHALLENGE_DOMAIN, message)
+    signature = slot._sign_challenge(message)
     from .handoffs import _ed25519_verify
     if not _ed25519_verify(slot._public, _BROKER_CHALLENGE_DOMAIN.encode("utf-8") + b"\0" + message, bytes.fromhex(signature)):
         raise ValueError("broker startup challenge signature is invalid")
@@ -3106,6 +3158,7 @@ def _install_fd_origin_bound_apis():
                     raise ValueError("received regular FD length differs from its descriptor")
                 if expected_length > maximum_length:
                     raise ValueError("received regular FD exceeds its frozen role budget")
+                _await_fd_timestamp_settle(fd, initial_identity)
                 filesystem_id = getattr(os.fstatvfs(fd), "f_fsid", None)
                 if not isinstance(filesystem_id, int):
                     raise ValueError("received regular FD mount identity is unavailable")
@@ -3236,24 +3289,31 @@ class CapabilityEnvelopeUnsignedV1(_SelfDigestRecord):
         return result
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class CapabilityEnvelopeV1:
     unsigned: CapabilityEnvelopeUnsignedV1
     broker_signature_hex: str
+    _TOKEN = object()
 
-    def __post_init__(self) -> None:
-        if type(self.unsigned) is not CapabilityEnvelopeUnsignedV1:
+    def __init__(self, token: object, unsigned: CapabilityEnvelopeUnsignedV1, broker_signature_hex: str) -> None:
+        if token is not self._TOKEN:
+            raise TypeError("signed capability envelopes are issued or decoded only")
+        if type(unsigned) is not CapabilityEnvelopeUnsignedV1:
             raise ValueError("signed capability envelope requires an unsigned envelope")
-        _signature(self.broker_signature_hex, "broker_signature_hex")
+        object.__setattr__(self, "unsigned", unsigned)
+        object.__setattr__(self, "broker_signature_hex", broker_signature_hex)
+        _signature(broker_signature_hex, "broker_signature_hex")
 
     @classmethod
-    def create(cls, unsigned_envelope: CapabilityEnvelopeUnsignedV1, broker_signer: RegistrationBrokerAuthPrivateKeySlotV1) -> "CapabilityEnvelopeV1":
+    def _create_from_issuer(cls, token: object, unsigned_envelope: CapabilityEnvelopeUnsignedV1, broker_signer: RegistrationBrokerAuthPrivateKeySlotV1) -> "CapabilityEnvelopeV1":
+        if token is not BrokerAuthAuthoritativeIssuerV1._ENVELOPE_TOKEN:
+            raise TypeError("capability envelope requires authoritative issuer")
         if type(unsigned_envelope) is not CapabilityEnvelopeUnsignedV1 or type(broker_signer) is not RegistrationBrokerAuthPrivateKeySlotV1:
             raise TypeError("capability envelope must be signed by a broker private-key slot")
         if (broker_signer.key_id, broker_signer.signature_domain, broker_signer.public_key_digest) != (unsigned_envelope.broker_auth_key_id, _ENVELOPE_DOMAIN, unsigned_envelope.broker_auth_public_key_digest):
             raise ValueError("broker signer does not close capability envelope")
         _require_broker_produced_fd_closure(unsigned_envelope.fd_descriptors)
-        return cls(unsigned_envelope, broker_signer.sign(_ENVELOPE_DOMAIN, unsigned_envelope.canonical_bytes))
+        return cls(cls._TOKEN, unsigned_envelope, broker_signer._sign_envelope(unsigned_envelope.canonical_bytes))
 
     @property
     def canonical_digest(self) -> str: return canonical_digest(self.to_wire())
@@ -3277,7 +3337,7 @@ class CapabilityEnvelopeV1:
         raw = _strict_object(payload, set(CapabilityEnvelopeUnsignedV1.from_canonical_bytes.__func__.__annotations__) if False else {"brokerAuthAllowedSignersDigest", "brokerAuthKeyId", "brokerAuthLeaseExpirySequence", "brokerAuthLeaseIssuedSequence", "brokerAuthPublicKeyDigest", "brokerAuthRegistryDigest", "brokerAuthRegistryGeneration", "brokerAuthRevocationDigest", "brokerAuthSignSequence", "brokerLeaseIdentityDigest", "brokerSessionNonce", "brokerSignatureHex", "canonicalDigest", "fdDescriptors", "lifecycleNonce", "operationId", "schema", "workerExecutableDigest", "workerInputDigest", "workerMode", "workerPidfdIdentityDigest", "workerProcessIdentityDigest", "workerSequence", "workerSessionId"}, "signed capability envelope")
         signature = raw.pop("brokerSignatureHex")
         unsigned = CapabilityEnvelopeUnsignedV1.from_canonical_bytes(canonical_json_bytes(raw))
-        return cls(unsigned, signature)
+        return cls(cls._TOKEN, unsigned, signature)
 
 
 @dataclass(frozen=True, slots=True)
@@ -3578,6 +3638,7 @@ class BrokerAuthAuthoritativeIssuerV1:
         "_root_identity_digest", "_allowed_signers_digest", "_signer", "_allowed_signers",
         "_governance", "_baseline", "_state_mac", "_frozen_profile_ttl_sequences", "_event_ids",
     )
+    _ENVELOPE_TOKEN = object()
 
     def __init__(
         self,
@@ -3625,7 +3686,7 @@ class BrokerAuthAuthoritativeIssuerV1:
             broker_state_mac_hex=state_mac.mac(canonical_json_bytes(provisional._unsigned_wire())),
         )
         issuer = cls(governance, state, root_identity_digest, signer, state_mac, frozen_profile_ttl_sequences)
-        issuer._require_active_signer()
+        issuer._require_active_signer(issuer._next_sequence())
         return issuer
 
     @property
@@ -3661,15 +3722,13 @@ class BrokerAuthAuthoritativeIssuerV1:
         ):
             raise ValueError("broker signer governance does not match authoritative state")
         key = governance.registry.key(governance.registry.active_key_id)
-        public = governance.allowed_signers.get(key.key_id)
         if (
-            key.state != "active"
-            or governance.revocations.revoked_at(key.key_id) is not None
-            or not isinstance(public, bytes)
-            or len(public) != 32
+            not _broker_auth_key_is_eligible(
+                key, governance.revocations, governance.allowed_signers,
+                self._next_sequence(), frozenset({"active"}),
+            )
             or (signer.key_id, signer.purpose, signer.lease_signature_domain, signer.public_key_digest)
             != (key.key_id, _BROKER_AUTH_PURPOSE, key.lease_signature_domain, key.public_key_digest)
-            or "sha256:" + hashlib.sha256(public).hexdigest() != key.public_key_digest
         ):
             raise ValueError("broker signer does not match current governance")
         self._signer = signer
@@ -3677,15 +3736,14 @@ class BrokerAuthAuthoritativeIssuerV1:
         self._allowed_signers_digest = governance.allowed_signers_digest
         self._governance = governance
 
-    def _require_active_signer(self) -> RegistrationBrokerAuthKeyRegistrationV1:
+    def _require_active_signer(self, event_sequence: int) -> RegistrationBrokerAuthKeyRegistrationV1:
         key = self._registry.key(self._registry.active_key_id)
-        public = self._allowed_signers.get(key.key_id)
-        if key.state != "active" or self._revocations.revoked_at(key.key_id) is not None or not isinstance(public, bytes) or len(public) != 32:
-            raise ValueError("broker active signer is unavailable")
+        if not _broker_auth_key_is_eligible(
+            key, self._revocations, self._allowed_signers, event_sequence, frozenset({"active"}),
+        ):
+            raise ValueError("broker active signer is unavailable or not yet effective")
         if (self._signer.key_id, self._signer.purpose, self._signer.lease_signature_domain, self._signer.public_key_digest) != (key.key_id, _BROKER_AUTH_PURPOSE, key.lease_signature_domain, key.public_key_digest):
             raise ValueError("broker signer does not match active key")
-        if "sha256:" + hashlib.sha256(public).hexdigest() != key.public_key_digest:
-            raise ValueError("broker allowed signer does not match active key")
         return key
 
     def _next_sequence(self) -> int:
@@ -3700,7 +3758,8 @@ class BrokerAuthAuthoritativeIssuerV1:
         if type(next_governance) is not RegistrationBrokerAuthGovernanceV1:
             raise ValueError("broker transition governance is invalid")
         next_registry, next_revocations = next_governance.registry, next_governance.revocations
-        active_key = self._require_active_signer()
+        sequence = self._next_sequence()
+        active_key = self._require_active_signer(sequence)
         signer_key = active_key if event_signer_key is None else event_signer_key
         if type(signer_key) is not RegistrationBrokerAuthKeyRegistrationV1:
             raise ValueError("broker event signer is invalid")
@@ -3711,7 +3770,11 @@ class BrokerAuthAuthoritativeIssuerV1:
             or payload.post_policy_digest != _broker_auth_policy_digest(next_registry, next_revocations)
         ):
             raise ValueError("broker event is replayed or has the wrong pre-state")
-        sequence = self._next_sequence()
+        if not _broker_auth_key_is_eligible(
+            signer_key, self._revocations, self._allowed_signers, sequence,
+            frozenset({"active", "retiring"}),
+        ):
+            raise ValueError("broker event signer is unavailable or not yet effective")
         if isinstance(payload, BrokerAuthLeaseIssueEventPayloadV1):
             if payload.issued_sequence != sequence or payload.broker_auth_key_id != signer_key.key_id:
                 raise ValueError("broker issue event sequence is invalid")
@@ -3780,7 +3843,8 @@ class BrokerAuthAuthoritativeIssuerV1:
     ) -> BrokerAuthLeaseIssuanceResultV1:
         if type(request) is not BrokerAuthLeaseIssueRequestV1 or type(family) is not RegistrationWorkerSessionFamilyAuthorizationV1 or type(lease_template) is not RegistrationRecoveryLeaseV1:
             raise ValueError("broker lease issue inputs are invalid")
-        key = self._require_active_signer()
+        sequence = self._next_sequence()
+        key = self._require_active_signer(sequence)
         expected_head = self._state.head_entry_digest or self._state.root_identity_digest
         if (request.operation_id, request.session_family_authorization_digest, request.broker_auth_key_id, request.expected_current_sequence, request.expected_current_head_digest, request.expected_registry_digest, request.expected_revocation_digest, request.expected_policy_digest, request.expected_allowed_signers_digest) != (family.operation_id, family.canonical_digest, key.key_id, self._state.current_sequence, expected_head, self._registry.canonical_digest, self._revocations.canonical_digest, self._state.current_policy_digest, self._allowed_signers_digest):
             raise ValueError("broker lease request does not match authoritative pre-state")
@@ -3792,7 +3856,6 @@ class BrokerAuthAuthoritativeIssuerV1:
             raise ValueError("broker lease template does not bind request")
         if (lease_template.state, lease_template.next_recovery_sequence) != ("OPEN", 1):
             raise ValueError("broker lease template is not an initial OPEN lease")
-        sequence = self._next_sequence()
         event_id_digest = "sha256:" + hashlib.sha256(b"ai-video-reverse-engineer/registration-broker-lease-issue-event/v1\0" + request.request_digest.encode("ascii")).hexdigest()
         payload = BrokerAuthLeaseIssueEventPayloadV1(
             "trusted-registration-broker-auth-lease-issue-payload/v1", "issue-lease", event_id_digest,
@@ -3816,7 +3879,7 @@ class BrokerAuthAuthoritativeIssuerV1:
             state="OPEN", next_recovery_sequence=1, lease_identity_digest="sha256:" + "0" * 64,
         )
         lease = replace(lease, lease_identity_digest=lease.identity_preimage().lease_identity_digest)
-        lease = replace(lease, broker_signature_hex=self._signer.sign(_BROKER_LEASE_DOMAIN, canonical_json_bytes(lease._unsigned_wire())))
+        lease = replace(lease, broker_signature_hex=self._signer._sign_lease(canonical_json_bytes(lease._unsigned_wire())))
         lease = replace(lease, broker_mac=self._state_mac.mac(canonical_json_bytes(lease._unsigned_wire())))
         lease.verify_signature(self._governance, sequence)
         result = BrokerAuthLeaseIssuanceResultV1(transition.payload, transition.entry, transition.state, transition.journal, transition.payloads, lease)
@@ -3847,57 +3910,71 @@ class BrokerAuthAuthoritativeIssuerV1:
         self._commit(result, next_governance)
         return result
 
-    def sign_envelope(
-        self,
-        operation_id: str,
-        lease_identity_digest: str,
-        lease_request_digest: str,
-        unsigned_envelope_digest: str,
-        event_id_digest: str,
-    ) -> BrokerAuthStateTransitionResultV1:
-        _require_text(operation_id, "operation_id")
-        for value, field in (
-            (lease_identity_digest, "lease_identity_digest"),
-            (lease_request_digest, "lease_request_digest"),
-            (unsigned_envelope_digest, "unsigned_envelope_digest"),
-            (event_id_digest, "event_id_digest"),
+    def _require_issued_lease(self, lease: RegistrationRecoveryLeaseV1) -> BrokerAuthLeaseIssueEventPayloadV1:
+        """Bind signing to the exact lease issue event already in this journal."""
+        lease.verify_signature(self._governance, self._state.current_sequence)
+        entry = next((item for item in self._entries if item.canonical_digest == lease.broker_auth_issue_entry_digest), None)
+        if entry is None:
+            raise ValueError("broker envelope lease was not issued by this authority")
+        payload = self._payloads.get(entry.event_payload_ref)
+        if type(payload) is not BrokerAuthLeaseIssueEventPayloadV1:
+            raise ValueError("broker envelope lease issue entry is invalid")
+        if (
+            entry.sequence != lease.broker_auth_lease_issued_sequence
+            or payload.issued_sequence != lease.broker_auth_lease_issued_sequence
+            or payload.expiry_sequence != lease.broker_auth_lease_expiry_sequence
+            or payload.broker_auth_key_id != lease.broker_auth_key_id
+            or payload.lease_request_digest != lease.broker_auth_lease_request_digest
+            or payload.lease_request.request_digest != lease.broker_auth_lease_request_digest
+            or payload.operation_id != lease.operation_id
+            or payload.lease_request.operation_id != lease.operation_id
+            or lease.broker_auth_sequence_root_identity_digest != self._root_identity_digest
+            or lease.broker_auth_sequence_head_digest != entry.canonical_digest
+            or (
+                lease.broker_auth_registry_digest,
+                lease.broker_auth_revocation_digest,
+                lease.broker_auth_policy_digest,
+                lease.broker_auth_allowed_signers_digest,
+            ) != (
+                payload.lease_request.expected_registry_digest,
+                entry.post_broker_auth_revocation_digest,
+                entry.post_policy_digest,
+                payload.lease_request.expected_allowed_signers_digest,
+            )
         ):
-            _require_digest(value, field)
-        key = self._require_active_signer()
-        sequence = self._next_sequence()
-        payload = BrokerAuthEnvelopeSignEventPayloadV1(
-            "trusted-registration-broker-auth-envelope-sign-payload/v1", "sign-envelope",
-            event_id_digest, operation_id, lease_identity_digest, lease_request_digest,
-            unsigned_envelope_digest, key.key_id, sequence, self._state.current_policy_digest,
-            self._state.current_policy_digest,
-        )
-        result = self._transition(payload, self._governance)
-        self._commit(result, self._governance)
-        return result
+            raise ValueError("broker envelope lease does not close authoritative issue state")
+        return payload
 
-    def sign_recovery_envelope(
+    def _sign_exact_envelope(
         self,
         lease: RegistrationRecoveryLeaseV1,
         unsigned_envelope: CapabilityEnvelopeUnsignedV1,
-        lease_signer: RegistrationBrokerAuthPrivateKeySlotV1,
         event_id_digest: str,
+        signer: RegistrationBrokerAuthPrivateKeySlotV1,
+        worker_mode: str,
     ) -> BrokerAuthSignedEnvelopeResultV1:
-        """Record and sign one recover envelope using the frozen lease signer."""
         if (
             type(lease) is not RegistrationRecoveryLeaseV1
             or type(unsigned_envelope) is not CapabilityEnvelopeUnsignedV1
-            or type(lease_signer) is not RegistrationBrokerAuthPrivateKeySlotV1
+            or type(signer) is not RegistrationBrokerAuthPrivateKeySlotV1
+            or worker_mode not in {"register", "recover"}
         ):
-            raise ValueError("broker recovery envelope inputs are invalid")
+            raise ValueError("broker envelope inputs are invalid")
         _require_digest(event_id_digest, "event_id_digest")
-        self._require_active_signer()
         sequence = self._next_sequence()
-        lease.verify_signature(self._governance, self._state.current_sequence)
+        issue = self._require_issued_lease(lease)
+        key = self._registry.key(lease.broker_auth_key_id)
         if (
-            lease.state != "RECOVERY_RUNNING"
-            or lease.next_recovery_sequence <= 1
-            or unsigned_envelope.worker_mode != "recover"
-            or unsigned_envelope.worker_sequence != lease.next_recovery_sequence
+            not _broker_auth_key_is_eligible(
+                key, self._revocations, self._allowed_signers, sequence,
+                frozenset({"active"}) if worker_mode == "register" else frozenset({"active", "retiring"}),
+            )
+            or (signer.key_id, signer.purpose, signer.signature_domain, signer.public_key_digest)
+            != (key.key_id, _BROKER_AUTH_PURPOSE, _ENVELOPE_DOMAIN, key.public_key_digest)
+            or (worker_mode == "register" and (lease.state != "OPEN" or lease.next_recovery_sequence != 1))
+            or (worker_mode == "recover" and (lease.state != "RECOVERY_RUNNING" or lease.next_recovery_sequence <= 1))
+            or unsigned_envelope.worker_mode != worker_mode
+            or unsigned_envelope.worker_sequence != (1 if worker_mode == "register" else lease.next_recovery_sequence)
             or unsigned_envelope.broker_auth_sign_sequence != sequence
             or unsigned_envelope.broker_lease_identity_digest != lease.lease_identity_digest
             or unsigned_envelope.operation_id != lease.operation_id
@@ -3917,31 +3994,38 @@ class BrokerAuthAuthoritativeIssuerV1:
                 self._allowed_signers_digest,
             )
         ):
-            raise ValueError("broker recovery envelope does not close lease and current governance")
-        key = self._registry.key(lease.broker_auth_key_id)
-        public = self._allowed_signers.get(key.key_id)
-        if (
-            key.state not in {"active", "retiring"}
-            or key.purpose != _BROKER_AUTH_PURPOSE
-            or self._revocations.revoked_at(key.key_id) is not None
-            or not isinstance(public, bytes)
-            or len(public) != 32
-            or key.public_key_digest != lease_signer.public_key_digest
-            or "sha256:" + hashlib.sha256(public).hexdigest() != lease_signer.public_key_digest
-            or (lease_signer.key_id, lease_signer.purpose, lease_signer.signature_domain) != (key.key_id, _BROKER_AUTH_PURPOSE, _ENVELOPE_DOMAIN)
-        ):
-            raise ValueError("broker recovery envelope signer is not the eligible lease key")
+            raise ValueError("broker envelope does not close lease and current governance")
+        _require_broker_produced_fd_closure(unsigned_envelope.fd_descriptors)
         payload = BrokerAuthEnvelopeSignEventPayloadV1(
             "trusted-registration-broker-auth-envelope-sign-payload/v1", "sign-envelope",
             event_id_digest, lease.operation_id, lease.lease_identity_digest,
-            lease.broker_auth_lease_request_digest, unsigned_envelope.canonical_digest,
-            key.key_id, sequence, self._state.current_policy_digest,
-            self._state.current_policy_digest,
+            issue.lease_request_digest, unsigned_envelope.canonical_digest, key.key_id,
+            sequence, self._state.current_policy_digest, self._state.current_policy_digest,
         )
         transition = self._transition(payload, self._governance, key)
-        envelope = CapabilityEnvelopeV1.create(unsigned_envelope, lease_signer)
+        envelope = CapabilityEnvelopeV1._create_from_issuer(
+            self._ENVELOPE_TOKEN, unsigned_envelope, signer,
+        )
         self._commit(transition, self._governance)
         return BrokerAuthSignedEnvelopeResultV1(transition, envelope)
+
+    def sign_initial_envelope(
+        self,
+        lease: RegistrationRecoveryLeaseV1,
+        unsigned_envelope: CapabilityEnvelopeUnsignedV1,
+        event_id_digest: str,
+    ) -> BrokerAuthSignedEnvelopeResultV1:
+        return self._sign_exact_envelope(lease, unsigned_envelope, event_id_digest, self._signer, "register")
+
+    def sign_recovery_envelope(
+        self,
+        lease: RegistrationRecoveryLeaseV1,
+        unsigned_envelope: CapabilityEnvelopeUnsignedV1,
+        lease_signer: RegistrationBrokerAuthPrivateKeySlotV1,
+        event_id_digest: str,
+    ) -> BrokerAuthSignedEnvelopeResultV1:
+        """Record and sign one recovery envelope against its exact issued lease."""
+        return self._sign_exact_envelope(lease, unsigned_envelope, event_id_digest, lease_signer, "recover")
 
     def revoke_key(
         self,
