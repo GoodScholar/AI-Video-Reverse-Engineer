@@ -56,6 +56,32 @@ binding spec 没有重列下列类型；补充授权明确由实施计划第 99�
 
 不应将当前变更视为完整 Task 2 或用于后续 Task 14/18；它尚不具备所要求的 fail-closed runtime/transport 合同。
 
+## D.1 — phase-aware output 与 pre-state codecs
+
+### RED / GREEN
+
+- RED：先以手工固定的 Task28/29 字面量、七个 candidate ref、以及 pre-state/staging/quarantine 反例扩展 `test_trusted_evidence_e2_policy_v2.py`，运行
+  `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_e2_policy_v2.py`
+  在收集阶段因 `ImportError: cannot import name 'AllowedTaskOutputsV1'` 失败，证明新断言命中缺失的 D.1 codec。
+- GREEN（定向）：实现后，同一 policy 文件与受影响 handoff 文件的联合命令为 `61 passed in 11.27s`。
+- 初次全量 acceptance（在最后一轮输入类型防御加固前）：
+  `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance`
+  为 `306 passed in 143.47s`。
+- 最后一轮全量 acceptance（输入类型防御加固后）为 `305 passed, 1 failed in 223.38s`；失败项是未改动的 `test_trusted_evidence_e2.py::test_e2_kills_the_process_group_when_the_parent_exits_before_a_pipe_holding_child`。它在 codec 文件之外，失败为 `background.pid` 尚未出现即读取；单独复跑仍同样失败。D.1 定向 policy+handoff 回归保持 `61 passed`，因此该既有 E2 process-group 时序失败未在本切片内修改。
+- 附加检查：`backend/.venv/bin/python -m py_compile .scratch/unified-remix-canvas-generation/acceptance/trusted_evidence/e2_policy.py` 与 `git diff --check` 均为 exit 0。
+
+### 实现与覆盖
+
+- `e2_policy.py` 新增严格不可变 codec：`SourceDirtyAllowanceV1`、`ExpectedTaskOutputV1`、`StagedCandidateIdentityV1`、`TaskOutputTransitionV1`、`AllowedTaskOutputsV1`、`RegistrationPreStatePathV1`、`TrustedRegistrationPreStateV1`、`StagingCandidateProvenanceV1`、`StagedCandidateSetV1`、`QuarantineObjectIdentityV1` 与 `QuarantineObjectSetV1`。
+- 所有 root schema decode 都拒绝未知、缺失、重复、非 NFC、非 canonical JSON 与自摘要篡改；自摘要均按去除 `canonicalDigest` 的 canonical JSON 仅计算一次。`AllowedTaskOutputsV1` 强制 64 KiB 上限、Task28/29 phase 对应关系、七 ref 闭包、排序唯一性与 new/idempotent CAS transition 一一对应。
+- Task28 只接受 catalog/audit/七个 evidence-CAS 的精确 transition；Task29 只接受 contract transition。source dirty 只可为原样的 unstaged added/modified/untracked；不存在 index/staged/rename 的可接受编码状态。
+- pre-state、staging provenance 和 quarantine 记录逐字段绑定 Git base/ref、角色/分类、device/inode、type、owner/mode/link count、length、digest/ref；quarantine 恰为 output plan、expected audit、七 candidate 的 regular file 闭包。
+- 新增的显式 `VisibleAuthorizationWriteRecorder` 在所有拒绝分支断言 `visible_authorization_writes == 0`；它观察实际 codec 调用结果，不以 mock 行为替代 codec 验证。
+
+### 范围
+
+- 此切片仅提供 portable codec；不包含 transaction、broker、真实文件 descriptor 读取、repository mutation 或 recovery 执行路径。Task 2 仍为 PARTIAL，D/E/F 的其余范围继续未完成。
+
 ## B.2 — handoff consumer lifecycle and cleanup
 
 ### RED / GREEN
