@@ -283,6 +283,11 @@ class _SelfDigestRecord:
     def canonical_bytes(self) -> bytes:
         return canonical_json_bytes(self.to_wire())
 
+    @property
+    def full_bytes_digest(self) -> str:
+        """Content-addressed digest of the complete canonical wire object."""
+        return "sha256:" + hashlib.sha256(self.canonical_bytes).hexdigest()
+
 
 @dataclass(frozen=True, slots=True)
 class SourceDirtyAllowanceV1:
@@ -2016,6 +2021,32 @@ class RegistrationBrokerAuthGovernanceV1:
         return cls(cls._TOKEN, registry, revocations, values, "sha256:" + hashlib.sha256(allowed_signers_bytes).hexdigest())
 
 
+@dataclass(frozen=True, slots=True)
+class BrokerAuthSequenceReplayBaselineV1:
+    """The fixed governance fact from which a broker journal is replayed."""
+
+    root_identity_digest: str
+    registry: RegistrationBrokerAuthRegistryV1
+    revocations: RegistrationBrokerAuthRevocationsV1
+    policy_digest: str
+    allowed_signers_digest: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.registry) is not RegistrationBrokerAuthRegistryV1
+            or type(self.revocations) is not RegistrationBrokerAuthRevocationsV1
+        ):
+            raise ValueError("broker replay baseline governance is invalid")
+        for value, field in (
+            (self.root_identity_digest, "root_identity_digest"),
+            (self.policy_digest, "policy_digest"),
+            (self.allowed_signers_digest, "allowed_signers_digest"),
+        ):
+            _require_digest(value, field)
+        if self.policy_digest != _broker_auth_policy_digest(self.registry, self.revocations):
+            raise ValueError("broker replay baseline policy is not derived from governance")
+
+
 def _verify_broker_signed_record(
     registry: RegistrationBrokerAuthRegistryV1,
     revocations: RegistrationBrokerAuthRevocationsV1,
@@ -2438,49 +2469,179 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
             raise ValueError("broker auth sequence journal digest is invalid")
         return item
 
-    def validate_state(self, state: BrokerAuthSequenceStateV1, payloads: Mapping[str, BrokerAuthSequenceEventPayloadV1]) -> None:
-        if type(state) is not BrokerAuthSequenceStateV1 or state.root_identity_digest != self.root_identity_digest or state.current_sequence != len(self.entries):
-            raise ValueError("broker auth state does not close journal")
-        prior_policy: str | None = None
-        prior_registry: str | None = None
-        prior_revocations: str | None = None
+    def validate_state(
+        self,
+        state: BrokerAuthSequenceStateV1,
+        payloads: Mapping[str, BrokerAuthSequenceEventPayloadV1],
+        baseline: BrokerAuthSequenceReplayBaselineV1,
+    ) -> None:
+        """Replay every event from one explicit, immutable governance baseline."""
+        if (
+            type(state) is not BrokerAuthSequenceStateV1
+            or type(baseline) is not BrokerAuthSequenceReplayBaselineV1
+            or state.root_identity_digest != self.root_identity_digest
+            or self.root_identity_digest != baseline.root_identity_digest
+            or state.current_sequence != len(self.entries)
+            or not isinstance(payloads, Mapping)
+        ):
+            raise ValueError("broker auth state does not close journal baseline")
+        for payload_ref, payload in payloads.items():
+            if (
+                not isinstance(payload_ref, str)
+                or type(payload) not in {
+                    BrokerAuthLeaseIssueEventPayloadV1,
+                    BrokerAuthEnvelopeSignEventPayloadV1,
+                    BrokerAuthRotatePolicyEventPayloadV1,
+                    BrokerAuthRevokePolicyEventPayloadV1,
+                }
+                or payload_ref != payload.full_bytes_digest
+            ):
+                raise ValueError("broker auth payload map is not content addressed")
+
+        current_registry = baseline.registry
+        current_revocations = baseline.revocations
+        current_policy = baseline.policy_digest
+        seen_event_ids: set[str] = set()
         for entry in self.entries:
             if entry.event_payload_length > _MAX_BROKER_AUTH_SEQUENCE_PAYLOAD_BYTES:
                 raise ValueError("broker auth event entry exceeds the fixed 256 KiB payload budget")
             payload = payloads.get(entry.event_payload_ref)
-            if payload is None or type(payload) not in {BrokerAuthLeaseIssueEventPayloadV1, BrokerAuthEnvelopeSignEventPayloadV1, BrokerAuthRotatePolicyEventPayloadV1, BrokerAuthRevokePolicyEventPayloadV1}:
-                raise ValueError("broker auth event payload is missing or typed incorrectly")
-            if len(payload.canonical_bytes) > _MAX_BROKER_AUTH_SEQUENCE_PAYLOAD_BYTES or (entry.event_kind, entry.event_id_digest, entry.event_payload_digest, entry.event_payload_length, entry.pre_policy_digest, entry.post_policy_digest) != (payload.event_kind, payload.event_id_digest, payload.canonical_digest, len(payload.canonical_bytes), payload.pre_policy_digest, payload.post_policy_digest):
-                raise ValueError("broker auth event entry does not close payload")
-            if prior_policy is not None and entry.pre_policy_digest != prior_policy:
+            if payload is None:
+                raise ValueError("broker auth event payload is missing")
+            payload_bytes = payload.canonical_bytes
+            payload_type = type(payload)
+            if payload_type.from_canonical_bytes(payload_bytes) != payload:
+                raise ValueError("broker auth event payload is not canonical")
+            full_bytes_digest = payload.full_bytes_digest
+            if (
+                entry.event_payload_ref != full_bytes_digest
+                or entry.event_payload_digest != full_bytes_digest
+                or entry.event_payload_length != len(payload_bytes)
+                or len(payload_bytes) > _MAX_BROKER_AUTH_SEQUENCE_PAYLOAD_BYTES
+                or (
+                    entry.event_kind,
+                    entry.event_id_digest,
+                    entry.pre_policy_digest,
+                    entry.post_policy_digest,
+                )
+                != (
+                    payload.event_kind,
+                    payload.event_id_digest,
+                    payload.pre_policy_digest,
+                    payload.post_policy_digest,
+                )
+            ):
+                raise ValueError("broker auth event entry does not close payload bytes")
+            if entry.event_id_digest in seen_event_ids:
+                raise ValueError("broker auth event ID is duplicated")
+            seen_event_ids.add(entry.event_id_digest)
+            if entry.pre_policy_digest != current_policy:
                 raise ValueError("broker auth policy chain is broken")
+
             if isinstance(payload, BrokerAuthLeaseIssueEventPayloadV1):
-                if payload.issued_sequence != entry.sequence or entry.broker_auth_key_id != payload.broker_auth_key_id:
-                    raise ValueError("broker auth issue sequence is invalid")
-                registry, revocations = payload.lease_request.expected_registry_digest, payload.lease_request.expected_revocation_digest
-                if payload.pre_policy_digest != payload.lease_request.expected_policy_digest:
-                    raise ValueError("broker auth issue policy is not bound to request")
+                expected_head = entry.previous_entry_digest or baseline.root_identity_digest
+                active_key = current_registry.key(current_registry.active_key_id)
+                if (
+                    payload.issued_sequence != entry.sequence
+                    or entry.broker_auth_key_id != active_key.key_id
+                    or payload.broker_auth_key_id != active_key.key_id
+                    or current_revocations.revoked_at(active_key.key_id) is not None
+                    or (
+                        payload.lease_request.expected_current_sequence,
+                        payload.lease_request.expected_current_head_digest,
+                        payload.lease_request.expected_registry_digest,
+                        payload.lease_request.expected_revocation_digest,
+                        payload.lease_request.expected_policy_digest,
+                        payload.lease_request.expected_allowed_signers_digest,
+                    )
+                    != (
+                        entry.sequence - 1,
+                        expected_head,
+                        current_registry.canonical_digest,
+                        current_revocations.canonical_digest,
+                        current_policy,
+                        baseline.allowed_signers_digest,
+                    )
+                    or payload.post_policy_digest != current_policy
+                ):
+                    raise ValueError("broker auth issue does not preserve replay pre-state")
+                next_registry, next_revocations, next_policy = current_registry, current_revocations, current_policy
             elif isinstance(payload, BrokerAuthEnvelopeSignEventPayloadV1):
-                if payload.sign_sequence != entry.sequence or entry.broker_auth_key_id != payload.broker_auth_key_id:
-                    raise ValueError("broker auth signing sequence is invalid")
-                registry, revocations = prior_registry, prior_revocations
+                signer_key = current_registry.key(payload.broker_auth_key_id)
+                if (
+                    payload.sign_sequence != entry.sequence
+                    or entry.broker_auth_key_id != payload.broker_auth_key_id
+                    or signer_key.state not in {"active", "retiring"}
+                    or current_revocations.revoked_at(signer_key.key_id) is not None
+                    or payload.post_policy_digest != current_policy
+                ):
+                    raise ValueError("broker auth signing does not preserve replay pre-state")
+                next_registry, next_revocations, next_policy = current_registry, current_revocations, current_policy
             elif isinstance(payload, BrokerAuthRotatePolicyEventPayloadV1):
-                if payload.effective_lease_sequence != entry.sequence:
-                    raise ValueError("broker auth rotate sequence is invalid")
-                registry, revocations = payload.next_registry.canonical_digest, payload.next_revocations.canonical_digest
-                if payload.post_policy_digest != _broker_auth_policy_digest(payload.next_registry, payload.next_revocations):
-                    raise ValueError("broker auth rotate policy is not derived from governance")
+                prior_active = current_registry.key(current_registry.active_key_id)
+                try:
+                    next_retiring = payload.next_registry.key(current_registry.active_key_id)
+                except ValueError as error:
+                    raise ValueError("broker auth rotation removed the prior active key") from error
+                if (
+                    payload.effective_lease_sequence != entry.sequence
+                    or payload.previous_registry_digest != current_registry.canonical_digest
+                    or payload.previous_revocations_digest != current_revocations.canonical_digest
+                    or payload.next_registry.generation != current_registry.generation + 1
+                    or payload.retiring_key_id != current_registry.active_key_id
+                    or next_retiring.state != "retiring"
+                    or next_retiring.effective_lease_sequence != prior_active.effective_lease_sequence
+                    or next_retiring.retire_after_lease_sequence != entry.sequence
+                    or tuple(payload.next_revocations.entries) != tuple(current_revocations.entries)
+                    or payload.next_revocations.registry_digest != payload.next_registry.canonical_digest
+                    or payload.post_policy_digest != _broker_auth_policy_digest(payload.next_registry, payload.next_revocations)
+                ):
+                    raise ValueError("broker auth rotation does not preserve replay pre-state")
+                next_registry, next_revocations, next_policy = payload.next_registry, payload.next_revocations, payload.post_policy_digest
             else:
-                if payload.revoked_at_broker_sequence != entry.sequence:
-                    raise ValueError("broker auth revoke sequence is invalid")
-                registry, revocations = payload.unchanged_registry_digest, payload.next_revocations.canonical_digest
-                if payload.post_policy_digest != _broker_auth_policy_digest_from_digests(registry, revocations):
-                    raise ValueError("broker auth revoke policy is not derived from governance")
-            if (entry.post_broker_auth_registry_digest, entry.post_broker_auth_revocation_digest) != (registry, revocations):
+                previous_entries = {item.key_id: item for item in current_revocations.entries}
+                next_entries = {item.key_id: item for item in payload.next_revocations.entries}
+                if (
+                    payload.revoked_at_broker_sequence != entry.sequence
+                    or payload.unchanged_registry_digest != current_registry.canonical_digest
+                    or payload.previous_revocations_digest != current_revocations.canonical_digest
+                    or payload.next_revocations.registry_digest != current_registry.canonical_digest
+                    or payload.revoked_key_id not in {item.key_id for item in current_registry.keys}
+                    or payload.revoked_key_id in previous_entries
+                    or next_entries.get(payload.revoked_key_id) is None
+                    or next_entries[payload.revoked_key_id].revoked_at_broker_sequence != entry.sequence
+                    or {key: value for key, value in next_entries.items() if key != payload.revoked_key_id} != previous_entries
+                    or payload.post_policy_digest != _broker_auth_policy_digest(current_registry, payload.next_revocations)
+                ):
+                    raise ValueError("broker auth revocation does not preserve replay pre-state")
+                next_registry, next_revocations, next_policy = current_registry, payload.next_revocations, payload.post_policy_digest
+            if (
+                entry.post_broker_auth_registry_digest,
+                entry.post_broker_auth_revocation_digest,
+                entry.post_policy_digest,
+            ) != (
+                next_registry.canonical_digest,
+                next_revocations.canonical_digest,
+                next_policy,
+            ):
                 raise ValueError("broker auth post-policy state is invalid")
-            prior_policy, prior_registry, prior_revocations = entry.post_policy_digest, registry, revocations
+            current_registry, current_revocations, current_policy = next_registry, next_revocations, next_policy
         head = self.entries[-1]
-        if (state.head_entry_digest, state.head_event_payload_ref, state.head_event_payload_digest, state.current_policy_digest, state.broker_auth_registry_digest, state.broker_auth_revocation_digest) != (head.canonical_digest, head.event_payload_ref, head.event_payload_digest, head.post_policy_digest, head.post_broker_auth_registry_digest, head.post_broker_auth_revocation_digest):
+        if (
+            state.head_entry_digest,
+            state.head_event_payload_ref,
+            state.head_event_payload_digest,
+            state.current_policy_digest,
+            state.broker_auth_registry_digest,
+            state.broker_auth_revocation_digest,
+        ) != (
+            head.canonical_digest,
+            head.event_payload_ref,
+            head.event_payload_digest,
+            current_policy,
+            current_registry.canonical_digest,
+            current_revocations.canonical_digest,
+        ):
             raise ValueError("broker auth state head is invalid")
 
 
@@ -3286,7 +3447,7 @@ class BrokerAuthAuthoritativeIssuerV1:
     __slots__ = (
         "_registry", "_revocations", "_state", "_entries", "_payloads", "_journal",
         "_root_identity_digest", "_allowed_signers_digest", "_signer", "_allowed_signers",
-        "_governance", "_state_mac", "_frozen_profile_ttl_sequences", "_event_ids",
+        "_governance", "_baseline", "_state_mac", "_frozen_profile_ttl_sequences", "_event_ids",
     )
 
     def __init__(
@@ -3304,6 +3465,10 @@ class BrokerAuthAuthoritativeIssuerV1:
         self._journal: BrokerAuthSequenceJournalV1 | None = None
         self._root_identity_digest, self._allowed_signers_digest = root_identity_digest, governance.allowed_signers_digest
         self._signer, self._allowed_signers, self._state_mac = signer, dict(governance.allowed_signers), state_mac
+        self._baseline = BrokerAuthSequenceReplayBaselineV1(
+            root_identity_digest, governance.registry, governance.revocations,
+            state.current_policy_digest, governance.allowed_signers_digest,
+        )
         self._frozen_profile_ttl_sequences, self._event_ids = _u64(frozen_profile_ttl_sequences, "frozen_profile_ttl_sequences", positive=True), set()
 
     @classmethod
@@ -3358,13 +3523,29 @@ class BrokerAuthAuthoritativeIssuerV1:
     def replace_signer(self, signer: RegistrationBrokerAuthPrivateKeySlotV1, governance: RegistrationBrokerAuthGovernanceV1) -> None:
         if type(signer) is not RegistrationBrokerAuthPrivateKeySlotV1 or type(governance) is not RegistrationBrokerAuthGovernanceV1:
             raise ValueError("broker signer is invalid")
-        previous_signer, previous_allowed, previous_digest, previous_governance = self._signer, self._allowed_signers, self._allowed_signers_digest, self._governance
-        self._signer, self._allowed_signers, self._allowed_signers_digest, self._governance = signer, dict(governance.allowed_signers), governance.allowed_signers_digest, governance
-        try:
-            self._require_active_signer()
-        except Exception:
-            self._signer, self._allowed_signers, self._allowed_signers_digest, self._governance = previous_signer, previous_allowed, previous_digest, previous_governance
-            raise
+        if (
+            governance.registry.canonical_digest != self._registry.canonical_digest
+            or governance.revocations.canonical_digest != self._revocations.canonical_digest
+            or governance.revocations.registry_digest != self._registry.canonical_digest
+            or self._state.current_policy_digest != _broker_auth_policy_digest(governance.registry, governance.revocations)
+        ):
+            raise ValueError("broker signer governance does not match authoritative state")
+        key = governance.registry.key(governance.registry.active_key_id)
+        public = governance.allowed_signers.get(key.key_id)
+        if (
+            key.state != "active"
+            or governance.revocations.revoked_at(key.key_id) is not None
+            or not isinstance(public, bytes)
+            or len(public) != 32
+            or (signer.key_id, signer.purpose, signer.lease_signature_domain, signer.public_key_digest)
+            != (key.key_id, _BROKER_AUTH_PURPOSE, key.lease_signature_domain, key.public_key_digest)
+            or "sha256:" + hashlib.sha256(public).hexdigest() != key.public_key_digest
+        ):
+            raise ValueError("broker signer does not match current governance")
+        self._signer = signer
+        self._allowed_signers = dict(governance.allowed_signers)
+        self._allowed_signers_digest = governance.allowed_signers_digest
+        self._governance = governance
 
     def _require_active_signer(self) -> RegistrationBrokerAuthKeyRegistrationV1:
         key = self._registry.key(self._registry.active_key_id)
@@ -3418,7 +3599,7 @@ class BrokerAuthAuthoritativeIssuerV1:
         provisional_entry = BrokerAuthSequenceJournalEntryV1(
             "trusted-registration-broker-auth-sequence-entry/v1", sequence,
             self._state.head_entry_digest, payload.event_id_digest, payload.event_kind,
-            payload.canonical_digest, len(payload.canonical_bytes), payload.canonical_digest,
+            payload.full_bytes_digest, len(payload.canonical_bytes), payload.full_bytes_digest,
             payload.pre_policy_digest, payload.post_policy_digest, next_registry.canonical_digest,
             next_revocations.canonical_digest, signer_key.key_id, "0" * 64,
         )
@@ -3428,7 +3609,7 @@ class BrokerAuthAuthoritativeIssuerV1:
         )
         provisional_state = BrokerAuthSequenceStateV1(
             "trusted-registration-broker-auth-sequence-state/v1", self._root_identity_digest,
-            sequence, entry.canonical_digest, payload.canonical_digest, payload.canonical_digest,
+            sequence, entry.canonical_digest, payload.full_bytes_digest, payload.full_bytes_digest,
             payload.post_policy_digest, next_registry.canonical_digest, next_revocations.canonical_digest,
             "0" * 64,
         )
@@ -3445,8 +3626,8 @@ class BrokerAuthAuthoritativeIssuerV1:
             provisional_journal,
             broker_state_mac_hex=self._state_mac.mac(canonical_json_bytes(provisional_journal._unsigned_wire())),
         )
-        payloads = MappingProxyType({**self._payloads, payload.canonical_digest: payload})
-        journal.validate_state(state, payloads)
+        payloads = MappingProxyType({**self._payloads, payload.full_bytes_digest: payload})
+        journal.validate_state(state, payloads, self._baseline)
         return BrokerAuthStateTransitionResultV1(payload, entry, state, journal, payloads)
 
     def _commit(
@@ -4001,6 +4182,7 @@ def verify_registration_forward_only_recovery(
     journal: BrokerAuthSequenceJournalV1,
     state: BrokerAuthSequenceStateV1,
     payloads: Mapping[str, BrokerAuthSequenceEventPayloadV1],
+    baseline: BrokerAuthSequenceReplayBaselineV1,
     *,
     registry: RegistrationBrokerAuthRegistryV1,
     revocations: RegistrationBrokerAuthRevocationsV1,
@@ -4039,7 +4221,7 @@ def verify_registration_forward_only_recovery(
         authority.catalog_parent_identity_digest, authority.registration_journal_identity_digest,
     ):
         raise ValueError("forward-only recovery identities changed")
-    journal.validate_state(state, payloads)
+    journal.validate_state(state, payloads, baseline)
     if state.current_sequence < authority.rename_sequence or state.broker_auth_registry_digest != registry.canonical_digest or state.broker_auth_revocation_digest != revocations.canonical_digest or revocations.registry_digest != registry.canonical_digest:
         raise ValueError("forward-only broker state is not current")
     bound_key = registry.key(authority.broker_auth_key_id)

@@ -51,6 +51,7 @@ from trusted_evidence.e2_policy import (
     BrokerAuthAuthoritativeIssuerV1,
     BrokerAuthSequenceJournalEntryV1,
     BrokerAuthSequenceJournalV1,
+    BrokerAuthSequenceReplayBaselineV1,
     BrokerAuthSequenceStateV1,
     RegistrationBrokerAuthKeyRegistrationV1,
     RegistrationBrokerAuthRegistryV1,
@@ -120,6 +121,7 @@ def _broker_governance(key_id: str, public: bytes):
     revocations = RegistrationBrokerAuthRevocationsV1(
         "trusted-registration-broker-auth-revocations/v1", registry.canonical_digest, ()
     )
+    policy_digest = _broker_policy_digest(registry, revocations)
     return (
         RegistrationBrokerAuthGovernanceV1.from_canonical_bytes(
             registry.canonical_bytes, revocations.canonical_bytes, allowed_bytes,
@@ -144,6 +146,50 @@ def _broker_policy_digest(registry, revocations):
         "revocationsDigest": revocations.canonical_digest,
         "schema": "trusted-registration-broker-auth-policy-state/v1",
     })
+
+
+def test_authoritative_issuer_rejects_cross_generation_signer_replacement(tmp_path):
+    """A signer replacement must close over the issuer's exact governance generation."""
+    seed = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+    public = bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+    governance, key = _broker_governance("broker-fixed", public)
+    allowed = {"keys": [{
+        "keyId": "broker-fixed", "purpose": "registration-broker-auth",
+        "rawPublicKey": base64.b64encode(public).decode("ascii"),
+        "resolvedPublicKey": base64.b64encode(public).decode("ascii"),
+        "signatureDomain": "ai-video-reverse-engineer/registration-broker-envelope/v1",
+        "wrapperIdentity": "test-broker-wrapper-v1",
+    }]}
+    next_registry = RegistrationBrokerAuthRegistryV1(
+        "trusted-registration-broker-auth-registry/v1", 2,
+        governance.registry.canonical_digest, "broker-fixed", (key,),
+    )
+    next_revocations = RegistrationBrokerAuthRevocationsV1(
+        "trusted-registration-broker-auth-revocations/v1", next_registry.canonical_digest, (),
+    )
+    cross_generation = RegistrationBrokerAuthGovernanceV1.from_canonical_bytes(
+        next_registry.canonical_bytes, next_revocations.canonical_bytes, canonical_json_bytes(allowed),
+    )
+    key_path = tmp_path / "broker-key"
+    key_path.write_bytes(seed)
+    descriptor = os.open(key_path, os.O_RDONLY)
+    try:
+        signer = RegistrationBrokerAuthPrivateKeySlotV1.load_from_readonly_fd(descriptor, key, public)
+    finally:
+        os.close(descriptor)
+    state_mac = _state_mac_capability(tmp_path, b"state-mac-key-is-independent-32!!!"[:32])
+    try:
+        issuer = BrokerAuthAuthoritativeIssuerV1.create(
+            governance, DIGEST_A, _broker_policy_digest(governance.registry, governance.revocations),
+            signer, state_mac, 2,
+        )
+        before = (issuer.state, issuer.registry, issuer.revocations)
+        with pytest.raises(ValueError, match="governance"):
+            issuer.replace_signer(signer, cross_generation)
+        assert (issuer.state, issuer.registry, issuer.revocations) == before
+    finally:
+        state_mac.close()
+        signer.close()
 
 
 def _binding(**overrides):
@@ -1009,6 +1055,7 @@ def test_broker_auth_issue_chain_is_prestate_only_and_contiguous_without_writes(
     revocations = RegistrationBrokerAuthRevocationsV1(
         "trusted-registration-broker-auth-revocations/v1", registry.canonical_digest, ()
     )
+    policy_digest = _broker_policy_digest(registry, revocations)
     family = RegistrationWorkerSessionFamilyAuthorizationV1(
         "trusted-registration-worker-session-family-authorization/v1", "op-1", DIGEST_A,
         DIGEST_B, DIGEST_C, DIGEST_A, DIGEST_B, "broker-fixed", key.canonical_digest,
@@ -1018,15 +1065,15 @@ def test_broker_auth_issue_chain_is_prestate_only_and_contiguous_without_writes(
     request = BrokerAuthLeaseIssueRequestV1(
         "trusted-registration-broker-auth-lease-issue-request/v1", "op-1", "lifecycle-1",
         family.canonical_digest, "broker-fixed", 0, DIGEST_A, registry.canonical_digest,
-        revocations.canonical_digest, DIGEST_B, DIGEST_C, 2,
+        revocations.canonical_digest, policy_digest, DIGEST_C, 2,
     )
     payload = BrokerAuthLeaseIssueEventPayloadV1(
         "trusted-registration-broker-auth-lease-issue-payload/v1", "issue-lease", DIGEST_A,
-        request, request.request_digest, "op-1", "broker-fixed", 1, 2, 3, DIGEST_B, DIGEST_B,
+        request, request.request_digest, "op-1", "broker-fixed", 1, 2, 3, policy_digest, policy_digest,
     )
     entry = BrokerAuthSequenceJournalEntryV1(
         "trusted-registration-broker-auth-sequence-entry/v1", 1, None, DIGEST_A, "issue-lease",
-        DIGEST_C, len(payload.canonical_bytes), payload.canonical_digest, DIGEST_B, DIGEST_B,
+        payload.full_bytes_digest, len(payload.canonical_bytes), payload.full_bytes_digest, policy_digest, policy_digest,
         registry.canonical_digest, revocations.canonical_digest, "broker-fixed", "a" * 64,
     )
     journal = BrokerAuthSequenceJournalV1(
@@ -1034,7 +1081,7 @@ def test_broker_auth_issue_chain_is_prestate_only_and_contiguous_without_writes(
     )
     state = BrokerAuthSequenceStateV1(
         "trusted-registration-broker-auth-sequence-state/v1", DIGEST_A, 1, entry.canonical_digest,
-        DIGEST_C, payload.canonical_digest, DIGEST_B, registry.canonical_digest,
+        payload.full_bytes_digest, payload.full_bytes_digest, policy_digest, registry.canonical_digest,
         revocations.canonical_digest, "c" * 64,
     )
     mac_key = b"0123456789abcdef0123456789abcdef"
@@ -1045,7 +1092,10 @@ def test_broker_auth_issue_chain_is_prestate_only_and_contiguous_without_writes(
     authenticated_entry.verify_state_mac(mac_key)
     with pytest.raises(ValueError):
         replace(authenticated_entry, broker_state_mac_hex="0" * 64).verify_state_mac(mac_key)
-    journal.validate_state(state, {DIGEST_C: payload})
+    journal.validate_state(
+        state, {payload.full_bytes_digest: payload},
+        BrokerAuthSequenceReplayBaselineV1(DIGEST_A, registry, revocations, policy_digest, DIGEST_C),
+    )
     # These records cross the broker boundary as canonical bytes.  Removing a
     # strict decoder would make a tampered chain look like an in-memory value.
     for record_type, record in (
@@ -1066,13 +1116,13 @@ def test_broker_auth_issue_chain_is_prestate_only_and_contiguous_without_writes(
     recorder.assert_rejected(lambda: BrokerAuthLeaseIssueRequestV1(
         "trusted-registration-broker-auth-lease-issue-request/v1", "op-1", "lifecycle-1",
         family.canonical_digest, "broker-fixed", 1, entry.canonical_digest, registry.canonical_digest,
-        revocations.canonical_digest, DIGEST_B, DIGEST_C, 0,
+        revocations.canonical_digest, policy_digest, DIGEST_C, 0,
     ))
     recorder.assert_rejected(lambda: BrokerAuthSequenceJournalV1(
         "trusted-registration-broker-auth-sequence-journal/v1", DIGEST_A, 1,
         (BrokerAuthSequenceJournalEntryV1(
             "trusted-registration-broker-auth-sequence-entry/v1", 2, None, DIGEST_A, "issue-lease",
-            DIGEST_C, len(payload.canonical_bytes), payload.canonical_digest, DIGEST_B, DIGEST_B,
+            payload.full_bytes_digest, len(payload.canonical_bytes), payload.full_bytes_digest, policy_digest, policy_digest,
             registry.canonical_digest, revocations.canonical_digest, "broker-fixed", "a" * 64,
         ),), "b" * 64,
     ))
@@ -1243,13 +1293,16 @@ def test_authoritative_broker_issuer_commits_a_verified_issue_chain_and_preserve
         assert issued.payload.event_id_digest == "sha256:" + hashlib.sha256(
             b"ai-video-reverse-engineer/registration-broker-lease-issue-event/v1\0" + request.request_digest.encode("ascii")
         ).hexdigest()
-        assert issued.entry.event_payload_ref == issued.payload.canonical_digest
+        assert issued.entry.event_payload_ref == "sha256:" + hashlib.sha256(issued.payload.canonical_bytes).hexdigest()
         issued.entry.verify_state_mac(b"state-mac-key-is-independent-32!!!"[:32])
         issued.state.verify_state_mac(b"state-mac-key-is-independent-32!!!"[:32])
         issued.journal.verify_state_mac(b"state-mac-key-is-independent-32!!!"[:32])
         with pytest.raises(ValueError):
             issued.entry.verify_state_mac(seed)
-        issued.journal.validate_state(issued.state, issued.payloads)
+        issued.journal.validate_state(
+            issued.state, issued.payloads,
+            BrokerAuthSequenceReplayBaselineV1(DIGEST_A, registry, revocations, policy_digest, governance.allowed_signers_digest),
+        )
         issued.lease.verify_signature(governance, 1)
         assert issued.lease.broker_auth_lease_request_digest == request.request_digest
         assert issued.lease.lease_identity_digest == issued.lease.identity_preimage().lease_identity_digest
@@ -1258,7 +1311,10 @@ def test_authoritative_broker_issuer_commits_a_verified_issue_chain_and_preserve
             "op-issuer", issued.lease.lease_identity_digest, request.request_digest, DIGEST_B, DIGEST_C
         )
         assert signed.entry.sequence == signed.payload.sign_sequence == signed.state.current_sequence == 2
-        signed.journal.validate_state(signed.state, signed.payloads)
+        signed.journal.validate_state(
+            signed.state, signed.payloads,
+            BrokerAuthSequenceReplayBaselineV1(DIGEST_A, registry, revocations, policy_digest, governance.allowed_signers_digest),
+        )
 
         stable = issuer.state
         with pytest.raises(ValueError):
@@ -1333,6 +1389,50 @@ def test_authoritative_broker_issuer_rotates_and_revokes_without_partial_state(t
         next_governance_value, new_key, next_registry, next_revocations = next_governance()
         before = issuer.state
         next_policy_digest = _broker_policy_digest(next_registry, next_revocations)
+        bad_registry = replace(next_registry, previous_registry_digest=DIGEST_C)
+        bad_revocations = RegistrationBrokerAuthRevocationsV1(
+            "trusted-registration-broker-auth-revocations/v1", bad_registry.canonical_digest, (),
+        )
+        bad_payload = BrokerAuthRotatePolicyEventPayloadV1(
+            "trusted-registration-broker-auth-rotate-payload/v1", "rotate-registry", DIGEST_C,
+            DIGEST_C, revocations.canonical_digest, bad_registry, bad_revocations, "new", "old", 2,
+            issuer.state.current_policy_digest, _broker_policy_digest(bad_registry, bad_revocations),
+        )
+        bad_entry = BrokerAuthSequenceJournalEntryV1(
+            "trusted-registration-broker-auth-sequence-entry/v1", 2, issued.entry.canonical_digest,
+            bad_payload.event_id_digest, bad_payload.event_kind, bad_payload.full_bytes_digest,
+            len(bad_payload.canonical_bytes), bad_payload.full_bytes_digest,
+            bad_payload.pre_policy_digest, bad_payload.post_policy_digest,
+            bad_registry.canonical_digest, bad_revocations.canonical_digest, "old", "0" * 64,
+        )
+        bad_entry = replace(
+            bad_entry,
+            broker_state_mac_hex=state_mac.mac(canonical_json_bytes(bad_entry._unsigned_wire())),
+        )
+        bad_state = BrokerAuthSequenceStateV1(
+            "trusted-registration-broker-auth-sequence-state/v1", DIGEST_A, 2,
+            bad_entry.canonical_digest, bad_payload.full_bytes_digest, bad_payload.full_bytes_digest,
+            bad_payload.post_policy_digest, bad_registry.canonical_digest,
+            bad_revocations.canonical_digest, "0" * 64,
+        )
+        bad_state = replace(
+            bad_state,
+            broker_state_mac_hex=state_mac.mac(canonical_json_bytes(bad_state._unsigned_wire())),
+        )
+        bad_journal = BrokerAuthSequenceJournalV1(
+            "trusted-registration-broker-auth-sequence-journal/v1", DIGEST_A, 1,
+            (issued.entry, bad_entry), "0" * 64,
+        )
+        bad_journal = replace(
+            bad_journal,
+            broker_state_mac_hex=state_mac.mac(canonical_json_bytes(bad_journal._unsigned_wire())),
+        )
+        with pytest.raises(ValueError, match="rotation"):
+            bad_journal.validate_state(
+                bad_state,
+                {issued.payload.full_bytes_digest: issued.payload, bad_payload.full_bytes_digest: bad_payload},
+                BrokerAuthSequenceReplayBaselineV1(DIGEST_A, registry, revocations, policy_digest, governance.allowed_signers_digest),
+            )
         with pytest.raises(ValueError):
             issuer.rotate_registry(next_registry, revocations, DIGEST_A, DIGEST_C)
         assert issuer.state == before and issuer.entries == (issued.entry,)
@@ -2138,19 +2238,20 @@ def test_e3_forward_only_recovery_authenticates_every_broker_state_record_before
     revocations = RegistrationBrokerAuthRevocationsV1(
         "trusted-registration-broker-auth-revocations/v1", registry.canonical_digest, ()
     )
+    policy_digest = _broker_policy_digest(registry, revocations)
     request = BrokerAuthLeaseIssueRequestV1(
         "trusted-registration-broker-auth-lease-issue-request/v1", "other-operation", "life",
         DIGEST_A, "broker-fixed", 0, DIGEST_A, registry.canonical_digest,
-        revocations.canonical_digest, DIGEST_B, DIGEST_C, 2,
+        revocations.canonical_digest, policy_digest, DIGEST_C, 2,
     )
     payload = BrokerAuthLeaseIssueEventPayloadV1(
         "trusted-registration-broker-auth-lease-issue-payload/v1", "issue-lease", DIGEST_A,
         request, request.request_digest, "other-operation", "broker-fixed", 1, 2, 3,
-        DIGEST_B, DIGEST_B,
+        policy_digest, policy_digest,
     )
     entry = BrokerAuthSequenceJournalEntryV1(
         "trusted-registration-broker-auth-sequence-entry/v1", 1, None, DIGEST_A, "issue-lease",
-        DIGEST_C, len(payload.canonical_bytes), payload.canonical_digest, DIGEST_B, DIGEST_B,
+        payload.full_bytes_digest, len(payload.canonical_bytes), payload.full_bytes_digest, policy_digest, policy_digest,
         registry.canonical_digest, revocations.canonical_digest, "broker-fixed", "a" * 64,
     )
     journal = BrokerAuthSequenceJournalV1(
@@ -2158,7 +2259,7 @@ def test_e3_forward_only_recovery_authenticates_every_broker_state_record_before
     )
     state = BrokerAuthSequenceStateV1(
         "trusted-registration-broker-auth-sequence-state/v1", DIGEST_A, 1, entry.canonical_digest,
-        DIGEST_C, payload.canonical_digest, DIGEST_B, registry.canonical_digest,
+        payload.full_bytes_digest, payload.full_bytes_digest, policy_digest, registry.canonical_digest,
         revocations.canonical_digest, "c" * 64,
     )
     state_mac = _state_mac_capability(tmp_path, b"e3 broker audit key is root-only!!"[:32])
@@ -2166,14 +2267,16 @@ def test_e3_forward_only_recovery_authenticates_every_broker_state_record_before
         state_mac, operation_id="operation-e2",
         lease_identity_digest=DIGEST_A, lease_request_digest=DIGEST_B,
         broker_auth_key_id="broker-fixed", broker_auth_key_registration_digest=key.canonical_digest,
-        rename_sequence=1, rename_head_digest=entry.canonical_digest, rename_policy_digest=DIGEST_B,
+        rename_sequence=1, rename_head_digest=entry.canonical_digest, rename_policy_digest=policy_digest,
         registration_transaction_intent_digest=DIGEST_C, expected_catalog_digest=DIGEST_A,
         catalog_parent_identity_digest=DIGEST_B, registration_journal_identity_digest=DIGEST_C,
     )
     def verify(candidate_authority, candidate_journal, candidate_state, candidate_state_mac=state_mac):
         verify_registration_forward_only_recovery(
             candidate_authority, candidate_state_mac, candidate_journal, candidate_state,
-            {DIGEST_C: payload}, registry=registry, revocations=revocations,
+            {payload.full_bytes_digest: payload},
+            BrokerAuthSequenceReplayBaselineV1(DIGEST_A, registry, revocations, policy_digest, DIGEST_C),
+            registry=registry, revocations=revocations,
             operation_id="operation-e2", lease_identity_digest=DIGEST_A,
             lease_request_digest=DIGEST_B,
             registration_transaction_intent_digest=DIGEST_C, catalog_digest=DIGEST_A,
@@ -2230,7 +2333,7 @@ def test_e3_forward_only_recovery_authenticates_every_broker_state_record_before
         state_mac, operation_id="operation-e2",
         lease_identity_digest=DIGEST_A, lease_request_digest=DIGEST_B,
         broker_auth_key_id="broker-fixed", broker_auth_key_registration_digest=key.canonical_digest,
-        rename_sequence=1, rename_head_digest=entry.canonical_digest, rename_policy_digest=DIGEST_B,
+        rename_sequence=1, rename_head_digest=entry.canonical_digest, rename_policy_digest=policy_digest,
         registration_transaction_intent_digest=DIGEST_C, expected_catalog_digest=DIGEST_A,
         catalog_parent_identity_digest=DIGEST_B, registration_journal_identity_digest=DIGEST_C,
     )
@@ -2240,7 +2343,8 @@ def test_e3_forward_only_recovery_authenticates_every_broker_state_record_before
 
     with pytest.raises(ValueError):
         verify_registration_forward_only_recovery(
-            authority, state_mac, authenticated_journal, authenticated_state, {DIGEST_C: payload},
+            authority, state_mac, authenticated_journal, authenticated_state, {payload.full_bytes_digest: payload},
+            BrokerAuthSequenceReplayBaselineV1(DIGEST_A, registry, revocations, policy_digest, DIGEST_C),
             registry=registry, revocations=revocations, operation_id="operation-e2",
             lease_identity_digest=DIGEST_A, lease_request_digest=DIGEST_B,
             registration_transaction_intent_digest=DIGEST_C, catalog_digest=DIGEST_A,
@@ -2249,7 +2353,8 @@ def test_e3_forward_only_recovery_authenticates_every_broker_state_record_before
         )
     with pytest.raises(ValueError):
         verify_registration_forward_only_recovery(
-            authority, state_mac, authenticated_journal, authenticated_state, {DIGEST_C: payload},
+            authority, state_mac, authenticated_journal, authenticated_state, {payload.full_bytes_digest: payload},
+            BrokerAuthSequenceReplayBaselineV1(DIGEST_A, registry, revocations, policy_digest, DIGEST_C),
             registry=registry, revocations=revocations, operation_id="operation-e2",
             lease_identity_digest=DIGEST_A, lease_request_digest=DIGEST_B,
             registration_transaction_intent_digest=DIGEST_C, catalog_digest=DIGEST_A,

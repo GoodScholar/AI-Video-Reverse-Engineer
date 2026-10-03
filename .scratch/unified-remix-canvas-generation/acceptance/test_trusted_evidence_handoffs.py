@@ -19,6 +19,7 @@ from trusted_evidence.e2_policy import (
     CapabilityEnvelopeV1, CapabilityEnvelopeUnsignedV1,
     BrokerAuthLeaseIssueEventPayloadV1, BrokerAuthLeaseIssueRequestV1,
     BrokerAuthSequenceJournalEntryV1, BrokerAuthSequenceJournalV1,
+    BrokerAuthSequenceReplayBaselineV1,
     BrokerAuthSequenceStateV1, RegistrationRecoveryLeaseV1,
     RegistrationRecoveryLeaseIdentityPreimageV1,
     RegistrationBrokerAuthKeyRegistrationV1, RegistrationBrokerAuthRegistryV1,
@@ -267,14 +268,20 @@ def test_tracked_broker_auth_issue_chain_golden_is_present_without_private_mater
     assert lease.canonical_bytes == decode("signedLeaseBytesHex")
     assert payload.lease_request == request
     assert payload.lease_request_digest == request.request_digest
-    assert entry.event_payload_ref == payload.canonical_digest
+    assert entry.event_payload_ref == payload.full_bytes_digest
     assert lease.identity_preimage() == lease_preimage
     assert lease.lease_identity_digest == lease_preimage.lease_identity_digest
     state_mac_key = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
     entry.verify_state_mac(state_mac_key)
     state.verify_state_mac(state_mac_key)
     journal.verify_state_mac(state_mac_key)
-    journal.validate_state(state, {payload.canonical_digest: payload})
+    journal.validate_state(
+        state, {payload.full_bytes_digest: payload},
+        BrokerAuthSequenceReplayBaselineV1(
+            state.root_identity_digest, registry, revocations, payload.pre_policy_digest,
+            request.expected_allowed_signers_digest,
+        ),
+    )
     # A frozen lease can outlive a governance rotation when the current
     # eligible key resolves to the same leaf.  Its old closure labels are
     # signed facts, not a requirement that current governance bytes match.
