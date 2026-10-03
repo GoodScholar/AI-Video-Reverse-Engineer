@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+import json
 from collections.abc import Mapping
 
 from .e2_policy import ProductGitObjectIdV1, canonical_json_bytes
@@ -24,6 +25,34 @@ def _require_digest(value: object, field: str) -> str:
     if not isinstance(value, str) or len(value) != 71 or not value.startswith(_DIGEST_PREFIX) or any(character not in "0123456789abcdef" for character in value[7:]):
         raise ValueError(f"{field} must be a lower-case SHA-256 digest")
     return value
+
+
+def _strict_object(payload: bytes, fields: set[str]) -> dict[str, object]:
+    """Decode one exact canonical JSON object with a closed field set."""
+    try:
+        value = json.loads(payload.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError("handoff JSON is invalid") from error
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("handoff JSON fields are invalid")
+    if canonical_json_bytes(value) != payload:
+        raise ValueError("handoff JSON is not canonical")
+    return value
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _product_oid(value: object) -> ProductGitObjectIdV1:
+    if not isinstance(value, dict) or set(value) != {"algorithm", "hex"}:
+        raise ValueError("product commit is invalid")
+    return ProductGitObjectIdV1(value["algorithm"], value["hex"])
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +100,23 @@ class TrustedHandoffRecordV1:
     def record_digest(self) -> str:
         return _digest(self.canonical_bytes)
 
+    @property
+    def binding_set_digest(self) -> str:
+        return _digest(canonical_json_bytes(self.to_wire()["bindings"]))
+
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "TrustedHandoffRecordV1":
+        raw = _strict_object(payload, {"bindings", "consumerTasks", "handoffId", "kind", "producerCommit", "producerTask", "schema"})
+        bindings = raw["bindings"]
+        if not isinstance(bindings, list) or not isinstance(raw["consumerTasks"], list):
+            raise ValueError("handoff record collections are invalid")
+        parsed_bindings: list[tuple[str, str]] = []
+        for item in bindings:
+            if not isinstance(item, dict) or set(item) != {"digest", "name"}:
+                raise ValueError("handoff binding is invalid")
+            parsed_bindings.append((item["name"], item["digest"]))
+        return cls(raw["schema"], raw["handoffId"], raw["kind"], raw["producerTask"], _product_oid(raw["producerCommit"]), tuple(raw["consumerTasks"]), tuple(parsed_bindings))
+
 
 @dataclass(frozen=True, slots=True)
 class HandoffPointerV1:
@@ -88,6 +134,18 @@ class HandoffPointerV1:
         _require_digest(self.record_digest, "record_digest")
         if self.record_ref != self.record_digest or self.producer_task != 22 or not isinstance(self.producer_commit, ProductGitObjectIdV1):
             raise ValueError("handoff pointer does not bind the product record")
+
+    def to_wire(self) -> dict[str, object]:
+        return {"handoffId": self.handoff_id, "producerCommit": self.producer_commit.to_wire(), "producerTask": self.producer_task, "recordDigest": self.record_digest, "recordRef": self.record_ref, "schema": self.schema}
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_wire())
+
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "HandoffPointerV1":
+        raw = _strict_object(payload, {"handoffId", "producerCommit", "producerTask", "recordDigest", "recordRef", "schema"})
+        return cls(raw["schema"], raw["handoffId"], raw["recordRef"], raw["recordDigest"], raw["producerTask"], _product_oid(raw["producerCommit"]))
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +173,13 @@ class HandoffExportRequestV1:
     def canonical_bytes(self) -> bytes:
         return canonical_json_bytes(self.to_wire())
 
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "HandoffExportRequestV1":
+        raw = _strict_object(payload, {"bindingSetDigest", "consumerTasks", "handoffId", "pointerBytesDigest", "recordFullBytesDigest", "recordRef", "schema"})
+        if not isinstance(raw["consumerTasks"], list):
+            raise ValueError("export request consumers are invalid")
+        return cls(raw["schema"], raw["handoffId"], raw["recordRef"], raw["recordFullBytesDigest"], raw["pointerBytesDigest"], tuple(raw["consumerTasks"]), raw["bindingSetDigest"])
+
 
 @dataclass(frozen=True, slots=True)
 class ProductRepositorySourceV1:
@@ -137,6 +202,18 @@ class ProductRepositorySourceV1:
             raise ValueError("product source subject must be a ProductGitObjectIdV1")
         for field in ("source_ref", "source_digest", "budget_digest", "boundary_digest", "tracked_checkout_digest", "control_metadata_digest", "raw_inspection_proof_ref"):
             _require_digest(getattr(self, field), field)
+
+    def to_wire(self) -> dict[str, object]:
+        return {"boundaryDigest": self.boundary_digest, "budgetDigest": self.budget_digest, "containerFormat": self.container_format, "controlMetadataDigest": self.control_metadata_digest, "objectFormat": self.object_format, "rawInspectionProofRef": self.raw_inspection_proof_ref, "sourceDigest": self.source_digest, "sourceRef": self.source_ref, "subjectCommit": self.subject_commit.to_wire(), "subjectRepository": self.subject_repository, "trackedCheckoutDigest": self.tracked_checkout_digest}
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_wire())
+
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "ProductRepositorySourceV1":
+        raw = _strict_object(payload, {"boundaryDigest", "budgetDigest", "containerFormat", "controlMetadataDigest", "objectFormat", "rawInspectionProofRef", "sourceDigest", "sourceRef", "subjectCommit", "subjectRepository", "trackedCheckoutDigest"})
+        return cls(raw["subjectRepository"], _product_oid(raw["subjectCommit"]), raw["sourceRef"], raw["sourceDigest"], raw["containerFormat"], raw["objectFormat"], raw["budgetDigest"], raw["boundaryDigest"], raw["trackedCheckoutDigest"], raw["controlMetadataDigest"], raw["rawInspectionProofRef"])
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,7 +296,131 @@ class TrustedHandoffStoreV1:
             raise ValueError("handoff blob digest mismatch")
         return payload
 
+    def read_pointer(self, handoff_id: str) -> bytes:
+        if not handoff_id or "/" in handoff_id:
+            raise ValueError("invalid handoff pointer")
+        path = self.root / "pointers" / f"{handoff_id}.json"
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("handoff pointer is missing or unsafe")
+        return path.read_bytes()
+
     def publish_pointer(self, handoff_id: str, payload: bytes) -> bool:
         if not handoff_id or "/" in handoff_id or not isinstance(payload, bytes):
             raise ValueError("invalid handoff pointer")
         return self._publish(self.root / "pointers" / f"{handoff_id}.json", payload)
+
+    def publish_export_request_ref(self, handoff_id: str, request_ref: str) -> bool:
+        if not handoff_id or "/" in handoff_id:
+            raise ValueError("invalid export request name")
+        _require_digest(request_ref, "export request ref")
+        return self._publish(self.root / "export-requests" / f"{handoff_id}.ref", (request_ref + "\n").encode("ascii"))
+
+    def read_export_request_ref(self, handoff_id: str) -> str:
+        if not handoff_id or "/" in handoff_id:
+            raise ValueError("invalid export request name")
+        path = self.root / "export-requests" / f"{handoff_id}.ref"
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("export request is missing or unsafe")
+        try:
+            return _require_digest(path.read_text(encoding="ascii").removesuffix("\n"), "export request ref")
+        except (UnicodeDecodeError, ValueError) as error:
+            raise ValueError("export request ref is invalid") from error
+
+
+@dataclass(frozen=True, slots=True)
+class HandoffRegistryV1:
+    """Consumer lifecycle over authenticated, content-addressed handoff bytes."""
+
+    store: TrustedHandoffStoreV1
+
+    def publish_local(self, record: TrustedHandoffRecordV1, pointer: HandoffPointerV1, blobs: tuple[bytes, ...] = ()) -> None:
+        if pointer.handoff_id != record.handoff_id or pointer.record_ref != record.record_digest or pointer.producer_commit != record.producer_commit:
+            raise ValueError("pointer does not bind record")
+        for blob in blobs:
+            self.store.put_blob(blob)
+        for _, ref in record.bindings:
+            self.store.read_blob(ref)
+        self.store.put_blob(record.canonical_bytes)
+        self.store.publish_pointer(record.handoff_id, pointer.canonical_bytes)
+
+    def publish_export_request(self, request: HandoffExportRequestV1) -> str:
+        record, pointer, record_bytes, pointer_bytes = self._closure(self.store, request.record_ref, request.handoff_id)
+        if request.record_full_bytes_digest != _digest(record_bytes) or request.pointer_bytes_digest != _digest(pointer_bytes):
+            raise ValueError("export request full-byte digests do not match")
+        if request.consumer_tasks != record.consumer_tasks or request.binding_set_digest != record.binding_set_digest:
+            raise ValueError("export request does not close record consumers or bindings")
+        request_ref = self.store.put_blob(request.canonical_bytes)
+        self.store.publish_export_request_ref(request.handoff_id, request_ref)
+        return request_ref
+
+    def fetch(self, source_store: TrustedHandoffStoreV1, export_request_ref: str, handoff_id: str, *, consumer_task: int) -> None:
+        request_bytes = source_store.read_blob(export_request_ref)
+        request = HandoffExportRequestV1.from_canonical_bytes(request_bytes)
+        if request.handoff_id != handoff_id or consumer_task not in request.consumer_tasks:
+            raise ValueError("export request does not authorize this consumer")
+        if source_store.read_export_request_ref(handoff_id) != export_request_ref:
+            raise ValueError("export request is not the source-store activation point")
+        record, pointer, record_bytes, pointer_bytes = self._closure(source_store, request.record_ref, handoff_id)
+        if request.record_full_bytes_digest != _digest(record_bytes) or request.pointer_bytes_digest != _digest(pointer_bytes) or request.binding_set_digest != record.binding_set_digest:
+            raise ValueError("export request closure digest mismatch")
+        refs = tuple(ref for _, ref in record.bindings)
+        if len(set(refs)) != len(refs):
+            raise ValueError("handoff closure contains duplicate blob refs")
+        for payload in (request_bytes, record_bytes, pointer_bytes, *(source_store.read_blob(ref) for ref in refs)):
+            self.store.put_blob(payload)
+        self.store.publish_pointer(handoff_id, pointer_bytes)
+        manifest = canonical_json_bytes({"consumerTask": consumer_task, "handoffId": handoff_id, "pointerBytesDigest": _digest(pointer_bytes), "recordRef": request.record_ref, "requestRef": export_request_ref, "schema": "trusted-handoff-fetch/v1"})
+        self.store._publish(self.store.root / "fetches" / f"{handoff_id}-{consumer_task}.json", manifest)
+
+    def import_(self, handoff_id: str, *, consumer_task: int) -> None:
+        manifest = self._read_fetch_manifest(handoff_id, consumer_task)
+        request = HandoffExportRequestV1.from_canonical_bytes(self.store.read_blob(manifest["requestRef"]))
+        if request.handoff_id != handoff_id or consumer_task not in request.consumer_tasks:
+            raise ValueError("fetched request is not authorized")
+        record, _, _, _ = self._closure(self.store, request.record_ref, handoff_id)
+        for _, ref in record.bindings:
+            self.store.read_blob(ref)
+        self.store._publish(self.store.root / "imports" / f"{handoff_id}-{consumer_task}.json", canonical_json_bytes({"consumerTask": consumer_task, "handoffId": handoff_id, "requestRef": manifest["requestRef"], "schema": "trusted-handoff-import/v1"}))
+
+    def finalize(self, handoff_id: str, *, expected_kind: str, expected_producer_task: int, consumer_task: int) -> None:
+        self._read_import_manifest(handoff_id, consumer_task)
+        raise ValueError("not finalized: transport seal and ready marker are required")
+
+    def read(self, handoff_id: str, *, consumer_task: int, field: str) -> str:
+        self._read_import_manifest(handoff_id, consumer_task)
+        raise ValueError("not finalized: transport seal and ready marker are required")
+
+    def read_product_subject(self, handoff_id: str, *, consumer_task: int) -> ProductGitObjectIdV1:
+        self._read_import_manifest(handoff_id, consumer_task)
+        raise ValueError("not finalized: transport seal and ready marker are required")
+
+    def _closure(self, store: TrustedHandoffStoreV1, record_ref: str, handoff_id: str) -> tuple[TrustedHandoffRecordV1, HandoffPointerV1, bytes, bytes]:
+        record_bytes = store.read_blob(record_ref)
+        record = TrustedHandoffRecordV1.from_canonical_bytes(record_bytes)
+        pointer_bytes = store.read_pointer(handoff_id)
+        pointer = HandoffPointerV1.from_canonical_bytes(pointer_bytes)
+        if record.handoff_id != handoff_id or pointer.handoff_id != handoff_id or pointer.record_ref != record_ref or pointer.record_digest != _digest(record_bytes) or pointer.producer_task != record.producer_task or pointer.producer_commit != record.producer_commit:
+            raise ValueError("record and pointer closure is mixed")
+        return record, pointer, record_bytes, pointer_bytes
+
+    def _read_fetch_manifest(self, handoff_id: str, consumer_task: int) -> dict[str, object]:
+        path = self.store.root / "fetches" / f"{handoff_id}-{consumer_task}.json"
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("fetched handoff is missing")
+        raw = _strict_object(path.read_bytes(), {"consumerTask", "handoffId", "pointerBytesDigest", "recordRef", "requestRef", "schema"})
+        if raw["schema"] != "trusted-handoff-fetch/v1" or raw["handoffId"] != handoff_id or raw["consumerTask"] != consumer_task:
+            raise ValueError("fetched handoff identity is invalid")
+        _require_digest(raw["requestRef"], "requestRef")
+        _require_digest(raw["recordRef"], "recordRef")
+        _require_digest(raw["pointerBytesDigest"], "pointerBytesDigest")
+        return raw
+
+    def _read_import_manifest(self, handoff_id: str, consumer_task: int) -> dict[str, object]:
+        path = self.store.root / "imports" / f"{handoff_id}-{consumer_task}.json"
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("imported handoff is missing")
+        raw = _strict_object(path.read_bytes(), {"consumerTask", "handoffId", "requestRef", "schema"})
+        if raw["schema"] != "trusted-handoff-import/v1" or raw["handoffId"] != handoff_id or raw["consumerTask"] != consumer_task:
+            raise ValueError("imported handoff identity is invalid")
+        _require_digest(raw["requestRef"], "requestRef")
+        return raw
