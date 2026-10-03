@@ -1108,10 +1108,10 @@ def _registration(entry: object, *, expected_purpose: str, expected_domain: str)
     )
 
 
-def _registrations(value: object, *, purpose: str, domain: str, label: str) -> tuple[SigningKeyRegistrationV1, ...]:
+def _registrations(value: object, *, purpose: str, domain: str, label: str, allow_empty: bool = False) -> tuple[SigningKeyRegistrationV1, ...]:
     registry = _registry_object(value, label)
     keys = registry["keys"]
-    if not isinstance(keys, list) or not keys:
+    if not isinstance(keys, list) or (not keys and not allow_empty):
         raise ValueError(f"{label} must contain keys")
     parsed = tuple(_registration(key, expected_purpose=purpose, expected_domain=domain) for key in keys)
     if tuple(sorted(key.key_id.encode("utf-8") for key in parsed)) != tuple(key.key_id.encode("utf-8") for key in parsed) or len({key.key_id for key in parsed}) != len(parsed):
@@ -1129,8 +1129,10 @@ class VerifiedSigningDomainsV1:
 def load_disjoint_signing_domains(transport_registry: object, activation_registry: object, broker_auth_registry: object, broker_auth_revocations: object, broker_auth_allowed_signers: object) -> VerifiedSigningDomainsV1:
     transport = _registrations(transport_registry, purpose=_TRANSPORT_PURPOSE, domain=_TRANSPORT_DOMAIN, label="transport registry")
     activation = _registrations(activation_registry, purpose=_ACTIVATION_PURPOSE, domain=_ACTIVATION_DOMAIN, label="activation registry")
-    broker = _registrations(broker_auth_registry, purpose=_BROKER_PURPOSE, domain=_BROKER_DOMAIN, label="broker-auth registry")
-    allowed = _registrations(broker_auth_allowed_signers, purpose=_BROKER_PURPOSE, domain=_BROKER_DOMAIN, label="broker-auth allowed signers")
+    # Task 2 checks in an explicit empty broker-auth production profile.  It is
+    # not a fallback: both files must be the exact canonical empty registries.
+    broker = _registrations(broker_auth_registry, purpose=_BROKER_PURPOSE, domain=_BROKER_DOMAIN, label="broker-auth registry", allow_empty=True)
+    allowed = _registrations(broker_auth_allowed_signers, purpose=_BROKER_PURPOSE, domain=_BROKER_DOMAIN, label="broker-auth allowed signers", allow_empty=True)
     if broker != allowed:
         raise ValueError("broker-auth allowed signers do not close the registry")
     if isinstance(broker_auth_revocations, bytes):

@@ -32,6 +32,23 @@ _GIT_REMOTE_SCHEMES = frozenset({"https", "ssh", "git"})
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _SUBJECT_REPOSITORY = "git://product/repository"
 
+# This is deliberately a closed list.  v1 verifier registrations remain
+# governed by _IMPLEMENTATION_TYPES and are never upgraded by this module.
+APPROVED_V2_SCHEMA_IDS = frozenset(
+    {
+        "trusted-allowed-task-outputs/v1",
+        "trusted-handoff-export-request/v1",
+        "trusted-handoff-transport-ready/v1",
+        "trusted-handoff-transport-seal/v1",
+        "trusted-handoff-transfer/v1",
+        "trusted-policy-activation-proof/v1",
+        "trusted-registration-broker-auth-registry/v1",
+        "trusted-registration-broker-auth-revocations/v1",
+        "trusted-registration-capability-envelope/v1",
+        "trusted-registration-recovery-lease-identity-preimage/v1",
+    }
+)
+
 
 class PolicyError(ValueError):
     """A fail-closed static-policy error with a stable bridge error code."""
