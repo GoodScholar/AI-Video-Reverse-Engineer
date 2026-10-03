@@ -1460,6 +1460,15 @@ class RegistrationWorkerSessionFamilyAuthorizationV1(_SelfDigestRecord):
     def _unsigned_wire(self) -> dict[str, object]:
         return {"allowedModeTransition": self.allowed_mode_transition, "allowedWorkerModes": list(self.allowed_worker_modes), "approvedLauncherFamilyDigest": self.approved_launcher_family_digest, "brokerAuthKeyId": self.broker_auth_key_id, "brokerAuthKeyRegistrationDigest": self.broker_auth_key_registration_digest, "executorIdentityDigest": self.executor_identity_digest, "operationDirectoryIdentityDigest": self.operation_directory_identity_digest, "operationId": self.operation_id, "profileIdentityDigest": self.profile_identity_digest, "repositoryBoundaryIdentityDigest": self.repository_boundary_identity_digest, "repositoryIdentityDigest": self.repository_identity_digest, "schema": self.schema, "transactionParentIdentityDigest": self.transaction_parent_identity_digest, "transactionRootIdentityDigest": self.transaction_root_identity_digest, "trustedRecoveryLauncherDigest": self.trusted_recovery_launcher_digest, "trustedToolchainBuildRecordDigest": self.trusted_toolchain_build_record_digest}
 
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "RegistrationWorkerSessionFamilyAuthorizationV1":
+        fields = set(cls("trusted-registration-worker-session-family-authorization/v1", "x", *(["sha256:" + "0" * 64] * 5), "key", "sha256:" + "0" * 64, ("register", "recover"), "register-to-recover", *(["sha256:" + "0" * 64] * 5)).to_wire())
+        raw = _broker_from_bytes(payload, fields, "worker session family authorization")
+        item = cls(raw["schema"], raw["operationId"], raw["transactionParentIdentityDigest"], raw["transactionRootIdentityDigest"], raw["operationDirectoryIdentityDigest"], raw["repositoryIdentityDigest"], raw["repositoryBoundaryIdentityDigest"], raw["brokerAuthKeyId"], raw["brokerAuthKeyRegistrationDigest"], tuple(raw["allowedWorkerModes"]) if isinstance(raw["allowedWorkerModes"], list) else (), raw["allowedModeTransition"], raw["approvedLauncherFamilyDigest"], raw["trustedToolchainBuildRecordDigest"], raw["trustedRecoveryLauncherDigest"], raw["executorIdentityDigest"], raw["profileIdentityDigest"])
+        if raw["canonicalDigest"] != item.canonical_digest:
+            raise ValueError("worker session family authorization digest is invalid")
+        return item
+
 
 @dataclass(frozen=True, slots=True)
 class RegistrationRecoveryLeaseIdentityPreimageV1:
@@ -1514,6 +1523,15 @@ class BrokerAuthLeaseIssueRequestV1(_SelfDigestRecord):
     def request_digest(self) -> str:
         return self.canonical_digest
 
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "BrokerAuthLeaseIssueRequestV1":
+        fields = {"brokerAuthKeyId", "canonicalDigest", "expectedAllowedSignersDigest", "expectedCurrentHeadDigest", "expectedCurrentSequence", "expectedPolicyDigest", "expectedRegistryDigest", "expectedRevocationDigest", "leaseTtlSequences", "lifecycleNonce", "operationId", "schema", "sessionFamilyAuthorizationDigest"}
+        raw = _broker_from_bytes(payload, fields, "broker auth lease request")
+        item = cls(raw["schema"], raw["operationId"], raw["lifecycleNonce"], raw["sessionFamilyAuthorizationDigest"], raw["brokerAuthKeyId"], raw["expectedCurrentSequence"], raw["expectedCurrentHeadDigest"], raw["expectedRegistryDigest"], raw["expectedRevocationDigest"], raw["expectedPolicyDigest"], raw["expectedAllowedSignersDigest"], raw["leaseTtlSequences"])
+        if raw["canonicalDigest"] != item.canonical_digest:
+            raise ValueError("broker auth lease request digest is invalid")
+        return item
+
 
 @dataclass(frozen=True, slots=True)
 class BrokerAuthLeaseIssueEventPayloadV1(_SelfDigestRecord):
@@ -1533,6 +1551,16 @@ class BrokerAuthLeaseIssueEventPayloadV1(_SelfDigestRecord):
     def _unsigned_wire(self) -> dict[str, object]:
         return {"brokerAuthKeyId": self.broker_auth_key_id, "eventIdDigest": self.event_id_digest, "eventKind": self.event_kind, "expirySequence": self.expiry_sequence, "issuedSequence": self.issued_sequence, "leaseRequest": self.lease_request.to_wire(), "leaseRequestDigest": self.lease_request_digest, "leaseTtlSequences": self.lease_ttl_sequences, "operationId": self.operation_id, "postPolicyDigest": self.post_policy_digest, "prePolicyDigest": self.pre_policy_digest, "schema": self.schema}
 
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "BrokerAuthLeaseIssueEventPayloadV1":
+        fields = {"brokerAuthKeyId", "canonicalDigest", "eventIdDigest", "eventKind", "expirySequence", "issuedSequence", "leaseRequest", "leaseRequestDigest", "leaseTtlSequences", "operationId", "postPolicyDigest", "prePolicyDigest", "schema"}
+        raw = _broker_from_bytes(payload, fields, "broker auth issue payload")
+        request = BrokerAuthLeaseIssueRequestV1.from_canonical_bytes(canonical_json_bytes(raw["leaseRequest"]))
+        item = cls(raw["schema"], raw["eventKind"], raw["eventIdDigest"], request, raw["leaseRequestDigest"], raw["operationId"], raw["brokerAuthKeyId"], raw["issuedSequence"], raw["leaseTtlSequences"], raw["expirySequence"], raw["prePolicyDigest"], raw["postPolicyDigest"])
+        if raw["canonicalDigest"] != item.canonical_digest:
+            raise ValueError("broker auth issue payload digest is invalid")
+        return item
+
 
 @dataclass(frozen=True, slots=True)
 class BrokerAuthEnvelopeSignEventPayloadV1(_SelfDigestRecord):
@@ -1549,6 +1577,15 @@ class BrokerAuthEnvelopeSignEventPayloadV1(_SelfDigestRecord):
 
     def _unsigned_wire(self) -> dict[str, object]:
         return {"brokerAuthKeyId": self.broker_auth_key_id, "eventIdDigest": self.event_id_digest, "eventKind": self.event_kind, "leaseIdentityDigest": self.lease_identity_digest, "leaseRequestDigest": self.lease_request_digest, "operationId": self.operation_id, "postPolicyDigest": self.post_policy_digest, "prePolicyDigest": self.pre_policy_digest, "schema": self.schema, "signSequence": self.sign_sequence, "unsignedEnvelopeDigest": self.unsigned_envelope_digest}
+
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "BrokerAuthEnvelopeSignEventPayloadV1":
+        fields = {"brokerAuthKeyId", "canonicalDigest", "eventIdDigest", "eventKind", "leaseIdentityDigest", "leaseRequestDigest", "operationId", "postPolicyDigest", "prePolicyDigest", "schema", "signSequence", "unsignedEnvelopeDigest"}
+        raw = _broker_from_bytes(payload, fields, "broker auth envelope payload")
+        item = cls(raw["schema"], raw["eventKind"], raw["eventIdDigest"], raw["operationId"], raw["leaseIdentityDigest"], raw["leaseRequestDigest"], raw["unsignedEnvelopeDigest"], raw["brokerAuthKeyId"], raw["signSequence"], raw["prePolicyDigest"], raw["postPolicyDigest"])
+        if raw["canonicalDigest"] != item.canonical_digest:
+            raise ValueError("broker auth envelope payload digest is invalid")
+        return item
 
 
 @dataclass(frozen=True, slots=True)
@@ -1567,6 +1604,17 @@ class BrokerAuthRotatePolicyEventPayloadV1(_SelfDigestRecord):
     def _unsigned_wire(self) -> dict[str, object]:
         return {"activatedKeyId": self.activated_key_id, "effectiveLeaseSequence": self.effective_lease_sequence, "eventIdDigest": self.event_id_digest, "eventKind": self.event_kind, "nextRegistry": self.next_registry.to_wire(), "nextRevocations": self.next_revocations.to_wire(), "postPolicyDigest": self.post_policy_digest, "prePolicyDigest": self.pre_policy_digest, "previousRegistryDigest": self.previous_registry_digest, "previousRevocationsDigest": self.previous_revocations_digest, "retiringKeyId": self.retiring_key_id, "schema": self.schema}
 
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "BrokerAuthRotatePolicyEventPayloadV1":
+        fields = {"activatedKeyId", "canonicalDigest", "effectiveLeaseSequence", "eventIdDigest", "eventKind", "nextRegistry", "nextRevocations", "postPolicyDigest", "prePolicyDigest", "previousRegistryDigest", "previousRevocationsDigest", "retiringKeyId", "schema"}
+        raw = _broker_from_bytes(payload, fields, "broker auth rotate payload")
+        registry = RegistrationBrokerAuthRegistryV1.from_canonical_bytes(canonical_json_bytes(raw["nextRegistry"]))
+        revocations = RegistrationBrokerAuthRevocationsV1.from_canonical_bytes(canonical_json_bytes(raw["nextRevocations"]))
+        item = cls(raw["schema"], raw["eventKind"], raw["eventIdDigest"], raw["previousRegistryDigest"], raw["previousRevocationsDigest"], registry, revocations, raw["activatedKeyId"], raw["retiringKeyId"], raw["effectiveLeaseSequence"], raw["prePolicyDigest"], raw["postPolicyDigest"])
+        if raw["canonicalDigest"] != item.canonical_digest:
+            raise ValueError("broker auth rotate payload digest is invalid")
+        return item
+
 
 @dataclass(frozen=True, slots=True)
 class BrokerAuthRevokePolicyEventPayloadV1(_SelfDigestRecord):
@@ -1583,6 +1631,16 @@ class BrokerAuthRevokePolicyEventPayloadV1(_SelfDigestRecord):
 
     def _unsigned_wire(self) -> dict[str, object]:
         return {"eventIdDigest": self.event_id_digest, "eventKind": self.event_kind, "nextRevocations": self.next_revocations.to_wire(), "postPolicyDigest": self.post_policy_digest, "prePolicyDigest": self.pre_policy_digest, "previousRevocationsDigest": self.previous_revocations_digest, "revokedAtBrokerSequence": self.revoked_at_broker_sequence, "revokedKeyId": self.revoked_key_id, "schema": self.schema, "unchangedRegistryDigest": self.unchanged_registry_digest}
+
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "BrokerAuthRevokePolicyEventPayloadV1":
+        fields = {"canonicalDigest", "eventIdDigest", "eventKind", "nextRevocations", "postPolicyDigest", "prePolicyDigest", "previousRevocationsDigest", "revokedAtBrokerSequence", "revokedKeyId", "schema", "unchangedRegistryDigest"}
+        raw = _broker_from_bytes(payload, fields, "broker auth revoke payload")
+        revocations = RegistrationBrokerAuthRevocationsV1.from_canonical_bytes(canonical_json_bytes(raw["nextRevocations"]))
+        item = cls(raw["schema"], raw["eventKind"], raw["eventIdDigest"], raw["unchangedRegistryDigest"], raw["previousRevocationsDigest"], revocations, raw["revokedKeyId"], raw["revokedAtBrokerSequence"], raw["prePolicyDigest"], raw["postPolicyDigest"])
+        if raw["canonicalDigest"] != item.canonical_digest:
+            raise ValueError("broker auth revoke payload digest is invalid")
+        return item
 
 
 BrokerAuthPolicyEventPayloadV1 = BrokerAuthRotatePolicyEventPayloadV1 | BrokerAuthRevokePolicyEventPayloadV1
@@ -1611,6 +1669,13 @@ class _BrokerStateRecord:
     def canonical_bytes(self) -> bytes:
         return canonical_json_bytes(self.to_wire())
 
+    def verify_state_mac(self, state_mac_key: bytes) -> None:
+        if not isinstance(state_mac_key, bytes) or len(state_mac_key) != 32:
+            raise ValueError("broker state MAC key is invalid")
+        expected = hmac.new(state_mac_key, canonical_json_bytes(self._unsigned_wire()), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, self.broker_state_mac_hex):  # type: ignore[attr-defined]
+            raise ValueError("broker state MAC is invalid")
+
 
 @dataclass(frozen=True, slots=True)
 class BrokerAuthSequenceJournalEntryV1(_BrokerStateRecord):
@@ -1628,6 +1693,15 @@ class BrokerAuthSequenceJournalEntryV1(_BrokerStateRecord):
 
     def _unsigned_wire(self) -> dict[str, object]:
         return {"brokerAuthKeyId": self.broker_auth_key_id, "eventIdDigest": self.event_id_digest, "eventKind": self.event_kind, "eventPayloadDigest": self.event_payload_digest, "eventPayloadLength": self.event_payload_length, "eventPayloadRef": self.event_payload_ref, "postBrokerAuthRegistryDigest": self.post_broker_auth_registry_digest, "postBrokerAuthRevocationDigest": self.post_broker_auth_revocation_digest, "postPolicyDigest": self.post_policy_digest, "prePolicyDigest": self.pre_policy_digest, "previousEntryDigest": self.previous_entry_digest, "schema": self.schema, "sequence": self.sequence}
+
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "BrokerAuthSequenceJournalEntryV1":
+        fields = {"brokerAuthKeyId", "brokerStateMacHex", "canonicalDigest", "eventIdDigest", "eventKind", "eventPayloadDigest", "eventPayloadLength", "eventPayloadRef", "postBrokerAuthRegistryDigest", "postBrokerAuthRevocationDigest", "postPolicyDigest", "prePolicyDigest", "previousEntryDigest", "schema", "sequence"}
+        raw = _broker_from_bytes(payload, fields, "broker auth sequence entry")
+        item = cls(raw["schema"], raw["sequence"], raw["previousEntryDigest"], raw["eventIdDigest"], raw["eventKind"], raw["eventPayloadRef"], raw["eventPayloadLength"], raw["eventPayloadDigest"], raw["prePolicyDigest"], raw["postPolicyDigest"], raw["postBrokerAuthRegistryDigest"], raw["postBrokerAuthRevocationDigest"], raw["brokerAuthKeyId"], raw["brokerStateMacHex"])
+        if raw["canonicalDigest"] != item.canonical_digest:
+            raise ValueError("broker auth sequence entry digest is invalid")
+        return item
 
 
 @dataclass(frozen=True, slots=True)
@@ -1654,6 +1728,15 @@ class BrokerAuthSequenceStateV1(_BrokerStateRecord):
     def _unsigned_wire(self) -> dict[str, object]:
         return {"brokerAuthRegistryDigest": self.broker_auth_registry_digest, "brokerAuthRevocationDigest": self.broker_auth_revocation_digest, "currentPolicyDigest": self.current_policy_digest, "currentSequence": self.current_sequence, "headEntryDigest": self.head_entry_digest, "headEventPayloadDigest": self.head_event_payload_digest, "headEventPayloadRef": self.head_event_payload_ref, "rootIdentityDigest": self.root_identity_digest, "schema": self.schema}
 
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "BrokerAuthSequenceStateV1":
+        fields = {"brokerAuthRegistryDigest", "brokerAuthRevocationDigest", "brokerStateMacHex", "canonicalDigest", "currentPolicyDigest", "currentSequence", "headEntryDigest", "headEventPayloadDigest", "headEventPayloadRef", "rootIdentityDigest", "schema"}
+        raw = _broker_from_bytes(payload, fields, "broker auth sequence state")
+        item = cls(raw["schema"], raw["rootIdentityDigest"], raw["currentSequence"], raw["headEntryDigest"], raw["headEventPayloadRef"], raw["headEventPayloadDigest"], raw["currentPolicyDigest"], raw["brokerAuthRegistryDigest"], raw["brokerAuthRevocationDigest"], raw["brokerStateMacHex"])
+        if raw["canonicalDigest"] != item.canonical_digest:
+            raise ValueError("broker auth sequence state digest is invalid")
+        return item
+
 
 @dataclass(frozen=True, slots=True)
 class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
@@ -1673,6 +1756,17 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
 
     def _unsigned_wire(self) -> dict[str, object]:
         return {"entries": [item.to_wire() for item in self.entries], "firstSequence": self.first_sequence, "rootIdentityDigest": self.root_identity_digest, "schema": self.schema}
+
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "BrokerAuthSequenceJournalV1":
+        fields = {"brokerStateMacHex", "canonicalDigest", "entries", "firstSequence", "rootIdentityDigest", "schema"}
+        raw = _broker_from_bytes(payload, fields, "broker auth sequence journal")
+        if not isinstance(raw["entries"], list):
+            raise ValueError("broker auth sequence journal entries are invalid")
+        item = cls(raw["schema"], raw["rootIdentityDigest"], raw["firstSequence"], tuple(BrokerAuthSequenceJournalEntryV1.from_canonical_bytes(canonical_json_bytes(entry)) for entry in raw["entries"]), raw["brokerStateMacHex"])
+        if raw["canonicalDigest"] != item.canonical_digest:
+            raise ValueError("broker auth sequence journal digest is invalid")
+        return item
 
     def validate_state(self, state: BrokerAuthSequenceStateV1, payloads: Mapping[str, BrokerAuthSequenceEventPayloadV1]) -> None:
         if type(state) is not BrokerAuthSequenceStateV1 or state.root_identity_digest != self.root_identity_digest or state.current_sequence != len(self.entries):
@@ -2226,6 +2320,51 @@ class RegistrationRecoveryLeaseV1:
     @property
     def canonical_bytes(self) -> bytes:
         return canonical_json_bytes(self.to_wire())
+
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "RegistrationRecoveryLeaseV1":
+        fields = {"brokerAuthAllowedSignersDigest", "brokerAuthIssueEntryDigest", "brokerAuthKeyId", "brokerAuthLeaseExpirySequence", "brokerAuthLeaseIssuedSequence", "brokerAuthLeaseRequestDigest", "brokerAuthPolicyDigest", "brokerAuthRegistryDigest", "brokerAuthRegistryGeneration", "brokerAuthRevocationDigest", "brokerAuthSequenceHeadDigest", "brokerAuthSequenceRootIdentityDigest", "brokerMac", "brokerSignatureHex", "canonicalDigest", "executorIdentityDigest", "leaseIdentityDigest", "lifecycleNonce", "nextRecoverySequence", "operationDirectoryIdentityDigest", "operationId", "profileIdentityDigest", "projectId", "repositoryBoundaryIdentityDigest", "repositoryIdentityDigest", "schema", "sessionFamilyAuthorizationDigest", "state", "transactionParentIdentityDigest", "transactionRootIdentityDigest", "transactionRootName", "trustedRecoveryLauncherDigest", "trustedToolchainBuildRecordDigest"}
+        raw = _broker_from_bytes(payload, fields, "registration recovery lease")
+        item = cls(raw["schema"], raw["projectId"], raw["operationId"], raw["lifecycleNonce"], raw["sessionFamilyAuthorizationDigest"], raw["nextRecoverySequence"], raw["transactionParentIdentityDigest"], raw["transactionRootName"], raw["transactionRootIdentityDigest"], raw["operationDirectoryIdentityDigest"], raw["repositoryIdentityDigest"], raw["repositoryBoundaryIdentityDigest"], raw["trustedToolchainBuildRecordDigest"], raw["trustedRecoveryLauncherDigest"], raw["executorIdentityDigest"], raw["profileIdentityDigest"], raw["brokerAuthRegistryGeneration"], raw["brokerAuthRegistryDigest"], raw["brokerAuthRevocationDigest"], raw["brokerAuthPolicyDigest"], raw["brokerAuthAllowedSignersDigest"], raw["brokerAuthKeyId"], raw["brokerAuthLeaseRequestDigest"], raw["brokerAuthSequenceRootIdentityDigest"], raw["brokerAuthIssueEntryDigest"], raw["brokerAuthSequenceHeadDigest"], raw["brokerAuthLeaseIssuedSequence"], raw["brokerAuthLeaseExpirySequence"], raw["leaseIdentityDigest"], raw["state"], raw["brokerSignatureHex"], raw["brokerMac"])
+        if raw["canonicalDigest"] != item.canonical_digest:
+            raise ValueError("registration recovery lease digest is invalid")
+        return item
+
+    def identity_preimage(self) -> RegistrationRecoveryLeaseIdentityPreimageV1:
+        return RegistrationRecoveryLeaseIdentityPreimageV1(
+            "trusted-registration-recovery-lease-identity-preimage/v1", self.project_id,
+            self.operation_id, self.lifecycle_nonce, self.session_family_authorization_digest,
+            self.broker_auth_lease_request_digest, self.broker_auth_key_id,
+            self.broker_auth_lease_issued_sequence, self.broker_auth_issue_entry_digest,
+            self.broker_auth_sequence_head_digest, self.broker_auth_registry_generation,
+            self.broker_auth_registry_digest, self.broker_auth_revocation_digest,
+            self.broker_auth_policy_digest, self.broker_auth_allowed_signers_digest,
+            self.broker_auth_sequence_root_identity_digest, self.broker_auth_lease_expiry_sequence,
+            self.transaction_parent_identity_digest, self.transaction_root_identity_digest,
+            self.operation_directory_identity_digest, self.repository_identity_digest,
+            self.repository_boundary_identity_digest, self.trusted_toolchain_build_record_digest,
+            self.trusted_recovery_launcher_digest, self.executor_identity_digest,
+            self.profile_identity_digest,
+        )
+
+    def verify_signature(self, registry: RegistrationBrokerAuthRegistryV1, revocations: RegistrationBrokerAuthRevocationsV1, allowed_signers: Mapping[str, bytes], current_sequence: int) -> None:
+        """Verify the public lease signature and its frozen trust-state facts."""
+        if type(registry) is not RegistrationBrokerAuthRegistryV1 or type(revocations) is not RegistrationBrokerAuthRevocationsV1:
+            raise ValueError("lease trust state is invalid")
+        if (registry.generation, registry.canonical_digest, revocations.canonical_digest, revocations.registry_digest) != (self.broker_auth_registry_generation, self.broker_auth_registry_digest, self.broker_auth_revocation_digest, registry.canonical_digest):
+            raise ValueError("lease trust state changed")
+        key = registry.key(self.broker_auth_key_id)
+        if key.state not in {"active", "retiring"} or self.broker_auth_lease_issued_sequence < key.effective_lease_sequence or (key.retire_after_lease_sequence is not None and self.broker_auth_lease_issued_sequence > key.retire_after_lease_sequence):
+            raise ValueError("lease signing key is not eligible")
+        public_key = allowed_signers.get(key.key_id)
+        if not isinstance(public_key, bytes) or len(public_key) != 32 or "sha256:" + hashlib.sha256(public_key).hexdigest() != key.public_key_digest:
+            raise ValueError("lease allowed signer is invalid")
+        if self.lease_identity_digest != self.identity_preimage().lease_identity_digest:
+            raise ValueError("lease identity preimage is invalid")
+        self.assert_valid_at(current_sequence, revocations)
+        from .handoffs import _ed25519_verify
+        if not _ed25519_verify(public_key, _BROKER_LEASE_DOMAIN.encode("utf-8") + b"\0" + canonical_json_bytes(self._unsigned_wire()), bytes.fromhex(self.broker_signature_hex)):
+            raise ValueError("lease signature is invalid")
 
     def assert_valid_at(self, current_sequence: int, revocations: RegistrationBrokerAuthRevocationsV1) -> None:
         _u64(current_sequence, "current_sequence")

@@ -1,6 +1,8 @@
 import hashlib
+import hmac
 import json
 import copy
+from dataclasses import replace
 import os
 import pickle
 import socket
@@ -44,6 +46,7 @@ from trusted_evidence.e2_policy import (
     RegistrationBrokerAuthRevocationEntryV1,
     RegistrationBrokerAuthRevocationsV1,
     RegistrationBrokerAuthPrivateKeySlotV1,
+    RegistrationRecoveryLeaseV1,
     RegistrationRecoveryLeaseIdentityPreimageV1,
     RegistrationWorkerSessionFamilyAuthorizationV1,
     RegistrationWorkerInputObjectV1,
@@ -530,7 +533,32 @@ def test_broker_auth_issue_chain_is_prestate_only_and_contiguous_without_writes(
         DIGEST_C, payload.canonical_digest, DIGEST_B, registry.canonical_digest,
         revocations.canonical_digest, "c" * 64,
     )
+    mac_key = b"0123456789abcdef0123456789abcdef"
+    authenticated_entry = replace(
+        entry,
+        broker_state_mac_hex=hmac.new(mac_key, json.dumps(entry._unsigned_wire(), separators=(",", ":"), sort_keys=True).encode(), hashlib.sha256).hexdigest(),
+    )
+    authenticated_entry.verify_state_mac(mac_key)
+    with pytest.raises(ValueError):
+        replace(authenticated_entry, broker_state_mac_hex="0" * 64).verify_state_mac(mac_key)
     journal.validate_state(state, {DIGEST_C: payload})
+    # These records cross the broker boundary as canonical bytes.  Removing a
+    # strict decoder would make a tampered chain look like an in-memory value.
+    for record_type, record in (
+        (RegistrationWorkerSessionFamilyAuthorizationV1, family),
+        (BrokerAuthLeaseIssueRequestV1, request),
+        (BrokerAuthLeaseIssueEventPayloadV1, payload),
+        (BrokerAuthSequenceJournalEntryV1, entry),
+        (BrokerAuthSequenceJournalV1, journal),
+        (BrokerAuthSequenceStateV1, state),
+    ):
+        assert record_type.from_canonical_bytes(record.canonical_bytes) == record
+        with pytest.raises(ValueError):
+            record_type.from_canonical_bytes(record.canonical_bytes[:-1] + b',"unexpected":null}')
+        with pytest.raises(ValueError):
+            record_type.from_canonical_bytes(record.canonical_bytes.replace(b'{', b'{"schema":"duplicate",', 1))
+        with pytest.raises(ValueError):
+            record_type.from_canonical_bytes(record.canonical_bytes + b"\n")
     recorder.assert_rejected(lambda: BrokerAuthLeaseIssueRequestV1(
         "trusted-registration-broker-auth-lease-issue-request/v1", "op-1", "lifecycle-1",
         family.canonical_digest, "broker-fixed", 1, entry.canonical_digest, registry.canonical_digest,
@@ -564,6 +592,57 @@ def test_lease_identity_preimage_rejects_session_fields_and_binds_family_authori
     recorder.assert_rejected(lambda: RegistrationRecoveryLeaseIdentityPreimageV1.from_canonical_bytes(
         preimage.canonical_bytes.replace(b"}", b',\"workerSessionId\":\"forbidden\"}', 1)
     ))
+
+
+def test_signed_lease_wire_is_canonical_and_respects_expiry_and_global_revocation():
+    seed = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+    public = bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+    public_digest = "sha256:" + hashlib.sha256(public).hexdigest()
+    key = RegistrationBrokerAuthKeyRegistrationV1(
+        "trusted-registration-broker-auth-key-registration/v1", "broker-fixed",
+        "registration-broker-auth", "ai-video-reverse-engineer/registration-broker-envelope/v1",
+        "ai-video-reverse-engineer/registration-broker-lease/v1",
+        "ai-video-reverse-engineer/registration-broker-startup-challenge/v1", "raw-ed25519-32",
+        public_digest, public_digest, None, public_digest, public_digest, DIGEST_B, "active", 1, None,
+    )
+    registry = RegistrationBrokerAuthRegistryV1(
+        "trusted-registration-broker-auth-registry/v1", 1, None, "broker-fixed", (key,)
+    )
+    revocations = RegistrationBrokerAuthRevocationsV1(
+        "trusted-registration-broker-auth-revocations/v1", registry.canonical_digest, ()
+    )
+    template = RegistrationRecoveryLeaseV1(
+        "trusted-registration-recovery-lease/v1", "ai-video-reverse-engineer", "op-lease", "life",
+        DIGEST_A, 1, DIGEST_A, "transaction-root", DIGEST_B, DIGEST_C, DIGEST_A, DIGEST_B,
+        DIGEST_C, DIGEST_A, DIGEST_B, DIGEST_C, 1, registry.canonical_digest, revocations.canonical_digest, DIGEST_B, DIGEST_C, "broker-fixed",
+        DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A, 1, 3, DIGEST_C, "OPEN", "a" * 128,
+        "b" * 64,
+    )
+    lease = replace(template, lease_identity_digest=template.identity_preimage().lease_identity_digest)
+    # Private test seed enters only a temporary read-only FD, mirroring the
+    # root-broker slot boundary rather than a serializable signer object.
+    import tempfile
+    with tempfile.NamedTemporaryFile() as stream:
+        stream.write(seed); stream.flush()
+        descriptor = os.open(stream.name, os.O_RDONLY)
+        try:
+            signer = RegistrationBrokerAuthPrivateKeySlotV1.load_from_readonly_fd(descriptor, key, public)
+        finally:
+            os.close(descriptor)
+        try:
+            lease = replace(lease, broker_signature_hex=signer.sign("ai-video-reverse-engineer/registration-broker-lease/v1", json.dumps(lease._unsigned_wire(), ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")))
+        finally:
+            signer.close()
+    assert RegistrationRecoveryLeaseV1.from_canonical_bytes(lease.canonical_bytes) == lease
+    lease.verify_signature(registry, revocations, {"broker-fixed": public}, 3)
+    with pytest.raises(ValueError):
+        RegistrationRecoveryLeaseV1.from_canonical_bytes(lease.canonical_bytes + b"\n")
+    with pytest.raises(ValueError):
+        lease.verify_signature(registry, revocations, {"broker-fixed": public}, 4)
+    with pytest.raises(ValueError):
+        replace(lease, broker_signature_hex="0" * 128).verify_signature(
+            registry, revocations, {"broker-fixed": public}, 3
+        )
 
 
 # E.2: these fixtures deliberately do not consult the codec under test to
