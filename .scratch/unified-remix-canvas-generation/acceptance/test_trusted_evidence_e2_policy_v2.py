@@ -685,12 +685,18 @@ def test_registration_transaction_records_decode_literal_bytes_and_reject_chain_
     recorder.assert_rejected(lambda: RegistrationTransactionIntentV1.from_canonical_bytes(intent.canonical_bytes.replace(b'"canonicalDigest"', b'"unexpected":null,"canonicalDigest"', 1)))
 
 
-def test_precreated_transaction_capability_owns_real_directory_fds_and_has_no_restoration_path(tmp_path):
-    parent, root, operation, repository = tmp_path / "parent", tmp_path / "parent" / "root", tmp_path / "parent" / "root" / "operation-d2", tmp_path / "parent" / "root" / "operation-d2" / "repository"
-    repository.mkdir(parents=True)
+def test_precreated_transaction_capability_owns_real_directory_fds_and_has_no_restoration_path(tmp_path, monkeypatch):
+    parent, root, operation = tmp_path / "parent", tmp_path / "parent" / "root", tmp_path / "parent" / "root" / "operation-d2"
+    repository = tmp_path / "repository-authority"
+    operation.mkdir(parents=True)
+    repository.mkdir()
+    for path in (parent, root, operation, repository):
+        path.chmod(0o700)
     descriptors = tuple(os.open(path, os.O_RDONLY | os.O_DIRECTORY) for path in (parent, root, operation, repository))
     capability = None
     try:
+        monkeypatch.setattr(fcntl, "fcntl", lambda *_args, **_kwargs: pytest.fail("capability must not recover a directory path"))
+        monkeypatch.setattr(os, "readlink", lambda *_args, **_kwargs: pytest.fail("capability must not recover a directory path"))
         capability = RegistrationTransactionCapabilityV1.open_precreated(*descriptors)
         assert len(capability.directory_identities) == 4
         capability.validate_open_identities()
@@ -715,12 +721,16 @@ def test_precreated_transaction_capability_owns_real_directory_fds_and_has_no_re
             os.close(descriptor)
 
 
+@pytest.mark.skipif(sys.platform.startswith("linux"), reason="Task 14 Linux mount-ID gate is intentionally fail-closed")
 def test_precreated_transaction_capability_revalidates_bound_directory_entries_after_root_swap(tmp_path):
     parent = tmp_path / "parent"
     root = parent / "transaction-root"
     operation = root / "operation-d2"
-    repository = operation / "repository"
-    repository.mkdir(parents=True)
+    repository = tmp_path / "repository-authority"
+    operation.mkdir(parents=True)
+    repository.mkdir()
+    for path in (parent, root, operation, repository):
+        path.chmod(0o700)
     descriptors = tuple(os.open(path, os.O_RDONLY | os.O_DIRECTORY) for path in (parent, root, operation, repository))
     capability = None
     try:
@@ -728,7 +738,7 @@ def test_precreated_transaction_capability_revalidates_bound_directory_entries_a
         capability.validate_open_identities()
 
         root.rename(parent / "replaced-root")
-        (parent / "transaction-root" / "operation-d2" / "repository").mkdir(parents=True)
+        (parent / "transaction-root" / "operation-d2").mkdir(parents=True)
 
         with pytest.raises(ValueError, match="directory.*identity|directory.*relationship"):
             capability.validate_open_identities()
@@ -739,7 +749,8 @@ def test_precreated_transaction_capability_revalidates_bound_directory_entries_a
             os.close(descriptor)
 
 
-def test_precreated_transaction_capability_rejects_unsafe_layouts_and_rebinds_without_writes(tmp_path, monkeypatch):
+@pytest.mark.skipif(sys.platform.startswith("linux"), reason="Task 14 Linux mount-ID gate is intentionally fail-closed")
+def test_precreated_transaction_capability_rejects_unsafe_modes_and_descriptor_replacements_without_writes(tmp_path, monkeypatch):
     writes = fsyncs = 0
 
     def no_write(*_args, **_kwargs):
@@ -755,13 +766,15 @@ def test_precreated_transaction_capability_rejects_unsafe_layouts_and_rebinds_wi
     monkeypatch.setattr(os, "write", no_write)
     monkeypatch.setattr(os, "fsync", no_fsync)
 
-    def open_layout(base, *, root_name="transaction-root", repository_under_operation=True):
+    def open_layout(base, *, root_name="transaction-root"):
         parent = base / "parent"
         root = parent / root_name
         operation = root / "operation-d2"
-        repository = operation / "repository" if repository_under_operation else root / "repository"
+        repository = base / "repository-authority"
         operation.mkdir(parents=True)
         repository.mkdir(parents=True)
+        for path in (parent, root, operation, repository):
+            path.chmod(0o700)
         return parent, root, operation, repository, tuple(os.open(path, os.O_RDONLY | os.O_DIRECTORY) for path in (parent, root, operation, repository))
 
     parent, root, operation, repository, descriptors = open_layout(tmp_path / "good")
@@ -769,7 +782,7 @@ def test_precreated_transaction_capability_rejects_unsafe_layouts_and_rebinds_wi
     try:
         capability = RegistrationTransactionCapabilityV1.open_precreated(*descriptors)
         operation.rename(root / "replaced-operation")
-        (root / "operation-d2" / "repository").mkdir(parents=True)
+        (root / "operation-d2").mkdir(parents=True)
         with pytest.raises(ValueError, match="directory.*identity|directory.*relationship"):
             capability.validate_open_identities()
     finally:
@@ -794,10 +807,11 @@ def test_precreated_transaction_capability_rejects_unsafe_layouts_and_rebinds_wi
         for descriptor in descriptors:
             os.close(descriptor)
 
-    parent, root, operation, repository, descriptors = open_layout(tmp_path / "wrong-repository", repository_under_operation=False)
+    parent, root, operation, repository, descriptors = open_layout(tmp_path / "independent-repository")
     try:
-        with pytest.raises(ValueError):
-            RegistrationTransactionCapabilityV1.open_precreated(*descriptors)
+        capability = RegistrationTransactionCapabilityV1.open_precreated(*descriptors)
+        capability.validate_open_identities()
+        capability.close()
         with pytest.raises(ValueError):
             RegistrationTransactionCapabilityV1.open_precreated(descriptors[0], descriptors[0], descriptors[2], descriptors[3])
     finally:
@@ -806,28 +820,27 @@ def test_precreated_transaction_capability_rejects_unsafe_layouts_and_rebinds_wi
 
     parent, root, operation, repository, descriptors = open_layout(tmp_path / "unsafe-mode")
     try:
-        parent.chmod(0o777)
-        with pytest.raises(ValueError):
-            RegistrationTransactionCapabilityV1.open_precreated(*descriptors)
+        for unsafe_mode in (0o755, 0o750, 0o711):
+            parent.chmod(unsafe_mode)
+            with pytest.raises(ValueError):
+                RegistrationTransactionCapabilityV1.open_precreated(*descriptors)
     finally:
         parent.chmod(0o700)
         for descriptor in descriptors:
             os.close(descriptor)
 
-    parent, root, operation, repository, descriptors = open_layout(tmp_path / "mount-rebind")
+    parent, root, operation, repository, descriptors = open_layout(tmp_path / "repository-swap")
     capability = None
     try:
         capability = RegistrationTransactionCapabilityV1.open_precreated(*descriptors)
-        real_fstatvfs = os.fstatvfs
-
-        def rebind_mount(fd):
-            result = real_fstatvfs(fd)
-            if fd == capability._fds[1]:
-                return type("ReboundMount", (), {"f_fsid": result.f_fsid + 1})()
-            return result
-
-        monkeypatch.setattr(os, "fstatvfs", rebind_mount)
-        with pytest.raises(ValueError, match="mount identity"):
+        repository.rename(tmp_path / "repository-replaced")
+        replacement = tmp_path / "repository-authority"
+        replacement.mkdir()
+        replacement.chmod(0o700)
+        capability_fd = capability._fds[3]
+        os.close(capability_fd)
+        assert os.open(replacement, os.O_RDONLY | os.O_DIRECTORY) == capability_fd
+        with pytest.raises(ValueError, match="directory.*identity"):
             capability.validate_open_identities()
     finally:
         if capability is not None:
@@ -836,6 +849,30 @@ def test_precreated_transaction_capability_rejects_unsafe_layouts_and_rebinds_wi
             os.close(descriptor)
 
     assert writes == fsyncs == 0
+
+
+def test_precreated_transaction_capability_labels_portable_filesystem_identity_and_fails_closed_for_linux_mount_identity(tmp_path):
+    parent, root, operation = tmp_path / "parent", tmp_path / "parent" / "root", tmp_path / "parent" / "root" / "operation-d2"
+    repository = tmp_path / "repository-authority"
+    operation.mkdir(parents=True)
+    repository.mkdir()
+    for path in (parent, root, operation, repository):
+        path.chmod(0o700)
+    descriptors = tuple(os.open(path, os.O_RDONLY | os.O_DIRECTORY) for path in (parent, root, operation, repository))
+    capability = None
+    try:
+        if sys.platform.startswith("linux"):
+            with pytest.raises(ValueError, match="Task 14.*mount identity"):
+                RegistrationTransactionCapabilityV1.open_precreated(*descriptors)
+        else:
+            capability = RegistrationTransactionCapabilityV1.open_precreated(*descriptors)
+            assert len(capability.filesystem_identities) == 4
+            assert not hasattr(capability, "mount_identities")
+    finally:
+        if capability is not None:
+            capability.close()
+        for descriptor in descriptors:
+            os.close(descriptor)
 
 
 def test_lifecycle_completion_and_policy_journal_bind_full_forward_chain_without_writes():
