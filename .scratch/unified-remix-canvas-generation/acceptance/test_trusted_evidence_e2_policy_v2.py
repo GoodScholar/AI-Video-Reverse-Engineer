@@ -1129,7 +1129,7 @@ def test_broker_auth_issue_chain_is_prestate_only_and_contiguous_without_writes(
 
 
 def test_broker_sequence_payload_and_entry_reject_the_fixed_256_kib_budget_before_decode():
-    """A producer cannot create a broker object the durable reader must reject."""
+    """Every typed payload constructor and decoder enforces the same 256 KiB cap."""
     boundary = BrokerAuthEnvelopeSignEventPayloadV1(
         "trusted-registration-broker-auth-envelope-sign-payload/v1", "sign-envelope",
         DIGEST_A, "x", DIGEST_B, DIGEST_C, DIGEST_A, "broker-fixed", 1, DIGEST_B, DIGEST_B,
@@ -1140,13 +1140,91 @@ def test_broker_sequence_payload_and_entry_reject_the_fixed_256_kib_budget_befor
         DIGEST_B, DIGEST_C, DIGEST_A, "broker-fixed", 1, DIGEST_B, DIGEST_B,
     )
     assert len(boundary.canonical_bytes) == 256 * 1024
-    oversized_operation = "o" * (256 * 1024)
-    with pytest.raises(ValueError, match="256 KiB"):
-        BrokerAuthEnvelopeSignEventPayloadV1(
+    oversized_text = "o" * (256 * 1024)
+    governance, key = _broker_governance("broker-fixed", bytes(32))
+    registry, revocations = governance.registry, governance.revocations
+    policy_digest = canonical_digest({
+        "registryDigest": registry.canonical_digest,
+        "revocationsDigest": revocations.canonical_digest,
+        "schema": "trusted-registration-broker-auth-policy-state/v1",
+    })
+    family = RegistrationWorkerSessionFamilyAuthorizationV1(
+        "trusted-registration-worker-session-family-authorization/v1", oversized_text,
+        DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A, DIGEST_B, "broker-fixed",
+        key.canonical_digest, ("register", "recover"), "register-to-recover", DIGEST_C,
+        DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A,
+    )
+    request = BrokerAuthLeaseIssueRequestV1(
+        "trusted-registration-broker-auth-lease-issue-request/v1", oversized_text,
+        "lifecycle-1", family.canonical_digest, "broker-fixed", 0, DIGEST_A,
+        registry.canonical_digest, revocations.canonical_digest, policy_digest,
+        governance.allowed_signers_digest, 2,
+    )
+    old_governance, old_key = _broker_governance("old", b"1" * 32)
+    large_governance, large_key = _broker_governance(oversized_text, b"2" * 32)
+    old_registry, old_revocations = old_governance.registry, old_governance.revocations
+    next_registry = RegistrationBrokerAuthRegistryV1(
+        "trusted-registration-broker-auth-registry/v1", 2, old_registry.canonical_digest,
+        oversized_text,
+        tuple(sorted((
+            replace(large_key, effective_lease_sequence=2),
+            replace(old_key, state="retiring", retire_after_lease_sequence=2),
+        ), key=lambda item: item.key_id.encode("utf-8"))),
+    )
+    next_revocations = RegistrationBrokerAuthRevocationsV1(
+        "trusted-registration-broker-auth-revocations/v1", next_registry.canonical_digest, (),
+    )
+    rotate_pre = canonical_digest({
+        "registryDigest": old_registry.canonical_digest,
+        "revocationsDigest": old_revocations.canonical_digest,
+        "schema": "trusted-registration-broker-auth-policy-state/v1",
+    })
+    rotate_post = canonical_digest({
+        "registryDigest": next_registry.canonical_digest,
+        "revocationsDigest": next_revocations.canonical_digest,
+        "schema": "trusted-registration-broker-auth-policy-state/v1",
+    })
+    revoked_governance, _ = _broker_governance(oversized_text, b"3" * 32)
+    revoked_registry, revoked_before = revoked_governance.registry, revoked_governance.revocations
+    revoked_after = RegistrationBrokerAuthRevocationsV1(
+        "trusted-registration-broker-auth-revocations/v1", revoked_registry.canonical_digest,
+        (RegistrationBrokerAuthRevocationEntryV1(oversized_text, 1, DIGEST_A),),
+    )
+    revoke_pre = canonical_digest({
+        "registryDigest": revoked_registry.canonical_digest,
+        "revocationsDigest": revoked_before.canonical_digest,
+        "schema": "trusted-registration-broker-auth-policy-state/v1",
+    })
+    revoke_post = canonical_digest({
+        "registryDigest": revoked_registry.canonical_digest,
+        "revocationsDigest": revoked_after.canonical_digest,
+        "schema": "trusted-registration-broker-auth-policy-state/v1",
+    })
+    constructors = {
+        "issue": lambda: BrokerAuthLeaseIssueEventPayloadV1(
+            "trusted-registration-broker-auth-lease-issue-payload/v1", "issue-lease", DIGEST_A,
+            request, request.request_digest, oversized_text, "broker-fixed", 1, 2, 3,
+            policy_digest, policy_digest,
+        ),
+        "sign": lambda: BrokerAuthEnvelopeSignEventPayloadV1(
             "trusted-registration-broker-auth-envelope-sign-payload/v1", "sign-envelope",
-            DIGEST_A, oversized_operation, DIGEST_B, DIGEST_C, DIGEST_A,
-            "broker-fixed", 1, DIGEST_B, DIGEST_B,
-        )
+            DIGEST_A, oversized_text, DIGEST_B, DIGEST_C, DIGEST_A, "broker-fixed", 1,
+            DIGEST_B, DIGEST_B,
+        ),
+        "rotate": lambda: BrokerAuthRotatePolicyEventPayloadV1(
+            "trusted-registration-broker-auth-rotate-payload/v1", "rotate-registry", DIGEST_A,
+            old_registry.canonical_digest, old_revocations.canonical_digest, next_registry,
+            next_revocations, oversized_text, "old", 2, rotate_pre, rotate_post,
+        ),
+        "revoke": lambda: BrokerAuthRevokePolicyEventPayloadV1(
+            "trusted-registration-broker-auth-revoke-payload/v1", "revoke-key", DIGEST_A,
+            revoked_registry.canonical_digest, revoked_before.canonical_digest, revoked_after,
+            oversized_text, 1, revoke_pre, revoke_post,
+        ),
+    }
+    for constructor in constructors.values():
+        with pytest.raises(ValueError, match="256 KiB"):
+            constructor()
     oversized_wire = b"{" + b" " * (256 * 1024) + b"}"
     for payload_type in (
         BrokerAuthLeaseIssueEventPayloadV1,
@@ -1713,6 +1791,22 @@ def _expected_regular_observable(fd, content):
     )
 
 
+def _regular_provenance(root_role="worker-input-inbox"):
+    return FdOpenProvenanceV1(
+        "openat2-beneath-no-symlinks", root_role, DIGEST_A, DIGEST_B,
+        ("O_CLOEXEC", "O_NOFOLLOW", "O_RDONLY"),
+        ("RESOLVE_BENEATH", "RESOLVE_NO_MAGICLINKS", "RESOLVE_NO_SYMLINKS", "RESOLVE_NO_XDEV"),
+        DIGEST_C,
+    )
+
+
+def _open_regular_descriptor(fd, *, role="worker-input", ordinal=0, logical_name="worker-input"):
+    return FdDescriptorV1.from_open_fd(
+        fd, role=role, ordinal=ordinal, logical_name=logical_name,
+        provenance_fields=_regular_provenance(),
+    )
+
+
 def test_e2_rebuilds_regular_fd_identity_from_kernel_facts(tmp_path):
     """Dropping mount/content/identity reconstruction must reject a real input FD."""
     source = tmp_path / "worker-input"
@@ -1721,14 +1815,14 @@ def test_e2_rebuilds_regular_fd_identity_from_kernel_facts(tmp_path):
     fd = os.open(source, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
     try:
         expected = _expected_regular_observable(fd, content)
-        assert FdObservableIdentityV1.from_open_fd(fd) == expected
-        RegistrationRecoveryCapabilityV1._verify_observable_fd(fd, expected)
+        assert _open_regular_descriptor(fd).observable_fields == expected
+        RegistrationRecoveryCapabilityV1._verify_observable_fd(fd, expected, role="worker-input")
         source.write_bytes(b"tampered regular worker input\n")
         with pytest.raises(ValueError, match="identity changed"):
-            RegistrationRecoveryCapabilityV1._verify_observable_fd(fd, expected)
+            RegistrationRecoveryCapabilityV1._verify_observable_fd(fd, expected, role="worker-input")
         fcntl.fcntl(fd, fcntl.F_SETFD, fcntl.fcntl(fd, fcntl.F_GETFD) & ~fcntl.FD_CLOEXEC)
         with pytest.raises(ValueError, match="FD_CLOEXEC"):
-            RegistrationRecoveryCapabilityV1._verify_observable_fd(fd, expected)
+            RegistrationRecoveryCapabilityV1._verify_observable_fd(fd, expected, role="worker-input")
     finally:
         os.close(fd)
 
@@ -1749,6 +1843,68 @@ def test_e2_regular_fd_rejects_size_or_role_budget_before_any_content_read(tmp_p
             )
     finally:
         os.close(fd)
+
+
+def test_e2_broker_producer_rejects_role_oversize_sparse_regular_fd_before_any_content_read(tmp_path, monkeypatch):
+    """Changing producer construction to hash before its role budget must fail this test."""
+    source = tmp_path / "oversize-broker-producer"
+    source.write_bytes(b"x")
+    fd = os.open(source, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        os.truncate(source, 1024 * 1024 + 1)
+        reads = 0
+
+        def counted_pread(*_args):
+            nonlocal reads
+            reads += 1
+            pytest.fail("producer read an over-budget regular FD")
+
+        monkeypatch.setattr(os, "pread", counted_pread)
+        with pytest.raises(ValueError, match="budget"):
+            _open_regular_descriptor(fd)
+        with pytest.raises(ValueError, match="role"):
+            _open_regular_descriptor(fd, role="unrecognized-role")
+        assert reads == 0
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize(
+    "writes",
+    (
+        (b"B" * 64,),
+        (b"B" * 64, b"A" * 64),
+    ),
+    ids=("same-length-overwrite", "same-length-overwrite-then-restore"),
+)
+def test_e2_regular_fd_rejects_same_length_mutation_during_hash_even_if_bytes_are_restored(tmp_path, monkeypatch, writes):
+    """A read-window mutation must reject even when the final bytes equal the signed bytes."""
+    source = tmp_path / "mutable-worker-input"
+    original = b"A" * 64
+    source.write_bytes(original)
+    read_fd = os.open(source, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    write_fd = os.open(source, os.O_WRONLY)
+    original_pread = os.pread
+    try:
+        first_read = True
+
+        def mutate_after_first_read(descriptor, size, offset):
+            nonlocal first_read
+            result = original_pread(descriptor, size, offset)
+            if first_read and descriptor == read_fd and result:
+                first_read = False
+                for replacement in writes:
+                    assert os.pwrite(write_fd, replacement, 0) == len(replacement)
+            return result
+
+        monkeypatch.setattr(os, "pread", mutate_after_first_read)
+        with pytest.raises(ValueError, match="changed while hashing"):
+            RegistrationRecoveryCapabilityV1._verify_observable_fd(
+                read_fd, _expected_regular_observable(read_fd, original), role="worker-input",
+            )
+    finally:
+        os.close(write_fd)
+        os.close(read_fd)
 
 
 def test_e2_regular_fd_hashes_only_the_exact_length_then_proves_eof(tmp_path, monkeypatch):
@@ -1775,6 +1931,27 @@ def test_e2_regular_fd_hashes_only_the_exact_length_then_proves_eof(tmp_path, mo
         os.close(fd)
 
 
+def test_e2_role_bound_fd_producer_and_worker_reject_wrong_type_access_and_length_before_reading(tmp_path, monkeypatch):
+    """A role-bound FD path must reject nonconforming kernel facts before hashing content."""
+    source = tmp_path / "worker-input-facts"
+    content = b"verified regular worker input"
+    source.write_bytes(content)
+    read_fd = os.open(source, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    write_fd = os.open(source, os.O_WRONLY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        monkeypatch.setattr(os, "pread", lambda *_args: pytest.fail("invalid FD facts were read"))
+        expected = _expected_regular_observable(read_fd, content)
+        with pytest.raises(ValueError, match="length"):
+            RegistrationRecoveryCapabilityV1._verify_observable_fd(
+                read_fd, replace(expected, byte_length=len(content) + 1), role="worker-input",
+            )
+        with pytest.raises(ValueError, match="state"):
+            _open_regular_descriptor(write_fd)
+    finally:
+        os.close(write_fd)
+        os.close(read_fd)
+
+
 def test_e2_regular_fd_masks_access_mode_without_rewriting_descriptor_status(tmp_path, monkeypatch):
     """A Linux status bit must not turn a read-only FD into a rejected access mode."""
     source = tmp_path / "worker-input-with-status"
@@ -1789,7 +1966,7 @@ def test_e2_regular_fd_masks_access_mode_without_rewriting_descriptor_status(tmp
 
     monkeypatch.setattr(fcntl, "fcntl", fcntl_with_status)
     try:
-        observed = FdObservableIdentityV1.from_open_fd(fd)
+        observed = _open_regular_descriptor(fd).observable_fields
         assert observed.access_mode == "read-only"
         assert observed.status_flags == ("O_RDONLY",)
     finally:
@@ -1800,7 +1977,9 @@ def test_e2_rebuilds_socket_identity_and_rejects_non_seqpacket_control_fd():
     """A control descriptor must use kernel socket family/type/options, never envelope claims."""
     local, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        observed = FdObservableIdentityV1.from_open_fd(local.fileno())
+        observed = FdObservableIdentityV1._from_open_fd(
+            local.fileno(), expected_byte_length=None, maximum_byte_length=None,
+        )
         assert observed.file_type == "socket-stream"
         assert observed.socket_options == ("SO_TYPE=SOCK_STREAM",)
         with pytest.raises(ValueError, match="control FD state"):
@@ -1997,9 +2176,15 @@ def _linux_delivery(tmp_path, mode, fault=None, envelope_overrides=None):
             source.write_bytes(f"{mode}-input-{ordinal}".encode())
             opened.append(os.open(source, os.O_RDONLY | os.O_CLOEXEC))
         descriptors = tuple(
-            replace(item, observable_fields=FdObservableIdentityV1.from_open_fd(fd))
+            FdDescriptorV1.from_open_fd(
+                fd, role=item.role, ordinal=item.ordinal, logical_name=item.logical_name,
+                provenance_fields=item.provenance_fields,
+            )
             for item, fd in zip(closure[:-1], opened)
-        ) + (replace(closure[-1], observable_fields=FdObservableIdentityV1.from_open_fd(control.fileno())),)
+        ) + (FdDescriptorV1.from_open_fd(
+            control.fileno(), role=closure[-1].role, ordinal=closure[-1].ordinal,
+            logical_name=closure[-1].logical_name, provenance_fields=closure[-1].provenance_fields,
+        ),)
         sent = [*opened, control.fileno()]
         if fault == "missing":
             sent.pop()

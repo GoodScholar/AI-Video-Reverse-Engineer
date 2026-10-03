@@ -2949,12 +2949,12 @@ class FdObservableIdentityV1(_SelfDigestRecord):
     def to_wire(self) -> dict[str, object]: return {**self._unsigned_wire(), "canonicalDigest": self.canonical_digest}
 
     @classmethod
-    def from_open_fd(
+    def _from_open_fd(
         cls,
         fd: int,
         *,
-        expected_byte_length: int | None = None,
-        maximum_byte_length: int | None = None,
+        expected_byte_length: int | None,
+        maximum_byte_length: int | None,
     ) -> "FdObservableIdentityV1":
         """Rebuild only observable FD facts; broker-open provenance remains unobservable."""
         try:
@@ -2967,13 +2967,13 @@ class FdObservableIdentityV1(_SelfDigestRecord):
             if stat.S_ISREG(info.st_mode):
                 if flags & os.O_ACCMODE != os.O_RDONLY:
                     raise ValueError("received regular FD state is invalid")
-                expected_length = info.st_size if expected_byte_length is None else _u64(
-                    expected_byte_length, "expected_byte_length",
+                if expected_byte_length is None or maximum_byte_length is None:
+                    raise ValueError("regular FD observation requires an explicit frozen budget")
+                expected_length = _u64(expected_byte_length, "expected_byte_length")
+                maximum_length = _u64(maximum_byte_length, "maximum_byte_length")
+                initial_identity = (
+                    info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
                 )
-                maximum_length = expected_length if maximum_byte_length is None else _u64(
-                    maximum_byte_length, "maximum_byte_length",
-                )
-                initial_identity = (info.st_dev, info.st_ino, info.st_size)
                 if info.st_size != expected_length:
                     raise ValueError("received regular FD length differs from its descriptor")
                 if expected_length > maximum_length:
@@ -2995,7 +2995,7 @@ class FdObservableIdentityV1(_SelfDigestRecord):
                     raise ValueError("received regular FD changed while hashing")
                 after = os.fstat(fd)
                 if (
-                    (after.st_dev, after.st_ino, after.st_size) != initial_identity
+                    (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != initial_identity
                     or not stat.S_ISREG(after.st_mode)
                     or not fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
                     or fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY
@@ -3054,6 +3054,36 @@ class FdDescriptorV1(_SelfDigestRecord):
             raise ValueError("FD descriptor mixes provenance and observable types")
         if not control and self.observable_fields.byte_length > _fd_role_profile_budget(self.role):
             raise ValueError("FD descriptor exceeds its frozen role/profile budget")
+
+    @classmethod
+    def from_open_fd(
+        cls,
+        fd: int,
+        *,
+        role: str,
+        ordinal: int,
+        logical_name: str,
+        provenance_fields: FdOpenProvenanceV1,
+    ) -> "FdDescriptorV1":
+        """Build the only public FD producer descriptor under its frozen role budget."""
+        if role == "broker-control":
+            observable = FdObservableIdentityV1._from_open_fd(
+                fd, expected_byte_length=None, maximum_byte_length=None,
+            )
+        else:
+            maximum = _fd_role_profile_budget(role)
+            try:
+                info = os.fstat(fd)
+            except OSError as error:
+                raise ValueError("received FD cannot be observed") from error
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("received regular FD state is invalid")
+            if info.st_size > maximum:
+                raise ValueError("received regular FD exceeds its frozen role budget")
+            observable = FdObservableIdentityV1._from_open_fd(
+                fd, expected_byte_length=info.st_size, maximum_byte_length=maximum,
+            )
+        return cls(role, ordinal, logical_name, "exactly-one", provenance_fields, observable)
 
     def _unsigned_wire(self) -> dict[str, object]:
         return {"cardinality": self.cardinality, "logicalName": self.logical_name, "observableFields": self.observable_fields.to_wire(), "ordinal": self.ordinal, "provenanceFields": self.provenance_fields.to_wire(), "role": self.role}
@@ -3294,12 +3324,13 @@ class RegistrationRecoveryCapabilityV1:
     ) -> None:
         if type(expected) is not FdObservableIdentityV1:
             raise ValueError("expected FD observable identity is invalid")
-        maximum = (
-            _fd_role_profile_budget(role)
-            if expected.file_type == "regular" and role is not None
-            else expected.byte_length
-        )
-        observed = FdObservableIdentityV1.from_open_fd(
+        if expected.file_type == "regular":
+            if role is None:
+                raise ValueError("regular FD verification requires a frozen role budget")
+            maximum = _fd_role_profile_budget(role)
+        else:
+            maximum = None
+        observed = FdObservableIdentityV1._from_open_fd(
             fd,
             expected_byte_length=expected.byte_length if expected.file_type == "regular" else None,
             maximum_byte_length=maximum if expected.file_type == "regular" else None,
