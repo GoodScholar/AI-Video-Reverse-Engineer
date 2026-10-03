@@ -80,3 +80,27 @@ binding spec 没有重列下列类型；补充授权明确由实施计划第 99�
 
 - 修改：`.scratch/unified-remix-canvas-generation/acceptance/trusted_evidence/handoffs.py`、`.scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py`、`.scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_handoffs.py`。
 - Scoped commit：`feat: close trusted handoff consumer lifecycle`（最终 revision 见交付消息）。
+
+## C.1 — signing domains and policy activation proof
+
+### RED / GREEN
+
+- RED（先新增固定 signer、完整 activation chain、跨域 identity collision 与 purpose/domain 反例）：
+  `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_handoffs.py`
+  在收集期以 `ImportError: cannot import name 'ActivatedPolicyExportRequestV1'` 失败，证明 C.1 的 codec/verifier 尚不存在。
+- GREEN（focused + affected policy）：
+  `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_handoffs.py .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_e2_policy_v2.py`
+  为 `38 passed in 0.57s`。
+
+### 实现与自审
+
+- `handoffs.py` 增加严格 canonical codec：signing registration/domain、embedded bytes、activation marker/proof、policy handoff 和 activated export request；unknown/missing/duplicate/non-canonical JSON 均拒绝。
+- 联合 loader 验证 transport、activation、broker-auth 的 key ID、raw digest/fingerprint、wrapper identity、resolved leaf digest/fingerprint 两两互斥，并闭合 broker allowed-signers 与 revocation；broker startup challenge 暂以明确 fail-closed stub 保留给 slice E。
+- activation verifier 用固定 `policy-activation` domain + NUL + unsigned canonical bytes 做纯公钥 Ed25519 验证，重算 proof ref、三个 embedded bytes/digest、intent→marker→ACTIVATED 链、core/final-ref fields 和 transport proof binding；不读 journal、路径或私钥。
+- 固定 RFC 8032 派生签名向量不调用被测实现生成 expected bytes/signature；篡改 embedded fields、commit/completion/signature，及跨域、缺/错 purpose/domain、revoked/empty/duplicate closure 都有真实 fail-closed 测试。
+- 范围刻意不含 transport install/orchestrator 或 broker-auth 私钥/slot；product transport proof-null enforcement 属 C.2 transport schema。
+
+### 文件与提交
+
+- 修改：`.scratch/unified-remix-canvas-generation/acceptance/trusted_evidence/handoffs.py`、`.scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_handoffs.py`。
+- Scoped commit：`eb6b1ea feat: verify trusted policy activation proofs`。

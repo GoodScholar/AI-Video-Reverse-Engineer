@@ -1,4 +1,6 @@
 import hashlib
+import base64
+import json
 import os
 import subprocess
 import sys
@@ -8,6 +10,8 @@ import pytest
 
 from trusted_evidence.e2_policy import ProductGitObjectIdV1
 from trusted_evidence.handoffs import (
+    ActivatedPolicyExportRequestV1,
+    EmbeddedCanonicalBytesV1,
     HandoffRegistryV1,
     HandoffPointerV1,
     HandoffExportRequestV1,
@@ -15,6 +19,8 @@ from trusted_evidence.handoffs import (
     Ticket23ProductSourceHandoffV1,
     TrustedHandoffRecordV1,
     TrustedHandoffStoreV1,
+    load_disjoint_signing_domains,
+    verify_policy_activation_proof,
 )
 
 
@@ -239,3 +245,221 @@ def test_handoff_cli_verifies_cache_and_cleans_only_a_narrow_owned_root(tmp_path
     assert cleanup.returncode == 0
     assert not owned.exists()
     assert broad_cleanup.returncode != 0
+
+
+# This vector is built only from literals with the standard library.  The
+# signature was independently fixed with the RFC 8032 reference algorithm for
+# seed 9d61…e7f60; the production module is never asked to generate expected
+# bytes or signatures.
+FIXED_ACTIVATION_PUBLIC_KEY = bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+FIXED_ACTIVATION_SIGNATURE = "4464c8bc88f64aa79c46729e27362f3b56a7763a66fac851ec81bfe1f4bd252d2e43f7a19b8e357f092fec467b8189700aabaac679884ee2515b60e66e62a203"
+FIXED_ACTIVATION_PROOF_REF = "sha256:efa99efdeafd72475650bad8158058aa9fb7119f367c1c2e7b9bdb13e0ccbd47"
+
+
+def _fixed_digest(character):
+    return "sha256:" + character * 64
+
+
+def _fixed_canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _fixed_embedded(value):
+    wire = _fixed_canonical(value)
+    return {"canonicalBytesB64": base64.b64encode(wire).decode("ascii"), "digest": "sha256:" + hashlib.sha256(wire).hexdigest(), "encoding": "base64"}
+
+
+def _activation_registry(public_key=FIXED_ACTIVATION_PUBLIC_KEY, *, key_id="activation-fixed"):
+    return {
+        "keys": [{
+            "keyId": key_id,
+            "purpose": "policy-activation",
+            "signatureDomain": "ai-video-reverse-engineer/policy-activation/v1",
+            "rawPublicKey": base64.b64encode(public_key).decode("ascii"),
+            "wrapperIdentity": "activation-wrapper-fixed",
+            "resolvedPublicKey": base64.b64encode(public_key).decode("ascii"),
+        }],
+    }
+
+
+def _fixed_activation_proof_bytes():
+    """Reference-only fixed activation chain; no trusted_evidence helper participates."""
+    commit = {"algorithm": "sha1", "hex": "3" * 40}
+    intent = {
+        "activationMarkerDigest": None, "completionRecordDigest": _fixed_digest("a"), "completionRecordRef": _fixed_digest("b"),
+        "entryDigest": _fixed_digest("c"), "exportRequestRef": _fixed_digest("d"),
+        "fixedRef": "refs/tags/trusted-acceptance/ticket-23-policy-v1", "fixedRefMustBeAbsent": True,
+        "operationId": "policy-operation-fixed", "pendingTransition": "ACTIVATE", "pointerDigest": _fixed_digest("e"),
+        "policyCommit": commit, "previousEntryDigest": _fixed_digest("f"), "recordRef": _fixed_digest("0"),
+        "schema": "trusted-policy-publish-transaction/v1", "stagedPayloadDigest": _fixed_digest("1"),
+        "state": "HANDOFF_INSTALLED", "targetHeadRef": "refs/heads/main",
+    }
+    embedded_intent = _fixed_embedded(intent)
+    marker = {
+        "activationIntentDigest": embedded_intent["digest"], "exportRequestRef": _fixed_digest("d"),
+        "fixedRef": "refs/tags/trusted-acceptance/ticket-23-policy-v1", "operationId": "policy-operation-fixed",
+        "pointerDigest": _fixed_digest("e"), "policyCommit": commit, "recordRef": _fixed_digest("0"),
+        "schema": "trusted-policy-activation/v1",
+    }
+    embedded_marker = _fixed_embedded(marker)
+    activated = {
+        "activationMarkerDigest": embedded_marker["digest"], "completionRecordDigest": _fixed_digest("a"),
+        "completionRecordRef": _fixed_digest("b"), "entryDigest": _fixed_digest("2"), "exportRequestRef": _fixed_digest("d"),
+        "fixedRef": "refs/tags/trusted-acceptance/ticket-23-policy-v1", "fixedRefMustBeAbsent": True,
+        "operationId": "policy-operation-fixed", "pendingTransition": None, "pointerDigest": _fixed_digest("e"),
+        "policyCommit": commit, "previousEntryDigest": embedded_intent["digest"], "recordRef": _fixed_digest("0"),
+        "schema": "trusted-policy-publish-transaction/v1", "stagedPayloadDigest": _fixed_digest("1"),
+        "state": "ACTIVATED", "targetHeadRef": "refs/heads/main",
+    }
+    transport = _transport_registry()["keys"][0]
+    activation = _activation_registry()["keys"][0]
+    broker = _broker_registry()["keys"][0]
+    trust_root = "sha256:" + hashlib.sha256(_fixed_canonical({
+        "activation": ["sha256:" + hashlib.sha256(_fixed_canonical(activation)).hexdigest()],
+        "broker": ["sha256:" + hashlib.sha256(_fixed_canonical(broker)).hexdigest()],
+        "transport": ["sha256:" + hashlib.sha256(_fixed_canonical(transport)).hexdigest()],
+    })).hexdigest()
+    unsigned = {
+        "activateIntent": embedded_intent, "activatedEntry": _fixed_embedded(activated), "activationMarker": embedded_marker,
+        "activationTrustRootDigest": trust_root, "brokerKeyId": "activation-fixed", "completionRecordDigest": _fixed_digest("a"),
+        "completionRecordRef": _fixed_digest("b"), "fixedRef": "refs/tags/trusted-acceptance/ticket-23-policy-v1",
+        "fixedRefValue": commit, "operationId": "policy-operation-fixed", "policyCommit": commit,
+        "policyCoreExportRequestFullBytesDigest": _fixed_digest("2"), "policyCoreExportRequestRef": _fixed_digest("d"),
+        "policyPointerBytesDigest": _fixed_digest("e"), "policyPointerName": "ticket-23-policy-v1",
+        "policyRecordFullBytesDigest": _fixed_digest("4"), "policyRecordRef": _fixed_digest("0"), "profileDigest": _fixed_digest("5"),
+        "schema": "trusted-policy-activation-proof/v1", "signatureAlgorithm": "ssh-ed25519",
+        "signatureDomain": "ai-video-reverse-engineer/policy-activation/v1", "signingKeyPurpose": "policy-activation",
+        "state": "ACTIVATED", "targetHeadRef": "refs/heads/main", "targetHeadValue": commit,
+        "toolchainBuildRecordRef": _fixed_digest("6"), "trustedGitExecutableDigest": _fixed_digest("7"),
+        "trustedGitViewDigest": _fixed_digest("8"),
+    }
+    return _fixed_canonical({**unsigned, "brokerSignature": FIXED_ACTIVATION_SIGNATURE})
+
+
+def _transport_registry(public_key=bytes.fromhex("11" * 32), *, key_id="transport-fixed", wrapper="transport-wrapper-fixed"):
+    return {
+        "keys": [{
+            "keyId": key_id,
+            "purpose": "transport-seal",
+            "signatureDomain": "ai-video-reverse-engineer/transport-seal/v1",
+            "rawPublicKey": base64.b64encode(public_key).decode("ascii"),
+            "wrapperIdentity": wrapper,
+            "resolvedPublicKey": base64.b64encode(public_key).decode("ascii"),
+        }],
+    }
+
+
+def _broker_registry(public_key=bytes.fromhex("22" * 32), *, key_id="broker-fixed", wrapper="broker-wrapper-fixed"):
+    return {
+        "keys": [{
+            "keyId": key_id,
+            "purpose": "registration-broker-auth",
+            "signatureDomain": "ai-video-reverse-engineer/registration-broker-envelope/v1",
+            "rawPublicKey": base64.b64encode(public_key).decode("ascii"),
+            "wrapperIdentity": wrapper,
+            "resolvedPublicKey": base64.b64encode(public_key).decode("ascii"),
+        }],
+    }
+
+
+def _allowed(registry):
+    return {"keys": registry["keys"]}
+
+
+def _domains(transport=None, activation=None, broker=None):
+    transport = transport or _transport_registry()
+    activation = activation or _activation_registry()
+    broker = broker or _broker_registry()
+    return load_disjoint_signing_domains(
+        transport,
+        activation,
+        broker,
+        {"revokedKeyIds": []},
+        _allowed(broker),
+    )
+
+
+def test_fixed_activation_signer_verifies_complete_canonical_chain():
+    """Changing proof bytes, signature binding, or any chain field must break this verifier."""
+    domains = _domains()
+
+    verified = verify_policy_activation_proof(
+        _fixed_activation_proof_bytes(),
+        domains,
+        expected_transport={"consumerTask": 28, "destinationExecutorId": "executor-28"},
+    )
+
+    assert verified.proof_ref == FIXED_ACTIVATION_PROOF_REF
+    assert verified.policy_commit.hex == "3" * 40
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("activateIntent", "activationMarker", "activatedEntry", "policyCommit", "completionRecordRef", "brokerSignature"),
+)
+def test_activation_proof_tampering_fails_closed(field):
+    """Every signed proof component is authenticated before a policy handoff can be trusted."""
+    proof = json.loads(_fixed_activation_proof_bytes())
+    if field == "brokerSignature":
+        proof[field] = "0" * 128
+    elif field == "policyCommit":
+        proof[field]["hex"] = "4" * 40
+    elif field == "completionRecordRef":
+        proof[field] = _fixed_digest("c")
+    else:
+        proof[field]["digest"] = _fixed_digest("f")
+    with pytest.raises(ValueError):
+        verify_policy_activation_proof(
+            _fixed_canonical(proof), _domains(),
+            expected_transport={"consumerTask": 28, "destinationExecutorId": "executor-28"},
+        )
+
+
+@pytest.mark.parametrize(
+    "transport,activation,broker",
+    (
+        # Re-identifying a raw/leaf key must not evade domain isolation.
+        (_transport_registry(), _activation_registry(bytes.fromhex("11" * 32)), _broker_registry()),
+        # Reusing an ID with a different wrapper is likewise forbidden.
+        (_transport_registry(), _activation_registry(key_id="transport-fixed"), _broker_registry()),
+        # A wrapper/certificate identity is independently part of the closure.
+        (_transport_registry(wrapper="shared-wrapper"), _activation_registry(), _broker_registry(wrapper="shared-wrapper")),
+    ),
+)
+def test_signing_domains_reject_cross_purpose_identity_collisions(transport, activation, broker):
+    """A collision in every identity dimension blocks proof/seal authorization before writes."""
+    with pytest.raises(ValueError):
+        _domains(transport, activation, broker)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("purpose", "transport-seal"),
+        ("signatureDomain", "ai-video-reverse-engineer/transport-seal/v1"),
+        ("purpose", None),
+        ("signatureDomain", None),
+    ),
+)
+def test_activation_registry_rejects_missing_or_wrong_purpose_domain(field, value):
+    """Only an immutable activation-purpose registration may verify an activation proof."""
+    activation = _activation_registry()
+    if value is None:
+        del activation["keys"][0][field]
+    else:
+        activation["keys"][0][field] = value
+    with pytest.raises(ValueError):
+        _domains(activation=activation)
+
+
+def test_broker_registry_requires_unrevoked_exact_allowed_signer_closure():
+    """Unknown, revoked, duplicate, or substituted broker keys cannot start a signing domain."""
+    broker = _broker_registry()
+    with pytest.raises(ValueError):
+        load_disjoint_signing_domains(_transport_registry(), _activation_registry(), broker, {"revokedKeyIds": ["broker-fixed"]}, _allowed(broker))
+    with pytest.raises(ValueError):
+        load_disjoint_signing_domains(_transport_registry(), _activation_registry(), broker, {"revokedKeyIds": []}, {"keys": []})
+    duplicate = _broker_registry()
+    duplicate["keys"].append(dict(duplicate["keys"][0]))
+    with pytest.raises(ValueError):
+        _domains(broker=duplicate)
