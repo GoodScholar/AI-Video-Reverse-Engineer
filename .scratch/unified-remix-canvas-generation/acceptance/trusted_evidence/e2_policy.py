@@ -2204,6 +2204,68 @@ class RegistrationRecoveryLeaseIdentityPreimageV1:
         return cls(raw["schema"], raw["projectId"], raw["operationId"], raw["lifecycleNonce"], raw["sessionFamilyAuthorizationDigest"], raw["brokerAuthLeaseRequestDigest"], raw["brokerAuthKeyId"], raw["brokerAuthIssueEntrySequence"], raw["brokerAuthIssueEntryDigest"], raw["brokerAuthEffectiveHeadDigest"], raw["brokerAuthRegistryGeneration"], raw["brokerAuthRegistryDigest"], raw["brokerAuthRevocationDigest"], raw["brokerAuthPolicyDigest"], raw["brokerAuthAllowedSignersDigest"], raw["brokerAuthSequenceRootIdentityDigest"], raw["brokerAuthLeaseExpirySequence"], raw["transactionParentIdentityDigest"], raw["transactionRootIdentityDigest"], raw["operationDirectoryIdentityDigest"], raw["repositoryIdentityDigest"], raw["repositoryBoundaryIdentityDigest"], raw["trustedToolchainBuildRecordDigest"], raw["trustedRecoveryLauncherDigest"], raw["executorIdentityDigest"], raw["profileIdentityDigest"])
 
 
+def _decode_issued_session_family(payload: "BrokerAuthLeaseIssueEventPayloadV1") -> RegistrationWorkerSessionFamilyAuthorizationV1:
+    """Recover the complete immutable family that the issue event content-addresses."""
+    encoded = payload.session_family_authorization_canonical_bytes_b64
+    if not isinstance(encoded, str):
+        raise ValueError("broker auth issue does not carry a session family closure")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+        family = RegistrationWorkerSessionFamilyAuthorizationV1.from_canonical_bytes(raw)
+    except (TypeError, ValueError) as error:
+        raise ValueError("broker auth issue family closure is invalid") from error
+    if (
+        base64.b64encode(raw).decode("ascii") != encoded
+        or family.canonical_bytes != raw
+        or family.canonical_digest != payload.lease_request.session_family_authorization_digest
+        or family.operation_id != payload.operation_id
+        or family.broker_auth_key_id != payload.broker_auth_key_id
+    ):
+        raise ValueError("broker auth issue family closure is invalid")
+    return family
+
+
+def _derive_authoritative_lease_preimage(
+    request: "BrokerAuthLeaseIssueRequestV1",
+    family: RegistrationWorkerSessionFamilyAuthorizationV1,
+    issue_entry: "BrokerAuthSequenceJournalEntryV1",
+    root_identity_digest: str,
+    registry: "RegistrationBrokerAuthRegistryV1",
+    revocations: "RegistrationBrokerAuthRevocationsV1",
+    allowed_signers_digest: str,
+    policy_digest: str,
+    expiry_sequence: int,
+) -> RegistrationRecoveryLeaseIdentityPreimageV1:
+    """The sole live/replay derivation of a lease's stable identity."""
+    key = registry.key(request.broker_auth_key_id)
+    if (
+        request.operation_id != family.operation_id
+        or request.session_family_authorization_digest != family.canonical_digest
+        or family.broker_auth_key_id != key.key_id
+        or family.broker_auth_key_registration_digest != key.canonical_digest
+        or request.expected_registry_digest != registry.canonical_digest
+        or request.expected_revocation_digest != revocations.canonical_digest
+        or request.expected_allowed_signers_digest != allowed_signers_digest
+        or request.expected_policy_digest != policy_digest
+        or issue_entry.event_kind != "issue-lease"
+        or issue_entry.sequence != _checked_add(request.expected_current_sequence, 1)
+        or expiry_sequence != _checked_add(issue_entry.sequence, request.lease_ttl_sequences)
+    ):
+        raise ValueError("broker auth issue cannot derive a unique lease identity")
+    return RegistrationRecoveryLeaseIdentityPreimageV1(
+        "trusted-registration-recovery-lease-identity-preimage/v1", "ai-video-reverse-engineer",
+        request.operation_id, request.lifecycle_nonce, family.canonical_digest, request.request_digest,
+        key.key_id, issue_entry.sequence, issue_entry.canonical_digest, issue_entry.canonical_digest,
+        registry.generation, registry.canonical_digest, revocations.canonical_digest, policy_digest,
+        allowed_signers_digest, root_identity_digest, expiry_sequence,
+        family.transaction_parent_identity_digest, family.transaction_root_identity_digest,
+        family.operation_directory_identity_digest, family.repository_identity_digest,
+        family.repository_boundary_identity_digest, family.trusted_toolchain_build_record_digest,
+        family.trusted_recovery_launcher_digest, family.executor_identity_digest,
+        family.profile_identity_digest,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class BrokerAuthLeaseIssueRequestV1(_SelfDigestRecord):
     schema: str; operation_id: str; lifecycle_nonce: str; session_family_authorization_digest: str; broker_auth_key_id: str; expected_current_sequence: int; expected_current_head_digest: str; expected_registry_digest: str; expected_revocation_digest: str; expected_policy_digest: str; expected_allowed_signers_digest: str; lease_ttl_sequences: int
@@ -2287,6 +2349,7 @@ def _broker_auth_key_is_eligible(
 @dataclass(frozen=True, slots=True)
 class BrokerAuthLeaseIssueEventPayloadV1(_SelfDigestRecord):
     schema: str; event_kind: str; event_id_digest: str; lease_request: BrokerAuthLeaseIssueRequestV1; lease_request_digest: str; operation_id: str; broker_auth_key_id: str; issued_sequence: int; lease_ttl_sequences: int; expiry_sequence: int; pre_policy_digest: str; post_policy_digest: str
+    session_family_authorization_canonical_bytes_b64: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema != "trusted-registration-broker-auth-lease-issue-payload/v1" or self.event_kind != "issue-lease" or type(self.lease_request) is not BrokerAuthLeaseIssueRequestV1:
@@ -2300,18 +2363,40 @@ class BrokerAuthLeaseIssueEventPayloadV1(_SelfDigestRecord):
             raise ValueError("broker auth issue payload sequence or policy is invalid")
         if self.pre_policy_digest != self.lease_request.expected_policy_digest:
             raise ValueError("broker auth issue payload policy does not bind request")
+        if self.session_family_authorization_canonical_bytes_b64 is not None:
+            try:
+                family_bytes = base64.b64decode(self.session_family_authorization_canonical_bytes_b64, validate=True)
+                family = RegistrationWorkerSessionFamilyAuthorizationV1.from_canonical_bytes(family_bytes)
+            except (TypeError, ValueError) as error:
+                raise ValueError("broker auth issue payload family closure is invalid") from error
+            if (
+                base64.b64encode(family_bytes).decode("ascii") != self.session_family_authorization_canonical_bytes_b64
+                or family.canonical_bytes != family_bytes
+                or family.canonical_digest != self.lease_request.session_family_authorization_digest
+                or family.operation_id != self.operation_id
+                or family.broker_auth_key_id != self.broker_auth_key_id
+            ):
+                raise ValueError("broker auth issue payload family closure is invalid")
         _require_broker_payload_budget(self)
 
     def _unsigned_wire(self) -> dict[str, object]:
-        return {"brokerAuthKeyId": self.broker_auth_key_id, "eventIdDigest": self.event_id_digest, "eventKind": self.event_kind, "expirySequence": self.expiry_sequence, "issuedSequence": self.issued_sequence, "leaseRequest": self.lease_request.to_wire(), "leaseRequestDigest": self.lease_request_digest, "leaseTtlSequences": self.lease_ttl_sequences, "operationId": self.operation_id, "postPolicyDigest": self.post_policy_digest, "prePolicyDigest": self.pre_policy_digest, "schema": self.schema}
+        wire = {"brokerAuthKeyId": self.broker_auth_key_id, "eventIdDigest": self.event_id_digest, "eventKind": self.event_kind, "expirySequence": self.expiry_sequence, "issuedSequence": self.issued_sequence, "leaseRequest": self.lease_request.to_wire(), "leaseRequestDigest": self.lease_request_digest, "leaseTtlSequences": self.lease_ttl_sequences, "operationId": self.operation_id, "postPolicyDigest": self.post_policy_digest, "prePolicyDigest": self.pre_policy_digest, "schema": self.schema}
+        if self.session_family_authorization_canonical_bytes_b64 is not None:
+            wire["sessionFamilyAuthorizationCanonicalBytesB64"] = self.session_family_authorization_canonical_bytes_b64
+        return wire
 
     @classmethod
     def from_canonical_bytes(cls, payload: bytes) -> "BrokerAuthLeaseIssueEventPayloadV1":
-        fields = {"brokerAuthKeyId", "canonicalDigest", "eventIdDigest", "eventKind", "expirySequence", "issuedSequence", "leaseRequest", "leaseRequestDigest", "leaseTtlSequences", "operationId", "postPolicyDigest", "prePolicyDigest", "schema"}
-        raw = _broker_payload_from_bytes(payload, fields, "broker auth issue payload")
+        legacy = {"brokerAuthKeyId", "canonicalDigest", "eventIdDigest", "eventKind", "expirySequence", "issuedSequence", "leaseRequest", "leaseRequestDigest", "leaseTtlSequences", "operationId", "postPolicyDigest", "prePolicyDigest", "schema"}
+        fields = legacy | {"sessionFamilyAuthorizationCanonicalBytesB64"}
+        try:
+            raw = _broker_payload_from_bytes(payload, fields, "broker auth issue payload")
+        except ValueError:
+            raw = _broker_payload_from_bytes(payload, legacy, "broker auth issue payload")
+            raw["sessionFamilyAuthorizationCanonicalBytesB64"] = None
         request = BrokerAuthLeaseIssueRequestV1.from_canonical_bytes(canonical_json_bytes(raw["leaseRequest"]))
-        item = cls(raw["schema"], raw["eventKind"], raw["eventIdDigest"], request, raw["leaseRequestDigest"], raw["operationId"], raw["brokerAuthKeyId"], raw["issuedSequence"], raw["leaseTtlSequences"], raw["expirySequence"], raw["prePolicyDigest"], raw["postPolicyDigest"])
-        if raw["canonicalDigest"] != item.canonical_digest:
+        item = cls(raw["schema"], raw["eventKind"], raw["eventIdDigest"], request, raw["leaseRequestDigest"], raw["operationId"], raw["brokerAuthKeyId"], raw["issuedSequence"], raw["leaseTtlSequences"], raw["expirySequence"], raw["prePolicyDigest"], raw["postPolicyDigest"], raw["sessionFamilyAuthorizationCanonicalBytesB64"])
+        if raw["sessionFamilyAuthorizationCanonicalBytesB64"] is not None and raw["canonicalDigest"] != item.canonical_digest:
             raise ValueError("broker auth issue payload digest is invalid")
         return item
 
@@ -2568,7 +2653,8 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
         state: BrokerAuthSequenceStateV1,
         payloads: Mapping[str, BrokerAuthSequenceEventPayloadV1],
         baseline: BrokerAuthSequenceReplayBaselineV1,
-    ) -> None:
+        state_mac: "RegistrationBrokerStateMacCapabilityV1 | None" = None,
+    ) -> "BrokerAuthAuthenticatedReplayResultV1 | None":
         """Replay every event from one explicit, immutable governance baseline."""
         if (
             type(state) is not BrokerAuthSequenceStateV1
@@ -2579,6 +2665,13 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
             or not isinstance(payloads, Mapping)
         ):
             raise ValueError("broker auth state does not close journal baseline")
+        if state_mac is not None:
+            if type(state_mac) is not RegistrationBrokerStateMacCapabilityV1:
+                raise ValueError("broker auth replay state MAC capability is invalid")
+            state_mac.verify(canonical_json_bytes(self._unsigned_wire()), self.broker_state_mac_hex)
+            state_mac.verify(canonical_json_bytes(state._unsigned_wire()), state.broker_state_mac_hex)
+            for item in self.entries:
+                state_mac.verify(canonical_json_bytes(item._unsigned_wire()), item.broker_state_mac_hex)
         for payload_ref, payload in payloads.items():
             if (
                 not isinstance(payload_ref, str)
@@ -2603,6 +2696,9 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
         current_revocations = current_governance.revocations
         current_policy = baseline.policy_digest
         seen_event_ids: set[str] = set()
+        issued_families: dict[str, RegistrationWorkerSessionFamilyAuthorizationV1] = {}
+        issued_preimages: dict[str, RegistrationRecoveryLeaseIdentityPreimageV1] = {}
+        sign_lifecycles: dict[str, tuple[str, int]] = {}
         for entry in self.entries:
             if entry.event_payload_length > _MAX_BROKER_AUTH_SEQUENCE_PAYLOAD_BYTES:
                 raise ValueError("broker auth event entry exceeds the fixed 256 KiB payload budget")
@@ -2642,6 +2738,10 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
             if isinstance(payload, BrokerAuthLeaseIssueEventPayloadV1):
                 expected_head = entry.previous_entry_digest or baseline.root_identity_digest
                 active_key = current_registry.key(current_registry.active_key_id)
+                family = (
+                    _decode_issued_session_family(payload)
+                    if payload.session_family_authorization_canonical_bytes_b64 is not None else None
+                )
                 if (
                     payload.issued_sequence != entry.sequence
                     or entry.broker_auth_key_id != active_key.key_id
@@ -2667,12 +2767,21 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
                         current_governance.allowed_signers_digest,
                     )
                     or payload.post_policy_digest != current_policy
+                    or (family is not None and family.broker_auth_key_registration_digest != active_key.canonical_digest)
                 ):
                     raise ValueError("broker auth issue does not preserve replay pre-state")
+                if family is not None:
+                    issued_families[entry.canonical_digest] = family
+                    sign_lifecycles[entry.canonical_digest] = ("register", 1)
+                    issued_preimages[entry.canonical_digest] = _derive_authoritative_lease_preimage(
+                        payload.lease_request, family, entry, self.root_identity_digest,
+                        current_registry, current_revocations, current_governance.allowed_signers_digest,
+                        current_policy, payload.expiry_sequence,
+                    )
                 next_governance, next_registry, next_revocations, next_policy = current_governance, current_registry, current_revocations, current_policy
             elif isinstance(payload, BrokerAuthEnvelopeSignEventPayloadV1):
                 signer_key = current_registry.key(payload.broker_auth_key_id)
-                issue_entry = next((item for item in self.entries if item.canonical_digest == payload.issue_entry_digest), None)
+                issue_entry = next((item for item in self.entries[:entry.sequence - 1] if item.canonical_digest == payload.issue_entry_digest), None)
                 issue_payload = None if issue_entry is None else payloads.get(issue_entry.event_payload_ref)
                 preimage = payload.lease_identity_preimage
                 try:
@@ -2680,6 +2789,9 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
                     unsigned = CapabilityEnvelopeUnsignedV1.from_canonical_bytes(unsigned_bytes)
                 except (TypeError, ValueError) as error:
                     raise ValueError("broker auth signing does not close issued lease") from error
+                family = None if issue_entry is None else issued_families.get(issue_entry.canonical_digest)
+                expected_lifecycle = None if issue_entry is None else sign_lifecycles.get(issue_entry.canonical_digest)
+                derived = None if issue_entry is None else issued_preimages.get(issue_entry.canonical_digest)
                 if (
                     payload.sign_sequence != entry.sequence
                     or entry.broker_auth_key_id != payload.broker_auth_key_id
@@ -2690,6 +2802,10 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
                     or payload.post_policy_digest != current_policy
                     or type(issue_payload) is not BrokerAuthLeaseIssueEventPayloadV1
                     or type(preimage) is not RegistrationRecoveryLeaseIdentityPreimageV1
+                    or derived is None
+                    or preimage != derived
+                    or payload.lease_identity_digest != derived.lease_identity_digest
+                    or expected_lifecycle is None
                     or issue_entry.sequence != payload.issued_sequence
                     or issue_entry.canonical_digest != payload.issue_entry_digest
                     or issue_entry.canonical_digest != payload.issued_head_digest
@@ -2733,12 +2849,11 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
                     or unsigned.operation_id != preimage.operation_id
                     or unsigned.lifecycle_nonce != preimage.lifecycle_nonce
                     or unsigned.broker_auth_key_id != preimage.broker_auth_key_id
+                    or unsigned.broker_auth_public_key_digest != signer_key.public_key_digest
                     or unsigned.broker_auth_lease_issued_sequence != preimage.broker_auth_issue_entry_sequence
                     or unsigned.broker_auth_lease_expiry_sequence != preimage.broker_auth_lease_expiry_sequence
                     or unsigned.broker_auth_sign_sequence != entry.sequence
-                    or (unsigned.worker_mode == "register" and unsigned.worker_sequence != 1)
-                    or (unsigned.worker_mode == "recover" and unsigned.worker_sequence <= 1)
-                    or unsigned.worker_mode not in {"register", "recover"}
+                    or (unsigned.worker_mode, unsigned.worker_sequence) != expected_lifecycle
                     or (
                         unsigned.broker_auth_registry_generation,
                         unsigned.broker_auth_registry_digest,
@@ -2753,6 +2868,7 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
                     )
                 ):
                     raise ValueError("broker auth signing does not close issued lease")
+                sign_lifecycles[issue_entry.canonical_digest] = ("recover", _checked_add(unsigned.worker_sequence, 1))
                 next_governance, next_registry, next_revocations, next_policy = current_governance, current_registry, current_revocations, current_policy
             elif isinstance(payload, BrokerAuthRotatePolicyEventPayloadV1):
                 prior_active = current_registry.key(current_registry.active_key_id)
@@ -2832,6 +2948,28 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
             current_revocations.canonical_digest,
         ):
             raise ValueError("broker auth state head is invalid")
+        if state_mac is None:
+            return None
+        return BrokerAuthAuthenticatedReplayResultV1._from_validated_replay(
+            self, state, baseline, current_governance, MappingProxyType(dict(payloads)),
+        )
+
+
+class BrokerAuthAuthenticatedReplayResultV1:
+    """Opaque in-memory proof that one exact baseline/journal/state closure replayed."""
+
+    __slots__ = ("journal", "state", "baseline", "governance", "payloads")
+    _TOKEN = object()
+
+    def __init__(self, token: object, journal: BrokerAuthSequenceJournalV1, state: BrokerAuthSequenceStateV1, baseline: BrokerAuthSequenceReplayBaselineV1, governance: RegistrationBrokerAuthGovernanceV1, payloads: Mapping[str, BrokerAuthSequenceEventPayloadV1]) -> None:
+        if token is not self._TOKEN:
+            raise TypeError("authenticated replay results are created only by journal validation")
+        self.journal, self.state, self.baseline, self.governance = journal, state, baseline, governance
+        self.payloads = payloads
+
+    @classmethod
+    def _from_validated_replay(cls, journal: BrokerAuthSequenceJournalV1, state: BrokerAuthSequenceStateV1, baseline: BrokerAuthSequenceReplayBaselineV1, governance: RegistrationBrokerAuthGovernanceV1, payloads: Mapping[str, BrokerAuthSequenceEventPayloadV1]) -> "BrokerAuthAuthenticatedReplayResultV1":
+        return cls(cls._TOKEN, journal, state, baseline, governance, payloads)
 
 
 def _ed_base() -> tuple[int, int, int, int]:
@@ -2946,44 +3084,23 @@ class RegistrationBrokerAuthPrivateKeySlotV1:
 
 
 def verify_registration_broker_startup_challenge(
-    governance: RegistrationBrokerAuthGovernanceV1,
+    replay: BrokerAuthAuthenticatedReplayResultV1,
     slot: RegistrationBrokerAuthPrivateKeySlotV1,
-    baseline: BrokerAuthSequenceReplayBaselineV1,
-    state: BrokerAuthSequenceStateV1,
-    state_mac: RegistrationBrokerStateMacCapabilityV1,
     nonce: str,
 ) -> str:
     """Sign and independently verify the exact startup challenge before child creation."""
     if (
-        type(governance) is not RegistrationBrokerAuthGovernanceV1
+        type(replay) is not BrokerAuthAuthenticatedReplayResultV1
         or type(slot) is not RegistrationBrokerAuthPrivateKeySlotV1
-        or type(baseline) is not BrokerAuthSequenceReplayBaselineV1
-        or type(state) is not BrokerAuthSequenceStateV1
-        or type(state_mac) is not RegistrationBrokerStateMacCapabilityV1
     ):
         raise ValueError("broker startup trust closure is invalid")
     _require_text(nonce, "nonce")
-    state_mac.verify(canonical_json_bytes(state._unsigned_wire()), state.broker_state_mac_hex)
-    if (
-        baseline.governance != governance
-        or state.root_identity_digest != baseline.root_identity_digest
-        or (
-            state.current_policy_digest,
-            state.broker_auth_registry_digest,
-            state.broker_auth_revocation_digest,
-        )
-        != (
-            baseline.policy_digest,
-            governance.registry.canonical_digest,
-            governance.revocations.canonical_digest,
-        )
-    ):
-        raise ValueError("broker startup authenticated state is invalid")
+    governance, state = replay.governance, replay.state
     active = governance.registry.key(governance.registry.active_key_id)
     if (
         not _broker_auth_key_is_eligible(
             active, governance.revocations, governance.allowed_signers,
-            max(1, state.current_sequence), frozenset({"active"}),
+            state.current_sequence, frozenset({"active"}),
         )
         or (slot.key_id, slot.purpose, slot.signature_domain, slot.challenge_domain, slot.public_key_digest)
         != (active.key_id, _BROKER_AUTH_PURPOSE, _BROKER_ENVELOPE_DOMAIN, _BROKER_CHALLENGE_DOMAIN, active.public_key_digest)
@@ -3773,6 +3890,7 @@ class BrokerAuthAuthoritativeIssuerV1:
         "_registry", "_revocations", "_state", "_entries", "_payloads", "_journal",
         "_root_identity_digest", "_allowed_signers_digest", "_signer", "_allowed_signers",
         "_governance", "_baseline", "_state_mac", "_frozen_profile_ttl_sequences", "_event_ids",
+        "_issued_families", "_issued_preimages", "_sign_lifecycles",
     )
     _ENVELOPE_TOKEN = object()
 
@@ -3795,6 +3913,9 @@ class BrokerAuthAuthoritativeIssuerV1:
             root_identity_digest, governance, state.current_policy_digest,
         )
         self._frozen_profile_ttl_sequences, self._event_ids = _u64(frozen_profile_ttl_sequences, "frozen_profile_ttl_sequences", positive=True), set()
+        self._issued_families: dict[str, RegistrationWorkerSessionFamilyAuthorizationV1] = {}
+        self._issued_preimages: dict[str, RegistrationRecoveryLeaseIdentityPreimageV1] = {}
+        self._sign_lifecycles: dict[str, tuple[str, int]] = {}
 
     @classmethod
     def create(
@@ -3998,8 +4119,14 @@ class BrokerAuthAuthoritativeIssuerV1:
             request, request.request_digest, request.operation_id, key.key_id, sequence,
             request.lease_ttl_sequences, _checked_add(sequence, request.lease_ttl_sequences),
             self._state.current_policy_digest, self._state.current_policy_digest,
+            base64.b64encode(family.canonical_bytes).decode("ascii"),
         )
         transition = self._transition(payload, self._governance)
+        derived = _derive_authoritative_lease_preimage(
+            request, family, transition.entry, self._root_identity_digest, self._registry,
+            self._revocations, self._allowed_signers_digest, transition.state.current_policy_digest,
+            payload.expiry_sequence,
+        )
         lease = replace(
             lease_template, broker_auth_registry_generation=self._registry.generation,
             broker_auth_registry_digest=self._registry.canonical_digest,
@@ -4014,12 +4141,15 @@ class BrokerAuthAuthoritativeIssuerV1:
             broker_auth_lease_expiry_sequence=payload.expiry_sequence,
             state="OPEN", next_recovery_sequence=1, lease_identity_digest="sha256:" + "0" * 64,
         )
-        lease = replace(lease, lease_identity_digest=lease.identity_preimage().lease_identity_digest)
+        lease = replace(lease, lease_identity_digest=derived.lease_identity_digest)
         lease = replace(lease, broker_signature_hex=self._signer._sign_lease(canonical_json_bytes(lease._unsigned_wire())))
         lease = replace(lease, broker_mac=self._state_mac.mac(canonical_json_bytes(lease._unsigned_wire())))
         lease.verify_signature(self._governance, sequence)
         result = BrokerAuthLeaseIssuanceResultV1(transition.payload, transition.entry, transition.state, transition.journal, transition.payloads, lease)
         self._commit(result, self._governance)
+        self._issued_families[transition.entry.canonical_digest] = family
+        self._issued_preimages[transition.entry.canonical_digest] = derived
+        self._sign_lifecycles[transition.entry.canonical_digest] = ("register", 1)
         return result
 
     def rotate_registry(
@@ -4046,7 +4176,7 @@ class BrokerAuthAuthoritativeIssuerV1:
         self._commit(result, next_governance)
         return result
 
-    def _require_issued_lease(self, lease: RegistrationRecoveryLeaseV1) -> BrokerAuthLeaseIssueEventPayloadV1:
+    def _require_issued_lease(self, lease: RegistrationRecoveryLeaseV1) -> tuple[BrokerAuthLeaseIssueEventPayloadV1, RegistrationWorkerSessionFamilyAuthorizationV1, RegistrationRecoveryLeaseIdentityPreimageV1]:
         """Bind signing to the exact lease issue event already in this journal."""
         lease.verify_signature(self._governance, self._state.current_sequence)
         entry = next((item for item in self._entries if item.canonical_digest == lease.broker_auth_issue_entry_digest), None)
@@ -4079,7 +4209,13 @@ class BrokerAuthAuthoritativeIssuerV1:
             )
         ):
             raise ValueError("broker envelope lease does not close authoritative issue state")
-        return payload
+        family = self._issued_families.get(entry.canonical_digest) or _decode_issued_session_family(payload)
+        derived = self._issued_preimages.get(entry.canonical_digest)
+        if derived is None:
+            raise ValueError("broker envelope issue has no authoritative derived preimage")
+        if lease.identity_preimage() != derived or lease.lease_identity_digest != derived.lease_identity_digest:
+            raise ValueError("broker envelope lease identity is not derived from its issue")
+        return payload, family, derived
 
     def _sign_exact_envelope(
         self,
@@ -4098,7 +4234,7 @@ class BrokerAuthAuthoritativeIssuerV1:
             raise ValueError("broker envelope inputs are invalid")
         _require_digest(event_id_digest, "event_id_digest")
         sequence = self._next_sequence()
-        issue = self._require_issued_lease(lease)
+        issue, family, derived = self._require_issued_lease(lease)
         key = self._registry.key(lease.broker_auth_key_id)
         if (
             not _broker_auth_key_is_eligible(
@@ -4112,6 +4248,7 @@ class BrokerAuthAuthoritativeIssuerV1:
             or unsigned_envelope.worker_mode != worker_mode
             or unsigned_envelope.worker_sequence != (1 if worker_mode == "register" else lease.next_recovery_sequence)
             or unsigned_envelope.broker_auth_sign_sequence != sequence
+            or (unsigned_envelope.worker_mode, unsigned_envelope.worker_sequence) != self._sign_lifecycles.get(lease.broker_auth_issue_entry_digest, (None, 0))
             or unsigned_envelope.broker_lease_identity_digest != lease.lease_identity_digest
             or unsigned_envelope.operation_id != lease.operation_id
             or unsigned_envelope.lifecycle_nonce != lease.lifecycle_nonce
@@ -4138,7 +4275,7 @@ class BrokerAuthAuthoritativeIssuerV1:
             issue.lease_request_digest, unsigned_envelope.canonical_digest, key.key_id,
             sequence, self._state.current_policy_digest, self._state.current_policy_digest,
             lease.broker_auth_issue_entry_digest, lease.broker_auth_lease_issued_sequence,
-            lease.broker_auth_sequence_head_digest, lease.identity_preimage(),
+            lease.broker_auth_sequence_head_digest, derived,
             "sha256:" + hashlib.sha256(unsigned_envelope.canonical_bytes).hexdigest(), len(unsigned_envelope.canonical_bytes),
             base64.b64encode(unsigned_envelope.canonical_bytes).decode("ascii"),
         )
@@ -4147,6 +4284,7 @@ class BrokerAuthAuthoritativeIssuerV1:
             self._ENVELOPE_TOKEN, unsigned_envelope, signer,
         )
         self._commit(transition, self._governance)
+        self._sign_lifecycles[lease.broker_auth_issue_entry_digest] = ("recover", _checked_add(unsigned_envelope.worker_sequence, 1))
         return BrokerAuthSignedEnvelopeResultV1(transition, envelope)
 
     def sign_initial_envelope(

@@ -83,6 +83,7 @@ from trusted_evidence.e2_policy import (
     PinnedTaskOutputRepositoryObservationV1,
     verify_registration_forward_only_recovery,
     validate_task_output_repository_state,
+    verify_registration_broker_startup_challenge,
     _read_bounded_broker_sequence_payload_fd,
     _ed_sign,
 )
@@ -1690,20 +1691,10 @@ def test_authoritative_broker_issuer_rotates_and_revokes_without_partial_state(t
             broker_auth_lease_expiry_sequence=recovery_lease.broker_auth_lease_expiry_sequence,
             broker_auth_sign_sequence=3, fd_descriptors=recovery_descriptors,
         )
-        if sys.platform == "darwin":
-            with pytest.raises(ValueError, match="broker-produced"):
-                issuer.sign_recovery_envelope(recovery_lease, unsigned_recovery, old_signer, DIGEST_C)
-        else:
-            signed_recovery = issuer.sign_recovery_envelope(
-                recovery_lease, unsigned_recovery, old_signer, DIGEST_C,
-            )
-            assert signed_recovery.transition.payload.broker_auth_key_id == "old"
-            assert signed_recovery.envelope.unsigned == unsigned_recovery
-            RegistrationExpectedReceiveContextV1(
-                "recover", DIGEST_C, DIGEST_B, DIGEST_A, _worker_input().canonical_digest,
-                "session-e2", "op-retiring", "lifecycle-retiring", 2, "broker-session-e2",
-                recovery_lease, 3, next_governance_value,
-            ).verify_envelope(signed_recovery.envelope)
+        # Recovery cannot skip the durable initial-sign lifecycle, even when a
+        # rotation leaves its frozen retiring key otherwise eligible.
+        with pytest.raises(ValueError):
+            issuer.sign_recovery_envelope(recovery_lease, unsigned_recovery, old_signer, DIGEST_C)
         stable = issuer.state
         with pytest.raises(ValueError):
             issuer.sign_recovery_envelope(recovery_lease, unsigned_recovery, new_signer, DIGEST_B)
@@ -2414,6 +2405,13 @@ def test_authoritative_issuer_signs_only_the_exact_issued_initial_envelope(tmp_p
         )
         issuer = BrokerAuthAuthoritativeIssuerV1.create(governance, DIGEST_A, policy_digest, signer, state_mac, 2)
         issued = issuer.issue_lease(request, family, template)
+        replay = issued.journal.validate_state(
+            issued.state, issued.payloads,
+            BrokerAuthSequenceReplayBaselineV1(DIGEST_A, governance, policy_digest), state_mac,
+        )
+        assert verify_registration_broker_startup_challenge(replay, signer, "startup-after-sequence-one")
+        with pytest.raises(ValueError, match="trust closure"):
+            verify_registration_broker_startup_challenge(governance, signer, "unreachable")
         unsigned = _unsigned_envelope(
             broker_lease_identity_digest=issued.lease.lease_identity_digest,
             operation_id=issued.lease.operation_id, lifecycle_nonce=issued.lease.lifecycle_nonce,
@@ -2439,6 +2437,12 @@ def test_authoritative_issuer_signs_only_the_exact_issued_initial_envelope(tmp_p
         stable = issuer.state
         with pytest.raises(ValueError):
             issuer.sign_initial_envelope(issued.lease, unsigned, DIGEST_C)
+        assert issuer.state == stable
+        # A new journal event sequence must not turn the same OPEN lease into
+        # another initial worker.  The old check only caught a stale sequence.
+        second_initial = replace(unsigned, broker_auth_sign_sequence=3)
+        with pytest.raises(ValueError):
+            issuer.sign_initial_envelope(issued.lease, second_initial, DIGEST_C)
         assert issuer.state == stable
     finally:
         state_mac.close()

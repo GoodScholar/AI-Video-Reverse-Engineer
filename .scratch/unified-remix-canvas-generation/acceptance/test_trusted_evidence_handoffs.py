@@ -1512,10 +1512,10 @@ def test_broker_startup_challenge_uses_fixed_ed25519_vector_and_rejects_without_
             provisional_state,
             broker_state_mac_hex=state_mac.mac(canonical_json_bytes(provisional_state._unsigned_wire())),
         )
-        signature = verify_registration_broker_startup_challenge(
-            governance, slot, baseline, state, state_mac, "nonce-fixed"
-        )
-        assert signature == "d56cbe8efa82d802a168d4c879d317f85a18d1353a63bce50db609323a31e993ae271827a6a15001ae563b1ec749e49c1d2d31b244dbf9c75dda84a8b11f8b0a"
+        # A MACed baseline state is not a startup authority: it has no journal
+        # replay result and sequence zero cannot be elevated to key-effective 1.
+        with pytest.raises(ValueError, match="trust closure"):
+            verify_registration_broker_startup_challenge(governance, slot, baseline)
         effects = {"childExec": 0, "repositoryWrites": 0, "fsyncs": 0}
         future_key = replace(key, effective_lease_sequence=2)
         future_registry = replace(governance.registry, keys=(future_key,))
@@ -1540,15 +1540,11 @@ def test_broker_startup_challenge_uses_fixed_ed25519_vector_and_rejects_without_
             future_state,
             broker_state_mac_hex=state_mac.mac(canonical_json_bytes(future_state._unsigned_wire())),
         )
-        with pytest.raises(ValueError, match="startup key"):
-            verify_registration_broker_startup_challenge(
-                future_governance, slot, future_baseline, future_state, state_mac, "nonce-fixed",
-            )
+        with pytest.raises(ValueError, match="trust closure"):
+            verify_registration_broker_startup_challenge(future_governance, slot, future_baseline)
         slot.close()
-        with pytest.raises(ValueError):
-            verify_registration_broker_startup_challenge(
-                governance, slot, baseline, state, state_mac, "nonce-fixed"
-            )
+        with pytest.raises(ValueError, match="trust closure"):
+            verify_registration_broker_startup_challenge(governance, slot, baseline)
         assert effects == {"childExec": 0, "repositoryWrites": 0, "fsyncs": 0}
     finally:
         if state_mac is not None:
