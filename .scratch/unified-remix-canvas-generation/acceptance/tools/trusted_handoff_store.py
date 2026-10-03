@@ -27,42 +27,150 @@ def _cache(root: str, *, require_empty: bool, expected_mode: int) -> TrustedHand
     return store
 
 
-def _owned_root(root: str, expected_mode: int) -> Path:
+def _mount_identity_from_kernel(descriptor: int) -> tuple[str, int, int]:
+    """Return the strongest mount identity the running kernel exposes."""
+    info = os.fstat(descriptor)
+    try:
+        for line in Path(f"/proc/self/fdinfo/{descriptor}").read_text(encoding="utf-8").splitlines():
+            if line.startswith("mnt_id:"):
+                return ("linux-mount-id", int(line.split(":", 1)[1]), info.st_dev)
+    except (OSError, ValueError):
+        pass
+    try:
+        return ("filesystem-id", os.fstatvfs(descriptor).f_fsid, info.st_dev)
+    except (AttributeError, OSError):
+        return ("device-id", info.st_dev, info.st_dev)
+
+
+def _entry_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_uid, stat.S_IFMT(info.st_mode), stat.S_IMODE(info.st_mode), info.st_nlink)
+
+
+def _same_entry(left: os.stat_result, right: os.stat_result, *, allow_owner_write: bool = False, allow_directory_link_count: bool = False) -> bool:
+    left_identity = _entry_identity(left)
+    right_identity = _entry_identity(right)
+    if allow_directory_link_count and stat.S_ISDIR(left.st_mode) and stat.S_ISDIR(right.st_mode):
+        left_identity = left_identity[:-1]
+        right_identity = right_identity[:-1]
+    if left_identity == right_identity:
+        return True
+    if not allow_owner_write:
+        return False
+    return left_identity[:4] + left_identity[5:] == right_identity[:4] + right_identity[5:] and stat.S_IMODE(right.st_mode) == (stat.S_IMODE(left.st_mode) | stat.S_IWUSR)
+
+
+def _reject_symlink_ancestors(path: Path) -> None:
+    if any(part == ".." for part in path.parts):
+        raise ValueError("cleanup root must not contain parent traversal")
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            raise ValueError("cleanup root must not contain a symlink ancestor")
+
+
+def _owned_root(root: str, expected_mode: int, expected_owner: int) -> tuple[Path, os.stat_result | None]:
     path = Path(root)
-    if not path.is_absolute() or path.is_symlink():
+    if not path.is_absolute():
         raise ValueError("cleanup root must be absolute and non-symlink")
-    if not path.exists():
-        return path
-    info = path.stat()
-    if not path.is_dir() or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != expected_mode:
+    _reject_symlink_ancestors(path)
+    try:
+        info = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return path, None
+    if not path.is_dir() or info.st_uid != expected_owner or stat.S_IMODE(info.st_mode) != expected_mode:
         raise ValueError("cleanup root is not an owned directory with the expected mode")
     resolved = path.resolve(strict=True)
     protected = (Path("/").resolve(), Path.home().resolve(), Path.cwd().resolve())
     if any(resolved == item or resolved in item.parents for item in protected):
         raise ValueError("cleanup root is too broad")
-    return resolved
+    return path, info
 
 
-def _cleanup_owned_tree(root: str, expected_mode: int) -> None:
-    path = _owned_root(root, expected_mode)
-    if not path.exists():
-        return
-    parent = path.parent
-    open_directory = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    parent_fd = os.open(parent, open_directory)
+def _open_directory_path(path: Path) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(path.anchor, flags)
     try:
-        root_stat = path.stat()
-        root_fd = os.open(path.name, open_directory, dir_fd=parent_fd)
+        for part in path.parts[1:]:
+            child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _assert_owned(info: os.stat_result, expected_owner: int, *, expected_mode: int | None = None) -> None:
+    if info.st_uid != expected_owner or (expected_mode is not None and stat.S_IMODE(info.st_mode) != expected_mode):
+        raise ValueError("cleanup tree identity is not owned with the expected mode")
+
+
+def _open_verified_entry(directory_fd: int, name: str, before: os.stat_result, mount_identity) -> tuple[int, tuple[str, int, int]]:
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    try:
+        after = os.fstat(descriptor)
+        if not _same_entry(before, after):
+            raise ValueError("cleanup tree entry identity changed")
+        return descriptor, mount_identity(descriptor)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _recheck_entry(directory_fd: int, name: str, before: os.stat_result, expected_mount: tuple[str, int, int], mount_identity, *, allow_owner_write: bool = False, allow_directory_link_count: bool = False) -> None:
+    current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    if not _same_entry(before, current, allow_owner_write=allow_owner_write, allow_directory_link_count=allow_directory_link_count):
+        raise ValueError("cleanup tree entry identity changed")
+    descriptor, actual_mount = _open_verified_entry(directory_fd, name, current, mount_identity)
+    try:
+        if actual_mount != expected_mount:
+            raise ValueError("cleanup tree entry mount identity changed")
+    finally:
+        os.close(descriptor)
+
+
+def _assert_directory_removed(descriptor: int, before: os.stat_result, message: str) -> None:
+    after = os.fstat(descriptor)
+    if sys.platform == "darwin":
+        if after.st_ctime_ns != before.st_ctime_ns:
+            raise ValueError(message)
+    elif after.st_nlink != 0:
+        raise ValueError(message)
+
+
+def _reject_overlapping_cleanup_roots(roots: list[str], expected_mode: int, expected_owner: int) -> None:
+    approved = [_owned_root(root, expected_mode, expected_owner)[0] for root in roots]
+    for index, root in enumerate(approved):
+        for other in approved[index + 1:]:
+            if root == other or root in other.parents or other in root.parents:
+                raise ValueError("cleanup roots must not overlap")
+
+
+def _cleanup_owned_tree(root: str, expected_mode: int, *, mount_identity=_mount_identity_from_kernel, owner_id=os.getuid) -> None:
+    expected_owner = owner_id()
+    path, approved_root = _owned_root(root, expected_mode, expected_owner)
+    if approved_root is None:
+        return
+    parent_fd = _open_directory_path(path.parent)
+    try:
+        root_stat = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not _same_entry(approved_root, root_stat):
+            raise ValueError("cleanup root identity changed")
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise ValueError("cleanup root is not an owned directory with the expected mode")
+        _assert_owned(root_stat, expected_owner, expected_mode=expected_mode)
+        root_fd, root_mount = _open_verified_entry(parent_fd, path.name, root_stat, mount_identity)
         try:
-            if (root_stat.st_dev, root_stat.st_ino) != (os.fstat(root_fd).st_dev, os.fstat(root_fd).st_ino):
-                raise ValueError("cleanup root identity changed")
-            _remove_tree_at(root_fd)
+            _remove_tree_at(root_fd, mount_identity, expected_owner, root_mount)
+            if mount_identity(root_fd) != root_mount:
+                raise ValueError("cleanup root mount identity changed")
+            _recheck_entry(parent_fd, path.name, root_stat, root_mount, mount_identity, allow_directory_link_count=True)
+            root_before_delete = os.fstat(root_fd)
+            os.rmdir(path.name, dir_fd=parent_fd)
+            _assert_directory_removed(root_fd, root_before_delete, "cleanup root identity changed")
         finally:
             os.close(root_fd)
-        current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-        if (root_stat.st_dev, root_stat.st_ino) != (current.st_dev, current.st_ino):
-            raise ValueError("cleanup root identity changed")
-        os.rmdir(path.name, dir_fd=parent_fd)
         os.fsync(parent_fd)
     finally:
         os.close(parent_fd)
@@ -70,25 +178,44 @@ def _cleanup_owned_tree(root: str, expected_mode: int) -> None:
         raise ValueError("cleanup left residual entries")
 
 
-def _remove_tree_at(directory_fd: int) -> None:
+def _remove_tree_at(directory_fd: int, mount_identity, expected_owner: int, expected_mount) -> None:
+    if mount_identity(directory_fd) != expected_mount:
+        raise ValueError("cleanup tree entry mount identity changed")
     open_directory = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     for entry in os.scandir(directory_fd):
         before = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
         if stat.S_ISLNK(before.st_mode):
             raise ValueError("cleanup tree contains a symlink")
         if stat.S_ISDIR(before.st_mode):
-            child_fd = os.open(entry.name, open_directory, dir_fd=directory_fd)
+            _assert_owned(before, expected_owner)
+            child_fd, child_mount = _open_verified_entry(directory_fd, entry.name, before, mount_identity)
             try:
-                after = os.fstat(child_fd)
-                if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
-                    raise ValueError("cleanup tree identity changed")
-                _remove_tree_at(child_fd)
+                if child_mount != expected_mount:
+                    raise ValueError("cleanup tree entry mount identity changed")
+                _remove_tree_at(child_fd, mount_identity, expected_owner, expected_mount)
+                if mount_identity(child_fd) != child_mount:
+                    raise ValueError("cleanup tree entry mount identity changed")
+                _recheck_entry(directory_fd, entry.name, before, child_mount, mount_identity, allow_directory_link_count=True)
+                child_before_delete = os.fstat(child_fd)
+                os.rmdir(entry.name, dir_fd=directory_fd)
+                _assert_directory_removed(child_fd, child_before_delete, "cleanup tree entry identity changed")
             finally:
                 os.close(child_fd)
-            os.rmdir(entry.name, dir_fd=directory_fd)
         elif stat.S_ISREG(before.st_mode):
+            _assert_owned(before, expected_owner)
+            if before.st_nlink != 1:
+                raise ValueError("cleanup tree contains a hardlink alias")
+            entry_fd, entry_mount = _open_verified_entry(directory_fd, entry.name, before, mount_identity)
             os.chmod(entry.name, before.st_mode | stat.S_IWUSR, dir_fd=directory_fd, follow_symlinks=False)
-            os.unlink(entry.name, dir_fd=directory_fd)
+            try:
+                if entry_mount != expected_mount:
+                    raise ValueError("cleanup tree entry mount identity changed")
+                _recheck_entry(directory_fd, entry.name, before, entry_mount, mount_identity, allow_owner_write=True)
+                os.unlink(entry.name, dir_fd=directory_fd)
+                if os.fstat(entry_fd).st_nlink != 0:
+                    raise ValueError("cleanup tree entry identity changed")
+            finally:
+                os.close(entry_fd)
         else:
             raise ValueError("cleanup tree contains an unsupported entry")
 
@@ -154,7 +281,7 @@ def main(argv: list[str] | None = None) -> int:
     subject.add_argument("--field", choices=("hex", "canonicalSubject"), default="hex")
     subject.add_argument("legacy_handoff_id", nargs="?")
     cleanup = commands.add_parser("cleanup-owned-tree")
-    cleanup.add_argument("--root", required=True)
+    cleanup.add_argument("--root", action="append", required=True)
     cleanup.add_argument("--expected-mode", type=lambda value: int(value, 8), required=True)
     activation = commands.add_parser("verify-policy-activation")
     _arguments(activation)
@@ -166,7 +293,15 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "verify-cache":
             _cache(args.cache_root, require_empty=args.require_empty, expected_mode=args.expected_mode)
         elif args.command == "cleanup-owned-tree":
-            _cleanup_owned_tree(args.root, args.expected_mode)
+            failures = []
+            _reject_overlapping_cleanup_roots(args.root, args.expected_mode, os.getuid())
+            for root in args.root:
+                try:
+                    _cleanup_owned_tree(root, args.expected_mode)
+                except (OSError, ValueError) as error:
+                    failures.append(f"{root}: {error}")
+            if failures:
+                raise ValueError("; ".join(failures))
         elif args.command == "publish-local":
             if args.producer_task in {22, 27}:
                 raise ValueError("reserved producer")

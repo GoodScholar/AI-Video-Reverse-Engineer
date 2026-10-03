@@ -1,6 +1,7 @@
 import hashlib
 import base64
 import copy
+import importlib.util
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 import inspect
@@ -39,6 +40,18 @@ from trusted_evidence.handoffs import (
 
 
 ACCEPTANCE_ROOT = Path(__file__).parent
+
+
+def _cleanup_tool_module():
+    """Load the CLI module so cleanup races can be exercised in-process."""
+    spec = importlib.util.spec_from_file_location(
+        "trusted_handoff_store_cleanup_test",
+        ACCEPTANCE_ROOT / "tools" / "trusted_handoff_store.py",
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_tracked_governance_inputs_are_canonical_and_keep_broker_auth_unprovisioned():
@@ -577,6 +590,253 @@ def test_handoff_cli_verifies_cache_and_cleans_only_a_narrow_owned_root(tmp_path
     assert cleanup.returncode == 0
     assert not owned.exists()
     assert broad_cleanup.returncode != 0
+
+
+def test_cleanup_rejects_ancestor_symlink_and_hardlink_aliases(tmp_path):
+    """A cleanup root and every regular entry must have one stable local identity."""
+    cli = ACCEPTANCE_ROOT / "tools" / "trusted_handoff_store.py"
+    environment = {**os.environ, "PYTHONPATH": str(ACCEPTANCE_ROOT)}
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir(mode=0o700)
+    alias_parent = tmp_path / "parent-alias"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+    aliased_root = real_parent / "owned"
+    aliased_root.mkdir(mode=0o700)
+    (aliased_root / "payload").write_text("safe")
+
+    ancestor_symlink = subprocess.run(
+        [sys.executable, str(cli), "cleanup-owned-tree", "--root", str(alias_parent / "owned"), "--expected-mode", "0700"],
+        env=environment,
+        capture_output=True,
+    )
+    assert ancestor_symlink.returncode != 0
+    assert aliased_root.exists()
+
+    owned = tmp_path / "hardlink-owned"
+    owned.mkdir(mode=0o700)
+    external = tmp_path / "external-payload"
+    external.write_text("must-survive")
+    os.link(external, owned / "payload")
+    hardlink_alias = subprocess.run(
+        [sys.executable, str(cli), "cleanup-owned-tree", "--root", str(owned), "--expected-mode", "0700"],
+        env=environment,
+        capture_output=True,
+    )
+    assert hardlink_alias.returncode != 0
+    assert owned.exists()
+    assert external.read_text() == "must-survive"
+
+
+def test_cleanup_detects_entry_replacement_before_unlink(tmp_path, monkeypatch):
+    """Replacing a file after its no-follow check must stop before unlinking either file."""
+    tool = _cleanup_tool_module()
+    owned = tmp_path / "owned"
+    owned.mkdir(mode=0o700)
+    (owned / "payload").write_text("original")
+    original_chmod = tool.os.chmod
+    swapped = False
+
+    def swap_after_chmod(name, mode, *, dir_fd=None, follow_symlinks=True):
+        nonlocal swapped
+        original_chmod(name, mode, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+        if name == "payload" and dir_fd is not None and not swapped:
+            swapped = True
+            tool.os.rename("payload", "escaped-original", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            replacement_fd = tool.os.open("payload", tool.os.O_WRONLY | tool.os.O_CREAT | tool.os.O_EXCL, 0o600, dir_fd=dir_fd)
+            tool.os.close(replacement_fd)
+
+    monkeypatch.setattr(tool.os, "chmod", swap_after_chmod)
+    with pytest.raises(ValueError, match="cleanup tree entry identity changed"):
+        tool._cleanup_owned_tree(str(owned), 0o700)
+    assert (owned / "payload").exists()
+    assert (owned / "escaped-original").read_text() == "original"
+
+
+def test_cleanup_rejects_root_replacement_during_identity_validation(tmp_path, monkeypatch):
+    """A root swapped into a symlink cannot redirect cleanup to the symlink target."""
+    tool = _cleanup_tool_module()
+    owned = tmp_path / "owned"
+    owned.mkdir(mode=0o700)
+    (owned / "payload").write_text("original")
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    (target / "must-survive").write_text("safe")
+    original_resolve = tool.Path.resolve
+    swapped = False
+
+    def swap_root_on_resolve(path, *args, **kwargs):
+        nonlocal swapped
+        if path == owned and not swapped:
+            swapped = True
+            owned.rename(tmp_path / "escaped-owned")
+            owned.symlink_to(target, target_is_directory=True)
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(tool.Path, "resolve", swap_root_on_resolve)
+    with pytest.raises(ValueError, match="cleanup root"):
+        tool._cleanup_owned_tree(str(owned), 0o700)
+    assert (target / "must-survive").read_text() == "safe"
+
+
+def test_cleanup_rechecks_the_root_identity_captured_before_opening_parent(tmp_path, monkeypatch):
+    """A same-owner replacement between lexical validation and FD traversal is not approved."""
+    tool = _cleanup_tool_module()
+    owned = tmp_path / "owned"
+    owned.mkdir(mode=0o700)
+    (owned / "original").write_text("must-survive")
+    original_open_directory_path = tool._open_directory_path
+    swapped = False
+
+    def swap_before_opening_parent(path):
+        nonlocal swapped
+        if path == owned.parent and not swapped:
+            swapped = True
+            owned.rename(tmp_path / "escaped-owned")
+            owned.mkdir(mode=0o700)
+            (owned / "replacement").write_text("unapproved")
+        return original_open_directory_path(path)
+
+    monkeypatch.setattr(tool, "_open_directory_path", swap_before_opening_parent)
+    with pytest.raises(ValueError, match="cleanup root identity changed"):
+        tool._cleanup_owned_tree(str(owned), 0o700)
+    assert (tmp_path / "escaped-owned" / "original").read_text() == "must-survive"
+    assert (owned / "replacement").read_text() == "unapproved"
+
+
+def test_cleanup_detects_root_replacement_after_the_last_predelete_check(tmp_path, monkeypatch):
+    """A swap in the final unlink window is reported after the FD proves the old root survived."""
+    tool = _cleanup_tool_module()
+    owned = tmp_path / "owned"
+    owned.mkdir(mode=0o700)
+    (owned / "original").write_text("must-survive")
+    original_rmdir = tool.os.rmdir
+    swapped = False
+
+    def swap_before_rmdir(name, *, dir_fd=None):
+        nonlocal swapped
+        if name == "owned" and dir_fd is not None and not swapped:
+            swapped = True
+            owned.rename(tmp_path / "escaped-owned")
+            owned.mkdir(mode=0o700)
+        original_rmdir(name, dir_fd=dir_fd)
+
+    monkeypatch.setattr(tool.os, "rmdir", swap_before_rmdir)
+    with pytest.raises(ValueError, match="cleanup root identity changed"):
+        tool._cleanup_owned_tree(str(owned), 0o700)
+    assert (tmp_path / "escaped-owned").exists()
+
+
+def test_cleanup_rejects_a_preexisting_child_mount_identity(tmp_path):
+    """A tree cannot cross into a child mount even before deletion begins."""
+    tool = _cleanup_tool_module()
+    owned = tmp_path / "owned"
+    child = owned / "child"
+    owned.mkdir(mode=0o700)
+    child.mkdir(mode=0o700)
+    root_inode = owned.stat().st_ino
+    child_inode = child.stat().st_ino
+
+    def mount_identity(fd):
+        inode = os.fstat(fd).st_ino
+        if inode == root_inode:
+            return 1
+        if inode == child_inode:
+            return 2
+        return 1
+
+    with pytest.raises(ValueError, match="mount identity changed"):
+        tool._cleanup_owned_tree(str(owned), 0o700, mount_identity=mount_identity)
+    assert child.exists()
+
+
+def test_cleanup_rejects_mount_identity_change_before_deletion(tmp_path):
+    """The injectable test seam proves the production path rechecks kernel mount identity."""
+    tool = _cleanup_tool_module()
+    owned = tmp_path / "owned"
+    owned.mkdir(mode=0o700)
+    root_inode = owned.stat().st_ino
+    root_calls = 0
+
+    def mount_identity(fd):
+        nonlocal root_calls
+        if os.fstat(fd).st_ino == root_inode:
+            root_calls += 1
+            return root_calls
+        return 0
+
+    with pytest.raises(ValueError, match="mount identity changed"):
+        tool._cleanup_owned_tree(str(owned), 0o700, mount_identity=mount_identity)
+    assert owned.exists()
+
+
+def test_cleanup_rejects_wrong_mode_or_owner_without_deleting(tmp_path):
+    """Mode is exercised against a real tree; owner comes from the injectable kernel-fact seam."""
+    tool = _cleanup_tool_module()
+    wrong_mode = tmp_path / "wrong-mode"
+    wrong_mode.mkdir(mode=0o700)
+    wrong_mode.chmod(0o755)
+    with pytest.raises(ValueError, match="expected mode"):
+        tool._cleanup_owned_tree(str(wrong_mode), 0o700)
+    assert wrong_mode.exists()
+
+    wrong_owner = tmp_path / "wrong-owner"
+    wrong_owner.mkdir(mode=0o700)
+    with pytest.raises(ValueError, match="owned"):
+        tool._cleanup_owned_tree(str(wrong_owner), 0o700, owner_id=lambda: os.getuid() + 1)
+    assert wrong_owner.exists()
+
+
+@pytest.mark.parametrize("first_invalid", (True, False))
+def test_cleanup_tries_every_root_and_reports_any_failure(tmp_path, first_invalid):
+    """One failing root cannot prevent or erase the other cleanup attempt."""
+    cli = ACCEPTANCE_ROOT / "tools" / "trusted_handoff_store.py"
+    environment = {**os.environ, "PYTHONPATH": str(ACCEPTANCE_ROOT)}
+    good = tmp_path / "good"
+    bad = tmp_path / "bad"
+    good.mkdir(mode=0o700)
+    bad.mkdir(mode=0o700)
+    (good / "readonly").write_text("x")
+    external = tmp_path / "external"
+    external.write_text("must-survive")
+    os.link(external, bad / "payload")
+    roots = (bad, good) if first_invalid else (good, bad)
+
+    completed = subprocess.run(
+        [
+            sys.executable, str(cli), "cleanup-owned-tree",
+            "--root", str(roots[0]), "--root", str(roots[1]),
+            "--expected-mode", "0700",
+        ],
+        env=environment,
+        capture_output=True,
+    )
+    assert completed.returncode != 0
+    assert not good.exists()
+    assert bad.exists()
+    assert external.read_text() == "must-survive"
+
+
+def test_cleanup_rejects_overlapping_roots_before_deleting_either_one(tmp_path):
+    """A parent root cannot consume a separately requested child root."""
+    cli = ACCEPTANCE_ROOT / "tools" / "trusted_handoff_store.py"
+    environment = {**os.environ, "PYTHONPATH": str(ACCEPTANCE_ROOT)}
+    parent = tmp_path / "parent"
+    child = parent / "child"
+    parent.mkdir(mode=0o700)
+    child.mkdir(mode=0o700)
+    (child / "payload").write_text("must-survive")
+
+    completed = subprocess.run(
+        [
+            sys.executable, str(cli), "cleanup-owned-tree",
+            "--root", str(parent), "--root", str(child),
+            "--expected-mode", "0700",
+        ],
+        env=environment,
+        capture_output=True,
+    )
+    assert completed.returncode != 0
+    assert (child / "payload").read_text() == "must-survive"
 
 
 # This vector is built only from literals with the standard library.  The
