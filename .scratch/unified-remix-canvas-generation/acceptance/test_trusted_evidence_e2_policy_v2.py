@@ -1476,6 +1476,27 @@ def test_e2_rebuilds_regular_fd_identity_from_kernel_facts(tmp_path):
         os.close(fd)
 
 
+def test_e2_regular_fd_masks_access_mode_without_rewriting_descriptor_status(tmp_path, monkeypatch):
+    """A Linux status bit must not turn a read-only FD into a rejected access mode."""
+    source = tmp_path / "worker-input-with-status"
+    source.write_bytes(b"verified regular worker input\n")
+    fd = os.open(source, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    original_fcntl = fcntl.fcntl
+    status_bit = getattr(os, "O_NONBLOCK", 0x800)
+
+    def fcntl_with_status(descriptor, command, *args):
+        result = original_fcntl(descriptor, command, *args)
+        return result | status_bit if descriptor == fd and command == fcntl.F_GETFL else result
+
+    monkeypatch.setattr(fcntl, "fcntl", fcntl_with_status)
+    try:
+        observed = FdObservableIdentityV1.from_open_fd(fd)
+        assert observed.access_mode == "read-only"
+        assert observed.status_flags == ("O_RDONLY",)
+    finally:
+        os.close(fd)
+
+
 def test_e2_rebuilds_socket_identity_and_rejects_non_seqpacket_control_fd():
     """A control descriptor must use kernel socket family/type/options, never envelope claims."""
     local, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)

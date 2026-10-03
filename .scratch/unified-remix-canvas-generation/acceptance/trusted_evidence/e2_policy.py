@@ -2593,7 +2593,7 @@ class FdObservableIdentityV1(_SelfDigestRecord):
             _require_digest(self.content_digest, "content_digest"); _require_digest(self.mount_identity_digest, "mount_identity_digest")
         else:
             expected_options = ("SO_PASSCRED=1", "SO_TYPE=SOCK_SEQPACKET") if self.file_type == "socket-seqpacket" else ("SO_TYPE=SOCK_STREAM",)
-            if any(value is not None for value in (self.device, self.inode, self.byte_length, self.content_digest, self.mount_identity_digest)) or tuple(self.socket_options) != expected_options or self.socket_identity_digest is None:
+            if tuple(self.status_flags) != () or any(value is not None for value in (self.device, self.inode, self.byte_length, self.content_digest, self.mount_identity_digest)) or tuple(self.socket_options) != expected_options or self.socket_identity_digest is None:
                 raise ValueError("control FD observable identity is invalid")
             _require_digest(self.socket_identity_digest, "socket_identity_digest")
         _require_digest(self.identity_digest, "identity_digest")
@@ -2616,7 +2616,7 @@ class FdObservableIdentityV1(_SelfDigestRecord):
             flags, info = fcntl.fcntl(fd, fcntl.F_GETFL), os.fstat(fd)
             fd_flags = ("FD_CLOEXEC",)
             if stat.S_ISREG(info.st_mode):
-                if flags != os.O_RDONLY:
+                if flags & os.O_ACCMODE != os.O_RDONLY:
                     raise ValueError("received regular FD state is invalid")
                 filesystem_id = getattr(os.fstatvfs(fd), "f_fsid", None)
                 if not isinstance(filesystem_id, int):
