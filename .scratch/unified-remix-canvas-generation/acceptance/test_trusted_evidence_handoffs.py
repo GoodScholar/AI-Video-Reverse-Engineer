@@ -1076,8 +1076,8 @@ def test_cleanup_rejects_wrong_mode_or_owner_without_deleting(tmp_path):
 
 
 @pytest.mark.parametrize("first_invalid", (True, False))
-def test_cleanup_tries_every_root_and_reports_any_failure(tmp_path, first_invalid):
-    """One failing root cannot prevent or erase the other cleanup attempt."""
+def test_cleanup_continues_after_execution_failure(tmp_path, first_invalid):
+    """A hardlink failure in one root cannot prevent the other cleanup attempt."""
     cli = ACCEPTANCE_ROOT / "tools" / "trusted_handoff_store.py"
     environment = {**os.environ, "PYTHONPATH": str(ACCEPTANCE_ROOT)}
     good = tmp_path / "good"
@@ -1105,27 +1105,65 @@ def test_cleanup_tries_every_root_and_reports_any_failure(tmp_path, first_invali
     assert external.read_text() == "must-survive"
 
 
-def test_cleanup_rejects_overlapping_roots_before_deleting_either_one(tmp_path):
-    """A parent root cannot consume a separately requested child root."""
+@pytest.mark.parametrize("invalid_first", (True, False))
+def test_cleanup_continues_after_preflight_failure_for_each_input_order(tmp_path, invalid_first):
+    """A rejected mode leaves two independent, owned roots eligible for cleanup."""
     cli = ACCEPTANCE_ROOT / "tools" / "trusted_handoff_store.py"
     environment = {**os.environ, "PYTHONPATH": str(ACCEPTANCE_ROOT)}
-    parent = tmp_path / "parent"
-    child = parent / "child"
-    parent.mkdir(mode=0o700)
-    child.mkdir(mode=0o700)
-    (child / "payload").write_text("must-survive")
+    invalid = tmp_path / "invalid"
+    first_good = tmp_path / "first-good"
+    second_good = tmp_path / "second-good"
+    invalid.mkdir(mode=0o700)
+    invalid.chmod(0o755)
+    for root in (first_good, second_good):
+        root.mkdir(mode=0o700)
+        (root / "readonly").write_text("x")
+    roots = (invalid, first_good, second_good) if invalid_first else (first_good, invalid, second_good)
 
     completed = subprocess.run(
         [
             sys.executable, str(cli), "cleanup-owned-tree",
-            "--root", str(parent), "--root", str(child),
+            *(argument for root in roots for argument in ("--root", str(root))),
+            "--expected-mode", "0700",
+        ],
+        env=environment,
+        capture_output=True,
+    )
+
+    assert completed.returncode != 0
+    assert str(invalid).encode() in completed.stderr
+    assert invalid.exists()
+    assert not first_good.exists()
+    assert not second_good.exists()
+
+
+def test_cleanup_preserves_overlapping_roots_but_cleans_an_independent_root(tmp_path):
+    """An overlap fails closed without withholding cleanup from a separate root."""
+    cli = ACCEPTANCE_ROOT / "tools" / "trusted_handoff_store.py"
+    environment = {**os.environ, "PYTHONPATH": str(ACCEPTANCE_ROOT)}
+    parent = tmp_path / "parent"
+    child = parent / "child"
+    independent = tmp_path / "independent"
+    parent.mkdir(mode=0o700)
+    child.mkdir(mode=0o700)
+    independent.mkdir(mode=0o700)
+    (child / "payload").write_text("must-survive")
+    (independent / "payload").write_text("remove-me")
+
+    completed = subprocess.run(
+        [
+            sys.executable, str(cli), "cleanup-owned-tree",
+            "--root", str(parent), "--root", str(child), "--root", str(independent),
             "--expected-mode", "0700",
         ],
         env=environment,
         capture_output=True,
     )
     assert completed.returncode != 0
+    assert str(parent).encode() in completed.stderr
+    assert str(child).encode() in completed.stderr
     assert (child / "payload").read_text() == "must-survive"
+    assert not independent.exists()
 
 
 # This vector is built only from literals with the standard library.  The

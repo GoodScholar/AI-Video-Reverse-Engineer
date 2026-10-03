@@ -139,12 +139,45 @@ def _assert_directory_removed(descriptor: int, before: os.stat_result, message: 
         raise ValueError(message)
 
 
-def _reject_overlapping_cleanup_roots(roots: list[str], expected_mode: int, expected_owner: int) -> None:
-    approved = [_owned_root(root, expected_mode, expected_owner)[0] for root in roots]
-    for index, root in enumerate(approved):
-        for other in approved[index + 1:]:
-            if root == other or root in other.parents or other in root.parents:
-                raise ValueError("cleanup roots must not overlap")
+def _overlapping_cleanup_root_indexes(roots: list[str]) -> set[int]:
+    """Return every requested root that might overlap after path resolution."""
+    resolved = []
+    for root in roots:
+        try:
+            resolved.append(Path(root).resolve(strict=False))
+        except (OSError, RuntimeError):
+            resolved.append(None)
+    overlapping = set()
+    for index, root in enumerate(resolved):
+        if root is None:
+            continue
+        for other_index, other in enumerate(resolved[index + 1:], index + 1):
+            if other is not None and (root == other or root in other.parents or other in root.parents):
+                overlapping.update((index, other_index))
+    return overlapping
+
+
+def _cleanup_owned_roots(roots: list[str], expected_mode: int, *, expected_owner: int) -> None:
+    failures = []
+    eligible = set(range(len(roots)))
+    for index, root in enumerate(roots):
+        try:
+            _owned_root(root, expected_mode, expected_owner)
+        except (OSError, ValueError) as error:
+            failures.append(f"{root}: {error}")
+            eligible.discard(index)
+    for index in _overlapping_cleanup_root_indexes(roots):
+        failures.append(f"{roots[index]}: cleanup roots must not overlap")
+        eligible.discard(index)
+    for index, root in enumerate(roots):
+        if index not in eligible:
+            continue
+        try:
+            _cleanup_owned_tree(root, expected_mode)
+        except (OSError, ValueError) as error:
+            failures.append(f"{root}: {error}")
+    if failures:
+        raise ValueError("; ".join(failures))
 
 
 def _cleanup_owned_tree(root: str, expected_mode: int, *, mount_identity=_mount_identity_from_kernel, owner_id=os.getuid) -> None:
@@ -293,15 +326,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "verify-cache":
             _cache(args.cache_root, require_empty=args.require_empty, expected_mode=args.expected_mode)
         elif args.command == "cleanup-owned-tree":
-            failures = []
-            _reject_overlapping_cleanup_roots(args.root, args.expected_mode, os.getuid())
-            for root in args.root:
-                try:
-                    _cleanup_owned_tree(root, args.expected_mode)
-                except (OSError, ValueError) as error:
-                    failures.append(f"{root}: {error}")
-            if failures:
-                raise ValueError("; ".join(failures))
+            _cleanup_owned_roots(args.root, args.expected_mode, expected_owner=os.getuid())
         elif args.command == "publish-local":
             if args.producer_task in {22, 27}:
                 raise ValueError("reserved producer")
