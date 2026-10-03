@@ -1,5 +1,8 @@
 import hashlib
 import json
+import copy
+import os
+import pickle
 
 import pytest
 
@@ -20,7 +23,18 @@ from trusted_evidence.e2_policy import (
     TaskOutputTransitionV1,
     TrustedRegistrationPreStateV1,
     ExpectedTaskOutputV1,
+    BrokerLifecycleProofV1,
+    PolicyPublishTransactionJournalV1,
+    RegistrationJournalEntryV1,
+    RegistrationPendingTransitionV1,
+    RegistrationRepositoryRecoveryBindingV1,
+    RegistrationTransactionCapabilityV1,
+    RegistrationTransactionIntentV1,
+    RegistrationTransactionStateV1,
+    Task26CompletionPayloadV1,
+    Task26CompletionRecordV1,
 )
+from trusted_evidence.handoffs import PolicyActivationMarkerV1
 
 
 DIGEST_A = "sha256:" + "a" * 64
@@ -325,3 +339,117 @@ def test_every_self_digest_codec_rejects_unknown_missing_duplicate_noncanonical_
     recorder.assert_rejected(lambda: decoder(payload[:-1] + b',"schema":"duplicate"}'))
     recorder.assert_rejected(lambda: decoder(payload + b"\n"))
     recorder.assert_rejected(lambda: decoder(payload.replace(record.canonical_digest.encode("ascii"), ("sha256:" + "0" * 64).encode("ascii"), 1)))
+
+
+# D.2 uses literal bytes, actual directory descriptors, and a side-effect
+# recorder: contract failures must never reach an authorization write.
+def _recovery_binding(**overrides):
+    values = {
+        "schema": "trusted-registration-repository-recovery-binding/v1",
+        "repository_absolute_path": "/audit/repository", "repository_device": 11,
+        "repository_inode": 12, "repository_mount_identity": "mount-1",
+        "repository_boundary_digest": DIGEST_A, "base_commit": BASE,
+        "fixed_ref_name": "refs/heads/fixed", "fixed_ref_commit": BASE,
+        "trusted_git_toolchain_build_record_ref": DIGEST_B,
+        "trusted_git_toolchain_build_record_digest": DIGEST_C,
+        "trusted_git_executable_digest": DIGEST_A,
+        "trusted_config_snapshot_digest": DIGEST_B,
+        "trusted_attribute_snapshot_digest": DIGEST_C,
+        "trusted_worktree_snapshot_digest": DIGEST_A,
+        "trusted_git_view_digest": DIGEST_B, "task_output_policy_digest": DIGEST_C,
+    }
+    values.update(overrides)
+    return RegistrationRepositoryRecoveryBindingV1(**values)
+
+
+def _registration_intent(**overrides):
+    staged = StagedCandidateSetV1("trusted-staged-candidate-set/v1", True, tuple(
+        StagingCandidateProvenanceV1(ref, 10, index, 17, ref)
+        for index, ref in enumerate(REFS, 100)
+    ))
+    values = {
+        "schema": "trusted-registration-transaction-intent/v1", "operation_id": "operation-d2",
+        "output_plan_digest": _task28_allowed().canonical_digest,
+        "trusted_pre_state_digest": _prestate().canonical_digest,
+        "staged_candidate_set_digest": staged.canonical_digest,
+        "quarantine_object_set_digest": _quarantine().canonical_digest,
+        "repository_recovery_binding_digest": _recovery_binding().canonical_digest,
+        "registration_recovery_lease_identity_digest": DIGEST_A,
+        "expected_cas_refs": REFS, "expected_audit_digest": DIGEST_B,
+        "expected_catalog_digest": DIGEST_C,
+    }
+    values.update(overrides)
+    return RegistrationTransactionIntentV1(**values)
+
+
+def test_registration_transaction_records_decode_literal_bytes_and_reject_chain_drift_without_writes():
+    recorder = VisibleAuthorizationWriteRecorder()
+    literal = b'{"action":"install-cas","expectedContentDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","targetRepositoryRelativePath":"evidence/1.json"}'
+    pending = RegistrationPendingTransitionV1.from_canonical_bytes(literal)
+    assert pending.to_wire() == {"action": "install-cas", "expectedContentDigest": DIGEST_A, "targetRepositoryRelativePath": "evidence/1.json"}
+
+    binding, intent = _recovery_binding(), _registration_intent()
+    prepared = RegistrationJournalEntryV1("trusted-registration-journal-entry/v1", "operation-d2", intent.canonical_digest, "PREPARED", None, None, DIGEST_C)
+    writing = RegistrationJournalEntryV1("trusted-registration-journal-entry/v1", "operation-d2", intent.canonical_digest, "WRITING_CAS", prepared.canonical_digest, pending, DIGEST_C)
+    state = RegistrationTransactionStateV1("trusted-registration-transaction-state/v1", "operation-d2", intent.canonical_digest, writing.canonical_digest, "WRITING_CAS", prepared.canonical_digest, pending, DIGEST_C, DIGEST_A, False, False)
+
+    assert RegistrationRepositoryRecoveryBindingV1.from_canonical_bytes(binding.canonical_bytes) == binding
+    assert RegistrationTransactionIntentV1.from_canonical_bytes(intent.canonical_bytes) == intent
+    assert RegistrationJournalEntryV1.from_canonical_bytes(writing.canonical_bytes) == writing
+    assert RegistrationTransactionStateV1.from_canonical_bytes(state.canonical_bytes) == state
+    RegistrationJournalEntryV1.validate_chain((prepared, writing))
+    recorder.assert_rejected(lambda: _registration_intent(expected_cas_refs=REFS[:-1]))
+    recorder.assert_rejected(lambda: RegistrationJournalEntryV1.validate_chain((prepared, RegistrationJournalEntryV1("trusted-registration-journal-entry/v1", "operation-d2", intent.canonical_digest, "WRITING_AUDIT", prepared.canonical_digest, pending, DIGEST_C))))
+    recorder.assert_rejected(lambda: RegistrationTransactionStateV1("trusted-registration-transaction-state/v1", "operation-d2", intent.canonical_digest, writing.canonical_digest, "ACTIVATED", prepared.canonical_digest, None, DIGEST_C, DIGEST_A, False, True))
+    recorder.assert_rejected(lambda: RegistrationTransactionIntentV1.from_canonical_bytes(intent.canonical_bytes.replace(b'"canonicalDigest"', b'"unexpected":null,"canonicalDigest"', 1)))
+
+
+def test_precreated_transaction_capability_owns_real_directory_fds_and_has_no_restoration_path(tmp_path):
+    parent, root, operation, repository = tmp_path / "parent", tmp_path / "parent" / "root", tmp_path / "parent" / "root" / "operation-d2", tmp_path / "repository"
+    operation.mkdir(parents=True)
+    repository.mkdir()
+    descriptors = tuple(os.open(path, os.O_RDONLY | os.O_DIRECTORY) for path in (parent, root, operation, repository))
+    capability = None
+    try:
+        capability = RegistrationTransactionCapabilityV1.open_precreated(*descriptors)
+        assert len(capability.directory_identities) == 4
+        capability.validate_open_identities()
+        with pytest.raises((TypeError, ValueError)):
+            RegistrationTransactionCapabilityV1(str(parent))
+        with pytest.raises(TypeError):
+            copy.copy(capability)
+        with pytest.raises(TypeError):
+            pickle.dumps(capability)
+        regular = tmp_path / "regular"
+        regular.write_text("not a directory")
+        regular_fd = os.open(regular, os.O_RDONLY)
+        try:
+            with pytest.raises(ValueError):
+                RegistrationTransactionCapabilityV1.open_precreated(regular_fd, *descriptors[1:])
+        finally:
+            os.close(regular_fd)
+    finally:
+        if capability is not None:
+            capability.close()
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+
+def test_lifecycle_completion_and_policy_journal_bind_full_forward_chain_without_writes():
+    recorder = VisibleAuthorizationWriteRecorder()
+    proof = BrokerLifecycleProofV1("trusted-broker-lifecycle-proof/v1", "broker-key", "lifecycle-1", "lease-1", ProductGitObjectIdV1("sha1", "1" * 40), (NamedDigest("record-payload", DIGEST_A), NamedDigest("staged/report", DIGEST_B)), DIGEST_C, DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A, "a" * 128)
+    proof.validate_staged_artifacts((NamedDigest("record-payload", DIGEST_A), NamedDigest("staged/report", DIGEST_B)))
+    payload = Task26CompletionPayloadV1("ai-video-reverse-engineer", 26, BASE, BASE, BASE, "refs/heads/main", "pass", NamedDigest("review", DIGEST_A), NamedDigest("plan", DIGEST_B), NamedDigest("spec", DIGEST_C), "task26-review-controller/v1", "executor-1", DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A)
+    record = Task26CompletionRecordV1("trusted-task-completion-record/v1", payload, "sha256:" + hashlib.sha256(payload.canonical_bytes).hexdigest(), "broker-key", "b" * 128)
+    assert Task26CompletionRecordV1.from_canonical_bytes(record.canonical_bytes) == record
+    entries, previous = [], None
+    for state, transition in (("PREPARED", "QUARANTINE"), ("QUARANTINED", "PROMOTE_OBJECTS"), ("OBJECTS_PROMOTED", "INSTALL_REFS"), ("REFS_INSTALLED", "INSTALL_HANDOFF"), ("HANDOFF_INSTALLED", "ACTIVATE")):
+        entry = PolicyPublishTransactionJournalV1("trusted-policy-publish-transaction/v1", "policy-op", record.canonical_digest, BASE, "refs/heads/main", "refs/tags/trusted-acceptance/ticket-23-policy-v1", True, BASE if state != "PREPARED" else None, DIGEST_A, DIGEST_A if state in {"HANDOFF_INSTALLED", "ACTIVATED"} else None, DIGEST_B if state in {"HANDOFF_INSTALLED", "ACTIVATED"} else None, DIGEST_C if state in {"HANDOFF_INSTALLED", "ACTIVATED"} else None, None, state, transition, previous)
+        entries.append(entry)
+        previous = entry.entry_digest
+    marker = PolicyActivationMarkerV1("trusted-policy-activation/v1", "policy-op", entries[-1].entry_digest, BASE, "refs/tags/trusted-acceptance/ticket-23-policy-v1", DIGEST_A, DIGEST_B, DIGEST_C)
+    entries.append(PolicyPublishTransactionJournalV1("trusted-policy-publish-transaction/v1", "policy-op", record.canonical_digest, BASE, "refs/heads/main", "refs/tags/trusted-acceptance/ticket-23-policy-v1", True, BASE, DIGEST_A, DIGEST_A, DIGEST_B, DIGEST_C, "sha256:" + hashlib.sha256(marker.canonical_bytes).hexdigest(), "ACTIVATED", None, previous))
+    PolicyPublishTransactionJournalV1.validate_forward_sequence(tuple(entries), marker)
+    recorder.assert_rejected(lambda: proof.validate_staged_artifacts((NamedDigest("record-payload", DIGEST_B), NamedDigest("staged/report", DIGEST_B))))
+    recorder.assert_rejected(lambda: Task26CompletionPayloadV1("ai-video-reverse-engineer", 26, BASE, BASE, BASE, "refs/heads/main", "fail", NamedDigest("review", DIGEST_A), NamedDigest("plan", DIGEST_B), NamedDigest("spec", DIGEST_C), "task26-review-controller/v1", "executor-1", DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A))
+    recorder.assert_rejected(lambda: PolicyPublishTransactionJournalV1.validate_forward_sequence(tuple(entries[:-1]), marker))

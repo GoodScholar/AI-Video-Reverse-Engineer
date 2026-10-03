@@ -182,3 +182,27 @@ binding spec 没有重列下列类型；补充授权明确由实施计划第 99�
 ### 范围
 
 - 未进入 D/E/F；broker-auth 启动能力仍由 slice E 负责。
+
+## D.2 — transaction, lifecycle and policy journal contracts
+
+### RED / GREEN
+
+- RED：先为 literal canonical pending-transition bytes、真实目录 FD、不可复制 capability、registration chain、lifecycle/completion proof 与完整 policy forward sequence 增加测试；运行
+  `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_e2_policy_v2.py`
+  在收集阶段以 `ImportError: cannot import name 'BrokerLifecycleProofV1'` 失败，确认新增断言命中缺失 D.2 contract。
+- GREEN（Task 2 两个测试文件）：
+  `... pytest -q test_trusted_evidence_e2_policy_v2.py test_trusted_evidence_handoffs.py` → `64 passed in 10.98s`。
+- GREEN（受影响回归 + 编译 + diff 检查）：`py_compile e2_policy.py handoffs.py`、`git diff --check` 通过；models、registry、registration、policy 与 handoffs 五个测试文件合计 `190 passed in 11.22s`。
+- 完整 acceptance（最终代码）：`308 passed, 1 failed in 214.74s`。失败是既有的 `test_trusted_evidence_e2.py::test_e2_kills_the_process_group_when_the_parent_exits_before_a_pipe_holding_child`，在未修改 E2 runner 的时序测试中读取尚未生成的 `background.pid`；此前 D.1 全量运行已记录同一失败，未在本切片扩大修复范围。
+
+### 实现与边界
+
+- `e2_policy.py` 增加 strict canonical codec：`RegistrationRepositoryRecoveryBindingV1`、`RegistrationTransactionIntentV1`、`RegistrationPendingTransitionV1`、`RegistrationJournalEntryV1`、`RegistrationTransactionStateV1`、`BrokerLifecycleProofV1`、`Task26CompletionPayloadV1`、`Task26CompletionRecordV1` 与 `PolicyPublishTransactionJournalV1`。自摘要只排除自身字段；decoder 拒绝未知、缺失、重复与非 canonical bytes。
+- registration journal 固定 PREPARED 起点、全链 hash/intent/operation/catalog bindings 与前向 phase；visible catalog 只能处于 catalog-committing/activated，activated 必须已 parent-fsync。policy journal 仅接受固定六步 forward sequence，并复用 C.1 `PolicyActivationMarkerV1` 验证 ACTIVATE intent、marker bytes digest 与最终 entry 的完整绑定。
+- `RegistrationTransactionCapabilityV1.open_precreated(...)` 仅接受四个已经打开的、互异目录 FD，复制并持有其 FD identity；没有 path/cwd/environment constructor 或 serialize/copy 恢复入口。没有实现 Linux broker、SCM_RIGHTS、repository mutation 或 fsync runtime，这些仍属于 Task 14。
+- lifecycle proof 要求包含 `record-payload` 与完整有序 staged digest set；Task 26 record 只接受 broker-signature-shaped 的 `pass` payload 并重算 payload digest。签名验证和 durable write executor 仍待后续 broker/auth slice 提供，不以此 portable codec 冒充真实生成或持久化闭环。
+
+### 文件
+
+- 修改：`.scratch/unified-remix-canvas-generation/acceptance/trusted_evidence/e2_policy.py`、`.scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_e2_policy_v2.py`。
+- Scoped commit：本切片提交后在交付消息记录。
