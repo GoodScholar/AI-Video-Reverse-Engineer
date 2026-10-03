@@ -66,6 +66,19 @@ class BootstrapError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class ArtifactSnapshot:
+    directory: Path
+    path: Path
+
+    def cleanup(self) -> None:
+        try:
+            self.path.unlink(missing_ok=True)
+            self.directory.rmdir()
+        except OSError:
+            pass
+
+
 def _sha256(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
@@ -109,10 +122,11 @@ def _regular_size(path: Path, *, label: str) -> int:
         raise BootstrapError(f"missing regular {label}: {path.name}") from error
 
 
-def _digest_file(path: Path, *, label: str, maximum: int) -> str:
+def _snapshot_file(path: Path, *, label: str, maximum: int) -> tuple[ArtifactSnapshot, str]:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    snapshot: ArtifactSnapshot | None = None
     try:
         descriptor = os.open(path, flags)
         with os.fdopen(descriptor, "rb") as handle:
@@ -121,20 +135,42 @@ def _digest_file(path: Path, *, label: str, maximum: int) -> str:
                 raise BootstrapError(f"missing regular {label}: {path.name}")
             if before.st_size > maximum:
                 raise BootstrapError(f"{label} compressed budget exceeded: {path.name}")
+            directory = Path(tempfile.mkdtemp(prefix="e2-bootstrap-artifact-"))
+            directory.chmod(0o700)
+            target = directory / "artifact"
+            snapshot = ArtifactSnapshot(directory, target)
+            target_descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             digest = hashlib.sha256()
-            while chunk := handle.read(1024 * 1024):
-                digest.update(chunk)
+            with os.fdopen(target_descriptor, "wb") as copied:
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+                    copied.write(chunk)
             after = os.fstat(handle.fileno())
     except OSError as error:
+        if snapshot is not None:
+            snapshot.cleanup()
         raise BootstrapError(f"missing regular {label}: {path.name}") from error
+    except BootstrapError:
+        if snapshot is not None:
+            snapshot.cleanup()
+        raise
     if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
         after.st_dev,
         after.st_ino,
         after.st_size,
         after.st_mtime_ns,
     ):
+        if snapshot is not None:
+            snapshot.cleanup()
         raise BootstrapError(f"{label} changed while being read: {path.name}")
-    return "sha256:" + digest.hexdigest()
+    if snapshot is None:
+        raise BootstrapError(f"missing regular {label}: {path.name}")
+    try:
+        snapshot.path.chmod(0o400)
+    except OSError as error:
+        snapshot.cleanup()
+        raise BootstrapError(f"unable to secure {label} snapshot") from error
+    return snapshot, "sha256:" + digest.hexdigest()
 
 
 def _classify_platform(system: str, machine: str, gnu_libc: str | None) -> str:
@@ -181,26 +217,36 @@ def _approved_entry(entry: dict[str, str], approved: tuple[str, str], *, kind: s
 
 
 def _all_entries(
-    root: Path, manifest: dict[str, object], key: str, approved: dict[str, tuple[str, str]], *, kind: str
-) -> dict[str, tuple[dict[str, str], Path]]:
-    checked: dict[str, tuple[dict[str, str], Path]] = {}
+    root: Path,
+    manifest: dict[str, object],
+    key: str,
+    approved: dict[str, tuple[str, str]],
+    snapshots: list[ArtifactSnapshot],
+    *,
+    kind: str,
+) -> dict[str, tuple[dict[str, str], ArtifactSnapshot]]:
+    checked: dict[str, tuple[dict[str, str], ArtifactSnapshot]] = {}
     for selected, identity in approved.items():
         entry = _entry(manifest, key, selected)
         _approved_entry(entry, identity, kind=kind)
-        checked[selected] = (entry, _artifact(root, entry, kind=kind))
+        snapshot = _artifact(root, entry, kind=kind)
+        snapshots.append(snapshot)
+        checked[selected] = (entry, snapshot)
     return checked
 
 
-def _artifact(root: Path, entry: dict[str, str], *, kind: str) -> Path:
+def _artifact(root: Path, entry: dict[str, str], *, kind: str) -> ArtifactSnapshot:
     filename = entry["filename"]
     path = root / "artifacts" / filename
     try:
         path.resolve(strict=False).relative_to((root / "artifacts").resolve())
     except ValueError as error:
         raise BootstrapError(f"{kind} filename escapes artifacts directory") from error
-    if _digest_file(path, label="artifact", maximum=DEFAULT_LIMITS.compressed_bytes) != entry["sha256"]:
+    snapshot, digest = _snapshot_file(path, label="artifact", maximum=DEFAULT_LIMITS.compressed_bytes)
+    if digest != entry["sha256"]:
+        snapshot.cleanup()
         raise BootstrapError(f"{kind} digest mismatch: {filename}")
-    return path
+    return snapshot
 
 
 def _check_expanded(total: int, compressed: int, limits: ArchiveLimits, *, label: str) -> int:
@@ -321,22 +367,45 @@ def _inspect_tar(path: Path, limits: ArchiveLimits) -> None:
         raise BootstrapError("uv archive is invalid") from error
 
 
-def _extract_uv(path: Path, limits: ArchiveLimits = DEFAULT_LIMITS) -> Path:
-    _inspect_tar(path, limits)
+def _extract_uv(snapshot: ArtifactSnapshot, limits: ArchiveLimits = DEFAULT_LIMITS) -> Path:
+    _inspect_tar(snapshot.path, limits)
+    directory: Path | None = None
+    destination: Path | None = None
     try:
-        with tarfile.open(path, mode="r:gz") as archive:
+        with tarfile.open(snapshot.path, mode="r:gz") as archive:
             candidate = next(member for member in archive if member.isfile() and Path(member.name).name == "uv")
             source = archive.extractfile(candidate)
             if source is None:
                 raise BootstrapError("uv archive executable is unavailable")
-            destination = Path(tempfile.mkdtemp(prefix="e2-bootstrap-")) / "uv"
+            directory = Path(tempfile.mkdtemp(prefix="e2-bootstrap-executable-"))
+            directory.chmod(0o700)
+            destination = directory / "uv"
             with destination.open("wb") as target:
                 while chunk := source.read(1024 * 1024):
                     target.write(chunk)
             destination.chmod(0o555)
+            metadata = destination.stat()
+            if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o555 or metadata.st_nlink != 1:
+                raise BootstrapError("extracted uv executable identity is invalid")
             return destination
     except (OSError, StopIteration, tarfile.TarError) as error:
+        if destination is not None:
+            destination.unlink(missing_ok=True)
+        if directory is not None:
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
         raise BootstrapError("uv archive is invalid") from error
+    except BootstrapError:
+        if destination is not None:
+            destination.unlink(missing_ok=True)
+        if directory is not None:
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        raise
 
 
 def _uv_environment() -> dict[str, str]:
@@ -355,7 +424,7 @@ def _verify_version(executable: Path, expected: str) -> None:
         raise BootstrapError("uv version/build identity does not match manifest")
 
 
-def verify(manifest_path: Path) -> tuple[Path, str]:
+def verify(manifest_path: Path, *, after_snapshots=None) -> tuple[Path, str]:
     root = manifest_path.parent
     raw_manifest = _regular_bytes(manifest_path, label="manifest")
     try:
@@ -364,23 +433,30 @@ def verify(manifest_path: Path) -> tuple[Path, str]:
         raise BootstrapError("manifest is not valid JSON") from error
     if not isinstance(manifest, dict) or manifest.get("schemaVersion") != "BootstrapArtifactsV1":
         raise BootstrapError("manifest schemaVersion must be BootstrapArtifactsV1")
-    selected = _host_platform()
-    checked_uv = _all_entries(root, manifest, "uvArchives", UV_ARCHIVES, kind="uv")
-    checked_wheels = _all_entries(root, manifest, "zstandardWheels", WHEELS, kind="zstandard")
-    uv, uv_path = checked_uv[selected]
-    config = manifest.get("emptyConfig")
-    if not isinstance(config, dict) or config.get("filename") != "uv-empty.toml" or config.get("sha256") != EMPTY_CONFIG_SHA256:
-        raise BootstrapError("empty config identity is invalid")
-    config_bytes = _regular_bytes(root / "uv-empty.toml", label="empty config")
-    if config_bytes:
-        raise BootstrapError("empty config must be zero bytes")
-    if _sha256(config_bytes) != EMPTY_CONFIG_SHA256:
-        raise BootstrapError("empty config digest mismatch")
-    for entry, wheel_path in checked_wheels.values():
-        _wheel_is_valid(wheel_path, entry)
-    executable = _extract_uv(uv_path)
-    _verify_version(executable, uv.get("versionOutput", ""))
-    return executable, _sha256(raw_manifest)
+    snapshots: list[ArtifactSnapshot] = []
+    try:
+        selected = _host_platform()
+        checked_uv = _all_entries(root, manifest, "uvArchives", UV_ARCHIVES, snapshots, kind="uv")
+        checked_wheels = _all_entries(root, manifest, "zstandardWheels", WHEELS, snapshots, kind="zstandard")
+        if after_snapshots is not None:
+            after_snapshots()
+        uv, uv_snapshot = checked_uv[selected]
+        config = manifest.get("emptyConfig")
+        if not isinstance(config, dict) or config.get("filename") != "uv-empty.toml" or config.get("sha256") != EMPTY_CONFIG_SHA256:
+            raise BootstrapError("empty config identity is invalid")
+        config_bytes = _regular_bytes(root / "uv-empty.toml", label="empty config")
+        if config_bytes:
+            raise BootstrapError("empty config must be zero bytes")
+        if _sha256(config_bytes) != EMPTY_CONFIG_SHA256:
+            raise BootstrapError("empty config digest mismatch")
+        for entry, wheel_snapshot in checked_wheels.values():
+            _wheel_is_valid(wheel_snapshot.path, entry)
+        executable = _extract_uv(uv_snapshot)
+        _verify_version(executable, uv.get("versionOutput", ""))
+        return executable, _sha256(raw_manifest)
+    finally:
+        for snapshot in snapshots:
+            snapshot.cleanup()
 
 
 def main() -> int:

@@ -108,13 +108,40 @@ def test_archive_budget_rejects_compressed_and_expanded_inputs_before_extraction
     verifier = _verifier()
     archive = tmp_path / "uv.tar.gz"
     _write_tar(archive, {"uv-root/uv": b"uv"})
+    ratio_archive = tmp_path / "ratio.tar.gz"
+    _write_tar(ratio_archive, {"uv-root/uv": b"a" * 4096})
     tiny_compressed = verifier.ArchiveLimits(compressed_bytes=1, members=100, member_bytes=1024, expanded_bytes=1024, ratio=100)
     tiny_expanded = verifier.ArchiveLimits(compressed_bytes=1024, members=100, member_bytes=1, expanded_bytes=1, ratio=100)
+    expanded_total = verifier.ArchiveLimits(compressed_bytes=1024, members=100, member_bytes=1024, expanded_bytes=1, ratio=100)
+    compressed_ratio = verifier.ArchiveLimits(compressed_bytes=1024, members=100, member_bytes=8192, expanded_bytes=8192, ratio=1)
 
     with pytest.raises(verifier.BootstrapError, match="compressed budget"):
         verifier._inspect_tar(archive, tiny_compressed)
     with pytest.raises(verifier.BootstrapError, match="member budget"):
         verifier._inspect_tar(archive, tiny_expanded)
+    with pytest.raises(verifier.BootstrapError, match="expanded budget"):
+        verifier._inspect_tar(archive, expanded_total)
+    with pytest.raises(verifier.BootstrapError, match="compression ratio"):
+        verifier._inspect_tar(ratio_archive, compressed_ratio)
+
+
+def test_bootstrap_consumes_private_snapshots_after_an_audited_source_path_is_replaced(tmp_path):
+    """Catches a verified artifact path being atomically replaced before wheel parsing or uv execution."""
+    verifier = _verifier()
+    root = _copy_bootstrap(tmp_path)
+    manifest = _manifest(root)
+    uv = _current_uv_artifact(manifest)
+    source = root / "artifacts" / uv["filename"]
+
+    def replace_source_path() -> None:
+        forged = tmp_path / "forged.tar.gz"
+        _write_tar(forged, {"forged/uv": b"#!/bin/sh\necho forged\n"})
+        os.replace(forged, source)
+
+    executable, _ = verifier.verify(root / "manifest.json", after_snapshots=replace_source_path)
+
+    assert executable.is_file()
+    assert source.read_bytes() != (BOOTSTRAP / "artifacts" / uv["filename"]).read_bytes()
 
 
 def test_wheel_budget_and_record_rows_fail_closed(tmp_path):
