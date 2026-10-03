@@ -1649,7 +1649,7 @@ def test_e2_expected_receive_context_rejects_old_or_cross_bound_signed_envelopes
         signer.close()
 
 
-def _linux_delivery(tmp_path, mode, fault=None, expected_overrides=None):
+def _linux_delivery(tmp_path, mode, fault=None, envelope_overrides=None):
     sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     control, control_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     opened = []
@@ -1678,9 +1678,12 @@ def _linux_delivery(tmp_path, mode, fault=None, expected_overrides=None):
                 replace(item, observable_fields=descriptors[0].observable_fields) if index == 1 else item
             ) for index, item in enumerate(descriptors))
             sent[1] = sent[0]
-        envelope = _signed_receive_envelope(governance, signer, lease, mode, fd_descriptors=descriptors)
+        envelope = _signed_receive_envelope(
+            governance, signer, lease, mode, fd_descriptors=descriptors,
+            **(envelope_overrides or {}),
+        )
         sender.sendmsg([envelope.canonical_bytes], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", sent))])
-        expected = _expected_receive_context(governance, lease, worker_mode=mode, **(expected_overrides or {}))
+        expected = _expected_receive_context(governance, lease, worker_mode=mode)
         return sender, receiver, opened, control, control_peer, signer, expected
     except Exception:
         signer.close()
@@ -1721,9 +1724,9 @@ def test_e2_linux_recvmsg_accepts_a_real_exact_recover_closure(tmp_path):
 @pytest.mark.parametrize("mode", ("register", "recover"))
 @pytest.mark.parametrize("fault", ("missing", "extra", "duplicate", "reordered", "wrong-context"))
 def test_e2_linux_recvmsg_rejects_invalid_real_fd_closures(tmp_path, mode, fault):
-    overrides = {"operation_id": "old-operation"} if fault == "wrong-context" else None
+    envelope_overrides = {"operation_id": "old-operation"} if fault == "wrong-context" else None
     sender, receiver, opened, control, control_peer, signer, expected = _linux_delivery(
-        tmp_path, mode, None if fault == "wrong-context" else fault, overrides,
+        tmp_path, mode, None if fault == "wrong-context" else fault, envelope_overrides,
     )
     try:
         with pytest.raises(ValueError):
