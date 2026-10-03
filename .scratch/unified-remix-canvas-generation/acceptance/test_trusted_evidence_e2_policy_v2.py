@@ -2212,9 +2212,15 @@ def _linux_delivery(tmp_path, mode, fault=None, envelope_overrides=None):
         elif fault == "reordered":
             sent.reverse()
         elif fault == "duplicate":
-            descriptors = tuple((
-                replace(item, observable_fields=descriptors[0].observable_fields) if index == 1 else item
-            ) for index, item in enumerate(descriptors))
+            duplicate = closure[1]
+            descriptors = (
+                descriptors[0],
+                FdDescriptorV1.from_open_fd(
+                    opened[0], role=duplicate.role, ordinal=duplicate.ordinal,
+                    logical_name=duplicate.logical_name, provenance_fields=duplicate.provenance_fields,
+                ),
+                *descriptors[2:],
+            )
             sent[1] = sent[0]
         envelope = _signed_receive_envelope(
             governance, signer, lease, mode, worker_sequence=worker_sequence, fd_descriptors=descriptors,
