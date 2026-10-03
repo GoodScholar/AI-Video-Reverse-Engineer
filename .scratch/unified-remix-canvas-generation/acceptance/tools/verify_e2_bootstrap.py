@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -43,6 +44,24 @@ EMPTY_CONFIG_SHA256 = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca4
 PROXY_VARIABLES = frozenset({"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"})
 
 
+@dataclass(frozen=True)
+class ArchiveLimits:
+    compressed_bytes: int
+    members: int
+    member_bytes: int
+    expanded_bytes: int
+    ratio: int
+
+
+DEFAULT_LIMITS = ArchiveLimits(
+    compressed_bytes=1024**3,
+    members=100_000,
+    member_bytes=256 * 1024**2,
+    expanded_bytes=4 * 1024**3,
+    ratio=100,
+)
+
+
 class BootstrapError(RuntimeError):
     pass
 
@@ -75,13 +94,69 @@ def _regular_bytes(path: Path, *, label: str) -> bytes:
     return data
 
 
-def _host_platform() -> str:
-    machine = platform.machine().lower()
-    if sys.platform == "darwin" and machine in {"arm64", "aarch64"}:
+def _regular_size(path: Path, *, label: str) -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as handle:
+            metadata = os.fstat(handle.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                raise BootstrapError(f"missing regular {label}: {path.name}")
+            return metadata.st_size
+    except OSError as error:
+        raise BootstrapError(f"missing regular {label}: {path.name}") from error
+
+
+def _digest_file(path: Path, *, label: str, maximum: int) -> str:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise BootstrapError(f"missing regular {label}: {path.name}")
+            if before.st_size > maximum:
+                raise BootstrapError(f"{label} compressed budget exceeded: {path.name}")
+            digest = hashlib.sha256()
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+            after = os.fstat(handle.fileno())
+    except OSError as error:
+        raise BootstrapError(f"missing regular {label}: {path.name}") from error
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise BootstrapError(f"{label} changed while being read: {path.name}")
+    return "sha256:" + digest.hexdigest()
+
+
+def _classify_platform(system: str, machine: str, gnu_libc: str | None) -> str:
+    system = system.lower()
+    machine = machine.lower()
+    if system == "darwin" and machine in {"arm64", "aarch64"}:
         return "darwin-arm64"
-    if sys.platform.startswith("linux") and machine in {"x86_64", "amd64"}:
+    if system == "linux" and machine in {"x86_64", "amd64"}:
+        if not gnu_libc or not gnu_libc.startswith("glibc "):
+            raise BootstrapError("Linux x86_64 bootstrap requires proven GNU libc")
         return "linux-x86_64-gnu"
-    raise BootstrapError(f"unsupported bootstrap platform: {sys.platform}/{machine}")
+    raise BootstrapError(f"unsupported bootstrap platform: {system}/{machine}")
+
+
+def _host_platform() -> str:
+    gnu_libc = None
+    if sys.platform.startswith("linux"):
+        try:
+            gnu_libc = os.confstr("CS_GNU_LIBC_VERSION")
+        except (AttributeError, OSError, ValueError):
+            pass
+    return _classify_platform(sys.platform, platform.machine(), gnu_libc)
 
 
 def _entry(manifest: dict[str, object], key: str, selected: str) -> dict[str, str]:
@@ -107,8 +182,8 @@ def _approved_entry(entry: dict[str, str], approved: tuple[str, str], *, kind: s
 
 def _all_entries(
     root: Path, manifest: dict[str, object], key: str, approved: dict[str, tuple[str, str]], *, kind: str
-) -> dict[str, tuple[dict[str, str], bytes]]:
-    checked: dict[str, tuple[dict[str, str], bytes]] = {}
+) -> dict[str, tuple[dict[str, str], Path]]:
+    checked: dict[str, tuple[dict[str, str], Path]] = {}
     for selected, identity in approved.items():
         entry = _entry(manifest, key, selected)
         _approved_entry(entry, identity, kind=kind)
@@ -116,29 +191,75 @@ def _all_entries(
     return checked
 
 
-def _artifact(root: Path, entry: dict[str, str], *, kind: str) -> bytes:
+def _artifact(root: Path, entry: dict[str, str], *, kind: str) -> Path:
     filename = entry["filename"]
     path = root / "artifacts" / filename
     try:
         path.resolve(strict=False).relative_to((root / "artifacts").resolve())
     except ValueError as error:
         raise BootstrapError(f"{kind} filename escapes artifacts directory") from error
-    data = _regular_bytes(path, label="artifact")
-    if _sha256(data) != entry["sha256"]:
+    if _digest_file(path, label="artifact", maximum=DEFAULT_LIMITS.compressed_bytes) != entry["sha256"]:
         raise BootstrapError(f"{kind} digest mismatch: {filename}")
-    return data
+    return path
 
 
-def _wheel_is_valid(data: bytes, entry: dict[str, str]) -> None:
+def _check_expanded(total: int, compressed: int, limits: ArchiveLimits, *, label: str) -> int:
+    if total > limits.expanded_bytes:
+        raise BootstrapError(f"{label} expanded budget exceeded")
+    if compressed == 0 or total > compressed * limits.ratio:
+        raise BootstrapError(f"{label} compression ratio exceeded")
+    return total
+
+
+def _inspect_zip(path: Path, limits: ArchiveLimits) -> list[zipfile.ZipInfo]:
+    compressed = _regular_size(path, label="artifact")
+    if compressed > limits.compressed_bytes:
+        raise BootstrapError(f"wheel compressed budget exceeded: {path.name}")
     try:
-        with zipfile.ZipFile(__import__("io").BytesIO(data)) as wheel:
-            names = wheel.namelist()
+        with zipfile.ZipFile(path) as wheel:
+            infos = wheel.infolist()
+    except (OSError, zipfile.BadZipFile) as error:
+        raise BootstrapError("wheel metadata is invalid") from error
+    if len(infos) > limits.members:
+        raise BootstrapError("wheel member budget exceeded")
+    total = 0
+    for info in infos:
+        if info.file_size < 0 or info.file_size > limits.member_bytes:
+            raise BootstrapError("wheel member budget exceeded")
+        total = _check_expanded(total + info.file_size, compressed, limits, label="wheel")
+    return infos
+
+
+def _member_bytes(wheel: zipfile.ZipFile, name: str, infos: dict[str, zipfile.ZipInfo]) -> bytes:
+    info = infos[name]
+    if info.file_size > 1024 * 1024:
+        raise BootstrapError("wheel metadata member is too large")
+    with wheel.open(info) as handle:
+        return handle.read()
+
+
+def _member_digest(wheel: zipfile.ZipFile, info: zipfile.ZipInfo) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    with wheel.open(info) as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+            size += len(chunk)
+    return base64.urlsafe_b64encode(digest.digest()).rstrip(b"=").decode("ascii"), size
+
+
+def _wheel_is_valid(path: Path, entry: dict[str, str], limits: ArchiveLimits = DEFAULT_LIMITS) -> None:
+    try:
+        infos_list = _inspect_zip(path, limits)
+        with zipfile.ZipFile(path) as wheel:
+            names = [info.filename for info in infos_list]
             if len(names) != len(set(names)):
                 raise BootstrapError("wheel has duplicate members")
+            infos = {info.filename: info for info in infos_list}
             prefix = "zstandard-0.23.0.dist-info/"
-            metadata = wheel.read(prefix + "METADATA").decode("utf-8")
-            wheel_metadata = wheel.read(prefix + "WHEEL").decode("utf-8")
-            record = wheel.read(prefix + "RECORD").decode("utf-8")
+            metadata = _member_bytes(wheel, prefix + "METADATA", infos).decode("utf-8")
+            wheel_metadata = _member_bytes(wheel, prefix + "WHEEL", infos).decode("utf-8")
+            record = _member_bytes(wheel, prefix + "RECORD", infos).decode("utf-8")
             if "Name: zstandard\n" not in metadata or "Version: 0.23.0\n" not in metadata:
                 raise BootstrapError("wheel metadata name or version is invalid")
             _, _, python_tag, abi_tag, platform_tags = entry["filename"].removesuffix(".whl").split("-", 4)
@@ -149,43 +270,87 @@ def _wheel_is_valid(data: bytes, entry: dict[str, str]) -> None:
             if not expected_tags <= actual_tags:
                 raise BootstrapError("wheel tag does not match filename")
             records = list(csv.reader(record.splitlines()))
-            if {row[0] for row in records if row} != {name for name in names if not name.endswith("/")}:
+            expected_names = {name for name in names if not name.endswith("/")}
+            record_names: set[str] = set()
+            for row in records:
+                if len(row) != 3 or not row[0] or row[0] in record_names:
+                    raise BootstrapError("wheel RECORD row is invalid")
+                record_names.add(row[0])
+            if record_names != expected_names:
                 raise BootstrapError("wheel RECORD does not list every member")
             for row in records:
-                if len(row) != 3 or row[0] == prefix + "RECORD":
+                filename, hash_value, expected_size = row
+                if filename == prefix + "RECORD":
+                    if hash_value or expected_size:
+                        raise BootstrapError("wheel RECORD row is invalid")
                     continue
-                algorithm, encoded = row[1].split("=", 1)
-                if algorithm != "sha256" or not row[2].isdigit():
+                try:
+                    algorithm, encoded = hash_value.split("=", 1)
+                except ValueError as error:
+                    raise BootstrapError("wheel RECORD row is invalid") from error
+                if algorithm != "sha256" or not encoded or not expected_size.isdigit():
                     raise BootstrapError("wheel RECORD entry is invalid")
-                content = wheel.read(row[0])
-                actual = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).rstrip(b"=").decode("ascii")
-                if actual != encoded or len(content) != int(row[2]):
+                actual, actual_size = _member_digest(wheel, infos[filename])
+                if actual != encoded or actual_size != int(expected_size):
                     raise BootstrapError("wheel RECORD digest mismatch")
     except (OSError, ValueError, zipfile.BadZipFile, KeyError) as error:
         raise BootstrapError("wheel metadata is invalid") from error
 
 
-def _extract_uv(data: bytes) -> Path:
+def _inspect_tar(path: Path, limits: ArchiveLimits) -> None:
+    compressed = _regular_size(path, label="artifact")
+    if compressed > limits.compressed_bytes:
+        raise BootstrapError(f"uv compressed budget exceeded: {path.name}")
     try:
-        with tarfile.open(fileobj=__import__("io").BytesIO(data), mode="r:gz") as archive:
-            candidates = [member for member in archive.getmembers() if member.isfile() and Path(member.name).name == "uv"]
-            if len(candidates) != 1 or archive.getmembers() != [member for member in archive.getmembers() if not member.issym() and not member.islnk()]:
-                raise BootstrapError("uv archive must contain one regular uv executable and no links")
-            source = archive.extractfile(candidates[0])
-            if source is None:
-                raise BootstrapError("uv archive executable is unavailable")
-            destination = Path(tempfile.mkdtemp(prefix="e2-bootstrap-")) / "uv"
-            destination.write_bytes(source.read())
-            destination.chmod(0o555)
-            return destination
+        with tarfile.open(path, mode="r:gz") as archive:
+            members = 0
+            total = 0
+            candidates = 0
+            for member in archive:
+                members += 1
+                if members > limits.members or member.size < 0 or member.size > limits.member_bytes:
+                    raise BootstrapError("uv member budget exceeded")
+                total = _check_expanded(total + member.size, compressed, limits, label="uv")
+                if member.issym() or member.islnk() or not (member.isdir() or member.isfile()):
+                    raise BootstrapError("uv archive must contain regular files and directories only")
+                if member.isfile() and Path(member.name).name == "uv":
+                    candidates += 1
+            if candidates != 1:
+                raise BootstrapError("uv archive must contain one regular uv executable")
     except (OSError, tarfile.TarError) as error:
         raise BootstrapError("uv archive is invalid") from error
 
 
+def _extract_uv(path: Path, limits: ArchiveLimits = DEFAULT_LIMITS) -> Path:
+    _inspect_tar(path, limits)
+    try:
+        with tarfile.open(path, mode="r:gz") as archive:
+            candidate = next(member for member in archive if member.isfile() and Path(member.name).name == "uv")
+            source = archive.extractfile(candidate)
+            if source is None:
+                raise BootstrapError("uv archive executable is unavailable")
+            destination = Path(tempfile.mkdtemp(prefix="e2-bootstrap-")) / "uv"
+            with destination.open("wb") as target:
+                while chunk := source.read(1024 * 1024):
+                    target.write(chunk)
+            destination.chmod(0o555)
+            return destination
+    except (OSError, StopIteration, tarfile.TarError) as error:
+        raise BootstrapError("uv archive is invalid") from error
+
+
+def _uv_environment() -> dict[str, str]:
+    return {
+        "LC_ALL": "C",
+        "LANG": "C",
+        "TZ": "UTC",
+        "UV_OFFLINE": "1",
+        "UV_CONFIG_FILE": os.devnull,
+    }
+
+
 def _verify_version(executable: Path, expected: str) -> None:
-    environment = {key: value for key, value in os.environ.items() if key.upper() not in PROXY_VARIABLES}
-    environment.update({"UV_OFFLINE": "1", "UV_CONFIG_FILE": os.devnull})
-    result = subprocess.run([executable, "--version"], env=environment, capture_output=True, text=True)
+    result = subprocess.run([executable, "--version"], env=_uv_environment(), capture_output=True, text=True)
     if result.returncode != 0 or result.stdout.strip() != expected:
         raise BootstrapError("uv version/build identity does not match manifest")
 
@@ -202,7 +367,7 @@ def verify(manifest_path: Path) -> tuple[Path, str]:
     selected = _host_platform()
     checked_uv = _all_entries(root, manifest, "uvArchives", UV_ARCHIVES, kind="uv")
     checked_wheels = _all_entries(root, manifest, "zstandardWheels", WHEELS, kind="zstandard")
-    uv, uv_bytes = checked_uv[selected]
+    uv, uv_path = checked_uv[selected]
     config = manifest.get("emptyConfig")
     if not isinstance(config, dict) or config.get("filename") != "uv-empty.toml" or config.get("sha256") != EMPTY_CONFIG_SHA256:
         raise BootstrapError("empty config identity is invalid")
@@ -211,9 +376,9 @@ def verify(manifest_path: Path) -> tuple[Path, str]:
         raise BootstrapError("empty config must be zero bytes")
     if _sha256(config_bytes) != EMPTY_CONFIG_SHA256:
         raise BootstrapError("empty config digest mismatch")
-    for entry, wheel_data in checked_wheels.values():
-        _wheel_is_valid(wheel_data, entry)
-    executable = _extract_uv(uv_bytes)
+    for entry, wheel_path in checked_wheels.values():
+        _wheel_is_valid(wheel_path, entry)
+    executable = _extract_uv(uv_path)
     _verify_version(executable, uv.get("versionOutput", ""))
     return executable, _sha256(raw_manifest)
 

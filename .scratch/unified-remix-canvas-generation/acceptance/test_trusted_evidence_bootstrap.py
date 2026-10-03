@@ -1,10 +1,14 @@
 import hashlib
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tarfile
+import zipfile
 
 import pytest
 
@@ -13,6 +17,15 @@ ACCEPTANCE_ROOT = Path(__file__).parent
 BOOTSTRAP = ACCEPTANCE_ROOT / "bootstrap"
 VERIFIER = ACCEPTANCE_ROOT / "tools" / "verify_e2_bootstrap.py"
 PYTHON = Path(sys.executable)
+
+
+def _verifier():
+    spec = importlib.util.spec_from_file_location("verify_e2_bootstrap", VERIFIER)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _run(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -56,13 +69,99 @@ def _write_manifest(root: Path, value: dict[str, object]) -> None:
 
 
 def _current_uv_artifact(manifest: dict[str, object]) -> dict[str, object]:
-    platform = "darwin-arm64" if sys.platform == "darwin" else "linux-x86_64-gnu"
-    return next(item for item in manifest["uvArchives"] if item["platform"] == platform)
+    return next(item for item in manifest["uvArchives"] if item["platform"] == _verifier()._host_platform())
 
 
 def _current_wheel_artifact(manifest: dict[str, object]) -> dict[str, object]:
-    platform = "darwin-arm64" if sys.platform == "darwin" else "linux-x86_64-gnu"
-    return next(item for item in manifest["zstandardWheels"] if item["platform"] == platform)
+    return next(item for item in manifest["zstandardWheels"] if item["platform"] == _verifier()._host_platform())
+
+
+def _write_tar(path: Path, members: dict[str, bytes]) -> None:
+    with tarfile.open(path, "w:gz") as archive:
+        for name, contents in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(contents)
+            archive.addfile(info, io.BytesIO(contents))
+
+
+def _rewrite_wheel_record(source: Path, destination: Path, transform) -> None:
+    with zipfile.ZipFile(source) as original, zipfile.ZipFile(destination, "w") as rewritten:
+        for info in original.infolist():
+            contents = original.read(info.filename)
+            if info.filename.endswith(".dist-info/RECORD"):
+                contents = transform(contents.decode("utf-8")).encode("utf-8")
+            rewritten.writestr(info, contents)
+
+
+def test_linux_x86_64_requires_proven_gnu_libc():
+    """Catches musl or unknown Linux hosts selecting the GNU-only bootstrap artifact."""
+    verifier = _verifier()
+
+    assert verifier._classify_platform("linux", "x86_64", "glibc 2.39") == "linux-x86_64-gnu"
+    for libc in (None, "", "musl 1.2.5", "uclibc 1.0"):
+        with pytest.raises(verifier.BootstrapError, match="GNU libc"):
+            verifier._classify_platform("linux", "x86_64", libc)
+
+
+def test_archive_budget_rejects_compressed_and_expanded_inputs_before_extraction(tmp_path):
+    """Catches archive bombs before digesting whole compressed inputs or extracting members."""
+    verifier = _verifier()
+    archive = tmp_path / "uv.tar.gz"
+    _write_tar(archive, {"uv-root/uv": b"uv"})
+    tiny_compressed = verifier.ArchiveLimits(compressed_bytes=1, members=100, member_bytes=1024, expanded_bytes=1024, ratio=100)
+    tiny_expanded = verifier.ArchiveLimits(compressed_bytes=1024, members=100, member_bytes=1, expanded_bytes=1, ratio=100)
+
+    with pytest.raises(verifier.BootstrapError, match="compressed budget"):
+        verifier._inspect_tar(archive, tiny_compressed)
+    with pytest.raises(verifier.BootstrapError, match="member budget"):
+        verifier._inspect_tar(archive, tiny_expanded)
+
+
+def test_wheel_budget_and_record_rows_fail_closed(tmp_path):
+    """Catches zip bombs and malformed, duplicate, missing, or unchecked RECORD rows."""
+    verifier = _verifier()
+    manifest = _manifest(BOOTSTRAP)
+    entry = _current_wheel_artifact(manifest)
+    source = BOOTSTRAP / "artifacts" / entry["filename"]
+    tiny = verifier.ArchiveLimits(compressed_bytes=1024**3, members=1, member_bytes=256 * 1024**2, expanded_bytes=4 * 1024**3, ratio=100)
+    with pytest.raises(verifier.BootstrapError, match="member budget"):
+        verifier._inspect_zip(source, tiny)
+
+    def bad_field(record: str) -> str:
+        row, *rest = record.splitlines()
+        return "broken,row\n" + "\n".join(rest) + "\n"
+
+    def duplicate(record: str) -> str:
+        row, *rest = record.splitlines()
+        return row + "\n" + row + "\n" + "\n".join(rest) + "\n"
+
+    def missing(record: str) -> str:
+        return "\n".join(record.splitlines()[1:]) + "\n"
+
+    def wrong_hash(record: str) -> str:
+        row, *rest = record.splitlines()
+        filename, _, size = row.split(",")
+        return f"{filename},sha256={'A' * 43},{size}\n" + "\n".join(rest) + "\n"
+
+    for name, transform in (("field", bad_field), ("duplicate", duplicate), ("missing", missing), ("hash", wrong_hash)):
+        rewritten = tmp_path / f"{name}.whl"
+        _rewrite_wheel_record(source, rewritten, transform)
+        with pytest.raises(verifier.BootstrapError, match="wheel RECORD"):
+            verifier._wheel_is_valid(rewritten, entry, verifier.DEFAULT_LIMITS)
+
+
+def test_uv_version_executes_with_only_the_explicit_controlled_environment():
+    """Catches host PATH, dynamic-loader, or arbitrary variables influencing uv identity checks."""
+    verifier = _verifier()
+    environment = verifier._uv_environment()
+
+    assert environment == {
+        "LC_ALL": "C",
+        "LANG": "C",
+        "TZ": "UTC",
+        "UV_OFFLINE": "1",
+        "UV_CONFIG_FILE": os.devnull,
+    }
 
 
 def test_bootstrap_verifier_requires_an_offline_manifest_and_is_not_a_missing_script():
