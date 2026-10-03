@@ -3873,7 +3873,12 @@ class BrokerAuthSignedEnvelopeResultV1:
 
 
 class _BrokerAuthIssuerFreshnessCellV1:
-    """Shared, process-local currentness for exactly one issuer shell."""
+    """Non-authoritative local diagnostic cache for an issuer shell.
+
+    The process registry below is the only source of authority currentness.
+    This remains deliberately harmless so old shell snapshots cannot turn an
+    observable cache into a second authority.
+    """
 
     __slots__ = ("_owner_ref", "_epoch", "_sequence", "_head")
 
@@ -3889,19 +3894,65 @@ class _BrokerAuthIssuerFreshnessCellV1:
         epoch: int,
         state: BrokerAuthSequenceStateV1,
     ) -> None:
-        if (
-            self._owner_ref() is not owner
-            or epoch != self._epoch
-            or (state.current_sequence, state.head_entry_digest) != (self._sequence, self._head)
-        ):
-            raise ValueError("broker issuer authority freshness is invalid")
+        # Compatibility-only cache validation.  It is never an authority gate.
+        return None
 
     def advance(self, owner: "BrokerAuthAuthoritativeIssuerV1", state: BrokerAuthSequenceStateV1) -> int:
-        if self._owner_ref() is not owner:
-            raise ValueError("broker issuer authority freshness is invalid")
         self._epoch = _checked_add(self._epoch, 1)
         self._sequence, self._head = state.current_sequence, state.head_entry_digest
         return self._epoch
+
+
+def _make_broker_auth_issuer_owner_registry():
+    """Create the process-local, non-serializable single-owner registry."""
+    records: dict[object, tuple[weakref.ReferenceType["BrokerAuthAuthoritativeIssuerV1"], int, object, int, str | None]] = {}
+
+    def register(
+        owner: "BrokerAuthAuthoritativeIssuerV1",
+        state: BrokerAuthSequenceStateV1,
+    ) -> tuple[object, object]:
+        handle = object()
+        epoch_handle = object()
+        records[handle] = (weakref.ref(owner), 0, epoch_handle, state.current_sequence, state.head_entry_digest)
+        return handle, epoch_handle
+
+    def require_current(
+        owner: "BrokerAuthAuthoritativeIssuerV1",
+        handle: object,
+        epoch_handle: object,
+        state: BrokerAuthSequenceStateV1,
+    ) -> None:
+        record = records.get(handle)
+        if (
+            record is None
+            or record[0]() is not owner
+            or record[2] is not epoch_handle
+            or (state.current_sequence, state.head_entry_digest) != record[3:]
+        ):
+            raise ValueError("broker issuer authority freshness is invalid")
+
+    def advance(
+        owner: "BrokerAuthAuthoritativeIssuerV1",
+        handle: object,
+        state: BrokerAuthSequenceStateV1,
+    ) -> tuple[int, object]:
+        record = records.get(handle)
+        if record is None or record[0]() is not owner:
+            raise ValueError("broker issuer authority freshness is invalid")
+        _owner_ref, epoch, _epoch_handle, _sequence, _head = record
+        epoch = _checked_add(epoch, 1)
+        epoch_handle = object()
+        records[handle] = (weakref.ref(owner), epoch, epoch_handle, state.current_sequence, state.head_entry_digest)
+        return epoch, epoch_handle
+
+    return register, require_current, advance
+
+
+(
+    _register_broker_auth_issuer_owner,
+    _require_broker_auth_issuer_owner,
+    _advance_broker_auth_issuer_owner,
+) = _make_broker_auth_issuer_owner_registry()
 
 
 class BrokerAuthAuthoritativeIssuerV1:
@@ -3916,7 +3967,7 @@ class BrokerAuthAuthoritativeIssuerV1:
         "_root_identity_digest", "_allowed_signers_digest", "_signer", "_allowed_signers",
         "_governance", "_baseline", "_state_mac", "_frozen_profile_ttl_sequences", "_event_ids",
         "_issued_families", "_issued_preimages", "_sign_lifecycles", "_freshness_cell",
-        "_freshness_epoch", "_issuer_sealed", "__weakref__",
+        "_freshness_epoch", "_authority_handle", "_authority_epoch_handle", "_issuer_sealed", "__weakref__",
     )
     _ENVELOPE_TOKEN = object()
 
@@ -3939,19 +3990,20 @@ class BrokerAuthAuthoritativeIssuerV1:
     ) -> None:
         self._governance, self._registry, self._revocations, self._state = governance, governance.registry, governance.revocations, state
         self._entries: tuple[BrokerAuthSequenceJournalEntryV1, ...] = ()
-        self._payloads: dict[str, BrokerAuthSequenceEventPayloadV1] = {}
+        self._payloads: Mapping[str, BrokerAuthSequenceEventPayloadV1] = MappingProxyType({})
         self._journal: BrokerAuthSequenceJournalV1 | None = None
         self._root_identity_digest, self._allowed_signers_digest = root_identity_digest, governance.allowed_signers_digest
-        self._signer, self._allowed_signers, self._state_mac = signer, dict(governance.allowed_signers), state_mac
+        self._signer, self._allowed_signers, self._state_mac = signer, MappingProxyType(dict(governance.allowed_signers)), state_mac
         self._baseline = BrokerAuthSequenceReplayBaselineV1(
             root_identity_digest, governance, state.current_policy_digest,
         )
-        self._frozen_profile_ttl_sequences, self._event_ids = _u64(frozen_profile_ttl_sequences, "frozen_profile_ttl_sequences", positive=True), set()
-        self._issued_families: dict[str, RegistrationWorkerSessionFamilyAuthorizationV1] = {}
-        self._issued_preimages: dict[str, RegistrationRecoveryLeaseIdentityPreimageV1] = {}
-        self._sign_lifecycles: dict[str, tuple[str, int]] = {}
+        self._frozen_profile_ttl_sequences, self._event_ids = _u64(frozen_profile_ttl_sequences, "frozen_profile_ttl_sequences", positive=True), frozenset()
+        self._issued_families: Mapping[str, RegistrationWorkerSessionFamilyAuthorizationV1] = MappingProxyType({})
+        self._issued_preimages: Mapping[str, RegistrationRecoveryLeaseIdentityPreimageV1] = MappingProxyType({})
+        self._sign_lifecycles: Mapping[str, tuple[str, int]] = MappingProxyType({})
         self._freshness_cell = _BrokerAuthIssuerFreshnessCellV1(self, state)
         self._freshness_epoch = 0
+        self._authority_handle, self._authority_epoch_handle = _register_broker_auth_issuer_owner(self, state)
         self._issuer_sealed = True
 
     @classmethod
@@ -4016,7 +4068,22 @@ class BrokerAuthAuthoritativeIssuerV1:
         raise TypeError("broker issuer is non-serializable")
 
     def _require_current_authority(self) -> None:
-        self._freshness_cell.require_current(self, self._freshness_epoch, self._state)
+        _require_broker_auth_issuer_owner(
+            self, self._authority_handle, self._authority_epoch_handle, self._state,
+        )
+
+    def _advance_current_authority(self, state: BrokerAuthSequenceStateV1) -> int:
+        epoch, epoch_handle = _advance_broker_auth_issuer_owner(self, self._authority_handle, state)
+        object.__setattr__(self, "_authority_epoch_handle", epoch_handle)
+        return epoch
+
+    def _refresh_freshness_cache(self, epoch: int) -> None:
+        """Update only an observable cache after the registry has committed."""
+        object.__setattr__(self, "_freshness_epoch", epoch)
+        object.__setattr__(self._freshness_cell, "_owner_ref", weakref.ref(self))
+        object.__setattr__(self._freshness_cell, "_epoch", epoch)
+        object.__setattr__(self._freshness_cell, "_sequence", self._state.current_sequence)
+        object.__setattr__(self._freshness_cell, "_head", self._state.head_entry_digest)
 
     def _replay_current_startup_closure(
         self,
@@ -4090,10 +4157,12 @@ class BrokerAuthAuthoritativeIssuerV1:
         ):
             raise ValueError("broker signer does not match current governance")
         object.__setattr__(self, "_signer", signer)
-        object.__setattr__(self, "_allowed_signers", dict(governance.allowed_signers))
+        object.__setattr__(self, "_allowed_signers", MappingProxyType(dict(governance.allowed_signers)))
         object.__setattr__(self, "_allowed_signers_digest", governance.allowed_signers_digest)
         object.__setattr__(self, "_governance", governance)
-        object.__setattr__(self, "_freshness_epoch", self._freshness_cell.advance(self, self._state))
+        self._refresh_freshness_cache(
+            self._advance_current_authority(self._state),
+        )
 
     def _require_active_signer(self, event_sequence: int) -> RegistrationBrokerAuthKeyRegistrationV1:
         key = self._registry.key(self._registry.active_key_id)
@@ -4189,19 +4258,38 @@ class BrokerAuthAuthoritativeIssuerV1:
         self,
         result: BrokerAuthStateTransitionResultV1,
         governance: RegistrationBrokerAuthGovernanceV1,
+        *,
+        issued_family: RegistrationWorkerSessionFamilyAuthorizationV1 | None = None,
+        issued_preimage: RegistrationRecoveryLeaseIdentityPreimageV1 | None = None,
+        sign_lifecycle_updates: Mapping[str, tuple[str, int]] | None = None,
     ) -> None:
         self._require_current_authority()
+        next_issued_families = dict(self._issued_families)
+        next_issued_preimages = dict(self._issued_preimages)
+        next_sign_lifecycles = dict(self._sign_lifecycles)
+        if issued_family is not None or issued_preimage is not None:
+            if issued_family is None or issued_preimage is None:
+                raise ValueError("broker issued authority cache is incomplete")
+            next_issued_families[result.entry.canonical_digest] = issued_family
+            next_issued_preimages[result.entry.canonical_digest] = issued_preimage
+        if sign_lifecycle_updates is not None:
+            next_sign_lifecycles.update(sign_lifecycle_updates)
         object.__setattr__(self, "_governance", governance)
         object.__setattr__(self, "_registry", governance.registry)
         object.__setattr__(self, "_revocations", governance.revocations)
         object.__setattr__(self, "_state", result.state)
-        object.__setattr__(self, "_allowed_signers", dict(governance.allowed_signers))
+        object.__setattr__(self, "_allowed_signers", MappingProxyType(dict(governance.allowed_signers)))
         object.__setattr__(self, "_allowed_signers_digest", governance.allowed_signers_digest)
         object.__setattr__(self, "_entries", (*self._entries, result.entry))
-        object.__setattr__(self, "_payloads", dict(result.payloads))
+        object.__setattr__(self, "_payloads", MappingProxyType(dict(result.payloads)))
         object.__setattr__(self, "_journal", result.journal)
-        self._event_ids.add(result.payload.event_id_digest)
-        object.__setattr__(self, "_freshness_epoch", self._freshness_cell.advance(self, result.state))
+        object.__setattr__(self, "_event_ids", self._event_ids | frozenset((result.payload.event_id_digest,)))
+        object.__setattr__(self, "_issued_families", MappingProxyType(next_issued_families))
+        object.__setattr__(self, "_issued_preimages", MappingProxyType(next_issued_preimages))
+        object.__setattr__(self, "_sign_lifecycles", MappingProxyType(next_sign_lifecycles))
+        self._refresh_freshness_cache(
+            self._advance_current_authority(result.state),
+        )
 
     def issue_lease(
         self,
@@ -4258,10 +4346,13 @@ class BrokerAuthAuthoritativeIssuerV1:
         lease = replace(lease, broker_mac=self._state_mac.mac(canonical_json_bytes(lease._unsigned_wire())))
         lease.verify_signature(self._governance, sequence)
         result = BrokerAuthLeaseIssuanceResultV1(transition.payload, transition.entry, transition.state, transition.journal, transition.payloads, lease)
-        self._commit(result, self._governance)
-        self._issued_families[transition.entry.canonical_digest] = family
-        self._issued_preimages[transition.entry.canonical_digest] = derived
-        self._sign_lifecycles[transition.entry.canonical_digest] = ("register", 1)
+        self._commit(
+            result,
+            self._governance,
+            issued_family=family,
+            issued_preimage=derived,
+            sign_lifecycle_updates={transition.entry.canonical_digest: ("register", 1)},
+        )
         return result
 
     def rotate_registry(
@@ -4395,8 +4486,15 @@ class BrokerAuthAuthoritativeIssuerV1:
         envelope = CapabilityEnvelopeV1._create_from_issuer(
             self._ENVELOPE_TOKEN, unsigned_envelope, signer,
         )
-        self._commit(transition, self._governance)
-        self._sign_lifecycles[lease.broker_auth_issue_entry_digest] = ("recover", _checked_add(unsigned_envelope.worker_sequence, 1))
+        self._commit(
+            transition,
+            self._governance,
+            sign_lifecycle_updates={
+                lease.broker_auth_issue_entry_digest: (
+                    "recover", _checked_add(unsigned_envelope.worker_sequence, 1),
+                ),
+            },
+        )
         return BrokerAuthSignedEnvelopeResultV1(transition, envelope)
 
     def sign_initial_envelope(

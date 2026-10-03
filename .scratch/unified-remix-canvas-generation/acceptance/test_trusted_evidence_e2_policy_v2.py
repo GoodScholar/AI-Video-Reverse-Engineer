@@ -10,6 +10,7 @@ import fcntl
 import array
 import base64
 import sys
+import weakref
 from pathlib import Path
 
 import pytest
@@ -2449,6 +2450,83 @@ def test_authoritative_issuer_rejects_slot_snapshot_after_owner_revocation(tmp_p
             verify_registration_broker_startup_challenge(snapshot, "snapshot-after-revoke")
         with pytest.raises(ValueError, match="startup key closure"):
             verify_registration_broker_startup_challenge(issuer, "owner-after-revoke")
+    finally:
+        state_mac.close()
+        signer.close()
+
+
+def test_authoritative_issuer_rejects_rehomed_slot_snapshot_after_owner_revocation(tmp_path):
+    """Rebuilding a local freshness cell must not give a stale shell authority."""
+    issuer, registry, state_mac, signer = _issued_startup_issuer(tmp_path)
+    try:
+        snapshot = object.__new__(BrokerAuthAuthoritativeIssuerV1)
+        for slot in BrokerAuthAuthoritativeIssuerV1.__slots__:
+            if slot != "__weakref__":
+                object.__setattr__(snapshot, slot, getattr(issuer, slot))
+        rehomed_cell = type(issuer._freshness_cell)(snapshot, snapshot.state)
+        object.__setattr__(snapshot, "_freshness_cell", rehomed_cell)
+        object.__setattr__(snapshot, "_freshness_epoch", 0)
+        with pytest.raises(ValueError, match="authority|freshness|closure"):
+            verify_registration_broker_startup_challenge(snapshot, "rehomed-before-revoke")
+
+        revoked = RegistrationBrokerAuthRevocationsV1(
+            "trusted-registration-broker-auth-revocations/v1", registry.canonical_digest,
+            (RegistrationBrokerAuthRevocationEntryV1("broker-fixed", 2, DIGEST_B),),
+        )
+        issuer.revoke_key("broker-fixed", revoked, DIGEST_B, _broker_policy_digest(registry, revoked))
+        with pytest.raises(ValueError, match="authority|freshness|closure"):
+            verify_registration_broker_startup_challenge(snapshot, "rehomed-after-revoke")
+    finally:
+        state_mac.close()
+        signer.close()
+
+
+def test_authoritative_issuer_rejects_shared_cell_takeover_after_owner_revocation(tmp_path):
+    """Overwriting every exposed cell field must not revive a stale shell."""
+    issuer, registry, state_mac, signer = _issued_startup_issuer(tmp_path)
+    try:
+        snapshot = object.__new__(BrokerAuthAuthoritativeIssuerV1)
+        for slot in BrokerAuthAuthoritativeIssuerV1.__slots__:
+            if slot != "__weakref__":
+                object.__setattr__(snapshot, slot, getattr(issuer, slot))
+        revoked = RegistrationBrokerAuthRevocationsV1(
+            "trusted-registration-broker-auth-revocations/v1", registry.canonical_digest,
+            (RegistrationBrokerAuthRevocationEntryV1("broker-fixed", 2, DIGEST_B),),
+        )
+        issuer.revoke_key("broker-fixed", revoked, DIGEST_B, _broker_policy_digest(registry, revoked))
+
+        cell = issuer._freshness_cell
+        object.__setattr__(cell, "_owner_ref", weakref.ref(snapshot))
+        object.__setattr__(cell, "_epoch", snapshot._freshness_epoch)
+        object.__setattr__(cell, "_sequence", snapshot.state.current_sequence)
+        object.__setattr__(cell, "_head", snapshot.state.head_entry_digest)
+        with pytest.raises(ValueError, match="authority|freshness|closure"):
+            verify_registration_broker_startup_challenge(snapshot, "stolen-cell-after-revoke")
+    finally:
+        state_mac.close()
+        signer.close()
+
+
+@pytest.mark.parametrize(
+    "attribute",
+    (
+        "_payloads",
+        "_event_ids",
+        "_issued_families",
+        "_issued_preimages",
+        "_sign_lifecycles",
+        "_allowed_signers",
+    ),
+)
+def test_authoritative_issuer_authorization_containers_cannot_mutate_in_place(tmp_path, attribute):
+    """A caller cannot clear one authorization fact without an epoch transition."""
+    issuer, _, state_mac, signer = _issued_startup_issuer(tmp_path)
+    try:
+        state_before = issuer.state
+        with pytest.raises(AttributeError):
+            getattr(issuer, attribute).clear()
+        assert issuer.state == state_before
+        assert verify_registration_broker_startup_challenge(issuer, f"immutable-{attribute}")
     finally:
         state_mac.close()
         signer.close()
