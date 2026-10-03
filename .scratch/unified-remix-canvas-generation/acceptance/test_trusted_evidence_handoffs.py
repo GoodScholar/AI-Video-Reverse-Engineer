@@ -29,6 +29,7 @@ from trusted_evidence.handoffs import (
     HandoffExportRequestV1,
     PolicyHandoffPointerV1,
     PolicyHandoffRecordV1,
+    ProductSourceBudgetV1,
     ProductRepositorySourceV1,
     Ticket23ProductSourceHandoffV1,
     TrustedHandoffRecordV1,
@@ -176,7 +177,7 @@ def _source(commit=COMMIT):
         source_digest=DIGEST,
         container_format="trusted-product-raw-git-tar-zstd/v1",
         object_format="sha1",
-        budget_digest=DIGEST,
+        budget=ProductSourceBudgetV1(),
         boundary_digest=DIGEST,
         tracked_checkout_digest=DIGEST,
         control_metadata_digest=DIGEST,
@@ -223,12 +224,61 @@ def test_product_source_rejects_host_path():
             source_digest=DIGEST,
             container_format="trusted-product-raw-git-tar-zstd/v1",
             object_format="sha1",
-            budget_digest=DIGEST,
+            budget=ProductSourceBudgetV1(),
             boundary_digest=DIGEST,
             tracked_checkout_digest=DIGEST,
             control_metadata_digest=DIGEST,
             raw_inspection_proof_ref=DIGEST,
         )
+
+
+def test_product_source_budget_and_handoff_wire_are_closed_by_kind(tmp_path):
+    """Budget bytes and kind are authenticated; policy cannot use a second wire."""
+    product = _record()
+    policy_commit = GitObjectIdV1("sha256", "c" * 64)
+    policy = TrustedHandoffRecordV1(
+        "trusted-acceptance-handoff/v1", "ticket-23-policy-v1", "policy", 27,
+        policy_commit, (28,), (("policy-payload", DIGEST),),
+    )
+    pointer = HandoffPointerV1(
+        "trusted-acceptance-handoff-pointer/v1", policy.handoff_id,
+        policy.record_digest, policy.record_digest, policy.producer_task,
+        policy.producer_commit,
+    )
+
+    source = _source()
+    assert source.to_wire()["budget"] == source.budget.to_wire()
+    assert ProductRepositorySourceV1.from_canonical_bytes(source.canonical_bytes).budget == source.budget
+    assert PolicyHandoffRecordV1 is TrustedHandoffRecordV1
+    assert PolicyHandoffPointerV1 is HandoffPointerV1
+    assert PolicyHandoffRecordV1.from_canonical_bytes(policy.canonical_bytes) == policy
+    assert HandoffPointerV1.from_canonical_bytes(pointer.canonical_bytes) == pointer
+
+    with pytest.raises(ValueError):
+        TrustedHandoffRecordV1(
+            "trusted-acceptance-handoff/v1", product.handoff_id, "policy", 22,
+            COMMIT, (23,), product.bindings,
+        )
+    wrong_pointer = HandoffPointerV1(
+        "trusted-acceptance-handoff-pointer/v1", product.handoff_id,
+        product.record_digest, product.record_digest, 27, policy_commit,
+    )
+    root = (tmp_path / "kind-store").resolve()
+    root.mkdir(mode=0o700)
+    with pytest.raises(ValueError):
+        HandoffRegistryV1(TrustedHandoffStoreV1(root)).publish_local(product, wrong_pointer)
+    tampered = json.loads(source.canonical_bytes)
+    tampered["budget"]["maxPackBytes"] -= 1
+    with pytest.raises(ValueError):
+        ProductRepositorySourceV1.from_canonical_bytes(canonical_json_bytes(tampered))
+
+
+def test_startup_challenge_has_one_public_owner():
+    """A same-named handoff stub must never shadow the broker challenge verifier."""
+    import trusted_evidence.handoffs as handoffs
+
+    assert not hasattr(handoffs, "verify_registration_broker_startup_challenge")
+    assert verify_registration_broker_startup_challenge.__module__ == "trusted_evidence.e2_policy"
 
 
 def test_handoff_store_publishes_content_addressed_blob_and_no_replace_pointer(tmp_path, monkeypatch):
@@ -1239,8 +1289,8 @@ def _policy_transport_fixture(tmp_path):
     source = TrustedHandoffStoreV1(source_root)
     commit = GitObjectIdV1("sha256", "c" * 64)
     payload_ref = source.put_blob(b"policy payload")
-    record = PolicyHandoffRecordV1("trusted-policy-handoff-record/v1", "ticket-23-policy-v1", "policy", 27, commit, (28,), (("policy-payload", payload_ref),))
-    pointer = PolicyHandoffPointerV1("trusted-policy-handoff-pointer/v1", record.handoff_id, record.record_digest, record.record_digest, 27, commit)
+    record = PolicyHandoffRecordV1("trusted-acceptance-handoff/v1", "ticket-23-policy-v1", "policy", 27, commit, (28,), (("policy-payload", payload_ref),))
+    pointer = PolicyHandoffPointerV1("trusted-acceptance-handoff-pointer/v1", record.handoff_id, record.record_digest, record.record_digest, 27, commit)
     core_request = HandoffExportRequestV1("trusted-handoff-export-request/v1", record.handoff_id, record.record_digest, record.record_digest, "sha256:" + hashlib.sha256(pointer.canonical_bytes).hexdigest(), (28,), record.binding_set_digest)
     core_request_ref = "sha256:" + hashlib.sha256(core_request.canonical_bytes).hexdigest()
     activation_seed = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
@@ -1488,18 +1538,18 @@ def test_policy_record_pointer_uses_general_git_oid_and_full_bytes_digest():
 
     commit = GitObjectIdV1("sha256", "c" * 64)
     record = PolicyHandoffRecordV1(
-        "trusted-policy-handoff-record/v1", "ticket-23-policy-v1", "policy", 27, commit,
+        "trusted-acceptance-handoff/v1", "ticket-23-policy-v1", "policy", 27, commit,
         (28,), (("policy-payload", "sha256:" + "d" * 64),),
     )
     pointer = PolicyHandoffPointerV1(
-        "trusted-policy-handoff-pointer/v1", record.handoff_id, record.record_digest,
+        "trusted-acceptance-handoff-pointer/v1", record.handoff_id, record.record_digest,
         record.record_digest, 27, commit,
     )
 
     assert pointer.record_ref == "sha256:" + hashlib.sha256(record.canonical_bytes).hexdigest()
     with pytest.raises(ValueError):
         PolicyHandoffRecordV1(
-            "trusted-policy-handoff-record/v1", "ticket-23-policy-v1", "policy", 27,
+            "trusted-acceptance-handoff/v1", "ticket-23-policy-v1", "policy", 27,
             ProductGitObjectIdV1("sha1", "e" * 40), (28,), (("policy-payload", "sha256:" + "d" * 64),),
         )
 
@@ -1517,11 +1567,11 @@ def test_policy_transport_requires_a_complete_activated_closure_before_ready(tmp
     commit = GitObjectIdV1("sha256", "c" * 64)
     payload_ref = source.put_blob(b"policy payload")
     record = PolicyHandoffRecordV1(
-        "trusted-policy-handoff-record/v1", "ticket-23-policy-v1", "policy", 27,
+        "trusted-acceptance-handoff/v1", "ticket-23-policy-v1", "policy", 27,
         commit, (28,), (("policy-payload", payload_ref),),
     )
     pointer = PolicyHandoffPointerV1(
-        "trusted-policy-handoff-pointer/v1", record.handoff_id, record.record_digest,
+        "trusted-acceptance-handoff-pointer/v1", record.handoff_id, record.record_digest,
         record.record_digest, 27, commit,
     )
 

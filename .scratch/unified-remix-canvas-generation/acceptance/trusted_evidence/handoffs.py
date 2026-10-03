@@ -70,15 +70,21 @@ class TrustedHandoffRecordV1:
     handoff_id: str
     kind: str
     producer_task: int
-    producer_commit: ProductGitObjectIdV1
+    producer_commit: GitObjectIdV1 | ProductGitObjectIdV1
     consumer_tasks: tuple[int, ...]
     bindings: tuple[tuple[str, str], ...]
 
     def __post_init__(self) -> None:
-        if self.schema != "trusted-acceptance-handoff/v1" or self.kind != "product-source" or self.producer_task != 22:
-            raise ValueError("invalid product-source handoff record")
-        if not self.handoff_id or not isinstance(self.producer_commit, ProductGitObjectIdV1):
+        if self.schema != "trusted-acceptance-handoff/v1" or not self.handoff_id:
             raise ValueError("invalid handoff identity")
+        if self.kind == "product-source":
+            if self.producer_task != 22 or type(self.producer_commit) is not ProductGitObjectIdV1:
+                raise ValueError("invalid product-source handoff record")
+        elif self.kind == "policy":
+            if self.producer_task != 27 or type(self.producer_commit) is not GitObjectIdV1:
+                raise ValueError("invalid policy handoff record")
+        else:
+            raise ValueError("handoff kind is invalid")
         if not self.consumer_tasks or tuple(sorted(self.consumer_tasks)) != self.consumer_tasks or len(set(self.consumer_tasks)) != len(self.consumer_tasks) or any(not isinstance(task, int) or task <= 0 for task in self.consumer_tasks):
             raise ValueError("consumerTasks must be sorted unique positive integers")
         bindings = tuple(sorted(self.bindings, key=lambda item: item[0].encode("utf-8")))
@@ -124,7 +130,10 @@ class TrustedHandoffRecordV1:
             if not isinstance(item, dict) or set(item) != {"digest", "name"}:
                 raise ValueError("handoff binding is invalid")
             parsed_bindings.append((item["name"], item["digest"]))
-        return cls(raw["schema"], raw["handoffId"], raw["kind"], raw["producerTask"], _product_oid(raw["producerCommit"]), tuple(raw["consumerTasks"]), tuple(parsed_bindings))
+        commit = _product_oid(raw["producerCommit"]) if raw["kind"] == "product-source" else GitObjectIdV1(raw["producerCommit"]["algorithm"], raw["producerCommit"]["hex"]) if raw["kind"] == "policy" and isinstance(raw["producerCommit"], dict) and set(raw["producerCommit"]) == {"algorithm", "hex"} else None
+        if commit is None:
+            raise ValueError("handoff kind or producer commit is invalid")
+        return cls(raw["schema"], raw["handoffId"], raw["kind"], raw["producerTask"], commit, tuple(raw["consumerTasks"]), tuple(parsed_bindings))
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,15 +143,20 @@ class HandoffPointerV1:
     record_ref: str
     record_digest: str
     producer_task: int
-    producer_commit: ProductGitObjectIdV1
+    producer_commit: GitObjectIdV1 | ProductGitObjectIdV1
 
     def __post_init__(self) -> None:
         if self.schema != "trusted-acceptance-handoff-pointer/v1" or not self.handoff_id:
             raise ValueError("invalid handoff pointer")
         _require_digest(self.record_ref, "record_ref")
         _require_digest(self.record_digest, "record_digest")
-        if self.record_ref != self.record_digest or self.producer_task != 22 or not isinstance(self.producer_commit, ProductGitObjectIdV1):
-            raise ValueError("handoff pointer does not bind the product record")
+        if self.record_ref != self.record_digest:
+            raise ValueError("handoff pointer does not bind full record bytes")
+        if self.producer_task == 22 and type(self.producer_commit) is ProductGitObjectIdV1:
+            return
+        if self.producer_task == 27 and type(self.producer_commit) is GitObjectIdV1:
+            return
+        raise ValueError("handoff pointer kind-specific producer is invalid")
 
     def to_wire(self) -> dict[str, object]:
         return {"handoffId": self.handoff_id, "producerCommit": self.producer_commit.to_wire(), "producerTask": self.producer_task, "recordDigest": self.record_digest, "recordRef": self.record_ref, "schema": self.schema}
@@ -154,92 +168,14 @@ class HandoffPointerV1:
     @classmethod
     def from_canonical_bytes(cls, payload: bytes) -> "HandoffPointerV1":
         raw = _strict_object(payload, {"handoffId", "producerCommit", "producerTask", "recordDigest", "recordRef", "schema"})
-        return cls(raw["schema"], raw["handoffId"], raw["recordRef"], raw["recordDigest"], raw["producerTask"], _product_oid(raw["producerCommit"]))
+        commit = _product_oid(raw["producerCommit"]) if raw["producerTask"] == 22 else GitObjectIdV1(raw["producerCommit"]["algorithm"], raw["producerCommit"]["hex"]) if raw["producerTask"] == 27 and isinstance(raw["producerCommit"], dict) and set(raw["producerCommit"]) == {"algorithm", "hex"} else None
+        if commit is None:
+            raise ValueError("handoff pointer producer commit is invalid")
+        return cls(raw["schema"], raw["handoffId"], raw["recordRef"], raw["recordDigest"], raw["producerTask"], commit)
 
 
-@dataclass(frozen=True, slots=True)
-class PolicyHandoffRecordV1:
-    """Strict policy record; unlike product records its Git object may be SHA-1 or SHA-256."""
-
-    schema: str
-    handoff_id: str
-    kind: str
-    producer_task: int
-    producer_commit: GitObjectIdV1
-    consumer_tasks: tuple[int, ...]
-    bindings: tuple[tuple[str, str], ...]
-
-    def __post_init__(self) -> None:
-        if self.schema != "trusted-policy-handoff-record/v1" or self.handoff_id != "ticket-23-policy-v1" or self.kind != "policy" or self.producer_task != 27 or type(self.producer_commit) is not GitObjectIdV1:
-            raise ValueError("policy handoff record identity is invalid")
-        if not self.consumer_tasks or tuple(sorted(self.consumer_tasks)) != self.consumer_tasks or len(set(self.consumer_tasks)) != len(self.consumer_tasks) or any(type(task) is not int or task <= 0 for task in self.consumer_tasks):
-            raise ValueError("policy consumers are invalid")
-        bindings = tuple(sorted(self.bindings, key=lambda item: item[0].encode("utf-8")))
-        if not bindings or len({name for name, _ in bindings}) != len(bindings):
-            raise ValueError("policy bindings are invalid")
-        for name, digest in bindings:
-            _require_transport_identity(name, "policy binding name")
-            _require_digest(digest, "policy binding digest")
-        object.__setattr__(self, "bindings", bindings)
-
-    def to_wire(self) -> dict[str, object]:
-        return {"bindings": [{"digest": digest, "name": name} for name, digest in self.bindings], "consumerTasks": list(self.consumer_tasks), "handoffId": self.handoff_id, "kind": self.kind, "producerCommit": self.producer_commit.to_wire(), "producerTask": self.producer_task, "schema": self.schema}
-
-    @property
-    def canonical_bytes(self) -> bytes:
-        return canonical_json_bytes(self.to_wire())
-
-    @property
-    def record_digest(self) -> str:
-        return _digest(self.canonical_bytes)
-
-    @property
-    def binding_set_digest(self) -> str:
-        return _digest(canonical_json_bytes(self.to_wire()["bindings"]))
-
-    @classmethod
-    def from_canonical_bytes(cls, payload: bytes) -> "PolicyHandoffRecordV1":
-        raw = _strict_object(payload, {"bindings", "consumerTasks", "handoffId", "kind", "producerCommit", "producerTask", "schema"})
-        if not isinstance(raw["bindings"], list) or not isinstance(raw["consumerTasks"], list) or not isinstance(raw["producerCommit"], dict) or set(raw["producerCommit"]) != {"algorithm", "hex"}:
-            raise ValueError("policy handoff record wire is invalid")
-        bindings = []
-        for item in raw["bindings"]:
-            if not isinstance(item, dict) or set(item) != {"digest", "name"}:
-                raise ValueError("policy handoff binding wire is invalid")
-            bindings.append((item["name"], item["digest"]))
-        return cls(raw["schema"], raw["handoffId"], raw["kind"], raw["producerTask"], GitObjectIdV1(raw["producerCommit"]["algorithm"], raw["producerCommit"]["hex"]), tuple(raw["consumerTasks"]), tuple(bindings))
-
-
-@dataclass(frozen=True, slots=True)
-class PolicyHandoffPointerV1:
-    schema: str
-    handoff_id: str
-    record_ref: str
-    record_digest: str
-    producer_task: int
-    producer_commit: GitObjectIdV1
-
-    def __post_init__(self) -> None:
-        if self.schema != "trusted-policy-handoff-pointer/v1" or self.handoff_id != "ticket-23-policy-v1" or self.producer_task != 27 or type(self.producer_commit) is not GitObjectIdV1:
-            raise ValueError("policy handoff pointer identity is invalid")
-        _require_digest(self.record_ref, "policy record ref")
-        _require_digest(self.record_digest, "policy record digest")
-        if self.record_ref != self.record_digest:
-            raise ValueError("policy pointer does not bind full record bytes")
-
-    def to_wire(self) -> dict[str, object]:
-        return {"handoffId": self.handoff_id, "producerCommit": self.producer_commit.to_wire(), "producerTask": self.producer_task, "recordDigest": self.record_digest, "recordRef": self.record_ref, "schema": self.schema}
-
-    @property
-    def canonical_bytes(self) -> bytes:
-        return canonical_json_bytes(self.to_wire())
-
-    @classmethod
-    def from_canonical_bytes(cls, payload: bytes) -> "PolicyHandoffPointerV1":
-        raw = _strict_object(payload, {"handoffId", "producerCommit", "producerTask", "recordDigest", "recordRef", "schema"})
-        if not isinstance(raw["producerCommit"], dict) or set(raw["producerCommit"]) != {"algorithm", "hex"}:
-            raise ValueError("policy handoff pointer wire is invalid")
-        return cls(raw["schema"], raw["handoffId"], raw["recordRef"], raw["recordDigest"], raw["producerTask"], GitObjectIdV1(raw["producerCommit"]["algorithm"], raw["producerCommit"]["hex"]))
+PolicyHandoffRecordV1 = TrustedHandoffRecordV1
+PolicyHandoffPointerV1 = HandoffPointerV1
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +212,59 @@ class HandoffExportRequestV1:
 
 
 @dataclass(frozen=True, slots=True)
+class ProductSourceBudgetV1:
+    """The immutable raw-Git limits carried by every product source."""
+
+    max_pack_bytes: int = 4 * 1024**3
+    max_index_bytes: int = 256 * 1024**2
+    max_object_bytes: int = 16 * 1024**3
+    max_loose_object_bytes: int = 256 * 1024**2
+    max_pack_count: int = 1024
+    max_ref_count: int = 100_000
+    max_metadata_bytes: int = 16 * 1024**2
+
+    def __post_init__(self) -> None:
+        if self.to_wire() != {
+            "maxIndexBytes": 256 * 1024**2,
+            "maxLooseObjectBytes": 256 * 1024**2,
+            "maxMetadataBytes": 16 * 1024**2,
+            "maxObjectBytes": 16 * 1024**3,
+            "maxPackBytes": 4 * 1024**3,
+            "maxPackCount": 1024,
+            "maxRefCount": 100_000,
+            "schema": "trusted-product-source-budget/v1",
+        }:
+            raise ValueError("product source budget limits are not frozen")
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "maxIndexBytes": self.max_index_bytes,
+            "maxLooseObjectBytes": self.max_loose_object_bytes,
+            "maxMetadataBytes": self.max_metadata_bytes,
+            "maxObjectBytes": self.max_object_bytes,
+            "maxPackBytes": self.max_pack_bytes,
+            "maxPackCount": self.max_pack_count,
+            "maxRefCount": self.max_ref_count,
+            "schema": "trusted-product-source-budget/v1",
+        }
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_wire())
+
+    @property
+    def canonical_digest(self) -> str:
+        return _digest(self.canonical_bytes)
+
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "ProductSourceBudgetV1":
+        raw = _strict_object(payload, {"maxIndexBytes", "maxLooseObjectBytes", "maxMetadataBytes", "maxObjectBytes", "maxPackBytes", "maxPackCount", "maxRefCount", "schema"})
+        if raw["schema"] != "trusted-product-source-budget/v1":
+            raise ValueError("product source budget schema is invalid")
+        return cls(raw["maxPackBytes"], raw["maxIndexBytes"], raw["maxObjectBytes"], raw["maxLooseObjectBytes"], raw["maxPackCount"], raw["maxRefCount"], raw["maxMetadataBytes"])
+
+
+@dataclass(frozen=True, slots=True)
 class ProductRepositorySourceV1:
     subject_repository: str
     subject_commit: ProductGitObjectIdV1
@@ -283,7 +272,7 @@ class ProductRepositorySourceV1:
     source_digest: str
     container_format: str
     object_format: str
-    budget_digest: str
+    budget: ProductSourceBudgetV1
     boundary_digest: str
     tracked_checkout_digest: str
     control_metadata_digest: str
@@ -294,11 +283,13 @@ class ProductRepositorySourceV1:
             raise ValueError("product source must be path-free SHA-1 source data")
         if not isinstance(self.subject_commit, ProductGitObjectIdV1):
             raise ValueError("product source subject must be a ProductGitObjectIdV1")
-        for field in ("source_ref", "source_digest", "budget_digest", "boundary_digest", "tracked_checkout_digest", "control_metadata_digest", "raw_inspection_proof_ref"):
+        if type(self.budget) is not ProductSourceBudgetV1:
+            raise ValueError("product source budget is invalid")
+        for field in ("source_ref", "source_digest", "boundary_digest", "tracked_checkout_digest", "control_metadata_digest", "raw_inspection_proof_ref"):
             _require_digest(getattr(self, field), field)
 
     def to_wire(self) -> dict[str, object]:
-        return {"boundaryDigest": self.boundary_digest, "budgetDigest": self.budget_digest, "containerFormat": self.container_format, "controlMetadataDigest": self.control_metadata_digest, "objectFormat": self.object_format, "rawInspectionProofRef": self.raw_inspection_proof_ref, "sourceDigest": self.source_digest, "sourceRef": self.source_ref, "subjectCommit": self.subject_commit.to_wire(), "subjectRepository": self.subject_repository, "trackedCheckoutDigest": self.tracked_checkout_digest}
+        return {"boundaryDigest": self.boundary_digest, "budget": self.budget.to_wire(), "containerFormat": self.container_format, "controlMetadataDigest": self.control_metadata_digest, "objectFormat": self.object_format, "rawInspectionProofRef": self.raw_inspection_proof_ref, "sourceDigest": self.source_digest, "sourceRef": self.source_ref, "subjectCommit": self.subject_commit.to_wire(), "subjectRepository": self.subject_repository, "trackedCheckoutDigest": self.tracked_checkout_digest}
 
     @property
     def canonical_bytes(self) -> bytes:
@@ -306,8 +297,11 @@ class ProductRepositorySourceV1:
 
     @classmethod
     def from_canonical_bytes(cls, payload: bytes) -> "ProductRepositorySourceV1":
-        raw = _strict_object(payload, {"boundaryDigest", "budgetDigest", "containerFormat", "controlMetadataDigest", "objectFormat", "rawInspectionProofRef", "sourceDigest", "sourceRef", "subjectCommit", "subjectRepository", "trackedCheckoutDigest"})
-        return cls(raw["subjectRepository"], _product_oid(raw["subjectCommit"]), raw["sourceRef"], raw["sourceDigest"], raw["containerFormat"], raw["objectFormat"], raw["budgetDigest"], raw["boundaryDigest"], raw["trackedCheckoutDigest"], raw["controlMetadataDigest"], raw["rawInspectionProofRef"])
+        raw = _strict_object(payload, {"boundaryDigest", "budget", "containerFormat", "controlMetadataDigest", "objectFormat", "rawInspectionProofRef", "sourceDigest", "sourceRef", "subjectCommit", "subjectRepository", "trackedCheckoutDigest"})
+        if not isinstance(raw["budget"], dict):
+            raise ValueError("product source budget wire is invalid")
+        budget = ProductSourceBudgetV1.from_canonical_bytes(canonical_json_bytes(raw["budget"]))
+        return cls(raw["subjectRepository"], _product_oid(raw["subjectCommit"]), raw["sourceRef"], raw["sourceDigest"], raw["containerFormat"], raw["objectFormat"], budget, raw["boundaryDigest"], raw["trackedCheckoutDigest"], raw["controlMetadataDigest"], raw["rawInspectionProofRef"])
 
 
 @dataclass(frozen=True, slots=True)
@@ -1790,8 +1784,3 @@ def verify_policy_transport_source_closure(
     if any(store.read_blob(ref) is None for ref in refs):
         raise ValueError("policy closure blob is missing")
     return activated, handoff, proof, record, pointer, core_request, refs
-
-
-def verify_registration_broker_startup_challenge(*_args: object, **_kwargs: object) -> None:
-    """Slice E owns broker-auth slots; accepting here would create a bypass."""
-    raise ValueError("registration broker startup challenge is unavailable until broker-auth is installed")
