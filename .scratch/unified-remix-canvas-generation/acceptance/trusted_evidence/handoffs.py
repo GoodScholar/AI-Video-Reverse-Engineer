@@ -8,8 +8,8 @@ from datetime import datetime, timezone
 import hashlib
 import os
 from pathlib import Path
+import secrets
 import stat
-import tempfile
 import json
 from collections.abc import Mapping
 
@@ -316,69 +316,294 @@ class Ticket23ProductSourceHandoffV1:
             raise ValueError("record, source, and view product commits must match")
 
 
-@dataclass(frozen=True, slots=True)
 class TrustedHandoffStoreV1:
-    """A durable, external content store with no-replace publication."""
+    """A durable store rooted in one held, no-follow directory capability."""
 
-    root: Path
+    __slots__ = ("root", "_root_fd", "_binding", "_sealed")
+
+    def __init__(self, root: Path) -> None:
+        root, descriptor, binding = self._open_root(root)
+        object.__setattr__(self, "root", root)
+        object.__setattr__(self, "_root_fd", descriptor)
+        object.__setattr__(self, "_binding", binding)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_sealed", False):
+            raise TypeError("handoff store capability is immutable")
+        object.__setattr__(self, name, value)
+
+    @staticmethod
+    def _open_root(value: Path) -> tuple[Path, int, tuple[tuple[str, int, int, int, int, int], ...]]:
+        if os.name != "posix" or not all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW")):
+            raise ValueError("handoff store owning-FD capability is unavailable")
+        path = Path(value)
+        if not path.is_absolute() or path == Path("/") or any(part in {".", ".."} for part in path.parts):
+            raise ValueError("handoff store root must be a narrow absolute directory")
+        protected = (Path.home(), Path.cwd())
+        if any(path == item or path in item.parents for item in protected):
+            raise ValueError("handoff store root is too broad")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open("/", flags)
+        binding: list[tuple[str, int, int, int, int, int]] = []
+        try:
+            for component in path.parts[1:]:
+                child = os.open(component, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+                info = os.fstat(descriptor)
+                if not stat.S_ISDIR(info.st_mode):
+                    raise ValueError("handoff store ancestor is not a directory")
+                binding.append((component, info.st_dev, info.st_ino, info.st_uid, stat.S_IMODE(info.st_mode), os.fstatvfs(descriptor).f_fsid))
+            info = os.fstat(descriptor)
+            if stat.S_IMODE(info.st_mode) != 0o700 or info.st_uid != os.getuid():
+                raise ValueError("handoff store root must be current-user 0700")
+            return path, descriptor, tuple(binding)
+        except OSError as error:
+            os.close(descriptor)
+            raise ValueError("handoff store root is unsafe") from error
+        except Exception:
+            os.close(descriptor)
+            raise
 
     @classmethod
     def open_from_environment(cls) -> "TrustedHandoffStoreV1":
         raw = os.environ.get("TRUSTED_HANDOFF_STORE_ROOT")
         if not raw:
             raise ValueError("TRUSTED_HANDOFF_STORE_ROOT is required")
-        path = Path(raw)
-        if not path.is_absolute() or path.is_symlink() or not path.is_dir():
-            raise ValueError("handoff store root must be an absolute non-symlink directory")
-        mode = stat.S_IMODE(path.stat().st_mode)
-        if mode != 0o700 or path.stat().st_uid != os.getuid():
-            raise ValueError("handoff store root must be current-user 0700")
-        return cls(path.resolve(strict=True))
-
-    def _blob_path(self, ref: str) -> Path:
-        _require_digest(ref, "blob ref")
-        return self.root / "sha256" / ref[7:9] / ref[9:]
-
-    def _publish(self, path: Path, payload: bytes) -> bool:
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if path.exists():
-            if path.is_symlink() or path.read_bytes() != payload:
-                raise ValueError("existing handoff object bytes differ")
-            return True
-        descriptor, temporary_name = tempfile.mkstemp(prefix=".handoff-", dir=path.parent)
-        temporary = Path(temporary_name)
+        store = cls(Path(raw))
         try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            try:
-                os.link(temporary, path)
-            except FileExistsError:
-                if path.is_symlink() or path.read_bytes() != payload:
-                    raise ValueError("concurrent handoff publication differs")
-                return True
-            directory = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-            return False
+            lease = os.environ.get("TRUSTED_HANDOFF_STORE_LEASE")
+            if lease is None:
+                raise ValueError("handoff store project lease is required")
+            raw_lease = _strict_object(lease.encode("utf-8"), {"projectId", "rootDevice", "rootInode", "schema"})
+            if raw_lease["schema"] != "trusted-handoff-store-lease/v1" or raw_lease["projectId"] != "ai-video-reverse-engineer":
+                raise ValueError("handoff store project lease is invalid")
+            if any(type(raw_lease[field]) is not int or raw_lease[field] < 0 for field in ("rootDevice", "rootInode")):
+                raise ValueError("handoff store project lease is invalid")
+            info = os.fstat(store._root_fd)
+            if (raw_lease["rootDevice"], raw_lease["rootInode"]) != (info.st_dev, info.st_ino):
+                raise ValueError("handoff store project lease does not bind root")
+            store._verify_binding()
+            return store
+        except Exception:
+            store.close()
+            raise
+
+    def __copy__(self):
+        raise TypeError("handoff store capability cannot be copied")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("handoff store capability cannot be copied")
+
+    def __reduce__(self):
+        raise TypeError("handoff store capability cannot be serialized")
+
+    def __replace__(self, **changes):
+        raise TypeError("handoff store capability cannot be copied")
+
+    def close(self) -> None:
+        descriptor = getattr(self, "_root_fd", -1)
+        if descriptor >= 0:
+            os.close(descriptor)
+            object.__setattr__(self, "_root_fd", -1)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except OSError:
+            pass
+
+    def _verify_binding(self) -> None:
+        if self._root_fd < 0:
+            raise ValueError("handoff store capability is closed")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open("/", flags)
+        try:
+            for component, device, inode, owner, mode, mount_id in self._binding:
+                child = os.open(component, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+                info = os.fstat(descriptor)
+                if (info.st_dev, info.st_ino, info.st_uid, stat.S_IMODE(info.st_mode), os.fstatvfs(descriptor).f_fsid) != (device, inode, owner, mode, mount_id):
+                    raise ValueError("handoff store root binding changed")
+            held = os.fstat(self._root_fd)
+            if (held.st_dev, held.st_ino, held.st_uid, stat.S_IMODE(held.st_mode), os.fstatvfs(self._root_fd).f_fsid) != self._binding[-1][1:]:
+                raise ValueError("handoff store root binding changed")
+            if stat.S_IMODE(held.st_mode) != 0o700 or held.st_uid != os.getuid():
+                raise ValueError("handoff store root binding changed")
+        except OSError as error:
+            raise ValueError("handoff store root binding changed") from error
         finally:
-            temporary.unlink(missing_ok=True)
+            os.close(descriptor)
+
+    @staticmethod
+    def _parts(*parts: str) -> tuple[str, ...]:
+        if not parts or any(not isinstance(part, str) or not part or "/" in part or "\x00" in part or part in {".", ".."} for part in parts):
+            raise ValueError("handoff store path is invalid")
+        return parts
+
+    def _open_directory(self, parts: tuple[str, ...], *, create: bool) -> int:
+        self._verify_binding()
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.dup(self._root_fd)
+        try:
+            for component in parts:
+                try:
+                    child = os.open(component, flags, dir_fd=descriptor)
+                except FileNotFoundError:
+                    if not create:
+                        raise ValueError("handoff store directory is missing")
+                    try:
+                        os.mkdir(component, 0o700, dir_fd=descriptor)
+                        os.fsync(descriptor)
+                    except FileExistsError:
+                        pass
+                    child = os.open(component, flags, dir_fd=descriptor)
+                info = os.fstat(child)
+                if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700 or info.st_uid != os.getuid():
+                    os.close(child)
+                    raise ValueError("handoff store directory is unsafe")
+                os.close(descriptor)
+                descriptor = child
+            self._verify_binding()
+            return descriptor
+        except OSError as error:
+            os.close(descriptor)
+            raise ValueError("handoff store directory is unsafe") from error
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    def _verify_relative_directory(self, parts: tuple[str, ...], expected_fd: int) -> None:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.dup(self._root_fd)
+        try:
+            for component in parts:
+                child = os.open(component, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+            expected = os.fstat(expected_fd)
+            actual = os.fstat(descriptor)
+            if (actual.st_dev, actual.st_ino, actual.st_uid, stat.S_IMODE(actual.st_mode)) != (expected.st_dev, expected.st_ino, expected.st_uid, stat.S_IMODE(expected.st_mode)):
+                raise ValueError("handoff store directory binding changed")
+        except OSError as error:
+            raise ValueError("handoff store directory binding changed") from error
+        finally:
+            os.close(descriptor)
+
+    def _read_at(self, parent_fd: int, name: str) -> tuple[bytes, tuple[int, int, int]]:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("handoff store entry is unsafe")
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino) or not stat.S_ISREG(opened.st_mode):
+                raise ValueError("handoff store entry changed")
+            payload = bytearray()
+            while True:
+                block = os.read(descriptor, 65536)
+                if not block:
+                    break
+                payload.extend(block)
+            after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if (after.st_dev, after.st_ino, after.st_size) != (opened.st_dev, opened.st_ino, opened.st_size):
+                raise ValueError("handoff store entry changed")
+            return bytes(payload), (opened.st_dev, opened.st_ino, opened.st_size)
+        finally:
+            os.close(descriptor)
+
+    def _publish_parts(self, parts: tuple[str, ...], payload: bytes) -> bool:
+        if not isinstance(payload, bytes):
+            raise ValueError("handoff store payload must be bytes")
+        parent_fd = self._open_directory(parts[:-1], create=True)
+        name = parts[-1]
+        temporary = ".handoff-" + secrets.token_hex(16)
+        try:
+            self._verify_relative_directory(parts[:-1], parent_fd)
+            try:
+                existing, identity = self._read_at(parent_fd, name)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None:
+                if existing != payload:
+                    raise ValueError("existing handoff object bytes differ")
+                current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if (current.st_dev, current.st_ino, current.st_size) != identity:
+                    raise ValueError("handoff store entry changed")
+                self._verify_binding()
+                return True
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o600, dir_fd=parent_fd)
+            try:
+                offset = 0
+                while offset < len(payload):
+                    offset += os.write(descriptor, payload[offset:])
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            temporary_identity = os.stat(temporary, dir_fd=parent_fd, follow_symlinks=False)
+            self._verify_relative_directory(parts[:-1], parent_fd)
+            try:
+                os.link(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd, follow_symlinks=False)
+            except FileExistsError:
+                existing, identity = self._read_at(parent_fd, name)
+                if existing != payload:
+                    raise ValueError("concurrent handoff publication differs")
+                current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if (current.st_dev, current.st_ino, current.st_size) != identity:
+                    raise ValueError("handoff store entry changed")
+                self._verify_binding()
+                return True
+            try:
+                installed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if (installed.st_dev, installed.st_ino) != (temporary_identity.st_dev, temporary_identity.st_ino):
+                    raise ValueError("handoff store entry changed")
+                self._verify_relative_directory(parts[:-1], parent_fd)
+                os.fsync(parent_fd)
+                self._verify_binding()
+                return False
+            except Exception:
+                try:
+                    current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    if (current.st_dev, current.st_ino) == (temporary_identity.st_dev, temporary_identity.st_ino):
+                        os.unlink(name, dir_fd=parent_fd)
+                        os.fsync(parent_fd)
+                except OSError:
+                    pass
+                raise
+        finally:
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            os.close(parent_fd)
+
+    def _read_parts(self, parts: tuple[str, ...]) -> bytes:
+        parent_fd = self._open_directory(parts[:-1], create=False)
+        try:
+            payload, _identity = self._read_at(parent_fd, parts[-1])
+            self._verify_binding()
+            return payload
+        except FileNotFoundError as error:
+            raise ValueError("handoff store entry is missing or unsafe") from error
+        finally:
+            os.close(parent_fd)
+
+    def _blob_parts(self, ref: str) -> tuple[str, ...]:
+        _require_digest(ref, "blob ref")
+        return self._parts("sha256", ref[7:9], ref[9:])
 
     def put_blob(self, payload: bytes) -> str:
         if not isinstance(payload, bytes):
             raise ValueError("handoff blob must be bytes")
         ref = _digest(payload)
-        self._publish(self._blob_path(ref), payload)
+        self._publish_parts(self._blob_parts(ref), payload)
         return ref
 
     def read_blob(self, ref: str) -> bytes:
-        path = self._blob_path(ref)
-        if path.is_symlink() or not path.is_file():
-            raise ValueError("handoff blob is missing or unsafe")
-        payload = path.read_bytes()
+        payload = self._read_parts(self._blob_parts(ref))
         if _digest(payload) != ref:
             raise ValueError("handoff blob digest mismatch")
         return payload
@@ -386,30 +611,24 @@ class TrustedHandoffStoreV1:
     def read_pointer(self, handoff_id: str) -> bytes:
         if not handoff_id or "/" in handoff_id:
             raise ValueError("invalid handoff pointer")
-        path = self.root / "pointers" / f"{handoff_id}.json"
-        if path.is_symlink() or not path.is_file():
-            raise ValueError("handoff pointer is missing or unsafe")
-        return path.read_bytes()
+        return self._read_parts(self._parts("pointers", f"{handoff_id}.json"))
 
     def publish_pointer(self, handoff_id: str, payload: bytes) -> bool:
         if not handoff_id or "/" in handoff_id or not isinstance(payload, bytes):
             raise ValueError("invalid handoff pointer")
-        return self._publish(self.root / "pointers" / f"{handoff_id}.json", payload)
+        return self._publish_parts(self._parts("pointers", f"{handoff_id}.json"), payload)
 
     def publish_export_request_ref(self, handoff_id: str, request_ref: str) -> bool:
         if not handoff_id or "/" in handoff_id:
             raise ValueError("invalid export request name")
         _require_digest(request_ref, "export request ref")
-        return self._publish(self.root / "export-requests" / f"{handoff_id}.ref", (request_ref + "\n").encode("ascii"))
+        return self._publish_parts(self._parts("export-requests", f"{handoff_id}.ref"), (request_ref + "\n").encode("ascii"))
 
     def read_export_request_ref(self, handoff_id: str) -> str:
         if not handoff_id or "/" in handoff_id:
             raise ValueError("invalid export request name")
-        path = self.root / "export-requests" / f"{handoff_id}.ref"
-        if path.is_symlink() or not path.is_file():
-            raise ValueError("export request is missing or unsafe")
         try:
-            return _require_digest(path.read_text(encoding="ascii").removesuffix("\n"), "export request ref")
+            return _require_digest(self._read_parts(self._parts("export-requests", f"{handoff_id}.ref")).decode("ascii").removesuffix("\n"), "export request ref")
         except (UnicodeDecodeError, ValueError) as error:
             raise ValueError("export request ref is invalid") from error
 
@@ -417,46 +636,63 @@ class TrustedHandoffStoreV1:
         if handoff_id != "ticket-23-policy-v1":
             raise ValueError("invalid policy export request name")
         _require_digest(request_ref, "policy export request ref")
-        return self._publish(self.root / "policy-export-requests" / f"{handoff_id}.ref", (request_ref + "\n").encode("ascii"))
+        return self._publish_parts(self._parts("policy-export-requests", f"{handoff_id}.ref"), (request_ref + "\n").encode("ascii"))
 
     def read_policy_export_request_ref(self, handoff_id: str) -> str:
         if handoff_id != "ticket-23-policy-v1":
             raise ValueError("invalid policy export request name")
-        path = self.root / "policy-export-requests" / f"{handoff_id}.ref"
-        if path.is_symlink() or not path.is_file():
-            raise ValueError("policy export request is missing or unsafe")
         try:
-            return _require_digest(path.read_text(encoding="ascii").removesuffix("\n"), "policy export request ref")
+            return _require_digest(self._read_parts(self._parts("policy-export-requests", f"{handoff_id}.ref")).decode("ascii").removesuffix("\n"), "policy export request ref")
         except (UnicodeDecodeError, ValueError) as error:
             raise ValueError("policy export request ref is invalid") from error
 
-    def _transport_path(self, handoff_id: str, transport_id: str, name: str) -> Path:
+    def _transport_path(self, handoff_id: str, transport_id: str, name: str) -> tuple[str, ...]:
         if not all(isinstance(value, str) and value and "/" not in value for value in (handoff_id, transport_id, name)):
             raise ValueError("transport path identity is invalid")
-        return self.root / "transports" / handoff_id / transport_id / name
+        return self._parts("transports", handoff_id, transport_id, name)
 
     def publish_transport_file(self, handoff_id: str, transport_id: str, name: str, payload: bytes) -> bool:
         if not isinstance(payload, bytes):
             raise ValueError("transport payload must be bytes")
-        return self._publish(self._transport_path(handoff_id, transport_id, name), payload)
+        return self._publish_parts(self._transport_path(handoff_id, transport_id, name), payload)
 
     def read_transport_file(self, handoff_id: str, transport_id: str, name: str) -> bytes:
-        path = self._transport_path(handoff_id, transport_id, name)
-        if path.is_symlink() or not path.is_file():
-            raise ValueError("transport file is missing or unsafe")
-        return path.read_bytes()
+        return self._read_parts(self._transport_path(handoff_id, transport_id, name))
 
     def publish_transport_replay(self, manifest: "HandoffTransferManifestV1") -> None:
-        self._publish(self._transport_replay_path(manifest), _transport_replay_bytes(manifest))
+        self._publish_parts(self._transport_replay_path(manifest), _transport_replay_bytes(manifest))
 
     def verify_transport_replay(self, manifest: "HandoffTransferManifestV1") -> None:
-        path = self._transport_replay_path(manifest)
-        if path.is_symlink() or not path.is_file() or path.read_bytes() != _transport_replay_bytes(manifest):
+        try:
+            payload = self._read_parts(self._transport_replay_path(manifest))
+        except ValueError as error:
+            raise ValueError("transport replay state is missing or mixed") from error
+        if payload != _transport_replay_bytes(manifest):
             raise ValueError("transport replay state is missing or mixed")
 
-    def _transport_replay_path(self, manifest: "HandoffTransferManifestV1") -> Path:
+    def _transport_replay_path(self, manifest: "HandoffTransferManifestV1") -> tuple[str, ...]:
         destination_key = hashlib.sha256(manifest.destination_executor_id.encode("utf-8")).hexdigest()
-        return self.root / "transport-replays" / manifest.handoff_id / f"{manifest.consumer_task}-{destination_key}-{manifest.sequence}.json"
+        return self._parts("transport-replays", manifest.handoff_id, f"{manifest.consumer_task}-{destination_key}-{manifest.sequence}.json")
+
+    def _publish_file(self, parts: tuple[str, ...], payload: bytes) -> bool:
+        return self._publish_parts(self._parts(*parts), payload)
+
+    def _read_file(self, parts: tuple[str, ...]) -> bytes:
+        return self._read_parts(self._parts(*parts))
+
+    def verify_root(self, *, expected_mode: int | None = None, require_empty: bool = False) -> None:
+        self._verify_binding()
+        info = os.fstat(self._root_fd)
+        if expected_mode is not None and stat.S_IMODE(info.st_mode) != expected_mode:
+            raise ValueError("handoff store root mode is invalid")
+        if require_empty:
+            descriptor = os.dup(self._root_fd)
+            try:
+                if any(True for _ in os.scandir(descriptor)):
+                    raise ValueError("cache is not empty")
+            finally:
+                os.close(descriptor)
+        self._verify_binding()
 
 
 def _require_transport_identity(value: object, field: str) -> str:
@@ -789,7 +1025,7 @@ class HandoffRegistryV1:
                 self.store.publish_transport_file(handoff_id, transport_id, "ready.json", ready_value.canonical_bytes)
                 self.store.publish_transport_replay(manifest_value)
                 fetch = canonical_json_bytes({"consumerTask": consumer_task, "destinationExecutorId": expected_destination_executor_id, "handoffId": handoff_id, "pointerBytesDigest": handoff.core_pointer_bytes_digest, "recordRef": handoff.core_record_ref, "requestRef": export_request_ref, "schema": "trusted-handoff-fetch/v1", "transportId": transport_id})
-                self.store._publish(self.store.root / "fetches" / f"{handoff_id}-{consumer_task}.json", fetch)
+                self.store._publish_file(("fetches", f"{handoff_id}-{consumer_task}.json"), fetch)
                 return
         request_bytes = source_store.read_blob(export_request_ref)
         request = HandoffExportRequestV1.from_canonical_bytes(request_bytes)
@@ -813,7 +1049,7 @@ class HandoffRegistryV1:
             self.store.publish_transport_file(handoff_id, transport_id, "ready.json", ready_value.canonical_bytes)
             self.store.publish_transport_replay(manifest_value)
         manifest = canonical_json_bytes({"consumerTask": consumer_task, "destinationExecutorId": expected_destination_executor_id, "handoffId": handoff_id, "pointerBytesDigest": _digest(pointer_bytes), "recordRef": request.record_ref, "requestRef": export_request_ref, "schema": "trusted-handoff-fetch/v1", "transportId": transport_id})
-        self.store._publish(self.store.root / "fetches" / f"{handoff_id}-{consumer_task}.json", manifest)
+        self.store._publish_file(("fetches", f"{handoff_id}-{consumer_task}.json"), manifest)
 
     def import_(self, handoff_id: str, *, consumer_task: int) -> None:
         manifest = self._read_fetch_manifest(handoff_id, consumer_task)
@@ -835,7 +1071,7 @@ class HandoffRegistryV1:
             record, _, _, _ = self._closure(self.store, request.record_ref, handoff_id)
         for _, ref in record.bindings:
             self.store.read_blob(ref)
-        self.store._publish(self.store.root / "imports" / f"{handoff_id}-{consumer_task}.json", canonical_json_bytes({"consumerTask": consumer_task, "destinationExecutorId": manifest["destinationExecutorId"], "handoffId": handoff_id, "requestRef": manifest["requestRef"], "schema": "trusted-handoff-import/v1", "transportId": manifest["transportId"]}))
+        self.store._publish_file(("imports", f"{handoff_id}-{consumer_task}.json"), canonical_json_bytes({"consumerTask": consumer_task, "destinationExecutorId": manifest["destinationExecutorId"], "handoffId": handoff_id, "requestRef": manifest["requestRef"], "schema": "trusted-handoff-import/v1", "transportId": manifest["transportId"]}))
 
     def finalize(self, handoff_id: str, *, expected_kind: str, expected_producer_task: int, consumer_task: int, expected_destination_executor_id: str | None = None, signing_domains: "VerifiedSigningDomainsV1 | None" = None) -> None:
         imported = self._read_import_manifest(handoff_id, consumer_task)
@@ -850,7 +1086,7 @@ class HandoffRegistryV1:
         if record.kind != expected_kind or record.producer_task != expected_producer_task:
             raise ValueError("finalized handoff kind or producer is invalid")
         final = canonical_json_bytes({"consumerTask": consumer_task, "handoffId": handoff_id, "readyDigest": _digest(ready.canonical_bytes), "schema": "trusted-handoff-finalized/v1", "transportId": transport_id})
-        self.store._publish(self.store.root / "finalized" / f"{handoff_id}-{consumer_task}.json", final)
+        self.store._publish_file(("finalized", f"{handoff_id}-{consumer_task}.json"), final)
 
     def read(self, handoff_id: str, *, consumer_task: int, field: str, expected_destination_executor_id: str | None = None, signing_domains: "VerifiedSigningDomainsV1 | None" = None) -> str:
         imported = self._read_import_manifest(handoff_id, consumer_task)
@@ -896,10 +1132,11 @@ class HandoffRegistryV1:
         return record, pointer, record_bytes, pointer_bytes
 
     def _read_fetch_manifest(self, handoff_id: str, consumer_task: int) -> dict[str, object]:
-        path = self.store.root / "fetches" / f"{handoff_id}-{consumer_task}.json"
-        if path.is_symlink() or not path.is_file():
-            raise ValueError("fetched handoff is missing")
-        raw = _strict_object(path.read_bytes(), {"consumerTask", "destinationExecutorId", "handoffId", "pointerBytesDigest", "recordRef", "requestRef", "schema", "transportId"})
+        try:
+            payload = self.store._read_file(("fetches", f"{handoff_id}-{consumer_task}.json"))
+        except ValueError as error:
+            raise ValueError("fetched handoff is missing") from error
+        raw = _strict_object(payload, {"consumerTask", "destinationExecutorId", "handoffId", "pointerBytesDigest", "recordRef", "requestRef", "schema", "transportId"})
         if raw["schema"] != "trusted-handoff-fetch/v1" or raw["handoffId"] != handoff_id or raw["consumerTask"] != consumer_task:
             raise ValueError("fetched handoff identity is invalid")
         _require_digest(raw["requestRef"], "requestRef")
@@ -912,10 +1149,11 @@ class HandoffRegistryV1:
         return raw
 
     def _read_import_manifest(self, handoff_id: str, consumer_task: int) -> dict[str, object]:
-        path = self.store.root / "imports" / f"{handoff_id}-{consumer_task}.json"
-        if path.is_symlink() or not path.is_file():
-            raise ValueError("imported handoff is missing")
-        raw = _strict_object(path.read_bytes(), {"consumerTask", "destinationExecutorId", "handoffId", "requestRef", "schema", "transportId"})
+        try:
+            payload = self.store._read_file(("imports", f"{handoff_id}-{consumer_task}.json"))
+        except ValueError as error:
+            raise ValueError("imported handoff is missing") from error
+        raw = _strict_object(payload, {"consumerTask", "destinationExecutorId", "handoffId", "requestRef", "schema", "transportId"})
         if raw["schema"] != "trusted-handoff-import/v1" or raw["handoffId"] != handoff_id or raw["consumerTask"] != consumer_task:
             raise ValueError("imported handoff identity is invalid")
         _require_digest(raw["requestRef"], "requestRef")
@@ -924,10 +1162,11 @@ class HandoffRegistryV1:
     def _read_finalized(self, handoff_id: str, consumer_task: int, transport_id: object) -> None:
         if not isinstance(transport_id, str):
             raise ValueError("not finalized: transport identity is missing")
-        path = self.store.root / "finalized" / f"{handoff_id}-{consumer_task}.json"
-        if path.is_symlink() or not path.is_file():
-            raise ValueError("not finalized: finalization marker is missing")
-        raw = _strict_object(path.read_bytes(), {"consumerTask", "handoffId", "readyDigest", "schema", "transportId"})
+        try:
+            payload = self.store._read_file(("finalized", f"{handoff_id}-{consumer_task}.json"))
+        except ValueError as error:
+            raise ValueError("not finalized: finalization marker is missing") from error
+        raw = _strict_object(payload, {"consumerTask", "handoffId", "readyDigest", "schema", "transportId"})
         if raw["schema"] != "trusted-handoff-finalized/v1" or raw["handoffId"] != handoff_id or raw["consumerTask"] != consumer_task or raw["transportId"] != transport_id:
             raise ValueError("not finalized: marker identity is invalid")
         _require_digest(raw["readyDigest"], "readyDigest")

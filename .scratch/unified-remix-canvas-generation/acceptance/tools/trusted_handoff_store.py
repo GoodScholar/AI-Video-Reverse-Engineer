@@ -15,21 +15,14 @@ from trusted_evidence.handoffs import HandoffExportRequestV1, HandoffPointerV1, 
 def _store(root: str | None) -> TrustedHandoffStoreV1:
     if root is None:
         return TrustedHandoffStoreV1.open_from_environment()
-    path = Path(root)
-    if not path.is_absolute() or path.is_symlink() or not path.is_dir():
-        raise ValueError("handoff store root must be an absolute non-symlink directory")
-    info = path.stat()
-    if stat.S_IMODE(info.st_mode) != 0o700 or info.st_uid != os.getuid():
-        raise ValueError("handoff store root must be current-user 0700")
-    return TrustedHandoffStoreV1(path.resolve(strict=True))
+    if os.environ.get("TRUSTED_HANDOFF_STORE_ROOT") != root:
+        raise ValueError("explicit store root must match the leased handoff store root")
+    return TrustedHandoffStoreV1.open_from_environment()
 
 
 def _cache(root: str, *, require_empty: bool, expected_mode: int) -> TrustedHandoffStoreV1:
-    store = _store(root)
-    if stat.S_IMODE(store.root.stat().st_mode) != expected_mode:
-        raise ValueError("cache mode is invalid")
-    if require_empty and any(store.root.iterdir()):
-        raise ValueError("cache is not empty")
+    store = TrustedHandoffStoreV1(Path(root))
+    store.verify_root(expected_mode=expected_mode, require_empty=require_empty)
     return store
 
 

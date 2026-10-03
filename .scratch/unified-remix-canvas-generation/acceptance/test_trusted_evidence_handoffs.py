@@ -1,5 +1,8 @@
 import hashlib
 import base64
+import copy
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, replace
 import json
 import os
 import subprocess
@@ -193,6 +196,7 @@ def test_handoff_store_publishes_content_addressed_blob_and_no_replace_pointer(t
     root = (tmp_path / "external-store").resolve()
     root.mkdir(mode=0o700)
     monkeypatch.setenv("TRUSTED_HANDOFF_STORE_ROOT", str(root))
+    monkeypatch.setenv("TRUSTED_HANDOFF_STORE_LEASE", _store_lease(root))
     store = TrustedHandoffStoreV1.open_from_environment()
     payload = b'{"record":"one"}'
     ref = store.put_blob(payload)
@@ -221,6 +225,194 @@ def test_handoff_store_rejects_nonabsolute_or_symlink_root(tmp_path, monkeypatch
         TrustedHandoffStoreV1.open_from_environment()
 
 
+def _store_lease(root: Path, *, project_id: str = "ai-video-reverse-engineer") -> str:
+    """Literal broker lease fixture bound to this owning directory identity."""
+    identity = root.stat()
+    return canonical_json_bytes({
+        "projectId": project_id,
+        "rootDevice": identity.st_dev,
+        "rootInode": identity.st_ino,
+        "schema": "trusted-handoff-store-lease/v1",
+    }).decode("utf-8")
+
+
+def test_handoff_store_environment_requires_a_matching_project_lease(tmp_path, monkeypatch):
+    """Removing or rebinding the broker lease must reject before a store capability is issued."""
+    root = (tmp_path / "leased-store").resolve()
+    root.mkdir(mode=0o700)
+    monkeypatch.setenv("TRUSTED_HANDOFF_STORE_ROOT", str(root))
+
+    with pytest.raises(ValueError, match="lease"):
+        TrustedHandoffStoreV1.open_from_environment()
+
+    monkeypatch.setenv("TRUSTED_HANDOFF_STORE_LEASE", _store_lease(root, project_id="other-project"))
+    with pytest.raises(ValueError, match="lease"):
+        TrustedHandoffStoreV1.open_from_environment()
+
+    monkeypatch.setenv("TRUSTED_HANDOFF_STORE_LEASE", _store_lease(root))
+    assert TrustedHandoffStoreV1.open_from_environment().read_blob is not None
+
+
+def test_handoff_store_rejects_ancestor_symlink_and_root_swap_before_visible_write(tmp_path, monkeypatch):
+    """Replacing either path component after capability issuance must not redirect a pointer write."""
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    alias = tmp_path / "alias"
+    alias.symlink_to(target, target_is_directory=True)
+    nested = alias / "store"
+    (target / "store").mkdir(mode=0o700)
+    monkeypatch.setenv("TRUSTED_HANDOFF_STORE_ROOT", str(nested))
+    monkeypatch.setenv("TRUSTED_HANDOFF_STORE_LEASE", _store_lease(target / "store"))
+    with pytest.raises(ValueError):
+        TrustedHandoffStoreV1.open_from_environment()
+
+    root = (tmp_path / "store").resolve()
+    root.mkdir(mode=0o700)
+    store = TrustedHandoffStoreV1(root)
+    original = tmp_path / "original"
+    root.rename(original)
+    root.mkdir(mode=0o700)
+    with pytest.raises(ValueError, match="binding"):
+        store.publish_pointer("ticket-23-product-v1", b'{"redirected":true}')
+    assert list(root.iterdir()) == []
+
+
+def test_handoff_store_rejects_swapped_entry_parent_without_writing_through_symlink(tmp_path):
+    """A parent entry changed to a symlink after open must fail rather than create files in its target."""
+    root = (tmp_path / "store").resolve()
+    root.mkdir(mode=0o700)
+    store = TrustedHandoffStoreV1(root)
+    (root / "pointers").mkdir(mode=0o700)
+    redirected = tmp_path / "redirected"
+    redirected.mkdir(mode=0o700)
+    (root / "pointers").rmdir()
+    (root / "pointers").symlink_to(redirected, target_is_directory=True)
+
+    with pytest.raises(ValueError):
+        store.publish_pointer("ticket-23-product-v1", b'{"pointer":"one"}')
+    assert list(redirected.iterdir()) == []
+
+
+def test_handoff_store_rejects_device_rebind_before_write(tmp_path, monkeypatch):
+    """A changed held-root device identity must stop a publish before it becomes visible."""
+    root = (tmp_path / "store").resolve()
+    root.mkdir(mode=0o700)
+    store = TrustedHandoffStoreV1(root)
+    real_fstat = os.fstat
+
+    def rebound(descriptor):
+        result = real_fstat(descriptor)
+        if descriptor == store._root_fd:
+            fields = list(result)
+            fields[2] += 1
+            return os.stat_result(fields)
+        return result
+
+    monkeypatch.setattr(os, "fstat", rebound)
+    with pytest.raises(ValueError, match="binding"):
+        store.publish_pointer("ticket-23-product-v1", b'{"pointer":"one"}')
+    assert not (root / "pointers").exists()
+
+
+def test_handoff_store_rejects_ancestor_owner_or_mode_identity_drift_before_write(tmp_path):
+    """A lease cannot outlive an ancestor permission identity change."""
+    ancestor = (tmp_path / "ancestor").resolve()
+    root = ancestor / "store"
+    ancestor.mkdir(mode=0o700)
+    root.mkdir(mode=0o700)
+    store = TrustedHandoffStoreV1(root)
+    ancestor.chmod(0o755)
+
+    with pytest.raises(ValueError, match="binding"):
+        store.publish_pointer("ticket-23-product-v1", b'{"pointer":"one"}')
+    assert not (root / "pointers").exists()
+
+
+def test_handoff_store_concurrent_publication_is_idempotent_only_for_identical_bytes(tmp_path):
+    """Concurrent publishers may converge on identical bytes but never mix competing payloads."""
+    root = (tmp_path / "store").resolve()
+    root.mkdir(mode=0o700)
+    same = (TrustedHandoffStoreV1(root), TrustedHandoffStoreV1(root))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(lambda item: item.publish_pointer("ticket-23-product-v1", b'{"pointer":"same"}'), same))
+    assert sorted(outcomes) == [False, True]
+    assert TrustedHandoffStoreV1(root).read_pointer("ticket-23-product-v1") == b'{"pointer":"same"}'
+
+    different_root = (tmp_path / "different-store").resolve()
+    different_root.mkdir(mode=0o700)
+    competing = (TrustedHandoffStoreV1(different_root), TrustedHandoffStoreV1(different_root))
+
+    def publish(pair):
+        try:
+            return pair[0].publish_pointer("ticket-23-product-v1", pair[1])
+        except ValueError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(publish, ((competing[0], b'{"pointer":"one"}'), (competing[1], b'{"pointer":"two"}'))))
+    assert results.count(None) == 1
+    assert sum(isinstance(result, bool) for result in results) == 1
+
+
+def test_handoff_store_rejects_post_link_entry_swap_without_accepting_redirected_bytes(tmp_path, monkeypatch):
+    """An attacker replacing the target after link must turn the publication into a failure."""
+    root = (tmp_path / "store").resolve()
+    root.mkdir(mode=0o700)
+    store = TrustedHandoffStoreV1(root)
+    real_link = os.link
+
+    def link_then_swap(source, destination, *, src_dir_fd, dst_dir_fd, follow_symlinks):
+        real_link(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd, follow_symlinks=follow_symlinks)
+        os.unlink(destination, dir_fd=dst_dir_fd)
+        descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dst_dir_fd)
+        try:
+            os.write(descriptor, b'{"pointer":"evil"}')
+        finally:
+            os.close(descriptor)
+
+    monkeypatch.setattr(os, "link", link_then_swap)
+    with pytest.raises(ValueError, match="entry changed"):
+        store.publish_pointer("ticket-23-product-v1", b'{"pointer":"good"}')
+    assert store.read_pointer("ticket-23-product-v1") == b'{"pointer":"evil"}'
+
+
+def test_handoff_store_removes_its_link_when_final_binding_check_fails(tmp_path, monkeypatch):
+    """A late binding failure must not leave this publisher's newly linked file behind."""
+    root = (tmp_path / "store").resolve()
+    root.mkdir(mode=0o700)
+    store = TrustedHandoffStoreV1(root)
+    original = TrustedHandoffStoreV1._verify_binding
+    calls = 0
+
+    def fail_after_link(self):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise ValueError("handoff store root binding changed")
+        original(self)
+
+    monkeypatch.setattr(TrustedHandoffStoreV1, "_verify_binding", fail_after_link)
+    with pytest.raises(ValueError, match="binding"):
+        store.publish_pointer("ticket-23-product-v1", b'{"pointer":"good"}')
+    assert not (root / "pointers" / "ticket-23-product-v1.json").exists()
+
+
+def test_handoff_store_capability_cannot_be_copied_or_dataclass_serialized(tmp_path):
+    """A directory FD capability must not be duplicated through generic object helpers."""
+    root = (tmp_path / "store").resolve()
+    root.mkdir(mode=0o700)
+    store = TrustedHandoffStoreV1(root)
+
+    with pytest.raises(TypeError):
+        copy.copy(store)
+    with pytest.raises(TypeError):
+        copy.replace(store)
+    with pytest.raises(TypeError):
+        replace(store)
+    with pytest.raises(TypeError):
+        asdict(store)
+
+
 def test_export_request_has_closed_sorted_consumers_and_full_record_binding():
     """Changing a consumer or a pointer byte changes the export authorization."""
     request = HandoffExportRequestV1(
@@ -241,7 +433,7 @@ def test_handoff_cli_fails_closed_before_finalize_and_for_reserved_producer(tmp_
     """Lifecycle read and privileged producer publication must not be ambient shortcuts."""
     root = tmp_path / "store"
     root.mkdir(mode=0o700)
-    environment = {**os.environ, "TRUSTED_HANDOFF_STORE_ROOT": str(root), "PYTHONPATH": str(Path(__file__).parent)}
+    environment = {**os.environ, "TRUSTED_HANDOFF_STORE_ROOT": str(root), "TRUSTED_HANDOFF_STORE_LEASE": _store_lease(root), "PYTHONPATH": str(Path(__file__).parent)}
     cli = Path(__file__).parent / "tools" / "trusted_handoff_store.py"
     read = subprocess.run([sys.executable, str(cli), "read", "ticket-23-product-v1"], env=environment, capture_output=True)
     publish = subprocess.run([sys.executable, str(cli), "publish-local", "--producer-task", "22"], env=environment, capture_output=True)
@@ -935,7 +1127,7 @@ def test_policy_transport_rejects_proof_binding_tamper_at_every_durable_location
     if location in {"activated-request", "policy-handoff", "activation-proof"}:
         activated = ActivatedPolicyExportRequestV1.from_canonical_bytes(target.read_blob(request_ref))
         ref = {"activated-request": request_ref, "policy-handoff": activated.policy_handoff_ref, "activation-proof": activated.policy_activation_proof_ref}[location]
-        target._blob_path(ref).write_bytes(b"tampered policy closure")
+        (target.root / "sha256" / ref[7:9] / ref[9:]).write_bytes(b"tampered policy closure")
     else:
         path = target_root / "transports" / record.handoff_id / "ticket-23-policy-v1-c28" / f"{location}.json"
         if location == "manifest":
