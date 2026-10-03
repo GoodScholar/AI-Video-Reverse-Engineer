@@ -763,11 +763,9 @@ class TransportJobV1:
     expires_at: str | None
     policy_activation_proof_ref: str | None
     policy_activation_proof_full_bytes_digest: str | None
-    signing_key_fd: int
     key_id: str
-    signing_key_purpose: str = "transport-seal"
-    signature_domain: str = "ai-video-reverse-engineer/transport-seal/v1"
-    signing_domains: "VerifiedSigningDomainsV1 | None" = None
+    signing_key_purpose: str
+    signature_domain: str
 
     def __post_init__(self) -> None:
         for path in (self.source_store_root, self.target_store_root, self.stage_root):
@@ -783,7 +781,7 @@ class TransportJobV1:
         _require_nonce(self.nonce)
         _require_expiry(self.expires_at)
         _proof_fields(self.policy_activation_proof_ref, self.policy_activation_proof_full_bytes_digest)
-        if not isinstance(self.signing_key_fd, int) or self.signing_key_fd < 0 or self.signing_key_purpose != "transport-seal" or self.signature_domain != "ai-video-reverse-engineer/transport-seal/v1":
+        if self.signing_key_purpose != "transport-seal" or self.signature_domain != "ai-video-reverse-engineer/transport-seal/v1":
             raise ValueError("transport signing identity is invalid")
 
 

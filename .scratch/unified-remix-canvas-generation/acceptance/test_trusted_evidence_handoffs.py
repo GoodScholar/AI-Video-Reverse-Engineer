@@ -3,6 +3,7 @@ import base64
 import copy
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
+import inspect
 import json
 import os
 import subprocess
@@ -1005,9 +1006,29 @@ def _policy_transport_fixture(tmp_path):
     return source, record, request_ref, transport_seed, domains
 
 
-def test_run_transport_creates_distinct_sealed_ready_closures_for_two_consumers(tmp_path):
+def test_run_transport_creates_distinct_sealed_ready_closures_for_two_consumers(tmp_path, monkeypatch):
     """Dropping per-consumer seal/ready bindings must make this real transport test fail."""
-    from tools.trusted_handoff_orchestrator import run_transport
+    from tools import trusted_handoff_orchestrator as orchestrator
+
+    observed_public_jobs = []
+    for stage_name in ("export", "upload", "install_transport"):
+        original_stage = getattr(orchestrator, stage_name)
+
+        def observe_public_job(*args, _original=original_stage, _stage_name=stage_name, **kwargs):
+            observed_public_jobs.append((_stage_name, args[0]))
+            assert not hasattr(args[0], "signing_key_fd")
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(orchestrator, stage_name, observe_public_job)
+
+    original_sign_seal = orchestrator.sign_seal
+    observed_signing_fds = []
+
+    def observe_sign_seal(*args, **kwargs):
+        observed_signing_fds.append(kwargs["signing_key_fd"])
+        return original_sign_seal(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "sign_seal", observe_sign_seal)
 
     source_root = (tmp_path / "source").resolve()
     source_root.mkdir(mode=0o700)
@@ -1043,7 +1064,7 @@ def test_run_transport_creates_distinct_sealed_ready_closures_for_two_consumers(
             stage_root = (tmp_path / f"stage-{consumer}").resolve()
             target_root.mkdir(mode=0o700)
             stage_root.mkdir(mode=0o700)
-            results.append(run_transport(
+            results.append(orchestrator.run_transport(
                 source_store=source,
                 target_store=TrustedHandoffStoreV1(target_root),
                 stage_root=stage_root,
@@ -1059,6 +1080,8 @@ def test_run_transport_creates_distinct_sealed_ready_closures_for_two_consumers(
                 expires_at=None,
                 signing_key_fd=key_fd,
                 key_id="transport-fixed",
+                signing_key_purpose="transport-seal",
+                signature_domain="ai-video-reverse-engineer/transport-seal/v1",
                 signing_domains=domains,
             ))
         ready_a = (tmp_path / "target-23" / "transports" / record.handoff_id / "ticket-23-product-v1-c23" / "ready.json").read_bytes()
@@ -1066,26 +1089,28 @@ def test_run_transport_creates_distinct_sealed_ready_closures_for_two_consumers(
         assert ready_a != ready_b
         assert results[0].transport_id != results[1].transport_id
         assert results[0].nonce != results[1].nonce
-        assert run_transport(
+        assert orchestrator.run_transport(
             source_store=source, target_store=TrustedHandoffStoreV1((tmp_path / "target-23").resolve()),
             stage_root=(tmp_path / "stage-23").resolve(), export_request_ref=request_ref, handoff_id=record.handoff_id,
             transport_id="ticket-23-product-v1-c23", consumer_task=23,
             store_namespace="ai-video-reverse-engineer/ticket-23", source_executor_id="source-executor",
             destination_executor_id="executor-23", nonce="nonce-23", sequence=1, expires_at=None,
-            signing_key_fd=key_fd, key_id="transport-fixed", signing_domains=domains,
+            signing_key_fd=key_fd, key_id="transport-fixed", signing_key_purpose="transport-seal", signature_domain="ai-video-reverse-engineer/transport-seal/v1", signing_domains=domains,
         ).canonical_bytes == results[0].canonical_bytes
         replay_stage = (tmp_path / "stage-replay").resolve()
         replay_stage.mkdir(mode=0o700)
         with pytest.raises(ValueError):
-            run_transport(
+            orchestrator.run_transport(
                 source_store=source, target_store=TrustedHandoffStoreV1((tmp_path / "target-23").resolve()),
                 stage_root=replay_stage, export_request_ref=request_ref, handoff_id=record.handoff_id,
                 transport_id="ticket-23-product-v1-c23-replay", consumer_task=23,
                 store_namespace="ai-video-reverse-engineer/ticket-23", source_executor_id="source-executor",
                 destination_executor_id="executor-23", nonce="nonce-replay", sequence=1, expires_at=None,
-                signing_key_fd=key_fd, key_id="transport-fixed", signing_domains=domains,
+                signing_key_fd=key_fd, key_id="transport-fixed", signing_key_purpose="transport-seal", signature_domain="ai-video-reverse-engineer/transport-seal/v1", signing_domains=domains,
             )
         assert (tmp_path / "target-23" / "transports" / record.handoff_id / "ticket-23-product-v1-c23" / "ready.json").read_bytes() == ready_a
+        assert {name for name, _job in observed_public_jobs} == {"export", "upload", "install_transport"}
+        assert observed_signing_fds == [key_fd] * 4
         with pytest.raises(ValueError):
             HandoffRegistryV1(TrustedHandoffStoreV1((tmp_path / "target-23").resolve())).fetch(
                 TrustedHandoffStoreV1((tmp_path / "target-25").resolve()), request_ref,
@@ -1171,7 +1196,7 @@ def test_run_transport_creates_distinct_sealed_ready_closures_for_two_consumers(
 
 
 def test_transport_cli_exposes_only_fd_keyed_public_stages():
-    """Replacing an FD-keyed seal interface with key path/value flags must fail this contract."""
+    """Giving a public transport stage the seal FD must fail this command-boundary contract."""
     cli = Path(__file__).parent / "tools" / "trusted_handoff_orchestrator.py"
     result = subprocess.run([sys.executable, str(cli), "--help"], env={**os.environ, "PYTHONPATH": str(Path(__file__).parent)}, capture_output=True, check=False)
 
@@ -1180,6 +1205,20 @@ def test_transport_cli_exposes_only_fd_keyed_public_stages():
         assert command in result.stdout
     assert b"signing-key-path" not in result.stdout
     assert b"signing-key-value" not in result.stdout
+    for command in ("export", "upload", "sign-seal", "install-transport", "run-transport"):
+        command_help = subprocess.run([sys.executable, str(cli), command, "--help"], env={**os.environ, "PYTHONPATH": str(Path(__file__).parent)}, capture_output=True, check=False)
+        assert command_help.returncode == 0
+        assert (b"--signing-key-fd" in command_help.stdout) is (command in {"sign-seal", "run-transport"})
+
+
+def test_transport_runner_requires_an_explicit_signing_identity():
+    """Adding a purpose/domain fallback would let callers silently change the signing contract."""
+    from tools.trusted_handoff_orchestrator import run_policy_transport, run_transport
+
+    for runner in (run_transport, run_policy_transport):
+        signature = inspect.signature(runner)
+        assert signature.parameters["signing_key_purpose"].default is inspect.Parameter.empty
+        assert signature.parameters["signature_domain"].default is inspect.Parameter.empty
 
 
 def test_policy_record_pointer_uses_general_git_oid_and_full_bytes_digest():
@@ -1248,6 +1287,8 @@ def test_policy_transport_requires_a_complete_activated_closure_before_ready(tmp
             expires_at=None,
             signing_key_fd=-1,
             key_id="transport-fixed",
+            signing_key_purpose="transport-seal",
+            signature_domain="ai-video-reverse-engineer/transport-seal/v1",
             signing_domains=_domains(),
         )
     assert not (target_root / "transports" / record.handoff_id).exists()
@@ -1269,7 +1310,7 @@ def test_policy_transport_runs_the_product_stages_then_finalizes_and_reads(tmp_p
             transport_id="ticket-23-policy-v1-c28", consumer_task=28,
             store_namespace="ai-video-reverse-engineer/ticket-23", source_executor_id="policy-source",
             destination_executor_id="executor-28", nonce="policy-nonce-28", sequence=1,
-            expires_at=None, signing_key_fd=key_fd, key_id="transport-fixed", signing_domains=domains,
+            expires_at=None, signing_key_fd=key_fd, key_id="transport-fixed", signing_key_purpose="transport-seal", signature_domain="ai-video-reverse-engineer/transport-seal/v1", signing_domains=domains,
         )
     finally:
         os.close(key_fd)
@@ -1294,7 +1335,7 @@ def test_policy_transport_runs_the_product_stages_then_finalizes_and_reads(tmp_p
                 transport_id="ticket-23-policy-v1-c28", consumer_task=28,
                 store_namespace="ai-video-reverse-engineer/ticket-23", source_executor_id="policy-source",
                 destination_executor_id="executor-28", nonce="changed-policy-nonce", sequence=1,
-                expires_at=None, signing_key_fd=key_fd, key_id="transport-fixed", signing_domains=domains,
+                expires_at=None, signing_key_fd=key_fd, key_id="transport-fixed", signing_key_purpose="transport-seal", signature_domain="ai-video-reverse-engineer/transport-seal/v1", signing_domains=domains,
             )
     finally:
         os.close(key_fd)
@@ -1316,7 +1357,7 @@ def test_policy_activation_cli_verifies_the_cached_proof_and_source_closure(tmp_
             transport_id="ticket-23-policy-v1-c28", consumer_task=28,
             store_namespace="ai-video-reverse-engineer/ticket-23", source_executor_id="policy-source",
             destination_executor_id="executor-28", nonce="policy-nonce-28", sequence=1,
-            expires_at=None, signing_key_fd=key_fd, key_id="transport-fixed", signing_domains=domains,
+            expires_at=None, signing_key_fd=key_fd, key_id="transport-fixed", signing_key_purpose="transport-seal", signature_domain="ai-video-reverse-engineer/transport-seal/v1", signing_domains=domains,
         )
     finally:
         os.close(key_fd)
@@ -1370,7 +1411,7 @@ def test_policy_transport_rejects_proof_binding_tamper_at_every_durable_location
     key_path = tmp_path / "key"; key_path.write_bytes(transport_seed); key_path.chmod(0o400)
     key_fd = os.open(key_path, os.O_RDONLY)
     try:
-        run_policy_transport(source_store=source, target_store=TrustedHandoffStoreV1(target_root), stage_root=stage_root, export_request_ref=request_ref, handoff_id=record.handoff_id, transport_id="ticket-23-policy-v1-c28", consumer_task=28, store_namespace="ai-video-reverse-engineer/ticket-23", source_executor_id="policy-source", destination_executor_id="executor-28", nonce="policy-nonce-28", sequence=1, expires_at=None, signing_key_fd=key_fd, key_id="transport-fixed", signing_domains=domains)
+        run_policy_transport(source_store=source, target_store=TrustedHandoffStoreV1(target_root), stage_root=stage_root, export_request_ref=request_ref, handoff_id=record.handoff_id, transport_id="ticket-23-policy-v1-c28", consumer_task=28, store_namespace="ai-video-reverse-engineer/ticket-23", source_executor_id="policy-source", destination_executor_id="executor-28", nonce="policy-nonce-28", sequence=1, expires_at=None, signing_key_fd=key_fd, key_id="transport-fixed", signing_key_purpose="transport-seal", signature_domain="ai-video-reverse-engineer/transport-seal/v1", signing_domains=domains)
     finally:
         os.close(key_fd)
     target = TrustedHandoffStoreV1(target_root)

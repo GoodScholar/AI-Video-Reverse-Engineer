@@ -112,13 +112,11 @@ def verify_export_request(source_store: TrustedHandoffStoreV1, export_request_re
     )
 
 
-def export(job: TransportJobV1, source_store: TrustedHandoffStoreV1) -> HandoffTransferManifestV1:
+def export(job: TransportJobV1, source_store: TrustedHandoffStoreV1, signing_domains: VerifiedSigningDomainsV1) -> HandoffTransferManifestV1:
     if job.policy_activation_proof_ref is None:
         request, request_bytes, record, _pointer, record_bytes, pointer_bytes, refs, _blobs = _closure(source_store, job.export_request_ref, job.handoff_id, job.consumer_task)
     else:
-        if job.signing_domains is None:
-            raise ValueError("policy transport requires signing domains")
-        request, request_bytes, record, _pointer, record_bytes, pointer_bytes, refs, _blobs, _core_request = _policy_closure(source_store, job.export_request_ref, job.handoff_id, job.consumer_task, job.destination_executor_id, job.signing_domains)
+        request, request_bytes, record, _pointer, record_bytes, pointer_bytes, refs, _blobs, _core_request = _policy_closure(source_store, job.export_request_ref, job.handoff_id, job.consumer_task, job.destination_executor_id, signing_domains)
     manifest = HandoffTransferManifestV1(
         "trusted-handoff-transfer/v1", job.export_request_ref, _digest(request_bytes), job.store_namespace,
         job.handoff_id, job.transport_id, job.consumer_task, record.record_digest, _digest(record_bytes), job.handoff_id,
@@ -129,16 +127,14 @@ def export(job: TransportJobV1, source_store: TrustedHandoffStoreV1) -> HandoffT
     return manifest
 
 
-def upload(job: TransportJobV1, source_store: TrustedHandoffStoreV1, target_store: TrustedHandoffStoreV1, manifest: HandoffTransferManifestV1) -> str:
+def upload(job: TransportJobV1, source_store: TrustedHandoffStoreV1, target_store: TrustedHandoffStoreV1, manifest: HandoffTransferManifestV1, signing_domains: VerifiedSigningDomainsV1) -> str:
     if HandoffTransferManifestV1.from_canonical_bytes(_stage_read(job.stage_root, "export-manifest.json")) != manifest:
         raise ValueError("upload manifest does not match exported bytes")
     if job.policy_activation_proof_ref is None:
         request, request_bytes, record, _pointer, record_bytes, pointer_bytes, refs, blobs = _closure(source_store, job.export_request_ref, job.handoff_id, job.consumer_task)
         core_request = None
     else:
-        if job.signing_domains is None:
-            raise ValueError("policy transport requires signing domains")
-        request, request_bytes, record, _pointer, record_bytes, pointer_bytes, refs, blobs, core_request = _policy_closure(source_store, job.export_request_ref, job.handoff_id, job.consumer_task, job.destination_executor_id, job.signing_domains)
+        request, request_bytes, record, _pointer, record_bytes, pointer_bytes, refs, blobs, core_request = _policy_closure(source_store, job.export_request_ref, job.handoff_id, job.consumer_task, job.destination_executor_id, signing_domains)
     if (manifest.export_request_ref, manifest.record_ref, manifest.record_full_bytes_digest, manifest.pointer_bytes_digest, manifest.blob_refs) != (job.export_request_ref, record.record_digest, _digest(record_bytes), _digest(pointer_bytes), refs):
         raise ValueError("upload manifest closure is mixed")
     for payload in (request_bytes, record_bytes, pointer_bytes, *blobs):
@@ -190,14 +186,14 @@ def _ed25519_sign_from_fd(fd: int, message: bytes) -> tuple[bytes, str]:
     return public_key, signature.hex()
 
 
-def sign_seal(job: TransportJobV1, manifest: HandoffTransferManifestV1, uploaded_manifest_digest: str, signing_domains: VerifiedSigningDomainsV1) -> TransportSealV1:
+def sign_seal(job: TransportJobV1, manifest: HandoffTransferManifestV1, uploaded_manifest_digest: str, *, signing_key_fd: int, signing_domains: VerifiedSigningDomainsV1) -> TransportSealV1:
     receipt = json.loads(_stage_read(job.stage_root, "upload-receipt.json"))
     if receipt != {"manifestDigest": manifest.digest, "schema": "trusted-handoff-upload-receipt/v1"} or uploaded_manifest_digest != manifest.digest:
         raise ValueError("seal requires the exact uploaded manifest receipt")
     registration = next((item for item in signing_domains.transport_keys if item.key_id == job.key_id), None)
     if registration is None or registration.purpose != job.signing_key_purpose or registration.signature_domain != job.signature_domain:
         raise ValueError("transport signing key is not registered for this purpose")
-    public_key, _signature = _ed25519_sign_from_fd(job.signing_key_fd, b"probe")
+    public_key, _signature = _ed25519_sign_from_fd(signing_key_fd, b"probe")
     if public_key != registration.resolved_public_key:
         raise ValueError("transport signing FD does not match the registered key")
     unsigned = TransportSealV1(
@@ -208,7 +204,7 @@ def sign_seal(job: TransportJobV1, manifest: HandoffTransferManifestV1, uploaded
         manifest.policy_activation_proof_full_bytes_digest, job.signing_key_purpose, job.signature_domain,
         "ssh-ed25519", job.key_id, "0" * 128,
     )
-    _public, signature = _ed25519_sign_from_fd(job.signing_key_fd, job.signature_domain.encode("utf-8") + b"\0" + unsigned.unsigned_canonical_bytes)
+    _public, signature = _ed25519_sign_from_fd(signing_key_fd, job.signature_domain.encode("utf-8") + b"\0" + unsigned.unsigned_canonical_bytes)
     seal = TransportSealV1(
         unsigned.schema, unsigned.store_namespace, unsigned.handoff_id, unsigned.transport_id, unsigned.consumer_task,
         unsigned.record_ref, unsigned.record_full_bytes_digest, unsigned.pointer_name, unsigned.pointer_bytes_digest,
@@ -254,28 +250,28 @@ def install_transport(job: TransportJobV1, target_store: TrustedHandoffStoreV1, 
     return ready
 
 
-def run_transport(*, source_store: TrustedHandoffStoreV1, target_store: TrustedHandoffStoreV1, stage_root: Path, export_request_ref: str, handoff_id: str, transport_id: str, consumer_task: int, store_namespace: str, source_executor_id: str, destination_executor_id: str, nonce: str, sequence: int, expires_at: str | None, signing_key_fd: int, key_id: str, signing_domains: VerifiedSigningDomainsV1) -> TransportReadyMarkerV1:
-    job = TransportJobV1(source_store.root, target_store.root, stage_root, export_request_ref, handoff_id, transport_id, consumer_task, store_namespace, source_executor_id, destination_executor_id, nonce, sequence, expires_at, None, None, signing_key_fd, key_id)
+def run_transport(*, source_store: TrustedHandoffStoreV1, target_store: TrustedHandoffStoreV1, stage_root: Path, export_request_ref: str, handoff_id: str, transport_id: str, consumer_task: int, store_namespace: str, source_executor_id: str, destination_executor_id: str, nonce: str, sequence: int, expires_at: str | None, signing_key_fd: int, key_id: str, signing_key_purpose: str, signature_domain: str, signing_domains: VerifiedSigningDomainsV1) -> TransportReadyMarkerV1:
+    job = TransportJobV1(source_store.root, target_store.root, stage_root, export_request_ref, handoff_id, transport_id, consumer_task, store_namespace, source_executor_id, destination_executor_id, nonce, sequence, expires_at, None, None, key_id, signing_key_purpose, signature_domain)
     _closure(source_store, export_request_ref, handoff_id, consumer_task)
-    manifest = export(job, source_store)
-    receipt = upload(job, source_store, target_store, manifest)
-    seal = sign_seal(job, manifest, receipt, signing_domains)
+    manifest = export(job, source_store, signing_domains)
+    receipt = upload(job, source_store, target_store, manifest, signing_domains)
+    seal = sign_seal(job, manifest, receipt, signing_key_fd=signing_key_fd, signing_domains=signing_domains)
     return install_transport(job, target_store, manifest, seal, signing_domains)
 
 
-def run_policy_transport(*, source_store: TrustedHandoffStoreV1, target_store: TrustedHandoffStoreV1, stage_root: Path, export_request_ref: str, handoff_id: str, transport_id: str, consumer_task: int, store_namespace: str, source_executor_id: str, destination_executor_id: str, nonce: str, sequence: int, expires_at: str | None, signing_key_fd: int, key_id: str, signing_domains: VerifiedSigningDomainsV1) -> TransportReadyMarkerV1:
+def run_policy_transport(*, source_store: TrustedHandoffStoreV1, target_store: TrustedHandoffStoreV1, stage_root: Path, export_request_ref: str, handoff_id: str, transport_id: str, consumer_task: int, store_namespace: str, source_executor_id: str, destination_executor_id: str, nonce: str, sequence: int, expires_at: str | None, signing_key_fd: int, key_id: str, signing_key_purpose: str, signature_domain: str, signing_domains: VerifiedSigningDomainsV1) -> TransportReadyMarkerV1:
     activated, _bytes, _record, _pointer, _record_bytes, _pointer_bytes, _refs, _blobs, _core = _policy_closure(source_store, export_request_ref, handoff_id, consumer_task, destination_executor_id, signing_domains)
     job = TransportJobV1(
         source_store.root, target_store.root, stage_root, export_request_ref, handoff_id,
         transport_id, consumer_task, store_namespace, source_executor_id,
         destination_executor_id, nonce, sequence, expires_at,
         activated.policy_activation_proof_ref,
-        activated.policy_activation_proof_full_bytes_digest, signing_key_fd, key_id,
-        signing_domains=signing_domains,
+        activated.policy_activation_proof_full_bytes_digest, key_id,
+        signing_key_purpose, signature_domain,
     )
-    manifest = export(job, source_store)
-    receipt = upload(job, source_store, target_store, manifest)
-    seal = sign_seal(job, manifest, receipt, signing_domains)
+    manifest = export(job, source_store, signing_domains)
+    receipt = upload(job, source_store, target_store, manifest, signing_domains)
+    seal = sign_seal(job, manifest, receipt, signing_key_fd=signing_key_fd, signing_domains=signing_domains)
     return install_transport(job, target_store, manifest, seal, signing_domains)
 
 
@@ -303,18 +299,16 @@ def _add_job_arguments(parser: argparse.ArgumentParser, *, target: bool, signing
     parser.add_argument("--nonce", required=True)
     parser.add_argument("--sequence", type=int, required=True)
     parser.add_argument("--expires-at")
+    parser.add_argument("--key-id", required=True)
+    parser.add_argument("--signing-key-purpose", required=True)
+    parser.add_argument("--signature-domain", required=True)
     if signing:
         parser.add_argument("--signing-key-fd", type=int, required=True)
-        parser.add_argument("--key-id", required=True)
 
 
 def _job_from_args(args: argparse.Namespace) -> TransportJobV1:
-    fd = getattr(args, "signing_key_fd", None)
-    key_id = getattr(args, "key_id", None)
-    if fd is None or key_id is None:
-        raise ValueError("transport signing key FD and key ID are required")
     target = Path(getattr(args, "target_store_root", args.source_store_root))
-    return TransportJobV1(Path(args.source_store_root), target, Path(args.stage_root), args.export_request_ref, args.handoff_id, args.transport_id, args.consumer_task, args.store_namespace, args.source_executor_id, args.destination_executor_id, args.nonce, args.sequence, args.expires_at, None, None, fd, key_id)
+    return TransportJobV1(Path(args.source_store_root), target, Path(args.stage_root), args.export_request_ref, args.handoff_id, args.transport_id, args.consumer_task, args.store_namespace, args.source_executor_id, args.destination_executor_id, args.nonce, args.sequence, args.expires_at, None, None, args.key_id, args.signing_key_purpose, args.signature_domain)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -325,13 +319,13 @@ def main(argv: list[str] | None = None) -> int:
     request = commands.add_parser("verify-export-request")
     request.add_argument("--source-store-root", required=True); request.add_argument("--export-request-ref", required=True); request.add_argument("--handoff-id", required=True); request.add_argument("--consumer-task", type=int, action="append", required=True)
     export_parser = commands.add_parser("export")
-    _add_job_arguments(export_parser, target=False, signing=True)
+    _add_job_arguments(export_parser, target=False, signing=False); _add_domains_arguments(export_parser)
     upload_parser = commands.add_parser("upload")
-    _add_job_arguments(upload_parser, target=True, signing=True)
+    _add_job_arguments(upload_parser, target=True, signing=False); _add_domains_arguments(upload_parser)
     seal_parser = commands.add_parser("sign-seal")
     _add_job_arguments(seal_parser, target=True, signing=True); _add_domains_arguments(seal_parser)
     install_parser = commands.add_parser("install-transport")
-    _add_job_arguments(install_parser, target=True, signing=True); _add_domains_arguments(install_parser)
+    _add_job_arguments(install_parser, target=True, signing=False); _add_domains_arguments(install_parser)
     run = commands.add_parser("run-transport")
     _add_job_arguments(run, target=True, signing=True); _add_domains_arguments(run)
     args = parser.parse_args(argv)
@@ -344,15 +338,15 @@ def main(argv: list[str] | None = None) -> int:
                 verify_export_request(source, args.export_request_ref, args.handoff_id, consumer_task)
         elif args.command == "export":
             job = _job_from_args(args)
-            export(job, TrustedHandoffStoreV1(job.source_store_root))
+            export(job, TrustedHandoffStoreV1(job.source_store_root), _domains_from_args(args))
         elif args.command == "upload":
             job = _job_from_args(args)
             manifest = HandoffTransferManifestV1.from_canonical_bytes(_stage_read(job.stage_root, "export-manifest.json"))
-            upload(job, TrustedHandoffStoreV1(job.source_store_root), TrustedHandoffStoreV1(job.target_store_root), manifest)
+            upload(job, TrustedHandoffStoreV1(job.source_store_root), TrustedHandoffStoreV1(job.target_store_root), manifest, _domains_from_args(args))
         elif args.command == "sign-seal":
             job = _job_from_args(args)
             manifest = HandoffTransferManifestV1.from_canonical_bytes(_stage_read(job.stage_root, "export-manifest.json"))
-            sign_seal(job, manifest, manifest.digest, _domains_from_args(args))
+            sign_seal(job, manifest, manifest.digest, signing_key_fd=args.signing_key_fd, signing_domains=_domains_from_args(args))
         elif args.command == "install-transport":
             job = _job_from_args(args)
             manifest = HandoffTransferManifestV1.from_canonical_bytes(_stage_read(job.stage_root, "export-manifest.json"))
@@ -366,7 +360,7 @@ def main(argv: list[str] | None = None) -> int:
             except ValueError:
                 policy_request_ref = None
             runner = run_policy_transport if policy_request_ref == job.export_request_ref else run_transport
-            runner(source_store=source, target_store=TrustedHandoffStoreV1(job.target_store_root), stage_root=job.stage_root, export_request_ref=job.export_request_ref, handoff_id=job.handoff_id, transport_id=job.transport_id, consumer_task=job.consumer_task, store_namespace=job.store_namespace, source_executor_id=job.source_executor_id, destination_executor_id=job.destination_executor_id, nonce=job.nonce, sequence=job.sequence, expires_at=job.expires_at, signing_key_fd=job.signing_key_fd, key_id=job.key_id, signing_domains=_domains_from_args(args))
+            runner(source_store=source, target_store=TrustedHandoffStoreV1(job.target_store_root), stage_root=job.stage_root, export_request_ref=job.export_request_ref, handoff_id=job.handoff_id, transport_id=job.transport_id, consumer_task=job.consumer_task, store_namespace=job.store_namespace, source_executor_id=job.source_executor_id, destination_executor_id=job.destination_executor_id, nonce=job.nonce, sequence=job.sequence, expires_at=job.expires_at, signing_key_fd=args.signing_key_fd, key_id=job.key_id, signing_key_purpose=job.signing_key_purpose, signature_domain=job.signature_domain, signing_domains=_domains_from_args(args))
         return 0
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(str(error), file=sys.stderr)
