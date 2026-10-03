@@ -127,6 +127,12 @@ binding spec 没有重列下列类型；补充授权明确由实施计划第 99�
 
 - 当前 durable `TrustedHandoffRecordV1` 仍是既有 product-source-only codec；因此本切片对 product transport 强制 proof fields 为 null。C.1 的 policy activation proof codec 已复用为后续 policy record/activated-request bridge 的验证基础，但完整 policy handoff durable closure 尚无现有 record/pointer codec，不能声称 policy transport 已闭环。
 
+### Policy bridge follow-up
+
+- RED：`test_policy_record_pointer_uses_general_git_oid_and_full_bytes_digest` 首次因缺少 `PolicyHandoffRecordV1` / `PolicyHandoffPointerV1` import 失败。
+- GREEN：新增严格 policy record/pointer canonical codec，policy commit 只接受通用 `GitObjectIdV1`（SHA-1 或 SHA-256），pointer 只绑定完整 canonical record bytes 的 digest；固定 product-only `ProductGitObjectIdV1` 被拒绝。定向验证为 `2 passed`（policy codec 与 product transport 回归）。
+- **仍未完成**：该 codec 尚未接入 `Ticket23PolicyHandoffV1` / `ActivatedPolicyExportRequestV1` 的 durable source closure、同一四阶段 transport 与消费者 proof 验证；因此 C.2 不能标记 complete，后续必须补成功 policy 全链与 proof/ref/digest 篡改矩阵。
+
 ### 文件
 
 - 修改：`.scratch/unified-remix-canvas-generation/acceptance/trusted_evidence/handoffs.py`、`.scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py`、`.scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_handoffs.py`。

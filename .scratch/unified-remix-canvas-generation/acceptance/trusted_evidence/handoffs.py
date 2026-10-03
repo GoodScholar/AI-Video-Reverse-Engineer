@@ -151,6 +151,87 @@ class HandoffPointerV1:
 
 
 @dataclass(frozen=True, slots=True)
+class PolicyHandoffRecordV1:
+    """Strict policy record; unlike product records its Git object may be SHA-1 or SHA-256."""
+
+    schema: str
+    handoff_id: str
+    kind: str
+    producer_task: int
+    producer_commit: GitObjectIdV1
+    consumer_tasks: tuple[int, ...]
+    bindings: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        if self.schema != "trusted-policy-handoff-record/v1" or self.handoff_id != "ticket-23-policy-v1" or self.kind != "policy" or self.producer_task != 27 or type(self.producer_commit) is not GitObjectIdV1:
+            raise ValueError("policy handoff record identity is invalid")
+        if not self.consumer_tasks or tuple(sorted(self.consumer_tasks)) != self.consumer_tasks or len(set(self.consumer_tasks)) != len(self.consumer_tasks) or any(type(task) is not int or task <= 0 for task in self.consumer_tasks):
+            raise ValueError("policy consumers are invalid")
+        bindings = tuple(sorted(self.bindings, key=lambda item: item[0].encode("utf-8")))
+        if not bindings or len({name for name, _ in bindings}) != len(bindings):
+            raise ValueError("policy bindings are invalid")
+        for name, digest in bindings:
+            _require_transport_identity(name, "policy binding name")
+            _require_digest(digest, "policy binding digest")
+        object.__setattr__(self, "bindings", bindings)
+
+    def to_wire(self) -> dict[str, object]:
+        return {"bindings": [{"digest": digest, "name": name} for name, digest in self.bindings], "consumerTasks": list(self.consumer_tasks), "handoffId": self.handoff_id, "kind": self.kind, "producerCommit": self.producer_commit.to_wire(), "producerTask": self.producer_task, "schema": self.schema}
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_wire())
+
+    @property
+    def record_digest(self) -> str:
+        return _digest(self.canonical_bytes)
+
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "PolicyHandoffRecordV1":
+        raw = _strict_object(payload, {"bindings", "consumerTasks", "handoffId", "kind", "producerCommit", "producerTask", "schema"})
+        if not isinstance(raw["bindings"], list) or not isinstance(raw["consumerTasks"], list) or not isinstance(raw["producerCommit"], dict) or set(raw["producerCommit"]) != {"algorithm", "hex"}:
+            raise ValueError("policy handoff record wire is invalid")
+        bindings = []
+        for item in raw["bindings"]:
+            if not isinstance(item, dict) or set(item) != {"digest", "name"}:
+                raise ValueError("policy handoff binding wire is invalid")
+            bindings.append((item["name"], item["digest"]))
+        return cls(raw["schema"], raw["handoffId"], raw["kind"], raw["producerTask"], GitObjectIdV1(raw["producerCommit"]["algorithm"], raw["producerCommit"]["hex"]), tuple(raw["consumerTasks"]), tuple(bindings))
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyHandoffPointerV1:
+    schema: str
+    handoff_id: str
+    record_ref: str
+    record_digest: str
+    producer_task: int
+    producer_commit: GitObjectIdV1
+
+    def __post_init__(self) -> None:
+        if self.schema != "trusted-policy-handoff-pointer/v1" or self.handoff_id != "ticket-23-policy-v1" or self.producer_task != 27 or type(self.producer_commit) is not GitObjectIdV1:
+            raise ValueError("policy handoff pointer identity is invalid")
+        _require_digest(self.record_ref, "policy record ref")
+        _require_digest(self.record_digest, "policy record digest")
+        if self.record_ref != self.record_digest:
+            raise ValueError("policy pointer does not bind full record bytes")
+
+    def to_wire(self) -> dict[str, object]:
+        return {"handoffId": self.handoff_id, "producerCommit": self.producer_commit.to_wire(), "producerTask": self.producer_task, "recordDigest": self.record_digest, "recordRef": self.record_ref, "schema": self.schema}
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_wire())
+
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "PolicyHandoffPointerV1":
+        raw = _strict_object(payload, {"handoffId", "producerCommit", "producerTask", "recordDigest", "recordRef", "schema"})
+        if not isinstance(raw["producerCommit"], dict) or set(raw["producerCommit"]) != {"algorithm", "hex"}:
+            raise ValueError("policy handoff pointer wire is invalid")
+        return cls(raw["schema"], raw["handoffId"], raw["recordRef"], raw["recordDigest"], raw["producerTask"], GitObjectIdV1(raw["producerCommit"]["algorithm"], raw["producerCommit"]["hex"]))
+
+
+@dataclass(frozen=True, slots=True)
 class HandoffExportRequestV1:
     schema: str
     handoff_id: str

@@ -613,3 +613,26 @@ def test_transport_cli_exposes_only_fd_keyed_public_stages():
         assert command in result.stdout
     assert b"signing-key-path" not in result.stdout
     assert b"signing-key-value" not in result.stdout
+
+
+def test_policy_record_pointer_uses_general_git_oid_and_full_bytes_digest():
+    """Replacing the policy's SHA-256 commit with a product SHA-1-only type must fail."""
+    from trusted_evidence.handoffs import PolicyHandoffPointerV1, PolicyHandoffRecordV1
+    from trusted_evidence.e2_policy import GitObjectIdV1
+
+    commit = GitObjectIdV1("sha256", "c" * 64)
+    record = PolicyHandoffRecordV1(
+        "trusted-policy-handoff-record/v1", "ticket-23-policy-v1", "policy", 27, commit,
+        (28,), (("policy-payload", "sha256:" + "d" * 64),),
+    )
+    pointer = PolicyHandoffPointerV1(
+        "trusted-policy-handoff-pointer/v1", record.handoff_id, record.record_digest,
+        record.record_digest, 27, commit,
+    )
+
+    assert pointer.record_ref == "sha256:" + hashlib.sha256(record.canonical_bytes).hexdigest()
+    with pytest.raises(ValueError):
+        PolicyHandoffRecordV1(
+            "trusted-policy-handoff-record/v1", "ticket-23-policy-v1", "policy", 27,
+            ProductGitObjectIdV1("sha1", "e" * 40), (28,), (("policy-payload", "sha256:" + "d" * 64),),
+        )
