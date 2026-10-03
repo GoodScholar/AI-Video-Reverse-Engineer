@@ -1,4 +1,5 @@
 import hashlib
+import os
 
 import pytest
 
@@ -8,6 +9,7 @@ from trusted_evidence.handoffs import (
     ProductRepositorySourceV1,
     Ticket23ProductSourceHandoffV1,
     TrustedHandoffRecordV1,
+    TrustedHandoffStoreV1,
 )
 
 
@@ -90,3 +92,36 @@ def test_product_source_rejects_host_path():
             control_metadata_digest=DIGEST,
             raw_inspection_proof_ref=DIGEST,
         )
+
+
+def test_handoff_store_publishes_content_addressed_blob_and_no_replace_pointer(tmp_path, monkeypatch):
+    """A record/pointer collision must never replace bytes selected by another producer."""
+    root = (tmp_path / "external-store").resolve()
+    root.mkdir(mode=0o700)
+    monkeypatch.setenv("TRUSTED_HANDOFF_STORE_ROOT", str(root))
+    store = TrustedHandoffStoreV1.open_from_environment()
+    payload = b'{"record":"one"}'
+    ref = store.put_blob(payload)
+
+    assert ref == "sha256:" + hashlib.sha256(payload).hexdigest()
+    assert store.read_blob(ref) == payload
+    pointer = b'{"pointer":"one"}'
+    assert store.publish_pointer("ticket-23-product-v1", pointer) is False
+    assert store.publish_pointer("ticket-23-product-v1", pointer) is True
+    with pytest.raises(ValueError):
+        store.publish_pointer("ticket-23-product-v1", b'{"pointer":"two"}')
+
+
+@pytest.mark.parametrize("root_value", ("relative-store",))
+def test_handoff_store_rejects_nonabsolute_or_symlink_root(tmp_path, monkeypatch, root_value):
+    """An ambient or aliased store root cannot carry durable handoff authority."""
+    monkeypatch.setenv("TRUSTED_HANDOFF_STORE_ROOT", root_value)
+    with pytest.raises(ValueError):
+        TrustedHandoffStoreV1.open_from_environment()
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    monkeypatch.setenv("TRUSTED_HANDOFF_STORE_ROOT", str(link))
+    with pytest.raises(ValueError):
+        TrustedHandoffStoreV1.open_from_environment()

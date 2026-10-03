@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import os
+from pathlib import Path
+import stat
+import tempfile
 from collections.abc import Mapping
 
 from .e2_policy import ProductGitObjectIdV1, canonical_json_bytes
@@ -120,3 +124,76 @@ class Ticket23ProductSourceHandoffV1:
             raise ValueError("invalid product-source handoff view")
         if self.record.producer_commit != self.source.subject_commit or self.source.subject_commit != self.producer_commit:
             raise ValueError("record, source, and view product commits must match")
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedHandoffStoreV1:
+    """A durable, external content store with no-replace publication."""
+
+    root: Path
+
+    @classmethod
+    def open_from_environment(cls) -> "TrustedHandoffStoreV1":
+        raw = os.environ.get("TRUSTED_HANDOFF_STORE_ROOT")
+        if not raw:
+            raise ValueError("TRUSTED_HANDOFF_STORE_ROOT is required")
+        path = Path(raw)
+        if not path.is_absolute() or path.is_symlink() or not path.is_dir():
+            raise ValueError("handoff store root must be an absolute non-symlink directory")
+        mode = stat.S_IMODE(path.stat().st_mode)
+        if mode != 0o700 or path.stat().st_uid != os.getuid():
+            raise ValueError("handoff store root must be current-user 0700")
+        return cls(path.resolve(strict=True))
+
+    def _blob_path(self, ref: str) -> Path:
+        _require_digest(ref, "blob ref")
+        return self.root / "sha256" / ref[7:9] / ref[9:]
+
+    def _publish(self, path: Path, payload: bytes) -> bool:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if path.exists():
+            if path.is_symlink() or path.read_bytes() != payload:
+                raise ValueError("existing handoff object bytes differ")
+            return True
+        descriptor, temporary_name = tempfile.mkstemp(prefix=".handoff-", dir=path.parent)
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                if path.is_symlink() or path.read_bytes() != payload:
+                    raise ValueError("concurrent handoff publication differs")
+                return True
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            return False
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def put_blob(self, payload: bytes) -> str:
+        if not isinstance(payload, bytes):
+            raise ValueError("handoff blob must be bytes")
+        ref = _digest(payload)
+        self._publish(self._blob_path(ref), payload)
+        return ref
+
+    def read_blob(self, ref: str) -> bytes:
+        path = self._blob_path(ref)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("handoff blob is missing or unsafe")
+        payload = path.read_bytes()
+        if _digest(payload) != ref:
+            raise ValueError("handoff blob digest mismatch")
+        return payload
+
+    def publish_pointer(self, handoff_id: str, payload: bytes) -> bool:
+        if not handoff_id or "/" in handoff_id or not isinstance(payload, bytes):
+            raise ValueError("invalid handoff pointer")
+        return self._publish(self.root / "pointers" / f"{handoff_id}.json", payload)
