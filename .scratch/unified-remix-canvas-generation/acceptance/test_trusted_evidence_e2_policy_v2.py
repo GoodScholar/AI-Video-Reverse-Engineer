@@ -652,9 +652,8 @@ def test_registration_transaction_records_decode_literal_bytes_and_reject_chain_
 
 
 def test_precreated_transaction_capability_owns_real_directory_fds_and_has_no_restoration_path(tmp_path):
-    parent, root, operation, repository = tmp_path / "parent", tmp_path / "parent" / "root", tmp_path / "parent" / "root" / "operation-d2", tmp_path / "repository"
-    operation.mkdir(parents=True)
-    repository.mkdir()
+    parent, root, operation, repository = tmp_path / "parent", tmp_path / "parent" / "root", tmp_path / "parent" / "root" / "operation-d2", tmp_path / "parent" / "root" / "operation-d2" / "repository"
+    repository.mkdir(parents=True)
     descriptors = tuple(os.open(path, os.O_RDONLY | os.O_DIRECTORY) for path in (parent, root, operation, repository))
     capability = None
     try:
@@ -680,6 +679,129 @@ def test_precreated_transaction_capability_owns_real_directory_fds_and_has_no_re
             capability.close()
         for descriptor in descriptors:
             os.close(descriptor)
+
+
+def test_precreated_transaction_capability_revalidates_bound_directory_entries_after_root_swap(tmp_path):
+    parent = tmp_path / "parent"
+    root = parent / "transaction-root"
+    operation = root / "operation-d2"
+    repository = operation / "repository"
+    repository.mkdir(parents=True)
+    descriptors = tuple(os.open(path, os.O_RDONLY | os.O_DIRECTORY) for path in (parent, root, operation, repository))
+    capability = None
+    try:
+        capability = RegistrationTransactionCapabilityV1.open_precreated(*descriptors)
+        capability.validate_open_identities()
+
+        root.rename(parent / "replaced-root")
+        (parent / "transaction-root" / "operation-d2" / "repository").mkdir(parents=True)
+
+        with pytest.raises(ValueError, match="directory.*identity|directory.*relationship"):
+            capability.validate_open_identities()
+    finally:
+        if capability is not None:
+            capability.close()
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+
+def test_precreated_transaction_capability_rejects_unsafe_layouts_and_rebinds_without_writes(tmp_path, monkeypatch):
+    writes = fsyncs = 0
+
+    def no_write(*_args, **_kwargs):
+        nonlocal writes
+        writes += 1
+        raise AssertionError("capability validation must not write")
+
+    def no_fsync(*_args, **_kwargs):
+        nonlocal fsyncs
+        fsyncs += 1
+        raise AssertionError("capability validation must not fsync")
+
+    monkeypatch.setattr(os, "write", no_write)
+    monkeypatch.setattr(os, "fsync", no_fsync)
+
+    def open_layout(base, *, root_name="transaction-root", repository_under_operation=True):
+        parent = base / "parent"
+        root = parent / root_name
+        operation = root / "operation-d2"
+        repository = operation / "repository" if repository_under_operation else root / "repository"
+        operation.mkdir(parents=True)
+        repository.mkdir(parents=True)
+        return parent, root, operation, repository, tuple(os.open(path, os.O_RDONLY | os.O_DIRECTORY) for path in (parent, root, operation, repository))
+
+    parent, root, operation, repository, descriptors = open_layout(tmp_path / "good")
+    capability = None
+    try:
+        capability = RegistrationTransactionCapabilityV1.open_precreated(*descriptors)
+        operation.rename(root / "replaced-operation")
+        (root / "operation-d2" / "repository").mkdir(parents=True)
+        with pytest.raises(ValueError, match="directory.*identity|directory.*relationship"):
+            capability.validate_open_identities()
+    finally:
+        if capability is not None:
+            capability.close()
+            with pytest.raises(ValueError):
+                capability.validate_open_identities()
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+    parent, root, operation, repository, descriptors = open_layout(tmp_path / "symlink")
+    capability = None
+    try:
+        capability = RegistrationTransactionCapabilityV1.open_precreated(*descriptors)
+        operation.rename(root / "real-operation")
+        os.symlink("real-operation", root / "operation-d2")
+        with pytest.raises(ValueError, match="directory.*identity|directory.*relationship"):
+            capability.validate_open_identities()
+    finally:
+        if capability is not None:
+            capability.close()
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+    parent, root, operation, repository, descriptors = open_layout(tmp_path / "wrong-repository", repository_under_operation=False)
+    try:
+        with pytest.raises(ValueError):
+            RegistrationTransactionCapabilityV1.open_precreated(*descriptors)
+        with pytest.raises(ValueError):
+            RegistrationTransactionCapabilityV1.open_precreated(descriptors[0], descriptors[0], descriptors[2], descriptors[3])
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+    parent, root, operation, repository, descriptors = open_layout(tmp_path / "unsafe-mode")
+    try:
+        parent.chmod(0o777)
+        with pytest.raises(ValueError):
+            RegistrationTransactionCapabilityV1.open_precreated(*descriptors)
+    finally:
+        parent.chmod(0o700)
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+    parent, root, operation, repository, descriptors = open_layout(tmp_path / "mount-rebind")
+    capability = None
+    try:
+        capability = RegistrationTransactionCapabilityV1.open_precreated(*descriptors)
+        real_fstatvfs = os.fstatvfs
+
+        def rebind_mount(fd):
+            result = real_fstatvfs(fd)
+            if fd == capability._fds[1]:
+                return type("ReboundMount", (), {"f_fsid": result.f_fsid + 1})()
+            return result
+
+        monkeypatch.setattr(os, "fstatvfs", rebind_mount)
+        with pytest.raises(ValueError, match="mount identity"):
+            capability.validate_open_identities()
+    finally:
+        if capability is not None:
+            capability.close()
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+    assert writes == fsyncs == 0
 
 
 def test_lifecycle_completion_and_policy_journal_bind_full_forward_chain_without_writes():

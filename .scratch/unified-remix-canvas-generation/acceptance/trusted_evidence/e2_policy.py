@@ -1154,14 +1154,63 @@ class RegistrationTransactionStateV1(_SelfDigestRecord):
 
 class RegistrationTransactionCapabilityV1:
     """In-memory owning directory handles; deliberately neither wire nor copyable."""
-    __slots__ = ("_fds", "directory_identities")
+    __slots__ = ("_fds", "directory_identities", "_entry_bindings", "_mount_identities")
     _TOKEN = object()
 
-    def __init__(self, token: object, descriptors: tuple[int, ...]) -> None:
+    def __init__(
+        self,
+        token: object,
+        descriptors: tuple[int, ...],
+        entry_bindings: tuple[tuple[int, str, tuple[int, int]], ...],
+        mount_identities: tuple[object, ...],
+    ) -> None:
         if token is not self._TOKEN:
             raise TypeError("use open_precreated with directory file descriptors")
         self._fds = descriptors
         self.directory_identities = tuple((os.fstat(fd).st_dev, os.fstat(fd).st_ino) for fd in descriptors)
+        self._entry_bindings = entry_bindings
+        self._mount_identities = mount_identities
+
+    @staticmethod
+    def _fd_path(fd: int) -> str:
+        try:
+            raw = fcntl.fcntl(fd, fcntl.F_GETPATH, b"\0" * 1024)
+            path = os.fsdecode(raw.split(b"\0", 1)[0])
+        except (AttributeError, OSError, ValueError):
+            try:
+                path = os.readlink(f"/proc/self/fd/{fd}")
+            except OSError as error:
+                raise ValueError("precreated directory path is unavailable") from error
+        if not os.path.isabs(path) or not path or path.endswith(" (deleted)"):
+            raise ValueError("precreated directory path is unavailable")
+        return path
+
+    @staticmethod
+    def _directory_metadata(fd: int) -> tuple[tuple[int, int], object]:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError("precreated descriptor is not a directory")
+        if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+            raise ValueError("precreated directory owner or mode is unsafe")
+        mount_identity = getattr(os.fstatvfs(fd), "f_fsid", None)
+        if mount_identity is None:
+            raise ValueError("precreated directory mount identity is unavailable")
+        return (info.st_dev, info.st_ino), mount_identity
+
+    @classmethod
+    def _bind_child(
+        cls,
+        parent_path: str,
+        child_path: str,
+        parent_fd_index: int,
+        child_identity: tuple[int, int],
+    ) -> tuple[int, str, tuple[int, int]]:
+        if os.path.dirname(child_path) != parent_path:
+            raise ValueError("precreated directory relationship is invalid")
+        name = os.path.basename(child_path)
+        if not name or name in {".", ".."}:
+            raise ValueError("precreated directory entry is invalid")
+        return parent_fd_index, name, child_identity
 
     @classmethod
     def open_precreated(cls, transaction_parent_fd: int, transaction_root_fd: int, operation_directory_fd: int, repository_fd: int) -> "RegistrationTransactionCapabilityV1":
@@ -1170,24 +1219,43 @@ class RegistrationTransactionCapabilityV1:
             raise ValueError("precreated directory descriptors are required")
         copies: list[int] = []
         try:
-            identities = []
+            identities: list[tuple[int, int]] = []
+            mount_identities: list[object] = []
+            paths: list[str] = []
             for fd in supplied:
-                info = os.fstat(fd)
-                if not stat.S_ISDIR(info.st_mode):
-                    raise ValueError("precreated descriptor is not a directory")
-                identities.append((info.st_dev, info.st_ino))
+                identity, mount_identity = cls._directory_metadata(fd)
+                identities.append(identity)
+                mount_identities.append(mount_identity)
+                paths.append(cls._fd_path(fd))
                 copies.append(os.dup(fd))
             if len(set(identities)) != 4:
                 raise ValueError("transaction and repository directories must have distinct identities")
-            return cls(cls._TOKEN, tuple(copies))
+            if len(set(mount_identities)) != 1:
+                raise ValueError("precreated directories cross a mount boundary")
+            bindings = (
+                cls._bind_child(paths[0], paths[1], 0, identities[1]),
+                cls._bind_child(paths[1], paths[2], 1, identities[2]),
+                cls._bind_child(paths[2], paths[3], 2, identities[3]),
+            )
+            return cls(cls._TOKEN, tuple(copies), bindings, tuple(mount_identities))
         except (OSError, TypeError, ValueError) as error:
             for copied in copies:
                 os.close(copied)
             raise ValueError("precreated directory validation failed") from error
 
     def validate_open_identities(self) -> None:
-        if tuple((os.fstat(fd).st_dev, os.fstat(fd).st_ino) for fd in self._fds) != self.directory_identities:
-            raise ValueError("directory descriptor identity changed")
+        try:
+            current = tuple(self._directory_metadata(fd) for fd in self._fds)
+            if tuple(identity for identity, _ in current) != self.directory_identities:
+                raise ValueError("directory descriptor identity changed")
+            if tuple(mount for _, mount in current) != self._mount_identities:
+                raise ValueError("directory mount identity changed")
+            for parent_index, name, expected_identity in self._entry_bindings:
+                entry = os.stat(name, dir_fd=self._fds[parent_index], follow_symlinks=False)
+                if not stat.S_ISDIR(entry.st_mode) or (entry.st_dev, entry.st_ino) != expected_identity:
+                    raise ValueError("directory relationship identity changed")
+        except OSError as error:
+            raise ValueError("directory relationship validation failed") from error
 
     def close(self) -> None:
         for fd in self._fds:
