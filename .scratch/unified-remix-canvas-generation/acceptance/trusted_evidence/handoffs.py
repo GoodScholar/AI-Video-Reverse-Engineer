@@ -1006,27 +1006,30 @@ class HandoffRegistryV1:
         return request_ref
 
     def fetch(self, source_store: TrustedHandoffStoreV1, export_request_ref: str, handoff_id: str, *, consumer_task: int, transport_id: str | None = None, expected_destination_executor_id: str | None = None, signing_domains: "VerifiedSigningDomainsV1 | None" = None) -> None:
-        transport = None
-        if transport_id is not None:
-            if signing_domains is None or expected_destination_executor_id is None:
-                raise ValueError("authenticated transport fetch requires destination and signing domains")
-            transport = verify_transport_closure(source_store, handoff_id, transport_id, consumer_task, expected_destination_executor_id, signing_domains)
-            if export_request_ref != transport[0].export_request_ref:
-                raise ValueError("fetch request does not match transport manifest")
-            if transport[0].policy_activation_proof_ref is not None:
-                manifest_value, seal_value, ready_value = transport
-                activated, handoff, _proof, _record, pointer, _core, refs = verify_policy_transport_source_closure(source_store, export_request_ref, handoff_id, consumer_task, expected_destination_executor_id, signing_domains)
-                for ref in refs:
-                    self.store.put_blob(source_store.read_blob(ref))
-                self.store.publish_pointer(handoff_id, source_store.read_pointer(handoff.core_pointer_name))
-                self.store.publish_policy_export_request_ref(handoff_id, export_request_ref)
-                self.store.publish_transport_file(handoff_id, transport_id, "manifest.json", manifest_value.canonical_bytes)
-                self.store.publish_transport_file(handoff_id, transport_id, "seal.json", seal_value.canonical_bytes)
-                self.store.publish_transport_file(handoff_id, transport_id, "ready.json", ready_value.canonical_bytes)
-                self.store.publish_transport_replay(manifest_value)
-                fetch = canonical_json_bytes({"consumerTask": consumer_task, "destinationExecutorId": expected_destination_executor_id, "handoffId": handoff_id, "pointerBytesDigest": handoff.core_pointer_bytes_digest, "recordRef": handoff.core_record_ref, "requestRef": export_request_ref, "schema": "trusted-handoff-fetch/v1", "transportId": transport_id})
-                self.store._publish_file(("fetches", f"{handoff_id}-{consumer_task}.json"), fetch)
-                return
+        if not isinstance(transport_id, str) or not transport_id or not isinstance(expected_destination_executor_id, str) or not expected_destination_executor_id or signing_domains is None:
+            raise ValueError("authenticated transport fetch requires destination and signing domains")
+        manifest_value, seal_value, ready_value = verify_transport_closure(
+            source_store, handoff_id, transport_id, consumer_task,
+            expected_destination_executor_id, signing_domains,
+        )
+        if export_request_ref != manifest_value.export_request_ref:
+            raise ValueError("fetch request does not match transport manifest")
+        if manifest_value.policy_activation_proof_ref is not None:
+            _activated, handoff, _proof, _record, _pointer, _core, refs = verify_policy_transport_source_closure(
+                source_store, export_request_ref, handoff_id, consumer_task,
+                expected_destination_executor_id, signing_domains,
+            )
+            for ref in refs:
+                self.store.put_blob(source_store.read_blob(ref))
+            self.store.publish_pointer(handoff_id, source_store.read_pointer(handoff.core_pointer_name))
+            self.store.publish_policy_export_request_ref(handoff_id, export_request_ref)
+            self.store.publish_transport_file(handoff_id, transport_id, "manifest.json", manifest_value.canonical_bytes)
+            self.store.publish_transport_file(handoff_id, transport_id, "seal.json", seal_value.canonical_bytes)
+            self.store.publish_transport_file(handoff_id, transport_id, "ready.json", ready_value.canonical_bytes)
+            self.store.publish_transport_replay(manifest_value)
+            fetch = canonical_json_bytes({"consumerTask": consumer_task, "destinationExecutorId": expected_destination_executor_id, "handoffId": handoff_id, "pointerBytesDigest": handoff.core_pointer_bytes_digest, "recordRef": handoff.core_record_ref, "requestRef": export_request_ref, "schema": "trusted-handoff-fetch/v1", "transportId": transport_id})
+            self.store._publish_file(("fetches", f"{handoff_id}-{consumer_task}.json"), fetch)
+            return
         request_bytes = source_store.read_blob(export_request_ref)
         request = HandoffExportRequestV1.from_canonical_bytes(request_bytes)
         if request.handoff_id != handoff_id or consumer_task not in request.consumer_tasks:
@@ -1042,17 +1045,27 @@ class HandoffRegistryV1:
         for payload in (request_bytes, record_bytes, pointer_bytes, *(source_store.read_blob(ref) for ref in refs)):
             self.store.put_blob(payload)
         self.store.publish_pointer(handoff_id, pointer_bytes)
-        if transport is not None:
-            manifest_value, seal_value, ready_value = transport
-            self.store.publish_transport_file(handoff_id, transport_id, "manifest.json", manifest_value.canonical_bytes)
-            self.store.publish_transport_file(handoff_id, transport_id, "seal.json", seal_value.canonical_bytes)
-            self.store.publish_transport_file(handoff_id, transport_id, "ready.json", ready_value.canonical_bytes)
-            self.store.publish_transport_replay(manifest_value)
+        self.store.publish_transport_file(handoff_id, transport_id, "manifest.json", manifest_value.canonical_bytes)
+        self.store.publish_transport_file(handoff_id, transport_id, "seal.json", seal_value.canonical_bytes)
+        self.store.publish_transport_file(handoff_id, transport_id, "ready.json", ready_value.canonical_bytes)
+        self.store.publish_transport_replay(manifest_value)
         manifest = canonical_json_bytes({"consumerTask": consumer_task, "destinationExecutorId": expected_destination_executor_id, "handoffId": handoff_id, "pointerBytesDigest": _digest(pointer_bytes), "recordRef": request.record_ref, "requestRef": export_request_ref, "schema": "trusted-handoff-fetch/v1", "transportId": transport_id})
         self.store._publish_file(("fetches", f"{handoff_id}-{consumer_task}.json"), manifest)
 
-    def import_(self, handoff_id: str, *, consumer_task: int) -> None:
+    def import_(self, handoff_id: str, *, consumer_task: int, expected_destination_executor_id: str | None = None, signing_domains: "VerifiedSigningDomainsV1 | None" = None) -> None:
         manifest = self._read_fetch_manifest(handoff_id, consumer_task)
+        transport_id = manifest["transportId"]
+        if not isinstance(transport_id, str) or not isinstance(expected_destination_executor_id, str) or not expected_destination_executor_id or signing_domains is None:
+            raise ValueError("authenticated transport import requires destination and signing domains")
+        transport, _seal, _ready = verify_transport_closure(
+            self.store, handoff_id, transport_id, consumer_task,
+            expected_destination_executor_id, signing_domains,
+        )
+        if (manifest["destinationExecutorId"], manifest["requestRef"], manifest["recordRef"], manifest["pointerBytesDigest"]) != (
+            expected_destination_executor_id, transport.export_request_ref, transport.record_ref,
+            transport.pointer_bytes_digest,
+        ):
+            raise ValueError("fetched handoff does not bind the verified transport")
         request_bytes = self.store.read_blob(manifest["requestRef"])
         try:
             request = HandoffExportRequestV1.from_canonical_bytes(request_bytes)

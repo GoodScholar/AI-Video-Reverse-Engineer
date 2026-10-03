@@ -437,14 +437,46 @@ def test_handoff_cli_fails_closed_before_finalize_and_for_reserved_producer(tmp_
     cli = Path(__file__).parent / "tools" / "trusted_handoff_store.py"
     read = subprocess.run([sys.executable, str(cli), "read", "ticket-23-product-v1"], env=environment, capture_output=True)
     publish = subprocess.run([sys.executable, str(cli), "publish-local", "--producer-task", "22"], env=environment, capture_output=True)
+    export = subprocess.run([sys.executable, str(cli), "publish-export-request", "--producer-task", "27", "--request", str(tmp_path / "missing-request")], env=environment, capture_output=True)
     assert read.returncode != 0
     assert publish.returncode != 0
+    assert export.returncode != 0
     assert b"not finalized" in read.stderr
     assert b"reserved producer" in publish.stderr
+    assert b"reserved producer" in export.stderr
 
 
-def test_registry_fetches_only_verified_canonical_request_closure_and_import_stays_unfinalized(tmp_path):
-    """A consumer accepts source CAS bytes only after the request closes every digest."""
+def test_handoff_cli_allows_a_nonreserved_export_request_producer(tmp_path):
+    """The explicit gate blocks privileged producers without disabling ordinary export."""
+    root = (tmp_path / "store").resolve()
+    root.mkdir(mode=0o700)
+    source = TrustedHandoffStoreV1(root)
+    document = _source()
+    document_ref = source.put_blob(document.canonical_bytes)
+    record = _record(bindings=(("product-source", document_ref),))
+    pointer = HandoffPointerV1(
+        "trusted-acceptance-handoff-pointer/v1", record.handoff_id, record.record_digest,
+        record.record_digest, 22, COMMIT,
+    )
+    request = HandoffExportRequestV1(
+        "trusted-handoff-export-request/v1", record.handoff_id, record.record_digest,
+        record.record_digest, "sha256:" + hashlib.sha256(pointer.canonical_bytes).hexdigest(),
+        (23,), record.binding_set_digest,
+    )
+    HandoffRegistryV1(source).publish_local(record, pointer, (document.canonical_bytes,))
+    request_path = tmp_path / "request.json"
+    request_path.write_bytes(request.canonical_bytes)
+    environment = {**os.environ, "TRUSTED_HANDOFF_STORE_ROOT": str(root), "TRUSTED_HANDOFF_STORE_LEASE": _store_lease(root), "PYTHONPATH": str(Path(__file__).parent)}
+    cli = Path(__file__).parent / "tools" / "trusted_handoff_store.py"
+
+    result = subprocess.run([sys.executable, str(cli), "publish-export-request", "--producer-task", "23", "--request", str(request_path)], env=environment, capture_output=True)
+
+    assert result.returncode == 0
+    assert result.stdout.strip().decode("ascii") == "sha256:" + hashlib.sha256(request.canonical_bytes).hexdigest()
+
+
+def test_registry_refuses_unsealed_fetch_and_import_before_consumer_write(tmp_path):
+    """A canonical export request alone never authorizes consumer-visible bytes."""
     source_root = (tmp_path / "source").resolve()
     cache_root = (tmp_path / "cache").resolve()
     source_root.mkdir(mode=0o700)
@@ -475,17 +507,15 @@ def test_registry_fetches_only_verified_canonical_request_closure_and_import_sta
     request_ref = producer.publish_export_request(request)
 
     consumer = HandoffRegistryV1(TrustedHandoffStoreV1(cache_root))
-    consumer.fetch(source, request_ref, record.handoff_id, consumer_task=23)
-    consumer.import_(record.handoff_id, consumer_task=23)
-
-    with pytest.raises(ValueError, match="not finalized"):
-        consumer.finalize(record.handoff_id, expected_kind="product-source", expected_producer_task=22, consumer_task=23)
-    with pytest.raises(ValueError, match="not finalized"):
-        consumer.read_product_subject(record.handoff_id, consumer_task=23)
+    with pytest.raises(ValueError, match="authenticated transport"):
+        consumer.fetch(source, request_ref, record.handoff_id, consumer_task=23)
+    with pytest.raises(ValueError, match="fetched handoff is missing"):
+        consumer.import_(record.handoff_id, consumer_task=23)
+    assert list(cache_root.iterdir()) == []
 
 
-def test_registry_rejects_tampered_or_noncanonical_request_bytes_before_cache_write(tmp_path):
-    """Replacing a request's canonical bytes must fail before it is copied to a consumer cache."""
+def test_registry_requires_an_authenticated_transport_before_reading_request_bytes(tmp_path):
+    """An unsealed request cannot reach the consumer cache, canonical or otherwise."""
     source_root = (tmp_path / "source").resolve()
     cache_root = (tmp_path / "cache").resolve()
     source_root.mkdir(mode=0o700)
@@ -494,7 +524,7 @@ def test_registry_rejects_tampered_or_noncanonical_request_bytes_before_cache_wr
     raw = b'{"bindingSetDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "consumerTasks":[23],"handoffId":"x","pointerBytesDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","recordFullBytesDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","recordRef":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","schema":"trusted-handoff-export-request/v1"}'
     ref = source.put_blob(raw)
 
-    with pytest.raises(ValueError, match="canonical"):
+    with pytest.raises(ValueError, match="authenticated transport"):
         HandoffRegistryV1(TrustedHandoffStoreV1(cache_root)).fetch(source, ref, "x", consumer_task=23)
     assert list(cache_root.iterdir()) == []
 
@@ -965,7 +995,16 @@ def test_run_transport_creates_distinct_sealed_ready_closures_for_two_consumers(
             consumer_task=23, transport_id="ticket-23-product-v1-c23",
             expected_destination_executor_id="executor-23", signing_domains=domains,
         )
-        consumer.import_(record.handoff_id, consumer_task=23)
+        cached_seal = cache_root / "transports" / record.handoff_id / "ticket-23-product-v1-c23" / "seal.json"
+        original_cached_seal = cached_seal.read_bytes()
+        tampered_cached_seal = json.loads(original_cached_seal)
+        tampered_cached_seal["nonce"] = "tampered-after-fetch"
+        cached_seal.write_bytes(canonical_json_bytes(tampered_cached_seal))
+        with pytest.raises(ValueError):
+            consumer.import_(record.handoff_id, consumer_task=23, expected_destination_executor_id="executor-23", signing_domains=domains)
+        assert not (cache_root / "imports").exists()
+        cached_seal.write_bytes(original_cached_seal)
+        consumer.import_(record.handoff_id, consumer_task=23, expected_destination_executor_id="executor-23", signing_domains=domains)
         with pytest.raises(ValueError, match="not finalized"):
             consumer.read_product_subject(record.handoff_id, consumer_task=23)
         consumer.finalize(
@@ -975,6 +1014,53 @@ def test_run_transport_creates_distinct_sealed_ready_closures_for_two_consumers(
         assert consumer.read_product_subject(
             record.handoff_id, consumer_task=23, expected_destination_executor_id="executor-23", signing_domains=domains,
         ).hex == COMMIT.hex
+        transport_root = tmp_path / "target-23" / "transports" / record.handoff_id / "ticket-23-product-v1-c23"
+        original = {name: (transport_root / name).read_bytes() for name in ("manifest.json", "seal.json", "ready.json")}
+        mutations = (
+            ("ready.json", "consumerTask", 25),
+            ("ready.json", "destinationExecutorId", "executor-other"),
+            ("seal.json", "signingKeyPurpose", "policy-activation"),
+            ("seal.json", "signatureDomain", "ai-video-reverse-engineer/policy-activation/v1"),
+            ("seal.json", "keyId", "activation-fixed"),
+            ("seal.json", "nonce", "other-nonce"),
+            ("seal.json", "sequence", 2),
+            ("manifest.json", "expiresAt", "2020-01-01T00:00:00Z"),
+        )
+        for name, field, value in mutations:
+            payload = json.loads(original[name])
+            payload[field] = value
+            (transport_root / name).write_bytes(canonical_json_bytes(payload))
+            rejected_cache = (tmp_path / f"rejected-{field}").resolve()
+            rejected_cache.mkdir(mode=0o700)
+            with pytest.raises(ValueError):
+                HandoffRegistryV1(TrustedHandoffStoreV1(rejected_cache)).fetch(
+                    TrustedHandoffStoreV1((tmp_path / "target-23").resolve()), request_ref,
+                    record.handoff_id, consumer_task=23, transport_id="ticket-23-product-v1-c23",
+                    expected_destination_executor_id="executor-23", signing_domains=domains,
+                )
+            assert list(rejected_cache.iterdir()) == []
+            (transport_root / name).write_bytes(original[name])
+        (transport_root / "ready.json").unlink()
+        missing_ready_cache = (tmp_path / "rejected-missing-ready").resolve()
+        missing_ready_cache.mkdir(mode=0o700)
+        with pytest.raises(ValueError):
+            HandoffRegistryV1(TrustedHandoffStoreV1(missing_ready_cache)).fetch(
+                TrustedHandoffStoreV1((tmp_path / "target-23").resolve()), request_ref,
+                record.handoff_id, consumer_task=23, transport_id="ticket-23-product-v1-c23",
+                expected_destination_executor_id="executor-23", signing_domains=domains,
+            )
+        assert list(missing_ready_cache.iterdir()) == []
+        (transport_root / "ready.json").write_bytes(original["ready.json"])
+        (transport_root / "seal.json").unlink()
+        missing_seal_cache = (tmp_path / "rejected-missing-seal").resolve()
+        missing_seal_cache.mkdir(mode=0o700)
+        with pytest.raises(ValueError):
+            HandoffRegistryV1(TrustedHandoffStoreV1(missing_seal_cache)).fetch(
+                TrustedHandoffStoreV1((tmp_path / "target-23").resolve()), request_ref,
+                record.handoff_id, consumer_task=23, transport_id="ticket-23-product-v1-c23",
+                expected_destination_executor_id="executor-23", signing_domains=domains,
+            )
+        assert list(missing_seal_cache.iterdir()) == []
     finally:
         os.close(key_fd)
 
@@ -1087,7 +1173,7 @@ def test_policy_transport_runs_the_product_stages_then_finalizes_and_reads(tmp_p
     cache_root = (tmp_path / "policy-cache").resolve(); cache_root.mkdir(mode=0o700)
     consumer = HandoffRegistryV1(TrustedHandoffStoreV1(cache_root))
     consumer.fetch(TrustedHandoffStoreV1(target_root), request_ref, record.handoff_id, consumer_task=28, transport_id="ticket-23-policy-v1-c28", expected_destination_executor_id="executor-28", signing_domains=domains)
-    consumer.import_(record.handoff_id, consumer_task=28)
+    consumer.import_(record.handoff_id, consumer_task=28, expected_destination_executor_id="executor-28", signing_domains=domains)
     consumer.finalize(record.handoff_id, expected_kind="policy", expected_producer_task=27, consumer_task=28, expected_destination_executor_id="executor-28", signing_domains=domains)
     assert consumer.read(record.handoff_id, consumer_task=28, field="producerCommit.hex", expected_destination_executor_id="executor-28", signing_domains=domains) == record.producer_commit.hex
     wrong_cache = (tmp_path / "wrong-policy-cache").resolve(); wrong_cache.mkdir(mode=0o700)
@@ -1107,6 +1193,65 @@ def test_policy_transport_runs_the_product_stages_then_finalizes_and_reads(tmp_p
             )
     finally:
         os.close(key_fd)
+
+
+def test_policy_activation_cli_verifies_the_cached_proof_and_source_closure(tmp_path):
+    """The policy CLI must report production-verifier output, never a fixed stub."""
+    from tools.trusted_handoff_orchestrator import run_policy_transport
+
+    source, record, request_ref, transport_seed, domains = _policy_transport_fixture(tmp_path)
+    target_root = (tmp_path / "policy-target").resolve(); target_root.mkdir(mode=0o700)
+    stage_root = (tmp_path / "policy-stage").resolve(); stage_root.mkdir(mode=0o700)
+    key_path = tmp_path / "policy-transport-key"; key_path.write_bytes(transport_seed); key_path.chmod(0o400)
+    key_fd = os.open(key_path, os.O_RDONLY)
+    try:
+        run_policy_transport(
+            source_store=source, target_store=TrustedHandoffStoreV1(target_root), stage_root=stage_root,
+            export_request_ref=request_ref, handoff_id=record.handoff_id,
+            transport_id="ticket-23-policy-v1-c28", consumer_task=28,
+            store_namespace="ai-video-reverse-engineer/ticket-23", source_executor_id="policy-source",
+            destination_executor_id="executor-28", nonce="policy-nonce-28", sequence=1,
+            expires_at=None, signing_key_fd=key_fd, key_id="transport-fixed", signing_domains=domains,
+        )
+    finally:
+        os.close(key_fd)
+    cache_root = (tmp_path / "policy-cache").resolve(); cache_root.mkdir(mode=0o700)
+    consumer = HandoffRegistryV1(TrustedHandoffStoreV1(cache_root))
+    consumer.fetch(TrustedHandoffStoreV1(target_root), request_ref, record.handoff_id, consumer_task=28, transport_id="ticket-23-policy-v1-c28", expected_destination_executor_id="executor-28", signing_domains=domains)
+    consumer.import_(record.handoff_id, consumer_task=28, expected_destination_executor_id="executor-28", signing_domains=domains)
+
+    transport = _transport_registry(_test_transport_public_key(transport_seed))
+    activation = _activation_registry(_test_transport_public_key(bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")))
+    broker = _broker_registry()
+    files = {
+        "transport": transport,
+        "activation": activation,
+        "broker": broker,
+        "revocations": {"revokedKeyIds": []},
+        "allowed": _allowed(broker),
+    }
+    paths = {}
+    for name, payload in files.items():
+        path = tmp_path / f"{name}.json"
+        path.write_bytes(canonical_json_bytes(payload))
+        paths[name] = path
+    cli = Path(__file__).parent / "tools" / "trusted_handoff_store.py"
+    command = [
+        sys.executable, str(cli), "verify-policy-activation", "--cache-root", str(cache_root),
+        "--handoff-id", record.handoff_id, "--consumer-task", "28",
+        "--expected-destination-executor-id", "executor-28",
+        "--transport-registry", str(paths["transport"]), "--activation-registry", str(paths["activation"]),
+        "--broker-auth-registry", str(paths["broker"]), "--broker-auth-revocations", str(paths["revocations"]),
+        "--broker-auth-allowed-signers", str(paths["allowed"]),
+    ]
+    result = subprocess.run(command, env={**os.environ, "PYTHONPATH": str(Path(__file__).parent)}, capture_output=True)
+    wrong_command = command.copy()
+    wrong_command[wrong_command.index("--expected-destination-executor-id") + 1] = "executor-other"
+    wrong_destination = subprocess.run(wrong_command, env={**os.environ, "PYTHONPATH": str(Path(__file__).parent)}, capture_output=True)
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["operationId"] == "policy-operation-28"
+    assert wrong_destination.returncode != 0
 
 
 @pytest.mark.parametrize("location", ("activated-request", "policy-handoff", "activation-proof", "manifest", "seal", "ready"))

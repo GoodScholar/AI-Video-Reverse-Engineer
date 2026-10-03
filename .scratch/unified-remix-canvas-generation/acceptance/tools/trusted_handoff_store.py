@@ -8,8 +8,9 @@ import os
 from pathlib import Path
 import stat
 import sys
+import json
 
-from trusted_evidence.handoffs import HandoffExportRequestV1, HandoffPointerV1, HandoffRegistryV1, TrustedHandoffRecordV1, TrustedHandoffStoreV1, load_disjoint_signing_domains
+from trusted_evidence.handoffs import HandoffExportRequestV1, HandoffPointerV1, HandoffRegistryV1, TrustedHandoffRecordV1, TrustedHandoffStoreV1, load_disjoint_signing_domains, verify_policy_activation_proof, verify_policy_transport_source_closure, verify_transport_closure
 
 
 def _store(root: str | None) -> TrustedHandoffStoreV1:
@@ -126,6 +127,7 @@ def main(argv: list[str] | None = None) -> int:
     publish.add_argument("--pointer", type=Path)
     publish.add_argument("--blob", type=Path, action="append", default=[])
     export_request = commands.add_parser("publish-export-request")
+    export_request.add_argument("--producer-task", type=int, required=True)
     export_request.add_argument("--request", type=Path, required=True)
     verify_cache = commands.add_parser("verify-cache")
     verify_cache.add_argument("--cache-root", required=True)
@@ -137,6 +139,7 @@ def main(argv: list[str] | None = None) -> int:
     _domain_arguments(fetch)
     import_command = commands.add_parser("import")
     _arguments(import_command)
+    _domain_arguments(import_command)
     finalize = commands.add_parser("finalize")
     _arguments(finalize)
     _domain_arguments(finalize)
@@ -176,6 +179,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("producer task does not match record")
             registry.publish_local(record, pointer, tuple(item.read_bytes() for item in args.blob))
         elif args.command == "publish-export-request":
+            if args.producer_task in {22, 27}:
+                raise ValueError("reserved producer")
             request = HandoffExportRequestV1.from_canonical_bytes(args.request.read_bytes())
             print(HandoffRegistryV1(_store(None)).publish_export_request(request))
         elif args.command == "fetch":
@@ -183,11 +188,11 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("fetch identity is required")
             source = _store(args.store_root)
             request_ref = args.export_request_ref or source.read_export_request_ref(args.handoff_id)
-            HandoffRegistryV1(_cache(args.cache_root, require_empty=False, expected_mode=0o700)).fetch(source, request_ref, args.handoff_id, consumer_task=args.consumer_task, transport_id=args.transport_id, expected_destination_executor_id=args.expected_destination_executor_id, signing_domains=_domains(args) if args.transport_id is not None else None)
+            HandoffRegistryV1(_cache(args.cache_root, require_empty=False, expected_mode=0o700)).fetch(source, request_ref, args.handoff_id, consumer_task=args.consumer_task, transport_id=args.transport_id, expected_destination_executor_id=args.expected_destination_executor_id, signing_domains=_domains(args))
         elif args.command == "import":
             if not args.cache_root or not args.handoff_id or not args.consumer_task:
                 raise ValueError("import identity is required")
-            HandoffRegistryV1(_cache(args.cache_root, require_empty=False, expected_mode=0o700)).import_(args.handoff_id, consumer_task=args.consumer_task)
+            HandoffRegistryV1(_cache(args.cache_root, require_empty=False, expected_mode=0o700)).import_(args.handoff_id, consumer_task=args.consumer_task, expected_destination_executor_id=args.expected_destination_executor_id, signing_domains=_domains(args))
         elif args.command in {"finalize", "read", "read-product-subject"}:
             handoff_id = args.handoff_id or getattr(args, "legacy_handoff_id", None)
             if not args.cache_root or not handoff_id or not args.consumer_task:
@@ -201,7 +206,42 @@ def main(argv: list[str] | None = None) -> int:
                 product = registry.read_product_subject(handoff_id, consumer_task=args.consumer_task, expected_destination_executor_id=args.expected_destination_executor_id, signing_domains=_domains(args))
                 print(product.hex if args.field == "hex" else f"git://product@{product.hex}")
         elif args.command == "verify-policy-activation":
-            raise ValueError("policy activation proof transport is unavailable for a product-only handoff")
+            if not args.cache_root or args.handoff_id != "ticket-23-policy-v1" or not args.consumer_task or not args.expected_destination_executor_id:
+                raise ValueError("policy activation lifecycle identity is required")
+            store = _cache(args.cache_root, require_empty=False, expected_mode=0o700)
+            domains = _domains(args)
+            registry = HandoffRegistryV1(store)
+            fetched = registry._read_fetch_manifest(args.handoff_id, args.consumer_task)
+            transport_id = fetched["transportId"]
+            if not isinstance(transport_id, str) or fetched["destinationExecutorId"] != args.expected_destination_executor_id:
+                raise ValueError("policy activation fetch does not bind the requested destination")
+            transport, _seal, _ready = verify_transport_closure(
+                store, args.handoff_id, transport_id, args.consumer_task,
+                args.expected_destination_executor_id, domains,
+            )
+            request_ref = store.read_policy_export_request_ref(args.handoff_id)
+            if transport.export_request_ref != request_ref or fetched["requestRef"] != request_ref:
+                raise ValueError("policy activation fetch does not bind the policy source closure")
+            activated, _handoff, proof, _record, _pointer, _core, _refs = verify_policy_transport_source_closure(
+                store, request_ref, args.handoff_id, args.consumer_task,
+                args.expected_destination_executor_id, domains,
+            )
+            verified = verify_policy_activation_proof(proof.canonical_bytes, domains, {
+                "consumerTask": args.consumer_task,
+                "destinationExecutorId": args.expected_destination_executor_id,
+                "policyActivationProofRef": activated.policy_activation_proof_ref,
+                "policyActivationProofFullBytesDigest": activated.policy_activation_proof_full_bytes_digest,
+            })
+            print(json.dumps({
+                "consumerTask": args.consumer_task,
+                "destinationExecutorId": args.expected_destination_executor_id,
+                "handoffId": args.handoff_id,
+                "operationId": verified.operation_id,
+                "policyCommit": verified.policy_commit.to_wire(),
+                "proofFullBytesDigest": verified.proof_full_bytes_digest,
+                "proofRef": verified.proof_ref,
+                "schema": "trusted-policy-activation-verification/v1",
+            }, sort_keys=True, separators=(",", ":")))
         else:
             raise ValueError("unsupported command")
         return 0
