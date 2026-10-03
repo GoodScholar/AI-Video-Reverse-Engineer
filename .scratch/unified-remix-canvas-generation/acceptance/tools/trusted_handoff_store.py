@@ -9,7 +9,7 @@ from pathlib import Path
 import stat
 import sys
 
-from trusted_evidence.handoffs import HandoffExportRequestV1, HandoffPointerV1, HandoffRegistryV1, TrustedHandoffRecordV1, TrustedHandoffStoreV1
+from trusted_evidence.handoffs import HandoffExportRequestV1, HandoffPointerV1, HandoffRegistryV1, TrustedHandoffRecordV1, TrustedHandoffStoreV1, load_disjoint_signing_domains
 
 
 def _store(root: str | None) -> TrustedHandoffStoreV1:
@@ -110,6 +110,18 @@ def _arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--expected-producer-task", type=int)
 
 
+def _domain_arguments(parser: argparse.ArgumentParser) -> None:
+    for name in ("transport-registry", "activation-registry", "broker-auth-registry", "broker-auth-revocations", "broker-auth-allowed-signers"):
+        parser.add_argument(f"--{name}")
+
+
+def _domains(args: argparse.Namespace):
+    values = (args.transport_registry, args.activation_registry, args.broker_auth_registry, args.broker_auth_revocations, args.broker_auth_allowed_signers)
+    if any(value is None for value in values):
+        raise ValueError("authenticated transport requires all signing-domain inputs")
+    return load_disjoint_signing_domains(*(Path(value).read_bytes() for value in values))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -129,21 +141,28 @@ def main(argv: list[str] | None = None) -> int:
     fetch = commands.add_parser("fetch")
     _arguments(fetch)
     fetch.add_argument("--export-request-ref")
+    _domain_arguments(fetch)
     import_command = commands.add_parser("import")
     _arguments(import_command)
     finalize = commands.add_parser("finalize")
     _arguments(finalize)
+    _domain_arguments(finalize)
     read = commands.add_parser("read")
     _arguments(read)
+    _domain_arguments(read)
     read.add_argument("--field", default="producerCommit.hex")
     read.add_argument("legacy_handoff_id", nargs="?")
     subject = commands.add_parser("read-product-subject")
     _arguments(subject)
+    _domain_arguments(subject)
     subject.add_argument("--field", choices=("hex", "canonicalSubject"), default="hex")
     subject.add_argument("legacy_handoff_id", nargs="?")
     cleanup = commands.add_parser("cleanup-owned-tree")
     cleanup.add_argument("--root", required=True)
     cleanup.add_argument("--expected-mode", type=lambda value: int(value, 8), required=True)
+    activation = commands.add_parser("verify-policy-activation")
+    _arguments(activation)
+    _domain_arguments(activation)
     args = parser.parse_args(argv)
     try:
         if args.command == "verify-root":
@@ -171,7 +190,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("fetch identity is required")
             source = _store(args.store_root)
             request_ref = args.export_request_ref or source.read_export_request_ref(args.handoff_id)
-            HandoffRegistryV1(_cache(args.cache_root, require_empty=False, expected_mode=0o700)).fetch(source, request_ref, args.handoff_id, consumer_task=args.consumer_task)
+            HandoffRegistryV1(_cache(args.cache_root, require_empty=False, expected_mode=0o700)).fetch(source, request_ref, args.handoff_id, consumer_task=args.consumer_task, transport_id=args.transport_id, expected_destination_executor_id=args.expected_destination_executor_id, signing_domains=_domains(args) if args.transport_id is not None else None)
         elif args.command == "import":
             if not args.cache_root or not args.handoff_id or not args.consumer_task:
                 raise ValueError("import identity is required")
@@ -182,12 +201,14 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("not finalized: lifecycle identity is required")
             registry = HandoffRegistryV1(_cache(args.cache_root, require_empty=False, expected_mode=0o700))
             if args.command == "finalize":
-                registry.finalize(handoff_id, expected_kind=args.expected_kind, expected_producer_task=args.expected_producer_task, consumer_task=args.consumer_task)
+                registry.finalize(handoff_id, expected_kind=args.expected_kind, expected_producer_task=args.expected_producer_task, consumer_task=args.consumer_task, expected_destination_executor_id=args.expected_destination_executor_id, signing_domains=_domains(args))
             elif args.command == "read":
-                print(registry.read(handoff_id, consumer_task=args.consumer_task, field=args.field))
+                print(registry.read(handoff_id, consumer_task=args.consumer_task, field=args.field, expected_destination_executor_id=args.expected_destination_executor_id, signing_domains=_domains(args)))
             else:
-                product = registry.read_product_subject(handoff_id, consumer_task=args.consumer_task)
+                product = registry.read_product_subject(handoff_id, consumer_task=args.consumer_task, expected_destination_executor_id=args.expected_destination_executor_id, signing_domains=_domains(args))
                 print(product.hex if args.field == "hex" else f"git://product@{product.hex}")
+        elif args.command == "verify-policy-activation":
+            raise ValueError("policy activation proof transport is unavailable for a product-only handoff")
         else:
             raise ValueError("unsupported command")
         return 0

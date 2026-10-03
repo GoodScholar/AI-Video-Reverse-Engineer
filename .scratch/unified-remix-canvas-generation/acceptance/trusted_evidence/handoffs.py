@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import base64
+from datetime import datetime, timezone
 import hashlib
 import os
 from pathlib import Path
@@ -327,6 +328,289 @@ class TrustedHandoffStoreV1:
         except (UnicodeDecodeError, ValueError) as error:
             raise ValueError("export request ref is invalid") from error
 
+    def _transport_path(self, handoff_id: str, transport_id: str, name: str) -> Path:
+        if not all(isinstance(value, str) and value and "/" not in value for value in (handoff_id, transport_id, name)):
+            raise ValueError("transport path identity is invalid")
+        return self.root / "transports" / handoff_id / transport_id / name
+
+    def publish_transport_file(self, handoff_id: str, transport_id: str, name: str, payload: bytes) -> bool:
+        if not isinstance(payload, bytes):
+            raise ValueError("transport payload must be bytes")
+        return self._publish(self._transport_path(handoff_id, transport_id, name), payload)
+
+    def read_transport_file(self, handoff_id: str, transport_id: str, name: str) -> bytes:
+        path = self._transport_path(handoff_id, transport_id, name)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("transport file is missing or unsafe")
+        return path.read_bytes()
+
+    def publish_transport_replay(self, manifest: "HandoffTransferManifestV1") -> None:
+        self._publish(self._transport_replay_path(manifest), _transport_replay_bytes(manifest))
+
+    def verify_transport_replay(self, manifest: "HandoffTransferManifestV1") -> None:
+        path = self._transport_replay_path(manifest)
+        if path.is_symlink() or not path.is_file() or path.read_bytes() != _transport_replay_bytes(manifest):
+            raise ValueError("transport replay state is missing or mixed")
+
+    def _transport_replay_path(self, manifest: "HandoffTransferManifestV1") -> Path:
+        destination_key = hashlib.sha256(manifest.destination_executor_id.encode("utf-8")).hexdigest()
+        return self.root / "transport-replays" / manifest.handoff_id / f"{manifest.consumer_task}-{destination_key}-{manifest.sequence}.json"
+
+
+def _require_transport_identity(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value or "/" in value or "\x00" in value:
+        raise ValueError(f"{field} is invalid")
+    return value
+
+
+def _require_nonce(value: object) -> str:
+    if not isinstance(value, str) or not value or len(value) > 256:
+        raise ValueError("transport nonce is invalid")
+    return value
+
+
+def _require_namespace(value: object) -> str:
+    if not isinstance(value, str) or not value or value.startswith("/") or "\x00" in value or any(part in {"", ".", ".."} for part in value.split("/")):
+        raise ValueError("store_namespace is invalid")
+    return value
+
+
+def _require_expiry(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError("transport expiry is invalid")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("transport expiry is invalid") from error
+    if parsed.tzinfo is None:
+        raise ValueError("transport expiry must include a timezone")
+    return value
+
+
+def _proof_fields(ref: object, digest: object) -> tuple[str | None, str | None]:
+    if ref is None and digest is None:
+        return None, None
+    _require_digest(ref, "policy_activation_proof_ref")
+    _require_digest(digest, "policy_activation_proof_full_bytes_digest")
+    if ref != digest:
+        raise ValueError("policy proof reference must equal its full-bytes digest")
+    return ref, digest
+
+
+@dataclass(frozen=True, slots=True)
+class TransportJobV1:
+    """In-memory only complete invocation input for the four transport stages."""
+
+    source_store_root: Path
+    target_store_root: Path
+    stage_root: Path
+    export_request_ref: str
+    handoff_id: str
+    transport_id: str
+    consumer_task: int
+    store_namespace: str
+    source_executor_id: str
+    destination_executor_id: str
+    nonce: str
+    sequence: int
+    expires_at: str | None
+    policy_activation_proof_ref: str | None
+    policy_activation_proof_full_bytes_digest: str | None
+    signing_key_fd: int
+    key_id: str
+    signing_key_purpose: str = "transport-seal"
+    signature_domain: str = "ai-video-reverse-engineer/transport-seal/v1"
+
+    def __post_init__(self) -> None:
+        for path in (self.source_store_root, self.target_store_root, self.stage_root):
+            if not isinstance(path, Path) or not path.is_absolute():
+                raise ValueError("transport roots must be absolute paths")
+        for field in ("export_request_ref",):
+            _require_digest(getattr(self, field), field)
+        for field in ("handoff_id", "transport_id", "source_executor_id", "destination_executor_id", "key_id"):
+            _require_transport_identity(getattr(self, field), field)
+        _require_namespace(self.store_namespace)
+        if not isinstance(self.consumer_task, int) or self.consumer_task <= 0 or not isinstance(self.sequence, int) or self.sequence < 0:
+            raise ValueError("transport consumer or sequence is invalid")
+        _require_nonce(self.nonce)
+        _require_expiry(self.expires_at)
+        _proof_fields(self.policy_activation_proof_ref, self.policy_activation_proof_full_bytes_digest)
+        if not isinstance(self.signing_key_fd, int) or self.signing_key_fd < 0 or self.signing_key_purpose != "transport-seal" or self.signature_domain != "ai-video-reverse-engineer/transport-seal/v1":
+            raise ValueError("transport signing identity is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class HandoffTransferManifestV1:
+    schema: str
+    export_request_ref: str
+    export_request_full_bytes_digest: str
+    store_namespace: str
+    handoff_id: str
+    transport_id: str
+    consumer_task: int
+    record_ref: str
+    record_full_bytes_digest: str
+    pointer_name: str
+    pointer_bytes_digest: str
+    source_executor_id: str
+    destination_executor_id: str
+    nonce: str
+    sequence: int
+    expires_at: str | None
+    policy_activation_proof_ref: str | None
+    policy_activation_proof_full_bytes_digest: str | None
+    blob_refs: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.schema != "trusted-handoff-transfer/v1" or self.export_request_ref != self.export_request_full_bytes_digest:
+            raise ValueError("transport manifest identity is invalid")
+        for field in ("export_request_ref", "export_request_full_bytes_digest", "record_ref", "record_full_bytes_digest", "pointer_bytes_digest"):
+            _require_digest(getattr(self, field), field)
+        if self.record_ref != self.record_full_bytes_digest:
+            raise ValueError("transport manifest record digest is invalid")
+        for field in ("handoff_id", "transport_id", "pointer_name", "source_executor_id", "destination_executor_id"):
+            _require_transport_identity(getattr(self, field), field)
+        _require_namespace(self.store_namespace)
+        if self.pointer_name != self.handoff_id or not isinstance(self.consumer_task, int) or self.consumer_task <= 0 or not isinstance(self.sequence, int) or self.sequence < 0:
+            raise ValueError("transport manifest binding is invalid")
+        _require_nonce(self.nonce)
+        _require_expiry(self.expires_at)
+        _proof_fields(self.policy_activation_proof_ref, self.policy_activation_proof_full_bytes_digest)
+        if not self.blob_refs or tuple(sorted(self.blob_refs)) != self.blob_refs or len(set(self.blob_refs)) != len(self.blob_refs):
+            raise ValueError("transport manifest blobs are not a canonical closure")
+        for ref in self.blob_refs:
+            _require_digest(ref, "transport blob ref")
+
+    def to_wire(self) -> dict[str, object]:
+        return {"blobRefs": list(self.blob_refs), "consumerTask": self.consumer_task, "destinationExecutorId": self.destination_executor_id, "expiresAt": self.expires_at, "exportRequestFullBytesDigest": self.export_request_full_bytes_digest, "exportRequestRef": self.export_request_ref, "handoffId": self.handoff_id, "nonce": self.nonce, "pointerBytesDigest": self.pointer_bytes_digest, "pointerName": self.pointer_name, "policyActivationProofFullBytesDigest": self.policy_activation_proof_full_bytes_digest, "policyActivationProofRef": self.policy_activation_proof_ref, "recordFullBytesDigest": self.record_full_bytes_digest, "recordRef": self.record_ref, "schema": self.schema, "sequence": self.sequence, "sourceExecutorId": self.source_executor_id, "storeNamespace": self.store_namespace, "transportId": self.transport_id}
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_wire())
+
+    @property
+    def digest(self) -> str:
+        return _digest(self.canonical_bytes)
+
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "HandoffTransferManifestV1":
+        raw = _strict_object(payload, {"blobRefs", "consumerTask", "destinationExecutorId", "expiresAt", "exportRequestFullBytesDigest", "exportRequestRef", "handoffId", "nonce", "pointerBytesDigest", "pointerName", "policyActivationProofFullBytesDigest", "policyActivationProofRef", "recordFullBytesDigest", "recordRef", "schema", "sequence", "sourceExecutorId", "storeNamespace", "transportId"})
+        if not isinstance(raw["blobRefs"], list):
+            raise ValueError("transport manifest blobs are invalid")
+        return cls(raw["schema"], raw["exportRequestRef"], raw["exportRequestFullBytesDigest"], raw["storeNamespace"], raw["handoffId"], raw["transportId"], raw["consumerTask"], raw["recordRef"], raw["recordFullBytesDigest"], raw["pointerName"], raw["pointerBytesDigest"], raw["sourceExecutorId"], raw["destinationExecutorId"], raw["nonce"], raw["sequence"], raw["expiresAt"], raw["policyActivationProofRef"], raw["policyActivationProofFullBytesDigest"], tuple(raw["blobRefs"]))
+
+
+def _transport_replay_bytes(manifest: HandoffTransferManifestV1) -> bytes:
+    return canonical_json_bytes({"consumerTask": manifest.consumer_task, "destinationExecutorId": manifest.destination_executor_id, "handoffId": manifest.handoff_id, "nonce": manifest.nonce, "schema": "trusted-handoff-transport-replay/v1", "sequence": manifest.sequence, "transportId": manifest.transport_id})
+
+
+@dataclass(frozen=True, slots=True)
+class TransportSealV1:
+    schema: str
+    store_namespace: str
+    handoff_id: str
+    transport_id: str
+    consumer_task: int
+    record_ref: str
+    record_full_bytes_digest: str
+    pointer_name: str
+    pointer_bytes_digest: str
+    transfer_manifest_digest: str
+    source_executor_id: str
+    destination_executor_id: str
+    nonce: str
+    sequence: int
+    expires_at: str | None
+    policy_activation_proof_ref: str | None
+    policy_activation_proof_full_bytes_digest: str | None
+    signing_key_purpose: str
+    signature_domain: str
+    signature_algorithm: str
+    key_id: str
+    signature: str
+
+    def __post_init__(self) -> None:
+        if self.schema != "trusted-handoff-transport-seal/v1" or self.signing_key_purpose != "transport-seal" or self.signature_domain != "ai-video-reverse-engineer/transport-seal/v1" or self.signature_algorithm != "ssh-ed25519":
+            raise ValueError("transport seal signing identity is invalid")
+        for field in ("record_ref", "record_full_bytes_digest", "pointer_bytes_digest", "transfer_manifest_digest"):
+            _require_digest(getattr(self, field), field)
+        if self.record_ref != self.record_full_bytes_digest:
+            raise ValueError("transport seal record digest is invalid")
+        for field in ("handoff_id", "transport_id", "pointer_name", "source_executor_id", "destination_executor_id", "key_id"):
+            _require_transport_identity(getattr(self, field), field)
+        _require_namespace(self.store_namespace)
+        if self.pointer_name != self.handoff_id or not isinstance(self.consumer_task, int) or self.consumer_task <= 0 or not isinstance(self.sequence, int) or self.sequence < 0:
+            raise ValueError("transport seal binding is invalid")
+        _require_nonce(self.nonce)
+        _require_expiry(self.expires_at)
+        _proof_fields(self.policy_activation_proof_ref, self.policy_activation_proof_full_bytes_digest)
+        _hex_signature(self.signature, "transport signature")
+
+    def unsigned_wire(self) -> dict[str, object]:
+        wire = self.to_wire()
+        del wire["signature"]
+        return wire
+
+    def to_wire(self) -> dict[str, object]:
+        return {"consumerTask": self.consumer_task, "destinationExecutorId": self.destination_executor_id, "expiresAt": self.expires_at, "handoffId": self.handoff_id, "keyId": self.key_id, "nonce": self.nonce, "pointerBytesDigest": self.pointer_bytes_digest, "pointerName": self.pointer_name, "policyActivationProofFullBytesDigest": self.policy_activation_proof_full_bytes_digest, "policyActivationProofRef": self.policy_activation_proof_ref, "recordFullBytesDigest": self.record_full_bytes_digest, "recordRef": self.record_ref, "schema": self.schema, "sequence": self.sequence, "signature": self.signature, "signatureAlgorithm": self.signature_algorithm, "signatureDomain": self.signature_domain, "signingKeyPurpose": self.signing_key_purpose, "sourceExecutorId": self.source_executor_id, "storeNamespace": self.store_namespace, "transferManifestDigest": self.transfer_manifest_digest, "transportId": self.transport_id}
+
+    @property
+    def unsigned_canonical_bytes(self) -> bytes:
+        return canonical_json_bytes(self.unsigned_wire())
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_wire())
+
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "TransportSealV1":
+        raw = _strict_object(payload, {"consumerTask", "destinationExecutorId", "expiresAt", "handoffId", "keyId", "nonce", "pointerBytesDigest", "pointerName", "policyActivationProofFullBytesDigest", "policyActivationProofRef", "recordFullBytesDigest", "recordRef", "schema", "sequence", "signature", "signatureAlgorithm", "signatureDomain", "signingKeyPurpose", "sourceExecutorId", "storeNamespace", "transferManifestDigest", "transportId"})
+        return cls(raw["schema"], raw["storeNamespace"], raw["handoffId"], raw["transportId"], raw["consumerTask"], raw["recordRef"], raw["recordFullBytesDigest"], raw["pointerName"], raw["pointerBytesDigest"], raw["transferManifestDigest"], raw["sourceExecutorId"], raw["destinationExecutorId"], raw["nonce"], raw["sequence"], raw["expiresAt"], raw["policyActivationProofRef"], raw["policyActivationProofFullBytesDigest"], raw["signingKeyPurpose"], raw["signatureDomain"], raw["signatureAlgorithm"], raw["keyId"], raw["signature"])
+
+
+@dataclass(frozen=True, slots=True)
+class TransportReadyMarkerV1:
+    schema: str
+    store_namespace: str
+    handoff_id: str
+    transport_id: str
+    consumer_task: int
+    source_executor_id: str
+    destination_executor_id: str
+    nonce: str
+    sequence: int
+    transfer_manifest_digest: str
+    transport_seal_digest: str
+    policy_activation_proof_ref: str | None
+    policy_activation_proof_full_bytes_digest: str | None
+
+    def __post_init__(self) -> None:
+        if self.schema != "trusted-handoff-transport-ready/v1":
+            raise ValueError("transport ready schema is invalid")
+        for field in ("transfer_manifest_digest", "transport_seal_digest"):
+            _require_digest(getattr(self, field), field)
+        for field in ("handoff_id", "transport_id", "source_executor_id", "destination_executor_id"):
+            _require_transport_identity(getattr(self, field), field)
+        _require_namespace(self.store_namespace)
+        if not isinstance(self.consumer_task, int) or self.consumer_task <= 0 or not isinstance(self.sequence, int) or self.sequence < 0:
+            raise ValueError("transport ready binding is invalid")
+        _require_nonce(self.nonce)
+        _proof_fields(self.policy_activation_proof_ref, self.policy_activation_proof_full_bytes_digest)
+
+    def to_wire(self) -> dict[str, object]:
+        return {"consumerTask": self.consumer_task, "destinationExecutorId": self.destination_executor_id, "handoffId": self.handoff_id, "nonce": self.nonce, "policyActivationProofFullBytesDigest": self.policy_activation_proof_full_bytes_digest, "policyActivationProofRef": self.policy_activation_proof_ref, "schema": self.schema, "sequence": self.sequence, "sourceExecutorId": self.source_executor_id, "storeNamespace": self.store_namespace, "transferManifestDigest": self.transfer_manifest_digest, "transportId": self.transport_id, "transportSealDigest": self.transport_seal_digest}
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_wire())
+
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "TransportReadyMarkerV1":
+        raw = _strict_object(payload, {"consumerTask", "destinationExecutorId", "handoffId", "nonce", "policyActivationProofFullBytesDigest", "policyActivationProofRef", "schema", "sequence", "sourceExecutorId", "storeNamespace", "transferManifestDigest", "transportId", "transportSealDigest"})
+        return cls(raw["schema"], raw["storeNamespace"], raw["handoffId"], raw["transportId"], raw["consumerTask"], raw["sourceExecutorId"], raw["destinationExecutorId"], raw["nonce"], raw["sequence"], raw["transferManifestDigest"], raw["transportSealDigest"], raw["policyActivationProofRef"], raw["policyActivationProofFullBytesDigest"])
+
 
 @dataclass(frozen=True, slots=True)
 class HandoffRegistryV1:
@@ -354,7 +638,14 @@ class HandoffRegistryV1:
         self.store.publish_export_request_ref(request.handoff_id, request_ref)
         return request_ref
 
-    def fetch(self, source_store: TrustedHandoffStoreV1, export_request_ref: str, handoff_id: str, *, consumer_task: int) -> None:
+    def fetch(self, source_store: TrustedHandoffStoreV1, export_request_ref: str, handoff_id: str, *, consumer_task: int, transport_id: str | None = None, expected_destination_executor_id: str | None = None, signing_domains: "VerifiedSigningDomainsV1 | None" = None) -> None:
+        transport = None
+        if transport_id is not None:
+            if signing_domains is None or expected_destination_executor_id is None:
+                raise ValueError("authenticated transport fetch requires destination and signing domains")
+            transport = verify_transport_closure(source_store, handoff_id, transport_id, consumer_task, expected_destination_executor_id, signing_domains)
+            if export_request_ref != transport[0].export_request_ref:
+                raise ValueError("fetch request does not match transport manifest")
         request_bytes = source_store.read_blob(export_request_ref)
         request = HandoffExportRequestV1.from_canonical_bytes(request_bytes)
         if request.handoff_id != handoff_id or consumer_task not in request.consumer_tasks:
@@ -370,7 +661,13 @@ class HandoffRegistryV1:
         for payload in (request_bytes, record_bytes, pointer_bytes, *(source_store.read_blob(ref) for ref in refs)):
             self.store.put_blob(payload)
         self.store.publish_pointer(handoff_id, pointer_bytes)
-        manifest = canonical_json_bytes({"consumerTask": consumer_task, "handoffId": handoff_id, "pointerBytesDigest": _digest(pointer_bytes), "recordRef": request.record_ref, "requestRef": export_request_ref, "schema": "trusted-handoff-fetch/v1"})
+        if transport is not None:
+            manifest_value, seal_value, ready_value = transport
+            self.store.publish_transport_file(handoff_id, transport_id, "manifest.json", manifest_value.canonical_bytes)
+            self.store.publish_transport_file(handoff_id, transport_id, "seal.json", seal_value.canonical_bytes)
+            self.store.publish_transport_file(handoff_id, transport_id, "ready.json", ready_value.canonical_bytes)
+            self.store.publish_transport_replay(manifest_value)
+        manifest = canonical_json_bytes({"consumerTask": consumer_task, "destinationExecutorId": expected_destination_executor_id, "handoffId": handoff_id, "pointerBytesDigest": _digest(pointer_bytes), "recordRef": request.record_ref, "requestRef": export_request_ref, "schema": "trusted-handoff-fetch/v1", "transportId": transport_id})
         self.store._publish(self.store.root / "fetches" / f"{handoff_id}-{consumer_task}.json", manifest)
 
     def import_(self, handoff_id: str, *, consumer_task: int) -> None:
@@ -381,19 +678,49 @@ class HandoffRegistryV1:
         record, _, _, _ = self._closure(self.store, request.record_ref, handoff_id)
         for _, ref in record.bindings:
             self.store.read_blob(ref)
-        self.store._publish(self.store.root / "imports" / f"{handoff_id}-{consumer_task}.json", canonical_json_bytes({"consumerTask": consumer_task, "handoffId": handoff_id, "requestRef": manifest["requestRef"], "schema": "trusted-handoff-import/v1"}))
+        self.store._publish(self.store.root / "imports" / f"{handoff_id}-{consumer_task}.json", canonical_json_bytes({"consumerTask": consumer_task, "destinationExecutorId": manifest["destinationExecutorId"], "handoffId": handoff_id, "requestRef": manifest["requestRef"], "schema": "trusted-handoff-import/v1", "transportId": manifest["transportId"]}))
 
-    def finalize(self, handoff_id: str, *, expected_kind: str, expected_producer_task: int, consumer_task: int) -> None:
-        self._read_import_manifest(handoff_id, consumer_task)
-        raise ValueError("not finalized: transport seal and ready marker are required")
+    def finalize(self, handoff_id: str, *, expected_kind: str, expected_producer_task: int, consumer_task: int, expected_destination_executor_id: str | None = None, signing_domains: "VerifiedSigningDomainsV1 | None" = None) -> None:
+        imported = self._read_import_manifest(handoff_id, consumer_task)
+        transport_id = imported["transportId"]
+        if not isinstance(transport_id, str) or not isinstance(expected_destination_executor_id, str) or signing_domains is None or imported["destinationExecutorId"] != expected_destination_executor_id:
+            raise ValueError("not finalized: transport seal and ready marker are required")
+        manifest, _seal, ready = verify_transport_closure(self.store, handoff_id, transport_id, consumer_task, expected_destination_executor_id, signing_domains)
+        record, _pointer, _record_bytes, _pointer_bytes = self._closure(self.store, manifest.record_ref, handoff_id)
+        if record.kind != expected_kind or record.producer_task != expected_producer_task:
+            raise ValueError("finalized handoff kind or producer is invalid")
+        final = canonical_json_bytes({"consumerTask": consumer_task, "handoffId": handoff_id, "readyDigest": _digest(ready.canonical_bytes), "schema": "trusted-handoff-finalized/v1", "transportId": transport_id})
+        self.store._publish(self.store.root / "finalized" / f"{handoff_id}-{consumer_task}.json", final)
 
-    def read(self, handoff_id: str, *, consumer_task: int, field: str) -> str:
-        self._read_import_manifest(handoff_id, consumer_task)
-        raise ValueError("not finalized: transport seal and ready marker are required")
+    def read(self, handoff_id: str, *, consumer_task: int, field: str, expected_destination_executor_id: str | None = None, signing_domains: "VerifiedSigningDomainsV1 | None" = None) -> str:
+        imported = self._read_import_manifest(handoff_id, consumer_task)
+        self._read_finalized(handoff_id, consumer_task, imported["transportId"])
+        if not isinstance(imported["transportId"], str) or not isinstance(expected_destination_executor_id, str) or signing_domains is None:
+            raise ValueError("read requires authenticated transport verification")
+        verify_transport_closure(self.store, handoff_id, imported["transportId"], consumer_task, expected_destination_executor_id, signing_domains)
+        request = HandoffExportRequestV1.from_canonical_bytes(self.store.read_blob(imported["requestRef"]))
+        record, _pointer, _record_bytes, _pointer_bytes = self._closure(self.store, request.record_ref, handoff_id)
+        if field == "producerCommit.hex":
+            return record.producer_commit.hex
+        if field == "producerCommit.algorithm":
+            return record.producer_commit.algorithm
+        raise ValueError("read field is invalid")
 
-    def read_product_subject(self, handoff_id: str, *, consumer_task: int) -> ProductGitObjectIdV1:
-        self._read_import_manifest(handoff_id, consumer_task)
-        raise ValueError("not finalized: transport seal and ready marker are required")
+    def read_product_subject(self, handoff_id: str, *, consumer_task: int, expected_destination_executor_id: str | None = None, signing_domains: "VerifiedSigningDomainsV1 | None" = None) -> ProductGitObjectIdV1:
+        imported = self._read_import_manifest(handoff_id, consumer_task)
+        self._read_finalized(handoff_id, consumer_task, imported["transportId"])
+        if not isinstance(imported["transportId"], str) or not isinstance(expected_destination_executor_id, str) or signing_domains is None:
+            raise ValueError("read requires authenticated transport verification")
+        verify_transport_closure(self.store, handoff_id, imported["transportId"], consumer_task, expected_destination_executor_id, signing_domains)
+        request = HandoffExportRequestV1.from_canonical_bytes(self.store.read_blob(imported["requestRef"]))
+        record, _pointer, _record_bytes, _pointer_bytes = self._closure(self.store, request.record_ref, handoff_id)
+        source_refs = [digest for name, digest in record.bindings if name == "product-source"]
+        if len(source_refs) != 1:
+            raise ValueError("product source binding is missing")
+        source = ProductRepositorySourceV1.from_canonical_bytes(self.store.read_blob(source_refs[0]))
+        if source.subject_commit != record.producer_commit:
+            raise ValueError("product subject does not match finalized record")
+        return source.subject_commit
 
     def _closure(self, store: TrustedHandoffStoreV1, record_ref: str, handoff_id: str) -> tuple[TrustedHandoffRecordV1, HandoffPointerV1, bytes, bytes]:
         record_bytes = store.read_blob(record_ref)
@@ -408,23 +735,40 @@ class HandoffRegistryV1:
         path = self.store.root / "fetches" / f"{handoff_id}-{consumer_task}.json"
         if path.is_symlink() or not path.is_file():
             raise ValueError("fetched handoff is missing")
-        raw = _strict_object(path.read_bytes(), {"consumerTask", "handoffId", "pointerBytesDigest", "recordRef", "requestRef", "schema"})
+        raw = _strict_object(path.read_bytes(), {"consumerTask", "destinationExecutorId", "handoffId", "pointerBytesDigest", "recordRef", "requestRef", "schema", "transportId"})
         if raw["schema"] != "trusted-handoff-fetch/v1" or raw["handoffId"] != handoff_id or raw["consumerTask"] != consumer_task:
             raise ValueError("fetched handoff identity is invalid")
         _require_digest(raw["requestRef"], "requestRef")
         _require_digest(raw["recordRef"], "recordRef")
         _require_digest(raw["pointerBytesDigest"], "pointerBytesDigest")
+        if raw["transportId"] is not None and not isinstance(raw["transportId"], str):
+            raise ValueError("fetched transport identity is invalid")
+        if raw["destinationExecutorId"] is not None and not isinstance(raw["destinationExecutorId"], str):
+            raise ValueError("fetched destination identity is invalid")
         return raw
 
     def _read_import_manifest(self, handoff_id: str, consumer_task: int) -> dict[str, object]:
         path = self.store.root / "imports" / f"{handoff_id}-{consumer_task}.json"
         if path.is_symlink() or not path.is_file():
             raise ValueError("imported handoff is missing")
-        raw = _strict_object(path.read_bytes(), {"consumerTask", "handoffId", "requestRef", "schema"})
+        raw = _strict_object(path.read_bytes(), {"consumerTask", "destinationExecutorId", "handoffId", "requestRef", "schema", "transportId"})
         if raw["schema"] != "trusted-handoff-import/v1" or raw["handoffId"] != handoff_id or raw["consumerTask"] != consumer_task:
             raise ValueError("imported handoff identity is invalid")
         _require_digest(raw["requestRef"], "requestRef")
         return raw
+
+    def _read_finalized(self, handoff_id: str, consumer_task: int, transport_id: object) -> None:
+        if not isinstance(transport_id, str):
+            raise ValueError("not finalized: transport identity is missing")
+        path = self.store.root / "finalized" / f"{handoff_id}-{consumer_task}.json"
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("not finalized: finalization marker is missing")
+        raw = _strict_object(path.read_bytes(), {"consumerTask", "handoffId", "readyDigest", "schema", "transportId"})
+        if raw["schema"] != "trusted-handoff-finalized/v1" or raw["handoffId"] != handoff_id or raw["consumerTask"] != consumer_task or raw["transportId"] != transport_id:
+            raise ValueError("not finalized: marker identity is invalid")
+        _require_digest(raw["readyDigest"], "readyDigest")
+        if _digest(self.store.read_transport_file(handoff_id, transport_id, "ready.json")) != raw["readyDigest"]:
+            raise ValueError("not finalized: ready marker changed")
 
 
 # C.1 signing-domain and policy-activation codecs.  These stay portable: the
@@ -707,6 +1051,49 @@ def _ed25519_verify(public_key: bytes, message: bytes, signature: bytes) -> bool
         return _ed_mul((base_x, base_y), scalar_s) == _ed_add(point_r, _ed_mul(public, challenge))
     except ValueError:
         return False
+
+
+def verify_transport_closure(store: TrustedHandoffStoreV1, handoff_id: str, transport_id: str, consumer_task: int, expected_destination_executor_id: str, signing_domains: VerifiedSigningDomainsV1) -> tuple[HandoffTransferManifestV1, TransportSealV1, TransportReadyMarkerV1]:
+    """Recompute the ready/seal/manifest closure before any consumer-visible use."""
+    if not isinstance(signing_domains, VerifiedSigningDomainsV1):
+        raise ValueError("transport signing domains are invalid")
+    ready_bytes = store.read_transport_file(handoff_id, transport_id, "ready.json")
+    ready = TransportReadyMarkerV1.from_canonical_bytes(ready_bytes)
+    manifest_bytes = store.read_transport_file(handoff_id, transport_id, "manifest.json")
+    manifest = HandoffTransferManifestV1.from_canonical_bytes(manifest_bytes)
+    seal_bytes = store.read_transport_file(handoff_id, transport_id, "seal.json")
+    seal = TransportSealV1.from_canonical_bytes(seal_bytes)
+    if ready.handoff_id != handoff_id or ready.transport_id != transport_id or ready.consumer_task != consumer_task or ready.destination_executor_id != expected_destination_executor_id:
+        raise ValueError("transport ready identity is invalid")
+    if ready.transfer_manifest_digest != _digest(manifest_bytes) or ready.transport_seal_digest != _digest(seal_bytes):
+        raise ValueError("transport ready digests are invalid")
+    store.verify_transport_replay(manifest)
+    for attribute in ("store_namespace", "handoff_id", "transport_id", "consumer_task", "source_executor_id", "destination_executor_id", "nonce", "sequence", "policy_activation_proof_ref", "policy_activation_proof_full_bytes_digest"):
+        if getattr(ready, attribute) != getattr(manifest, attribute) or getattr(seal, attribute) != getattr(manifest, attribute):
+            raise ValueError("transport closure bindings are mixed")
+    if seal.transfer_manifest_digest != _digest(manifest_bytes) or seal.record_ref != manifest.record_ref or seal.record_full_bytes_digest != manifest.record_full_bytes_digest or seal.pointer_name != manifest.pointer_name or seal.pointer_bytes_digest != manifest.pointer_bytes_digest:
+        raise ValueError("transport seal manifest binding is invalid")
+    registration = next((key for key in signing_domains.transport_keys if key.key_id == seal.key_id), None)
+    if registration is None or registration.purpose != seal.signing_key_purpose or registration.signature_domain != seal.signature_domain:
+        raise ValueError("transport signing key is not registered for this purpose")
+    message = seal.signature_domain.encode("utf-8") + b"\0" + seal.unsigned_canonical_bytes
+    if not _ed25519_verify(registration.resolved_public_key, message, _hex_signature(seal.signature, "transport signature")):
+        raise ValueError("transport seal signature is invalid")
+    if manifest.expires_at is not None and datetime.fromisoformat(manifest.expires_at.replace("Z", "+00:00")) <= datetime.now(timezone.utc):
+        raise ValueError("transport has expired")
+    # The current portable record is product-only; proof fields must stay absent.
+    if manifest.policy_activation_proof_ref is not None or manifest.policy_activation_proof_full_bytes_digest is not None:
+        raise ValueError("product transport carries an unexpected policy proof")
+    request_bytes = store.read_blob(manifest.export_request_ref)
+    request = HandoffExportRequestV1.from_canonical_bytes(request_bytes)
+    if _digest(request_bytes) != manifest.export_request_full_bytes_digest or request.handoff_id != handoff_id or consumer_task not in request.consumer_tasks or request.record_ref != manifest.record_ref:
+        raise ValueError("transport export request closure is invalid")
+    record, _pointer, record_bytes, pointer_bytes = HandoffRegistryV1(store)._closure(store, manifest.record_ref, handoff_id)
+    if _digest(record_bytes) != manifest.record_full_bytes_digest or _digest(pointer_bytes) != manifest.pointer_bytes_digest or tuple(sorted(ref for _, ref in record.bindings)) != manifest.blob_refs:
+        raise ValueError("transport record closure is invalid")
+    for ref in manifest.blob_refs:
+        store.read_blob(ref)
+    return manifest, seal, ready
 
 
 @dataclass(frozen=True, slots=True)

@@ -104,3 +104,30 @@ binding spec 没有重列下列类型；补充授权明确由实施计划第 99�
 
 - 修改：`.scratch/unified-remix-canvas-generation/acceptance/trusted_evidence/handoffs.py`、`.scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_handoffs.py`。
 - Scoped commit：`eb6b1ea feat: verify trusted policy activation proofs`。
+
+## C.2 — authenticated product transport state machine
+
+### RED / GREEN
+
+- RED：新增两消费者、真实 0700 临时 source/target/stage 根与固定 Ed25519 signer 的 transport 测试后，
+  `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_handoffs.py -k 'run_transport_creates_distinct'`
+  因 `ModuleNotFoundError: tools.trusted_handoff_orchestrator` 失败；随后 CLI surface 测试因缺少 `upload/sign-seal/install-transport` 子命令失败。
+- GREEN：同一 transport 测试通过；最终
+  `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_handoffs.py .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_e2_policy_v2.py`
+  为 `40 passed`。`py_compile` 三个实现文件与 `git diff --check` 均为 exit 0。
+
+### 实现与验证
+
+- 新增严格 canonical `TransportJobV1`（内存调用对象）、`HandoffTransferManifestV1`、`TransportSealV1`、`TransportReadyMarkerV1`；全量绑定 request/record/pointer/CAS closure、consumer/destination、nonce/sequence/expiry、key purpose/domain 及 manifest/seal digest。
+- 新增 orchestrator 公共阶段与 CLI：`verify-signing-domains`、`verify-export-request`、`export`、`upload`、`sign-seal`、`install-transport`、`run-transport`。私钥只从 read-only regular-file FD 读取，拒绝 key path/value 接口、错误 FD 类型、可写 FD 或非 32-byte slot；签名和验签均固定 transport domain。
+- 安装使用已有 temp + hard-link no-replace + fsync 发布原语，manifest/seal 先于 ready；same-byte retry 幂等、变更字节拒绝，且 replay marker 固定 consumer/destination/sequence/nonce/transport ID。消费者 fetch/import/finalize/read/read-product-subject 重验 ready→seal→manifest→CAS closure，finalize 前不可读。
+- 真实路径测试覆盖两个消费者独立 transport ID/nonce/seal/ready、交叉 consumer seal 拒绝、同字节 retry、同 consumer replay 拒绝、ready 前不可读及 finalize 后仅返回 verified SHA-1 product subject；没有 mock 存在性断言。
+
+### 已知边界
+
+- 当前 durable `TrustedHandoffRecordV1` 仍是既有 product-source-only codec；因此本切片对 product transport 强制 proof fields 为 null。C.1 的 policy activation proof codec 已复用为后续 policy record/activated-request bridge 的验证基础，但完整 policy handoff durable closure 尚无现有 record/pointer codec，不能声称 policy transport 已闭环。
+
+### 文件
+
+- 修改：`.scratch/unified-remix-canvas-generation/acceptance/trusted_evidence/handoffs.py`、`.scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_store.py`、`.scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_handoffs.py`。
+- 新增：`.scratch/unified-remix-canvas-generation/acceptance/tools/trusted_handoff_orchestrator.py`。
