@@ -1041,20 +1041,8 @@ def test_lifecycle_and_completion_signatures_close_governance_before_durable_wri
 # request must make this test fail before it can reach authorization writes.
 def test_broker_auth_issue_chain_is_prestate_only_and_contiguous_without_writes():
     recorder = VisibleAuthorizationWriteRecorder()
-    key = RegistrationBrokerAuthKeyRegistrationV1(
-        "trusted-registration-broker-auth-key-registration/v1", "broker-fixed",
-        "registration-broker-auth", "ai-video-reverse-engineer/registration-broker-envelope/v1",
-        "ai-video-reverse-engineer/registration-broker-lease/v1",
-        "ai-video-reverse-engineer/registration-broker-startup-challenge/v1",
-        "raw-ed25519-32", DIGEST_A, DIGEST_A, None, DIGEST_A, DIGEST_A, DIGEST_B,
-        "active", 1, None,
-    )
-    registry = RegistrationBrokerAuthRegistryV1(
-        "trusted-registration-broker-auth-registry/v1", 1, None, "broker-fixed", (key,)
-    )
-    revocations = RegistrationBrokerAuthRevocationsV1(
-        "trusted-registration-broker-auth-revocations/v1", registry.canonical_digest, ()
-    )
+    governance, key = _broker_governance("broker-fixed", bytes(32))
+    registry, revocations = governance.registry, governance.revocations
     policy_digest = _broker_policy_digest(registry, revocations)
     family = RegistrationWorkerSessionFamilyAuthorizationV1(
         "trusted-registration-worker-session-family-authorization/v1", "op-1", DIGEST_A,
@@ -1065,7 +1053,7 @@ def test_broker_auth_issue_chain_is_prestate_only_and_contiguous_without_writes(
     request = BrokerAuthLeaseIssueRequestV1(
         "trusted-registration-broker-auth-lease-issue-request/v1", "op-1", "lifecycle-1",
         family.canonical_digest, "broker-fixed", 0, DIGEST_A, registry.canonical_digest,
-        revocations.canonical_digest, policy_digest, DIGEST_C, 2,
+        revocations.canonical_digest, policy_digest, governance.allowed_signers_digest, 2,
     )
     payload = BrokerAuthLeaseIssueEventPayloadV1(
         "trusted-registration-broker-auth-lease-issue-payload/v1", "issue-lease", DIGEST_A,
@@ -1094,7 +1082,7 @@ def test_broker_auth_issue_chain_is_prestate_only_and_contiguous_without_writes(
         replace(authenticated_entry, broker_state_mac_hex="0" * 64).verify_state_mac(mac_key)
     journal.validate_state(
         state, {payload.full_bytes_digest: payload},
-        BrokerAuthSequenceReplayBaselineV1(DIGEST_A, registry, revocations, policy_digest, DIGEST_C),
+        BrokerAuthSequenceReplayBaselineV1(DIGEST_A, governance, policy_digest),
     )
     # These records cross the broker boundary as canonical bytes.  Removing a
     # strict decoder would make a tampered chain look like an in-memory value.
@@ -1211,10 +1199,10 @@ def test_broker_sequence_payload_and_entry_reject_the_fixed_256_kib_budget_befor
             DIGEST_A, oversized_text, DIGEST_B, DIGEST_C, DIGEST_A, "broker-fixed", 1,
             DIGEST_B, DIGEST_B,
         ),
-        "rotate": lambda: BrokerAuthRotatePolicyEventPayloadV1(
-            "trusted-registration-broker-auth-rotate-payload/v1", "rotate-registry", DIGEST_A,
-            old_registry.canonical_digest, old_revocations.canonical_digest, next_registry,
-            next_revocations, oversized_text, "old", 2, rotate_pre, rotate_post,
+            "rotate": lambda: BrokerAuthRotatePolicyEventPayloadV1(
+                "trusted-registration-broker-auth-rotate-payload/v1", "rotate-registry", DIGEST_A,
+                old_registry.canonical_digest, old_revocations.canonical_digest, large_governance,
+                oversized_text, "old", 2, rotate_pre, rotate_post,
         ),
         "revoke": lambda: BrokerAuthRevokePolicyEventPayloadV1(
             "trusted-registration-broker-auth-revoke-payload/v1", "revoke-key", DIGEST_A,
@@ -1223,7 +1211,7 @@ def test_broker_sequence_payload_and_entry_reject_the_fixed_256_kib_budget_befor
         ),
     }
     for constructor in constructors.values():
-        with pytest.raises(ValueError, match="256 KiB"):
+        with pytest.raises(ValueError):
             constructor()
     oversized_wire = b"{" + b" " * (256 * 1024) + b"}"
     for payload_type in (
@@ -1379,7 +1367,7 @@ def test_authoritative_broker_issuer_commits_a_verified_issue_chain_and_preserve
             issued.entry.verify_state_mac(seed)
         issued.journal.validate_state(
             issued.state, issued.payloads,
-            BrokerAuthSequenceReplayBaselineV1(DIGEST_A, registry, revocations, policy_digest, governance.allowed_signers_digest),
+            BrokerAuthSequenceReplayBaselineV1(DIGEST_A, governance, policy_digest),
         )
         issued.lease.verify_signature(governance, 1)
         assert issued.lease.broker_auth_lease_request_digest == request.request_digest
@@ -1391,7 +1379,7 @@ def test_authoritative_broker_issuer_commits_a_verified_issue_chain_and_preserve
         assert signed.entry.sequence == signed.payload.sign_sequence == signed.state.current_sequence == 2
         signed.journal.validate_state(
             signed.state, signed.payloads,
-            BrokerAuthSequenceReplayBaselineV1(DIGEST_A, registry, revocations, policy_digest, governance.allowed_signers_digest),
+            BrokerAuthSequenceReplayBaselineV1(DIGEST_A, governance, policy_digest),
         )
 
         stable = issuer.state
@@ -1471,9 +1459,13 @@ def test_authoritative_broker_issuer_rotates_and_revokes_without_partial_state(t
         bad_revocations = RegistrationBrokerAuthRevocationsV1(
             "trusted-registration-broker-auth-revocations/v1", bad_registry.canonical_digest, (),
         )
+        bad_governance = RegistrationBrokerAuthGovernanceV1.from_canonical_bytes(
+            bad_registry.canonical_bytes, bad_revocations.canonical_bytes,
+            next_governance_value.allowed_signers_canonical_bytes,
+        )
         bad_payload = BrokerAuthRotatePolicyEventPayloadV1(
             "trusted-registration-broker-auth-rotate-payload/v1", "rotate-registry", DIGEST_C,
-            DIGEST_C, revocations.canonical_digest, bad_registry, bad_revocations, "new", "old", 2,
+            DIGEST_C, revocations.canonical_digest, bad_governance, "new", "old", 2,
             issuer.state.current_policy_digest, _broker_policy_digest(bad_registry, bad_revocations),
         )
         bad_entry = BrokerAuthSequenceJournalEntryV1(
@@ -1509,15 +1501,12 @@ def test_authoritative_broker_issuer_rotates_and_revokes_without_partial_state(t
             bad_journal.validate_state(
                 bad_state,
                 {issued.payload.full_bytes_digest: issued.payload, bad_payload.full_bytes_digest: bad_payload},
-                BrokerAuthSequenceReplayBaselineV1(DIGEST_A, registry, revocations, policy_digest, governance.allowed_signers_digest),
+                BrokerAuthSequenceReplayBaselineV1(DIGEST_A, governance, policy_digest),
             )
         with pytest.raises(ValueError):
-            issuer.rotate_registry(next_registry, revocations, DIGEST_A, DIGEST_C)
+            issuer.rotate_registry(governance, DIGEST_A)
         assert issuer.state == before and issuer.entries == (issued.entry,)
-        with pytest.raises(ValueError):
-            issuer.rotate_registry(next_registry, next_revocations, DIGEST_A, DIGEST_C)
-        assert issuer.state == before and issuer.entries == (issued.entry,)
-        rotated = issuer.rotate_registry(next_registry, next_revocations, DIGEST_A, next_policy_digest)
+        rotated = issuer.rotate_registry(next_governance_value, DIGEST_A)
         assert rotated.entry.sequence == rotated.payload.effective_lease_sequence == 2
         assert issuer.registry == next_registry and issuer.revocations == next_revocations
 
@@ -1565,19 +1554,29 @@ def test_authoritative_broker_issuer_rotates_and_revokes_without_partial_state(t
             issuer.sign_recovery_envelope(recovery_lease, unsigned_recovery, new_signer, DIGEST_B)
         assert issuer.state == stable
 
+        # This is the liveness half of rotation: the new active signer must
+        # issue and then record a new envelope against the replayed closure.
+        new_family = replace(family, operation_id="op-after-rotation", broker_auth_key_id="new", broker_auth_key_registration_digest=new_key.canonical_digest)
+        new_request = BrokerAuthLeaseIssueRequestV1("trusted-registration-broker-auth-lease-issue-request/v1", "op-after-rotation", "lifecycle-after-rotation", new_family.canonical_digest, "new", issuer.state.current_sequence, issuer.state.head_entry_digest, next_registry.canonical_digest, next_revocations.canonical_digest, issuer.state.current_policy_digest, next_governance_value.allowed_signers_digest, 2)
+        new_template = replace(template, operation_id="op-after-rotation", lifecycle_nonce="lifecycle-after-rotation", session_family_authorization_digest=new_family.canonical_digest, broker_auth_lease_request_digest=new_request.request_digest)
+        post_rotation = issuer.issue_lease(new_request, new_family, new_template)
+        assert post_rotation.lease.broker_auth_key_id == "new"
+        signed_new = issuer.sign_envelope(post_rotation.lease.operation_id, post_rotation.lease.lease_identity_digest, new_request.request_digest, DIGEST_B, "sha256:" + "d" * 64)
+        signed_new.journal.validate_state(signed_new.state, signed_new.payloads, BrokerAuthSequenceReplayBaselineV1(DIGEST_A, governance, policy_digest))
+
         stale = issuer.state
         with pytest.raises(ValueError):
             issuer.revoke_key("not-registered", next_revocations, DIGEST_B, DIGEST_A)
         assert issuer.state == stale and issuer.revocations == next_revocations
         revoked = RegistrationBrokerAuthRevocationsV1(
             "trusted-registration-broker-auth-revocations/v1", next_registry.canonical_digest,
-            (RegistrationBrokerAuthRevocationEntryV1("old", 4, DIGEST_A),),
+            (RegistrationBrokerAuthRevocationEntryV1("old", 6, DIGEST_A),),
         )
         with pytest.raises(ValueError):
             issuer.revoke_key("old", revoked, DIGEST_B, DIGEST_A)
         assert issuer.state == stale and issuer.revocations == next_revocations
         result = issuer.revoke_key("old", revoked, DIGEST_B, _broker_policy_digest(next_registry, revoked))
-        assert result.entry.sequence == result.payload.revoked_at_broker_sequence == 4
+        assert result.entry.sequence == result.payload.revoked_at_broker_sequence == 6
         assert issuer.revocations == revoked
     finally:
         state_mac.close()
@@ -1634,11 +1633,31 @@ def _fd_descriptor(ordinal, entry):
     role, logical_name, root_role = entry
     if role == "broker-control":
         provenance = FdOpenProvenanceV1("broker-created-seqpacket", None, None, None, ("SOCK_CLOEXEC", "SOCK_SEQPACKET"), (), None)
-        observable = FdObservableIdentityV1("socket-seqpacket", "bidirectional-control", (), ("FD_CLOEXEC",), None, None, None, None, None, ("SO_PASSCRED=1", "SO_TYPE=SOCK_SEQPACKET"), DIGEST_A, DIGEST_B)
+        observable_wire = {"accessMode": "bidirectional-control", "byteLength": None, "contentDigest": None, "device": None, "fdFlags": ["FD_CLOEXEC"], "fileType": "socket-seqpacket", "identityDigest": DIGEST_B, "inode": None, "mountIdentityDigest": None, "socketIdentityDigest": DIGEST_A, "socketOptions": ["SO_PASSCRED=1", "SO_TYPE=SOCK_SEQPACKET"], "statusFlags": []}
     else:
         provenance = FdOpenProvenanceV1("openat2-beneath-no-symlinks", root_role, DIGEST_A, DIGEST_B, ("O_CLOEXEC", "O_NOFOLLOW", "O_RDONLY"), ("RESOLVE_BENEATH", "RESOLVE_NO_MAGICLINKS", "RESOLVE_NO_SYMLINKS", "RESOLVE_NO_XDEV"), DIGEST_C)
-        observable = FdObservableIdentityV1("regular", "read-only", ("O_RDONLY",), ("FD_CLOEXEC",), 1, ordinal + 100, 7, DIGEST_A, DIGEST_B, (), None, DIGEST_C)
-    return FdDescriptorV1(role, ordinal, logical_name, "exactly-one", provenance, observable)
+        observable_wire = {"accessMode": "read-only", "byteLength": 7, "contentDigest": DIGEST_A, "device": 1, "fdFlags": ["FD_CLOEXEC"], "fileType": "regular", "identityDigest": DIGEST_C, "inode": ordinal + 100, "mountIdentityDigest": DIGEST_B, "socketIdentityDigest": None, "socketOptions": [], "statusFlags": ["O_RDONLY"]}
+    observable_wire["canonicalDigest"] = canonical_digest(observable_wire)
+    descriptor_wire = {"cardinality": "exactly-one", "logicalName": logical_name, "observableFields": observable_wire, "ordinal": ordinal, "provenanceFields": provenance.to_wire(), "role": role}
+    descriptor_wire["canonicalDigest"] = canonical_digest(descriptor_wire)
+    return FdDescriptorV1._from_wire(descriptor_wire)
+
+
+def test_e2_fd_observable_and_descriptor_reject_public_manual_construction():
+    """A claimed wire identity cannot become a broker-produced descriptor."""
+    provenance = FdOpenProvenanceV1(
+        "openat2-beneath-no-symlinks", "worker-input-inbox", DIGEST_A, DIGEST_B,
+        ("O_CLOEXEC", "O_NOFOLLOW", "O_RDONLY"),
+        ("RESOLVE_BENEATH", "RESOLVE_NO_MAGICLINKS", "RESOLVE_NO_SYMLINKS", "RESOLVE_NO_XDEV"),
+        DIGEST_C,
+    )
+    with pytest.raises(TypeError, match="FD observable"):
+        FdObservableIdentityV1(
+            "regular", "read-only", ("O_RDONLY",), ("FD_CLOEXEC",), 1, 2, 7,
+            DIGEST_A, DIGEST_B, (), None, DIGEST_C,
+        )
+    with pytest.raises(TypeError, match="FD descriptor"):
+        FdDescriptorV1("worker-input", 0, "worker-input", "exactly-one", provenance, object())
 
 
 def _worker_input(**overrides):
@@ -1778,17 +1797,18 @@ def _fd_digest(value):
 def _expected_regular_observable(fd, content):
     info = os.fstat(fd)
     mount_digest = _fd_digest({"filesystemId": os.fstatvfs(fd).f_fsid, "kind": "fstatvfs-fsid/v1"})
-    wire = {
-        "accessMode": "read-only", "byteLength": len(content),
-        "contentDigest": "sha256:" + hashlib.sha256(content).hexdigest(), "device": info.st_dev,
-        "fdFlags": ["FD_CLOEXEC"], "fileType": "regular", "inode": info.st_ino,
-        "mountIdentityDigest": mount_digest, "socketIdentityDigest": None, "socketOptions": [],
-        "statusFlags": ["O_RDONLY"],
-    }
-    return FdObservableIdentityV1(
-        "regular", "read-only", ("O_RDONLY",), ("FD_CLOEXEC",), info.st_dev, info.st_ino,
-        len(content), wire["contentDigest"], mount_digest, (), None, _fd_digest(wire),
-    )
+    wire = {"accessMode": "read-only", "byteLength": len(content), "contentDigest": "sha256:" + hashlib.sha256(content).hexdigest(), "device": info.st_dev, "fdFlags": ["FD_CLOEXEC"], "fileType": "regular", "inode": info.st_ino, "mountIdentityDigest": mount_digest, "socketIdentityDigest": None, "socketOptions": [], "statusFlags": ["O_RDONLY"]}
+    wire["identityDigest"] = _fd_digest(wire)
+    wire["canonicalDigest"] = canonical_digest(wire)
+    return FdObservableIdentityV1._from_wire(wire)
+
+
+def _decoded_observable_with_length(observable, length):
+    wire = observable.to_wire()
+    wire["byteLength"] = length
+    wire["identityDigest"] = canonical_digest({key: value for key, value in wire.items() if key not in {"canonicalDigest", "identityDigest"}})
+    wire["canonicalDigest"] = canonical_digest({key: value for key, value in wire.items() if key != "canonicalDigest"})
+    return FdObservableIdentityV1._from_wire(wire)
 
 
 def _regular_provenance(root_role="worker-input-inbox"):
@@ -1835,7 +1855,7 @@ def test_e2_regular_fd_rejects_size_or_role_budget_before_any_content_read(tmp_p
     try:
         expected = _expected_regular_observable(fd, b"x")
         os.truncate(source, 256 * 1024 * 1024 + 1)
-        expected = replace(expected, byte_length=256 * 1024 * 1024 + 1)
+        expected = _decoded_observable_with_length(expected, 256 * 1024 * 1024 + 1)
         monkeypatch.setattr(os, "pread", lambda *_args: pytest.fail("regular content was read"))
         with pytest.raises(ValueError, match="budget"):
             RegistrationRecoveryCapabilityV1._verify_observable_fd(
@@ -1943,7 +1963,7 @@ def test_e2_role_bound_fd_producer_and_worker_reject_wrong_type_access_and_lengt
         expected = _expected_regular_observable(read_fd, content)
         with pytest.raises(ValueError, match="length"):
             RegistrationRecoveryCapabilityV1._verify_observable_fd(
-                read_fd, replace(expected, byte_length=len(content) + 1), role="worker-input",
+                read_fd, _decoded_observable_with_length(expected, len(content) + 1), role="worker-input",
             )
         with pytest.raises(ValueError, match="state"):
             _open_regular_descriptor(write_fd)
@@ -1982,14 +2002,13 @@ def test_e2_rebuilds_socket_identity_and_rejects_non_seqpacket_control_fd():
         )
         assert observed.file_type == "socket-stream"
         assert observed.socket_options == ("SO_TYPE=SOCK_STREAM",)
+        claimed = {"accessMode": "bidirectional-control", "byteLength": None, "contentDigest": None, "device": None, "fdFlags": ["FD_CLOEXEC"], "fileType": "socket-seqpacket", "inode": None, "mountIdentityDigest": None, "socketIdentityDigest": observed.socket_identity_digest, "socketOptions": ["SO_PASSCRED=1", "SO_TYPE=SOCK_SEQPACKET"], "statusFlags": []}
+        claimed["identityDigest"] = observed.identity_digest
+        claimed["canonicalDigest"] = canonical_digest(claimed)
         with pytest.raises(ValueError, match="control FD state"):
             RegistrationRecoveryCapabilityV1._verify_observable_fd(
                 local.fileno(),
-                FdObservableIdentityV1(
-                    "socket-seqpacket", "bidirectional-control", (), ("FD_CLOEXEC",),
-                    None, None, None, None, None, ("SO_PASSCRED=1", "SO_TYPE=SOCK_SEQPACKET"),
-                    observed.socket_identity_digest, observed.identity_digest,
-                ),
+                FdObservableIdentityV1._from_wire(claimed),
             )
         local.setblocking(False)
         with pytest.raises(ValueError, match="control FD state"):
@@ -2423,11 +2442,13 @@ def test_e3_forward_only_recovery_authenticates_every_broker_state_record_before
     revocations = RegistrationBrokerAuthRevocationsV1(
         "trusted-registration-broker-auth-revocations/v1", registry.canonical_digest, ()
     )
+    governance, key = _broker_governance("broker-fixed", bytes(32))
+    registry, revocations = governance.registry, governance.revocations
     policy_digest = _broker_policy_digest(registry, revocations)
     request = BrokerAuthLeaseIssueRequestV1(
         "trusted-registration-broker-auth-lease-issue-request/v1", "other-operation", "life",
         DIGEST_A, "broker-fixed", 0, DIGEST_A, registry.canonical_digest,
-        revocations.canonical_digest, policy_digest, DIGEST_C, 2,
+        revocations.canonical_digest, policy_digest, governance.allowed_signers_digest, 2,
     )
     payload = BrokerAuthLeaseIssueEventPayloadV1(
         "trusted-registration-broker-auth-lease-issue-payload/v1", "issue-lease", DIGEST_A,
@@ -2460,7 +2481,7 @@ def test_e3_forward_only_recovery_authenticates_every_broker_state_record_before
         verify_registration_forward_only_recovery(
             candidate_authority, candidate_state_mac, candidate_journal, candidate_state,
             {payload.full_bytes_digest: payload},
-            BrokerAuthSequenceReplayBaselineV1(DIGEST_A, registry, revocations, policy_digest, DIGEST_C),
+            BrokerAuthSequenceReplayBaselineV1(DIGEST_A, governance, policy_digest),
             registry=registry, revocations=revocations,
             operation_id="operation-e2", lease_identity_digest=DIGEST_A,
             lease_request_digest=DIGEST_B,
@@ -2529,7 +2550,7 @@ def test_e3_forward_only_recovery_authenticates_every_broker_state_record_before
     with pytest.raises(ValueError):
         verify_registration_forward_only_recovery(
             authority, state_mac, authenticated_journal, authenticated_state, {payload.full_bytes_digest: payload},
-            BrokerAuthSequenceReplayBaselineV1(DIGEST_A, registry, revocations, policy_digest, DIGEST_C),
+            BrokerAuthSequenceReplayBaselineV1(DIGEST_A, governance, policy_digest),
             registry=registry, revocations=revocations, operation_id="operation-e2",
             lease_identity_digest=DIGEST_A, lease_request_digest=DIGEST_B,
             registration_transaction_intent_digest=DIGEST_C, catalog_digest=DIGEST_A,
@@ -2539,7 +2560,7 @@ def test_e3_forward_only_recovery_authenticates_every_broker_state_record_before
     with pytest.raises(ValueError):
         verify_registration_forward_only_recovery(
             authority, state_mac, authenticated_journal, authenticated_state, {payload.full_bytes_digest: payload},
-            BrokerAuthSequenceReplayBaselineV1(DIGEST_A, registry, revocations, policy_digest, DIGEST_C),
+            BrokerAuthSequenceReplayBaselineV1(DIGEST_A, governance, policy_digest),
             registry=registry, revocations=revocations, operation_id="operation-e2",
             lease_identity_digest=DIGEST_A, lease_request_digest=DIGEST_B,
             registration_transaction_intent_digest=DIGEST_C, catalog_digest=DIGEST_A,

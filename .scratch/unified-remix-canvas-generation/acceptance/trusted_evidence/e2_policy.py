@@ -6,7 +6,7 @@ production-runtime capabilities are introduced by their dedicated tasks.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import hmac
 import json
@@ -1972,14 +1972,23 @@ class RegistrationBrokerStateMacCapabilityV1:
 class RegistrationBrokerAuthGovernanceV1:
     """Canonical broker governance closure used by every lease authority API."""
 
-    __slots__ = ("registry", "revocations", "allowed_signers", "allowed_signers_digest")
+    __slots__ = ("registry", "revocations", "allowed_signers", "allowed_signers_digest", "allowed_signers_canonical_bytes")
     _TOKEN = object()
 
-    def __init__(self, token: object, registry: RegistrationBrokerAuthRegistryV1, revocations: RegistrationBrokerAuthRevocationsV1, allowed_signers: Mapping[str, bytes], allowed_signers_digest: str) -> None:
+    def __init__(self, token: object, registry: RegistrationBrokerAuthRegistryV1, revocations: RegistrationBrokerAuthRevocationsV1, allowed_signers: Mapping[str, bytes], allowed_signers_digest: str, allowed_signers_canonical_bytes: bytes) -> None:
         if token is not self._TOKEN:
             raise TypeError("broker governance must be constructed from canonical governance bytes")
         self.registry, self.revocations = registry, revocations
         self.allowed_signers, self.allowed_signers_digest = MappingProxyType(dict(allowed_signers)), allowed_signers_digest
+        self.allowed_signers_canonical_bytes = allowed_signers_canonical_bytes
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            type(other) is type(self)
+            and self.registry == other.registry
+            and self.revocations == other.revocations
+            and self.allowed_signers_canonical_bytes == other.allowed_signers_canonical_bytes
+        )
 
     @classmethod
     def from_canonical_bytes(
@@ -2018,7 +2027,7 @@ class RegistrationBrokerAuthGovernanceV1:
         if names != sorted(names) or len(values) != len(names):
             raise ValueError("broker allowed signer keys must be unique and ordered")
         verify_registration_broker_governance(registry, revocations, values)
-        return cls(cls._TOKEN, registry, revocations, values, "sha256:" + hashlib.sha256(allowed_signers_bytes).hexdigest())
+        return cls(cls._TOKEN, registry, revocations, values, "sha256:" + hashlib.sha256(allowed_signers_bytes).hexdigest(), allowed_signers_bytes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2026,25 +2035,33 @@ class BrokerAuthSequenceReplayBaselineV1:
     """The fixed governance fact from which a broker journal is replayed."""
 
     root_identity_digest: str
-    registry: RegistrationBrokerAuthRegistryV1
-    revocations: RegistrationBrokerAuthRevocationsV1
+    governance: RegistrationBrokerAuthGovernanceV1
     policy_digest: str
-    allowed_signers_digest: str
 
     def __post_init__(self) -> None:
         if (
-            type(self.registry) is not RegistrationBrokerAuthRegistryV1
-            or type(self.revocations) is not RegistrationBrokerAuthRevocationsV1
+            type(self.governance) is not RegistrationBrokerAuthGovernanceV1
         ):
             raise ValueError("broker replay baseline governance is invalid")
         for value, field in (
             (self.root_identity_digest, "root_identity_digest"),
             (self.policy_digest, "policy_digest"),
-            (self.allowed_signers_digest, "allowed_signers_digest"),
         ):
             _require_digest(value, field)
-        if self.policy_digest != _broker_auth_policy_digest(self.registry, self.revocations):
+        if self.policy_digest != _broker_auth_policy_digest(self.governance.registry, self.governance.revocations):
             raise ValueError("broker replay baseline policy is not derived from governance")
+
+    @property
+    def registry(self) -> RegistrationBrokerAuthRegistryV1:
+        return self.governance.registry
+
+    @property
+    def revocations(self) -> RegistrationBrokerAuthRevocationsV1:
+        return self.governance.revocations
+
+    @property
+    def allowed_signers_digest(self) -> str:
+        return self.governance.allowed_signers_digest
 
 
 def _verify_broker_signed_record(
@@ -2287,10 +2304,10 @@ class BrokerAuthEnvelopeSignEventPayloadV1(_SelfDigestRecord):
 
 @dataclass(frozen=True, slots=True)
 class BrokerAuthRotatePolicyEventPayloadV1(_SelfDigestRecord):
-    schema: str; event_kind: str; event_id_digest: str; previous_registry_digest: str; previous_revocations_digest: str; next_registry: RegistrationBrokerAuthRegistryV1; next_revocations: RegistrationBrokerAuthRevocationsV1; activated_key_id: str; retiring_key_id: str; effective_lease_sequence: int; pre_policy_digest: str; post_policy_digest: str
+    schema: str; event_kind: str; event_id_digest: str; previous_registry_digest: str; previous_revocations_digest: str; next_governance: RegistrationBrokerAuthGovernanceV1; activated_key_id: str; retiring_key_id: str; effective_lease_sequence: int; pre_policy_digest: str; post_policy_digest: str
 
     def __post_init__(self) -> None:
-        if self.schema != "trusted-registration-broker-auth-rotate-payload/v1" or self.event_kind != "rotate-registry" or type(self.next_registry) is not RegistrationBrokerAuthRegistryV1 or type(self.next_revocations) is not RegistrationBrokerAuthRevocationsV1:
+        if self.schema != "trusted-registration-broker-auth-rotate-payload/v1" or self.event_kind != "rotate-registry" or type(self.next_governance) is not RegistrationBrokerAuthGovernanceV1:
             raise ValueError("broker auth rotate payload identity is invalid")
         for field in ("event_id_digest", "previous_registry_digest", "previous_revocations_digest", "pre_policy_digest", "post_policy_digest"):
             _require_digest(getattr(self, field), field)
@@ -2300,15 +2317,22 @@ class BrokerAuthRotatePolicyEventPayloadV1(_SelfDigestRecord):
         _require_broker_payload_budget(self)
 
     def _unsigned_wire(self) -> dict[str, object]:
-        return {"activatedKeyId": self.activated_key_id, "effectiveLeaseSequence": self.effective_lease_sequence, "eventIdDigest": self.event_id_digest, "eventKind": self.event_kind, "nextRegistry": self.next_registry.to_wire(), "nextRevocations": self.next_revocations.to_wire(), "postPolicyDigest": self.post_policy_digest, "prePolicyDigest": self.pre_policy_digest, "previousRegistryDigest": self.previous_registry_digest, "previousRevocationsDigest": self.previous_revocations_digest, "retiringKeyId": self.retiring_key_id, "schema": self.schema}
+        return {"activatedKeyId": self.activated_key_id, "effectiveLeaseSequence": self.effective_lease_sequence, "eventIdDigest": self.event_id_digest, "eventKind": self.event_kind, "nextAllowedSigners": json.loads(self.next_governance.allowed_signers_canonical_bytes), "nextRegistry": self.next_registry.to_wire(), "nextRevocations": self.next_revocations.to_wire(), "postPolicyDigest": self.post_policy_digest, "prePolicyDigest": self.pre_policy_digest, "previousRegistryDigest": self.previous_registry_digest, "previousRevocationsDigest": self.previous_revocations_digest, "retiringKeyId": self.retiring_key_id, "schema": self.schema}
+
+    @property
+    def next_registry(self) -> RegistrationBrokerAuthRegistryV1:
+        return self.next_governance.registry
+
+    @property
+    def next_revocations(self) -> RegistrationBrokerAuthRevocationsV1:
+        return self.next_governance.revocations
 
     @classmethod
     def from_canonical_bytes(cls, payload: bytes) -> "BrokerAuthRotatePolicyEventPayloadV1":
-        fields = {"activatedKeyId", "canonicalDigest", "effectiveLeaseSequence", "eventIdDigest", "eventKind", "nextRegistry", "nextRevocations", "postPolicyDigest", "prePolicyDigest", "previousRegistryDigest", "previousRevocationsDigest", "retiringKeyId", "schema"}
+        fields = {"activatedKeyId", "canonicalDigest", "effectiveLeaseSequence", "eventIdDigest", "eventKind", "nextAllowedSigners", "nextRegistry", "nextRevocations", "postPolicyDigest", "prePolicyDigest", "previousRegistryDigest", "previousRevocationsDigest", "retiringKeyId", "schema"}
         raw = _broker_payload_from_bytes(payload, fields, "broker auth rotate payload")
-        registry = RegistrationBrokerAuthRegistryV1.from_canonical_bytes(canonical_json_bytes(raw["nextRegistry"]))
-        revocations = RegistrationBrokerAuthRevocationsV1.from_canonical_bytes(canonical_json_bytes(raw["nextRevocations"]))
-        item = cls(raw["schema"], raw["eventKind"], raw["eventIdDigest"], raw["previousRegistryDigest"], raw["previousRevocationsDigest"], registry, revocations, raw["activatedKeyId"], raw["retiringKeyId"], raw["effectiveLeaseSequence"], raw["prePolicyDigest"], raw["postPolicyDigest"])
+        governance = RegistrationBrokerAuthGovernanceV1.from_canonical_bytes(canonical_json_bytes(raw["nextRegistry"]), canonical_json_bytes(raw["nextRevocations"]), canonical_json_bytes(raw["nextAllowedSigners"]))
+        item = cls(raw["schema"], raw["eventKind"], raw["eventIdDigest"], raw["previousRegistryDigest"], raw["previousRevocationsDigest"], governance, raw["activatedKeyId"], raw["retiringKeyId"], raw["effectiveLeaseSequence"], raw["prePolicyDigest"], raw["postPolicyDigest"])
         if raw["canonicalDigest"] != item.canonical_digest:
             raise ValueError("broker auth rotate payload digest is invalid")
         return item
@@ -2498,8 +2522,9 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
             ):
                 raise ValueError("broker auth payload map is not content addressed")
 
-        current_registry = baseline.registry
-        current_revocations = baseline.revocations
+        current_governance = baseline.governance
+        current_registry = current_governance.registry
+        current_revocations = current_governance.revocations
         current_policy = baseline.policy_digest
         seen_event_ids: set[str] = set()
         for entry in self.entries:
@@ -2560,12 +2585,12 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
                         current_registry.canonical_digest,
                         current_revocations.canonical_digest,
                         current_policy,
-                        baseline.allowed_signers_digest,
+                        current_governance.allowed_signers_digest,
                     )
                     or payload.post_policy_digest != current_policy
                 ):
                     raise ValueError("broker auth issue does not preserve replay pre-state")
-                next_registry, next_revocations, next_policy = current_registry, current_revocations, current_policy
+                next_governance, next_registry, next_revocations, next_policy = current_governance, current_registry, current_revocations, current_policy
             elif isinstance(payload, BrokerAuthEnvelopeSignEventPayloadV1):
                 signer_key = current_registry.key(payload.broker_auth_key_id)
                 if (
@@ -2573,10 +2598,12 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
                     or entry.broker_auth_key_id != payload.broker_auth_key_id
                     or signer_key.state not in {"active", "retiring"}
                     or current_revocations.revoked_at(signer_key.key_id) is not None
+                    or not isinstance(current_governance.allowed_signers.get(signer_key.key_id), bytes)
+                    or "sha256:" + hashlib.sha256(current_governance.allowed_signers[signer_key.key_id]).hexdigest() != signer_key.public_key_digest
                     or payload.post_policy_digest != current_policy
                 ):
                     raise ValueError("broker auth signing does not preserve replay pre-state")
-                next_registry, next_revocations, next_policy = current_registry, current_revocations, current_policy
+                next_governance, next_registry, next_revocations, next_policy = current_governance, current_registry, current_revocations, current_policy
             elif isinstance(payload, BrokerAuthRotatePolicyEventPayloadV1):
                 prior_active = current_registry.key(current_registry.active_key_id)
                 try:
@@ -2597,7 +2624,7 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
                     or payload.post_policy_digest != _broker_auth_policy_digest(payload.next_registry, payload.next_revocations)
                 ):
                     raise ValueError("broker auth rotation does not preserve replay pre-state")
-                next_registry, next_revocations, next_policy = payload.next_registry, payload.next_revocations, payload.post_policy_digest
+                next_governance, next_registry, next_revocations, next_policy = payload.next_governance, payload.next_registry, payload.next_revocations, payload.post_policy_digest
             else:
                 previous_entries = {item.key_id: item for item in current_revocations.entries}
                 next_entries = {item.key_id: item for item in payload.next_revocations.entries}
@@ -2614,6 +2641,7 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
                     or payload.post_policy_digest != _broker_auth_policy_digest(current_registry, payload.next_revocations)
                 ):
                     raise ValueError("broker auth revocation does not preserve replay pre-state")
+                next_governance = current_governance
                 next_registry, next_revocations, next_policy = current_registry, payload.next_revocations, payload.post_policy_digest
             if (
                 entry.post_broker_auth_registry_digest,
@@ -2625,7 +2653,7 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
                 next_policy,
             ):
                 raise ValueError("broker auth post-policy state is invalid")
-            current_registry, current_revocations, current_policy = next_registry, next_revocations, next_policy
+            current_governance, current_registry, current_revocations, current_policy = next_governance, next_registry, next_revocations, next_policy
         head = self.entries[-1]
         if (
             state.head_entry_digest,
@@ -2925,8 +2953,13 @@ class FdOpenProvenanceV1(_SelfDigestRecord):
 @dataclass(frozen=True, slots=True)
 class FdObservableIdentityV1(_SelfDigestRecord):
     file_type: str; access_mode: str; status_flags: tuple[str, ...]; fd_flags: tuple[str, ...]; device: int | None; inode: int | None; byte_length: int | None; content_digest: str | None; mount_identity_digest: str | None; socket_options: tuple[str, ...]; socket_identity_digest: str | None; identity_digest: str
+    _construction_origin: object = field(init=False, compare=False, repr=False, default=None)
+    _BROKER_TOKEN = object()
+    _DECODED_TOKEN = object()
 
     def __post_init__(self) -> None:
+        if self._construction_origin not in (self._BROKER_TOKEN, self._DECODED_TOKEN):
+            raise TypeError("FD observable identity must be constructed by a trusted producer")
         if (self.file_type, self.access_mode) not in {("regular", "read-only"), ("socket-seqpacket", "bidirectional-control"), ("socket-stream", "bidirectional-control")} or tuple(self.fd_flags) != ("FD_CLOEXEC",):
             raise ValueError("FD observable identity is invalid")
         if self.file_type == "regular":
@@ -2941,6 +2974,31 @@ class FdObservableIdentityV1(_SelfDigestRecord):
             _require_digest(self.socket_identity_digest, "socket_identity_digest")
         _require_digest(self.identity_digest, "identity_digest")
         object.__setattr__(self, "status_flags", tuple(self.status_flags)); object.__setattr__(self, "fd_flags", tuple(self.fd_flags)); object.__setattr__(self, "socket_options", tuple(self.socket_options))
+
+    @classmethod
+    def _construct(cls, origin: object, *values: object) -> "FdObservableIdentityV1":
+        if origin not in (cls._BROKER_TOKEN, cls._DECODED_TOKEN):
+            raise TypeError("FD observable identity construction token is invalid")
+        result = object.__new__(cls)
+        for name, value in zip(cls.__dataclass_fields__, values):
+            if name != "_construction_origin":
+                object.__setattr__(result, name, value)
+        object.__setattr__(result, "_construction_origin", origin)
+        result.__post_init__()
+        return result
+
+    @property
+    def _is_broker_produced(self) -> bool:
+        return self._construction_origin is self._BROKER_TOKEN
+
+    def __copy__(self):
+        raise TypeError("FD observable identities are non-copyable")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("FD observable identities are non-copyable")
+
+    def __reduce__(self):
+        raise TypeError("FD observable identities are non-serializable")
 
     def _identity_wire(self) -> dict[str, object]:
         return {"accessMode": self.access_mode, "byteLength": self.byte_length, "contentDigest": self.content_digest, "device": self.device, "fdFlags": list(self.fd_flags), "fileType": self.file_type, "inode": self.inode, "mountIdentityDigest": self.mount_identity_digest, "socketIdentityDigest": self.socket_identity_digest, "socketOptions": list(self.socket_options), "statusFlags": list(self.status_flags)}
@@ -3005,7 +3063,7 @@ class FdObservableIdentityV1(_SelfDigestRecord):
                 content_digest = "sha256:" + digest.hexdigest()
                 mount_identity_digest = canonical_digest({"filesystemId": filesystem_id, "kind": "fstatvfs-fsid/v1"})
                 wire = {"accessMode": "read-only", "byteLength": info.st_size, "contentDigest": content_digest, "device": info.st_dev, "fdFlags": list(fd_flags), "fileType": "regular", "inode": info.st_ino, "mountIdentityDigest": mount_identity_digest, "socketIdentityDigest": None, "socketOptions": [], "statusFlags": ["O_RDONLY"]}
-                return cls("regular", "read-only", ("O_RDONLY",), fd_flags, info.st_dev, info.st_ino, info.st_size, content_digest, mount_identity_digest, (), None, canonical_digest(wire))
+                return cls._construct(cls._BROKER_TOKEN, "regular", "read-only", ("O_RDONLY",), fd_flags, info.st_dev, info.st_ino, info.st_size, content_digest, mount_identity_digest, (), None, canonical_digest(wire))
             if not stat.S_ISSOCK(info.st_mode) or flags != os.O_RDWR:
                 raise ValueError("received control FD state is invalid")
             probe = socket.socket(fileno=os.dup(fd))
@@ -3024,7 +3082,7 @@ class FdObservableIdentityV1(_SelfDigestRecord):
                 probe.close()
             socket_identity_digest = canonical_digest({"family": family, "inode": info.st_ino, "socketType": socket_type})
             wire = {"accessMode": "bidirectional-control", "byteLength": None, "contentDigest": None, "device": None, "fdFlags": list(fd_flags), "fileType": file_type, "inode": None, "mountIdentityDigest": None, "socketIdentityDigest": socket_identity_digest, "socketOptions": list(options), "statusFlags": []}
-            return cls(file_type, "bidirectional-control", (), fd_flags, None, None, None, None, None, options, socket_identity_digest, canonical_digest(wire))
+            return cls._construct(cls._BROKER_TOKEN, file_type, "bidirectional-control", (), fd_flags, None, None, None, None, None, options, socket_identity_digest, canonical_digest(wire))
         except OSError as error:
             raise ValueError("received FD cannot be observed") from error
 
@@ -3032,7 +3090,7 @@ class FdObservableIdentityV1(_SelfDigestRecord):
     def _from_wire(cls, raw: object) -> "FdObservableIdentityV1":
         fields = {"accessMode", "byteLength", "canonicalDigest", "contentDigest", "device", "fdFlags", "fileType", "identityDigest", "inode", "mountIdentityDigest", "socketIdentityDigest", "socketOptions", "statusFlags"}
         if not isinstance(raw, dict) or set(raw) != fields or any(not isinstance(raw[key], list) for key in ("fdFlags", "socketOptions", "statusFlags")): raise ValueError("FD observable wire is invalid")
-        result = cls(raw["fileType"], raw["accessMode"], tuple(raw["statusFlags"]), tuple(raw["fdFlags"]), raw["device"], raw["inode"], raw["byteLength"], raw["contentDigest"], raw["mountIdentityDigest"], tuple(raw["socketOptions"]), raw["socketIdentityDigest"], raw["identityDigest"])
+        result = cls._construct(cls._DECODED_TOKEN, raw["fileType"], raw["accessMode"], tuple(raw["statusFlags"]), tuple(raw["fdFlags"]), raw["device"], raw["inode"], raw["byteLength"], raw["contentDigest"], raw["mountIdentityDigest"], tuple(raw["socketOptions"]), raw["socketIdentityDigest"], raw["identityDigest"])
         if raw["canonicalDigest"] != result.canonical_digest: raise ValueError("FD observable digest is invalid")
         return result
 
@@ -3040,8 +3098,13 @@ class FdObservableIdentityV1(_SelfDigestRecord):
 @dataclass(frozen=True, slots=True)
 class FdDescriptorV1(_SelfDigestRecord):
     role: str; ordinal: int; logical_name: str; cardinality: str; provenance_fields: FdOpenProvenanceV1; observable_fields: FdObservableIdentityV1
+    _construction_origin: object = field(init=False, compare=False, repr=False, default=None)
+    _BROKER_TOKEN = object()
+    _DECODED_TOKEN = object()
 
     def __post_init__(self) -> None:
+        if self._construction_origin not in (self._BROKER_TOKEN, self._DECODED_TOKEN):
+            raise TypeError("FD descriptor must be constructed by a trusted producer")
         if self.role not in _FD_ROLES or self.cardinality != "exactly-one" or not isinstance(self.logical_name, str) or not self.logical_name or type(self.provenance_fields) is not FdOpenProvenanceV1 or type(self.observable_fields) is not FdObservableIdentityV1:
             raise ValueError("FD descriptor is invalid")
         _u64(self.ordinal, "ordinal")
@@ -3054,6 +3117,31 @@ class FdDescriptorV1(_SelfDigestRecord):
             raise ValueError("FD descriptor mixes provenance and observable types")
         if not control and self.observable_fields.byte_length > _fd_role_profile_budget(self.role):
             raise ValueError("FD descriptor exceeds its frozen role/profile budget")
+
+    @classmethod
+    def _construct(cls, origin: object, *values: object) -> "FdDescriptorV1":
+        if origin not in (cls._BROKER_TOKEN, cls._DECODED_TOKEN):
+            raise TypeError("FD descriptor construction token is invalid")
+        result = object.__new__(cls)
+        for name, value in zip(cls.__dataclass_fields__, values):
+            if name != "_construction_origin":
+                object.__setattr__(result, name, value)
+        object.__setattr__(result, "_construction_origin", origin)
+        result.__post_init__()
+        return result
+
+    @property
+    def _is_broker_produced(self) -> bool:
+        return self._construction_origin is self._BROKER_TOKEN and self.observable_fields._is_broker_produced
+
+    def __copy__(self):
+        raise TypeError("FD descriptors are non-copyable")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("FD descriptors are non-copyable")
+
+    def __reduce__(self):
+        raise TypeError("FD descriptors are non-serializable")
 
     @classmethod
     def from_open_fd(
@@ -3083,7 +3171,7 @@ class FdDescriptorV1(_SelfDigestRecord):
             observable = FdObservableIdentityV1._from_open_fd(
                 fd, expected_byte_length=info.st_size, maximum_byte_length=maximum,
             )
-        return cls(role, ordinal, logical_name, "exactly-one", provenance_fields, observable)
+        return cls._construct(cls._BROKER_TOKEN, role, ordinal, logical_name, "exactly-one", provenance_fields, observable)
 
     def _unsigned_wire(self) -> dict[str, object]:
         return {"cardinality": self.cardinality, "logicalName": self.logical_name, "observableFields": self.observable_fields.to_wire(), "ordinal": self.ordinal, "provenanceFields": self.provenance_fields.to_wire(), "role": self.role}
@@ -3092,7 +3180,7 @@ class FdDescriptorV1(_SelfDigestRecord):
     def _from_wire(cls, raw: object) -> "FdDescriptorV1":
         fields = {"canonicalDigest", "cardinality", "logicalName", "observableFields", "ordinal", "provenanceFields", "role"}
         if not isinstance(raw, dict) or set(raw) != fields: raise ValueError("FD descriptor wire is invalid")
-        result = cls(raw["role"], raw["ordinal"], raw["logicalName"], raw["cardinality"], FdOpenProvenanceV1._from_wire(raw["provenanceFields"]), FdObservableIdentityV1._from_wire(raw["observableFields"]))
+        result = cls._construct(cls._DECODED_TOKEN, raw["role"], raw["ordinal"], raw["logicalName"], raw["cardinality"], FdOpenProvenanceV1._from_wire(raw["provenanceFields"]), FdObservableIdentityV1._from_wire(raw["observableFields"]))
         if raw["canonicalDigest"] != result.canonical_digest: raise ValueError("FD descriptor digest is invalid")
         return result
 
@@ -3497,8 +3585,7 @@ class BrokerAuthAuthoritativeIssuerV1:
         self._root_identity_digest, self._allowed_signers_digest = root_identity_digest, governance.allowed_signers_digest
         self._signer, self._allowed_signers, self._state_mac = signer, dict(governance.allowed_signers), state_mac
         self._baseline = BrokerAuthSequenceReplayBaselineV1(
-            root_identity_digest, governance.registry, governance.revocations,
-            state.current_policy_digest, governance.allowed_signers_digest,
+            root_identity_digest, governance, state.current_policy_digest,
         )
         self._frozen_profile_ttl_sequences, self._event_ids = _u64(frozen_profile_ttl_sequences, "frozen_profile_ttl_sequences", positive=True), set()
 
@@ -3558,6 +3645,8 @@ class BrokerAuthAuthoritativeIssuerV1:
             governance.registry.canonical_digest != self._registry.canonical_digest
             or governance.revocations.canonical_digest != self._revocations.canonical_digest
             or governance.revocations.registry_digest != self._registry.canonical_digest
+            or governance.allowed_signers_digest != self._allowed_signers_digest
+            or dict(governance.allowed_signers) != self._allowed_signers
             or self._state.current_policy_digest != _broker_auth_policy_digest(governance.registry, governance.revocations)
         ):
             raise ValueError("broker signer governance does not match authoritative state")
@@ -3595,10 +3684,12 @@ class BrokerAuthAuthoritativeIssuerV1:
     def _transition(
         self,
         payload: BrokerAuthSequenceEventPayloadV1,
-        next_registry: RegistrationBrokerAuthRegistryV1,
-        next_revocations: RegistrationBrokerAuthRevocationsV1,
+        next_governance: RegistrationBrokerAuthGovernanceV1,
         event_signer_key: RegistrationBrokerAuthKeyRegistrationV1 | None = None,
     ) -> BrokerAuthStateTransitionResultV1:
+        if type(next_governance) is not RegistrationBrokerAuthGovernanceV1:
+            raise ValueError("broker transition governance is invalid")
+        next_registry, next_revocations = next_governance.registry, next_governance.revocations
         active_key = self._require_active_signer()
         signer_key = active_key if event_signer_key is None else event_signer_key
         if type(signer_key) is not RegistrationBrokerAuthKeyRegistrationV1:
@@ -3664,10 +3755,10 @@ class BrokerAuthAuthoritativeIssuerV1:
     def _commit(
         self,
         result: BrokerAuthStateTransitionResultV1,
-        registry: RegistrationBrokerAuthRegistryV1,
-        revocations: RegistrationBrokerAuthRevocationsV1,
+        governance: RegistrationBrokerAuthGovernanceV1,
     ) -> None:
-        self._registry, self._revocations, self._state = registry, revocations, result.state
+        self._governance, self._registry, self._revocations, self._state = governance, governance.registry, governance.revocations, result.state
+        self._allowed_signers, self._allowed_signers_digest = dict(governance.allowed_signers), governance.allowed_signers_digest
         self._entries, self._payloads, self._journal = (*self._entries, result.entry), dict(result.payloads), result.journal
         self._event_ids.add(result.payload.event_id_digest)
 
@@ -3699,7 +3790,7 @@ class BrokerAuthAuthoritativeIssuerV1:
             request.lease_ttl_sequences, _checked_add(sequence, request.lease_ttl_sequences),
             self._state.current_policy_digest, self._state.current_policy_digest,
         )
-        transition = self._transition(payload, self._registry, self._revocations)
+        transition = self._transition(payload, self._governance)
         lease = replace(
             lease_template, broker_auth_registry_generation=self._registry.generation,
             broker_auth_registry_digest=self._registry.canonical_digest,
@@ -3719,31 +3810,31 @@ class BrokerAuthAuthoritativeIssuerV1:
         lease = replace(lease, broker_mac=self._state_mac.mac(canonical_json_bytes(lease._unsigned_wire())))
         lease.verify_signature(self._governance, sequence)
         result = BrokerAuthLeaseIssuanceResultV1(transition.payload, transition.entry, transition.state, transition.journal, transition.payloads, lease)
-        self._commit(result, self._registry, self._revocations)
+        self._commit(result, self._governance)
         return result
 
     def rotate_registry(
         self,
-        next_registry: RegistrationBrokerAuthRegistryV1,
-        next_revocations: RegistrationBrokerAuthRevocationsV1,
+        next_governance: RegistrationBrokerAuthGovernanceV1,
         event_id_digest: str,
-        post_policy_digest: str,
     ) -> BrokerAuthStateTransitionResultV1:
-        if type(next_registry) is not RegistrationBrokerAuthRegistryV1 or type(next_revocations) is not RegistrationBrokerAuthRevocationsV1:
+        if type(next_governance) is not RegistrationBrokerAuthGovernanceV1:
             raise ValueError("broker rotation inputs are invalid")
+        next_registry, next_revocations = next_governance.registry, next_governance.revocations
+        post_policy_digest = _broker_auth_policy_digest(next_registry, next_revocations)
         if post_policy_digest != _broker_auth_policy_digest(next_registry, next_revocations):
             raise ValueError("broker rotation policy digest is not derived from governance")
         sequence = self._next_sequence()
         payload = BrokerAuthRotatePolicyEventPayloadV1(
             "trusted-registration-broker-auth-rotate-payload/v1", "rotate-registry", event_id_digest,
-            self._registry.canonical_digest, self._revocations.canonical_digest, next_registry,
-            next_revocations, next_registry.active_key_id, self._registry.active_key_id, sequence,
+            self._registry.canonical_digest, self._revocations.canonical_digest, next_governance,
+            next_registry.active_key_id, self._registry.active_key_id, sequence,
             self._state.current_policy_digest, post_policy_digest,
         )
         if next_registry.generation != self._registry.generation + 1 or tuple(next_revocations.entries) != tuple(self._revocations.entries):
             raise ValueError("broker rotation does not preserve prior state")
-        result = self._transition(payload, next_registry, next_revocations)
-        self._commit(result, next_registry, next_revocations)
+        result = self._transition(payload, next_governance)
+        self._commit(result, next_governance)
         return result
 
     def sign_envelope(
@@ -3770,8 +3861,8 @@ class BrokerAuthAuthoritativeIssuerV1:
             unsigned_envelope_digest, key.key_id, sequence, self._state.current_policy_digest,
             self._state.current_policy_digest,
         )
-        result = self._transition(payload, self._registry, self._revocations)
-        self._commit(result, self._registry, self._revocations)
+        result = self._transition(payload, self._governance)
+        self._commit(result, self._governance)
         return result
 
     def sign_recovery_envelope(
@@ -3837,9 +3928,9 @@ class BrokerAuthAuthoritativeIssuerV1:
             key.key_id, sequence, self._state.current_policy_digest,
             self._state.current_policy_digest,
         )
-        transition = self._transition(payload, self._registry, self._revocations, key)
+        transition = self._transition(payload, self._governance, key)
         envelope = CapabilityEnvelopeV1.create(unsigned_envelope, lease_signer)
-        self._commit(transition, self._registry, self._revocations)
+        self._commit(transition, self._governance)
         return BrokerAuthSignedEnvelopeResultV1(transition, envelope)
 
     def revoke_key(
@@ -3865,8 +3956,9 @@ class BrokerAuthAuthoritativeIssuerV1:
             self._registry.canonical_digest, self._revocations.canonical_digest, next_revocations,
             revoked_key_id, sequence, self._state.current_policy_digest, post_policy_digest,
         )
-        result = self._transition(payload, self._registry, next_revocations)
-        self._commit(result, self._registry, next_revocations)
+        next_governance = RegistrationBrokerAuthGovernanceV1.from_canonical_bytes(self._registry.canonical_bytes, next_revocations.canonical_bytes, self._governance.allowed_signers_canonical_bytes)
+        result = self._transition(payload, next_governance)
+        self._commit(result, next_governance)
         return result
 
 

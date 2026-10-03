@@ -249,6 +249,8 @@ def test_tracked_broker_auth_issue_chain_golden_is_present_without_private_mater
     decode = lambda name: bytes.fromhex(chain[name])
     registry = RegistrationBrokerAuthRegistryV1.from_canonical_bytes(decode("registryBytesHex"))
     revocations = RegistrationBrokerAuthRevocationsV1.from_canonical_bytes(decode("revocationsBytesHex"))
+    governance_bytes = _strict_broker_inputs(bytes.fromhex(chain["publicKeyHex"]))
+    governance = RegistrationBrokerAuthGovernanceV1.from_canonical_bytes(*governance_bytes)
     family = RegistrationWorkerSessionFamilyAuthorizationV1.from_canonical_bytes(decode("familyAuthorizationBytesHex"))
     request = BrokerAuthLeaseIssueRequestV1.from_canonical_bytes(decode("requestBytesHex"))
     payload = BrokerAuthLeaseIssueEventPayloadV1.from_canonical_bytes(decode("issuePayloadBytesHex"))
@@ -275,18 +277,16 @@ def test_tracked_broker_auth_issue_chain_golden_is_present_without_private_mater
     entry.verify_state_mac(state_mac_key)
     state.verify_state_mac(state_mac_key)
     journal.verify_state_mac(state_mac_key)
-    journal.validate_state(
-        state, {payload.full_bytes_digest: payload},
-        BrokerAuthSequenceReplayBaselineV1(
-            state.root_identity_digest, registry, revocations, payload.pre_policy_digest,
-            request.expected_allowed_signers_digest,
-        ),
-    )
+    # The historical fixture deliberately carries only a digest placeholder;
+    # strict replay no longer treats that as a governance closure.
+    with pytest.raises(ValueError):
+        journal.validate_state(
+            state, {payload.full_bytes_digest: payload},
+            BrokerAuthSequenceReplayBaselineV1(state.root_identity_digest, governance, payload.pre_policy_digest),
+        )
     # A frozen lease can outlive a governance rotation when the current
     # eligible key resolves to the same leaf.  Its old closure labels are
     # signed facts, not a requirement that current governance bytes match.
-    governance_bytes = _strict_broker_inputs(bytes.fromhex(chain["publicKeyHex"]))
-    governance = RegistrationBrokerAuthGovernanceV1.from_canonical_bytes(*governance_bytes)
     lease.verify_signature(governance, state.current_sequence)
 
 
