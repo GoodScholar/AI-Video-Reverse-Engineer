@@ -39,6 +39,7 @@ from trusted_evidence.handoffs import (
     ProductSourceBudgetV1,
     ProductRepositorySourceV1,
     PolicyActivationMarkerV1,
+    Ticket23PolicyHandoffV1,
     Ticket23ProductSourceHandoffV1,
     TrustedHandoffRecordV1,
     TrustedHandoffStoreV1,
@@ -1553,6 +1554,152 @@ def _policy_transport_fixture(tmp_path):
     request = ActivatedPolicyExportRequestV1("trusted-activated-policy-export-request/v1", record.handoff_id, handoff_ref, handoff_ref, core_request_ref, core_request_ref, proof_ref, proof_ref, (28,))
     request_ref = HandoffRegistryV1(source).publish_policy_local(record, pointer, core_request, handoff, request, proof_bytes, (b"policy payload",))
     return source, record, request_ref, transport_seed, domains
+
+
+def _ordinary_policy_fixture(tmp_path):
+    """Build the legacy normal-request shape that must never carry Task 27."""
+    source_root = (tmp_path / "ordinary-policy-source").resolve()
+    source_root.mkdir(mode=0o700)
+    source = TrustedHandoffStoreV1(source_root)
+    record = PolicyHandoffRecordV1(
+        "trusted-acceptance-handoff/v1", "ticket-23-policy-v1", "policy", 27,
+        GitObjectIdV1("sha256", "c" * 64), (28,),
+        (("policy-payload", source.put_blob(b"ordinary policy payload")),),
+    )
+    pointer = PolicyHandoffPointerV1(
+        "trusted-acceptance-handoff-pointer/v1", record.handoff_id, record.record_digest,
+        record.record_digest, record.producer_task, record.producer_commit,
+    )
+    request = HandoffExportRequestV1(
+        "trusted-handoff-export-request/v1", record.handoff_id, record.record_digest,
+        record.record_digest, "sha256:" + hashlib.sha256(pointer.canonical_bytes).hexdigest(),
+        record.consumer_tasks, record.binding_set_digest,
+    )
+    source.put_blob(record.canonical_bytes)
+    source.publish_pointer(record.handoff_id, pointer.canonical_bytes)
+    request_ref = source.put_blob(request.canonical_bytes)
+    source.publish_export_request_ref(record.handoff_id, request_ref)
+    seed = bytes.fromhex("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb")
+    return source, record, request_ref, seed, _domains(transport=_transport_registry(_test_transport_public_key(seed)))
+
+
+def test_normal_transport_cannot_complete_the_policy_activation_bypass(tmp_path):
+    """Removing the policy-only gate would let a normal Task 27 closure reach read()."""
+    from tools.trusted_handoff_orchestrator import run_transport
+
+    source, record, request_ref, seed, domains = _ordinary_policy_fixture(tmp_path)
+    target_root = (tmp_path / "ordinary-policy-target").resolve()
+    stage_root = (tmp_path / "ordinary-policy-stage").resolve()
+    cache_root = (tmp_path / "ordinary-policy-cache").resolve()
+    for root in (target_root, stage_root, cache_root):
+        root.mkdir(mode=0o700)
+    key_path = tmp_path / "ordinary-policy-key"
+    key_path.write_bytes(seed)
+    key_path.chmod(0o400)
+    key_fd = os.open(key_path, os.O_RDONLY)
+    try:
+        with pytest.raises(ValueError, match="policy"):
+            run_transport(
+                source_store=source, target_store=TrustedHandoffStoreV1(target_root), stage_root=stage_root,
+                export_request_ref=request_ref, handoff_id=record.handoff_id,
+                transport_id="ticket-23-policy-v1-c28", consumer_task=28,
+                store_namespace="ai-video-reverse-engineer/ticket-23", source_executor_id="policy-source",
+                destination_executor_id="executor-28", nonce="ordinary-policy-nonce", sequence=1,
+                expires_at=None, signing_key_fd=key_fd, key_id="transport-fixed",
+                signing_key_purpose="transport-seal", signature_domain="ai-video-reverse-engineer/transport-seal/v1",
+                signing_domains=domains,
+            )
+            consumer = HandoffRegistryV1(TrustedHandoffStoreV1(cache_root))
+            consumer.fetch(TrustedHandoffStoreV1(target_root), request_ref, record.handoff_id,
+                           consumer_task=28, transport_id="ticket-23-policy-v1-c28",
+                           expected_destination_executor_id="executor-28", signing_domains=domains)
+            consumer.import_(record.handoff_id, consumer_task=28,
+                             expected_destination_executor_id="executor-28", signing_domains=domains)
+            consumer.finalize(record.handoff_id, expected_kind="policy", expected_producer_task=27,
+                              consumer_task=28, expected_destination_executor_id="executor-28", signing_domains=domains)
+            assert consumer.read(record.handoff_id, consumer_task=28, field="producerCommit.hex",
+                                 expected_destination_executor_id="executor-28", signing_domains=domains) == record.producer_commit.hex
+    finally:
+        os.close(key_fd)
+    assert list(target_root.iterdir()) == []
+    assert list(cache_root.iterdir()) == []
+
+
+def test_public_library_cannot_publish_the_normal_policy_closure(tmp_path):
+    """Deleting the library gate would restore the producer-side activation-proof bypass."""
+    source, record, request_ref, _seed, _domains_value = _ordinary_policy_fixture(tmp_path)
+    registry = HandoffRegistryV1(source)
+    pointer = PolicyHandoffPointerV1.from_canonical_bytes(source.read_pointer(record.handoff_id))
+    request = HandoffExportRequestV1.from_canonical_bytes(source.read_blob(request_ref))
+
+    with pytest.raises(ValueError, match="policy"):
+        registry.publish_local(record, pointer)
+    with pytest.raises(ValueError, match="policy"):
+        registry.publish_export_request(request)
+
+
+def test_policy_publication_rejects_product_proof_pollution_before_writes(tmp_path):
+    """A product record must not enter the proof-bearing policy publication API."""
+    policy_source, _policy_record, policy_request_ref, _seed, _domains_value = _policy_transport_fixture(tmp_path)
+    activated = ActivatedPolicyExportRequestV1.from_canonical_bytes(policy_source.read_blob(policy_request_ref))
+    handoff = Ticket23PolicyHandoffV1.from_canonical_bytes(policy_source.read_blob(activated.policy_handoff_ref))
+    core_request = HandoffExportRequestV1.from_canonical_bytes(policy_source.read_blob(handoff.core_export_request_ref))
+    proof = policy_source.read_blob(activated.policy_activation_proof_ref)
+
+    source_root = (tmp_path / "product-proof-pollution").resolve()
+    source_root.mkdir(mode=0o700)
+    source = TrustedHandoffStoreV1(source_root)
+    payload_ref = source.put_blob(b"product payload")
+    product = TrustedHandoffRecordV1(
+        "trusted-acceptance-handoff/v1", "ticket-23-product-v1", "product-source", 22,
+        ProductGitObjectIdV1("sha1", "a" * 40), (28,), (("product-source", payload_ref),),
+    )
+    pointer = HandoffPointerV1(
+        "trusted-acceptance-handoff-pointer/v1", product.handoff_id, product.record_digest,
+        product.record_digest, product.producer_task, product.producer_commit,
+    )
+    before = sorted(path.relative_to(source_root) for path in source_root.rglob("*") if path.is_file())
+
+    with pytest.raises(ValueError, match="policy"):
+        HandoffRegistryV1(source).publish_policy_local(
+            product, pointer, core_request, handoff, activated, proof,
+        )
+
+    assert sorted(path.relative_to(source_root) for path in source_root.rglob("*") if path.is_file()) == before
+
+
+def test_run_transport_cli_never_falls_back_when_a_policy_pointer_is_damaged(tmp_path, monkeypatch):
+    """Catching a damaged activated pointer and choosing the normal runner reopens C3."""
+    from tools import trusted_handoff_orchestrator as orchestrator
+
+    source, record, request_ref, _seed, domains = _ordinary_policy_fixture(tmp_path)
+    target_root = (tmp_path / "cli-target").resolve()
+    stage_root = (tmp_path / "cli-stage").resolve()
+    target_root.mkdir(mode=0o700)
+    stage_root.mkdir(mode=0o700)
+    target = TrustedHandoffStoreV1(target_root)
+    source._publish_file(("policy-export-requests", f"{record.handoff_id}.ref"), b"not-a-policy-request\n")
+    monkeypatch.setattr(orchestrator, "_role_store", lambda _args, role: source if role == "source" else target)
+    monkeypatch.setattr(orchestrator, "_domains_from_args", lambda _args: domains)
+
+    def normal_runner_must_not_run(**_kwargs):
+        pytest.fail("run-transport fell back to the normal runner")
+
+    monkeypatch.setattr(orchestrator, "run_transport", normal_runner_must_not_run)
+    result = orchestrator.main([
+        "run-transport", "--source-store-root", str(source.root), "--target-store-root", str(target.root),
+        "--stage-root", str(stage_root), "--export-request-ref", request_ref, "--handoff-id", record.handoff_id,
+        "--transport-id", "ticket-23-policy-v1-c28", "--consumer-task", "28",
+        "--store-namespace", "ai-video-reverse-engineer/ticket-23", "--source-executor-id", "policy-source",
+        "--destination-executor-id", "executor-28", "--nonce", "cli-policy-nonce", "--sequence", "1",
+        "--key-id", "transport-fixed", "--signing-key-purpose", "transport-seal",
+        "--signature-domain", "ai-video-reverse-engineer/transport-seal/v1", "--signing-key-fd", "-1",
+        "--transport-registry", "unused", "--activation-registry", "unused", "--broker-auth-registry", "unused",
+        "--broker-auth-revocations", "unused", "--broker-auth-allowed-signers", "unused",
+    ])
+
+    assert result == 2
+    assert list(target_root.iterdir()) == []
 
 
 def test_run_transport_creates_distinct_sealed_ready_closures_for_two_consumers(tmp_path, monkeypatch):

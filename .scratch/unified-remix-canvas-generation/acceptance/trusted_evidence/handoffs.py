@@ -781,6 +781,16 @@ def _proof_fields(ref: object, digest: object) -> tuple[str | None, str | None]:
     return ref, digest
 
 
+def _require_regular_transport_record(record: TrustedHandoffRecordV1) -> None:
+    if record.kind != "product-source" or record.producer_task != 22:
+        raise ValueError("policy handoffs require the activated policy transport")
+
+
+def _require_policy_transport_record(record: TrustedHandoffRecordV1) -> None:
+    if record.kind != "policy" or record.producer_task != 27:
+        raise ValueError("policy transport requires a Task 27 policy record")
+
+
 @dataclass(frozen=True, slots=True)
 class TransportJobV1:
     """In-memory only complete invocation input for the four transport stages."""
@@ -1000,6 +1010,7 @@ class HandoffRegistryV1:
     store: TrustedHandoffStoreV1
 
     def publish_local(self, record: TrustedHandoffRecordV1, pointer: HandoffPointerV1, blobs: tuple[bytes, ...] = ()) -> None:
+        _require_regular_transport_record(record)
         if pointer.handoff_id != record.handoff_id or pointer.record_ref != record.record_digest or pointer.producer_commit != record.producer_commit:
             raise ValueError("pointer does not bind record")
         for blob in blobs:
@@ -1020,6 +1031,7 @@ class HandoffRegistryV1:
         blobs: tuple[bytes, ...] = (),
     ) -> str:
         """Publish the policy closure before its activated request pointer, no replace."""
+        _require_policy_transport_record(record)
         if pointer.handoff_id != record.handoff_id or pointer.record_ref != record.record_digest or pointer.producer_commit != record.producer_commit:
             raise ValueError("policy pointer does not bind record")
         for blob in blobs:
@@ -1039,6 +1051,7 @@ class HandoffRegistryV1:
 
     def publish_export_request(self, request: HandoffExportRequestV1) -> str:
         record, pointer, record_bytes, pointer_bytes = self._closure(self.store, request.record_ref, request.handoff_id)
+        _require_regular_transport_record(record)
         if request.record_full_bytes_digest != _digest(record_bytes) or request.pointer_bytes_digest != _digest(pointer_bytes):
             raise ValueError("export request full-byte digests do not match")
         if request.consumer_tasks != record.consumer_tasks or request.binding_set_digest != record.binding_set_digest:
@@ -1180,6 +1193,7 @@ class HandoffRegistryV1:
     def _closure(self, store: TrustedHandoffStoreV1, record_ref: str, handoff_id: str) -> tuple[TrustedHandoffRecordV1, HandoffPointerV1, bytes, bytes]:
         record_bytes = store.read_blob(record_ref)
         record = TrustedHandoffRecordV1.from_canonical_bytes(record_bytes)
+        _require_regular_transport_record(record)
         pointer_bytes = store.read_pointer(handoff_id)
         pointer = HandoffPointerV1.from_canonical_bytes(pointer_bytes)
         if record.handoff_id != handoff_id or pointer.handoff_id != handoff_id or pointer.record_ref != record_ref or pointer.record_digest != _digest(record_bytes) or pointer.producer_task != record.producer_task or pointer.producer_commit != record.producer_commit:
@@ -1828,6 +1842,7 @@ def verify_policy_transport_source_closure(
         raise ValueError("policy handoff and activated request are mixed")
     record_bytes = store.read_blob(handoff.core_record_ref)
     record = PolicyHandoffRecordV1.from_canonical_bytes(record_bytes)
+    _require_policy_transport_record(record)
     pointer_bytes = store.read_pointer(handoff.core_pointer_name)
     pointer = PolicyHandoffPointerV1.from_canonical_bytes(pointer_bytes)
     core_request_bytes = store.read_blob(handoff.core_export_request_ref)

@@ -21,6 +21,7 @@ from trusted_evidence.handoffs import (
     TransportJobV1,
     TransportReadyMarkerV1,
     TransportSealV1,
+    TrustedHandoffRecordV1,
     TrustedHandoffStoreV1,
     VerifiedSigningDomainsV1,
     _ed_add,
@@ -387,10 +388,17 @@ def main(argv: list[str] | None = None) -> int:
             source = _role_store(args, "source")
             target = _role_store(args, "target")
             try:
-                policy_request_ref = source.read_policy_export_request_ref(job.handoff_id)
+                request = HandoffExportRequestV1.from_canonical_bytes(source.read_blob(job.export_request_ref))
             except ValueError:
-                policy_request_ref = None
-            runner = run_policy_transport if policy_request_ref == job.export_request_ref else run_transport
+                policy_request_ref = source.read_policy_export_request_ref(job.handoff_id)
+                if policy_request_ref != job.export_request_ref:
+                    raise ValueError("activated policy request does not match run-transport input")
+                runner = run_policy_transport
+            else:
+                record = TrustedHandoffRecordV1.from_canonical_bytes(source.read_blob(request.record_ref))
+                if request.handoff_id != job.handoff_id or record.kind == "policy" or record.producer_task == 27:
+                    raise ValueError("policy handoffs require the activated policy transport")
+                runner = run_transport
             runner(source_store=source, target_store=target, stage_root=job.stage_root, export_request_ref=job.export_request_ref, handoff_id=job.handoff_id, transport_id=job.transport_id, consumer_task=job.consumer_task, store_namespace=job.store_namespace, source_executor_id=job.source_executor_id, destination_executor_id=job.destination_executor_id, nonce=job.nonce, sequence=job.sequence, expires_at=job.expires_at, signing_key_fd=args.signing_key_fd, key_id=job.key_id, signing_key_purpose=job.signing_key_purpose, signature_domain=job.signature_domain, signing_domains=_domains_from_args(args))
         return 0
     except (OSError, ValueError, json.JSONDecodeError) as error:
