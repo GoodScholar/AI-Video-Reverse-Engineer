@@ -179,6 +179,22 @@ binding spec 没有重列下列类型；补充授权明确由实施计划第 99�
 - `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_handoffs.py .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_e2_policy_v2.py`：`49 passed in 10.89s`。
 - `backend/.venv/bin/python -m py_compile .../handoffs.py .../trusted_handoff_store.py .../trusted_handoff_orchestrator.py` 与 `git diff --check`：exit 0。
 
+## E.1 — broker-auth registry, sequence journal and lease identity
+
+### RED / GREEN
+
+- RED：在两个 Task 2 测试文件先加入固定 Ed25519 startup 与 lease-identity 向量、request → payload → entry → state 的闭合断言后，命令
+  `PYTHONPATH=.scratch/unified-remix-canvas-generation/acceptance backend/.venv/bin/python -m pytest -q .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_e2_policy_v2.py .scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_handoffs.py`
+  以缺少 `BrokerAuthLeaseIssueRequestV1` / `RegistrationBrokerAuthKeyRegistrationV1` 的 `ImportError` 失败。
+- GREEN：同一命令为 `67 passed in 11.28s`；`py_compile trusted_evidence/e2_policy.py` 和 `git diff --check` 均为 exit 0。
+
+### 实现与边界
+
+- `e2_policy.py` 新增严格 broker-auth registry、revocation、pre-state-only lease request、typed issue/sign/rotate/revoke payload、连续 sequence journal/state、稳定 worker-family authorization、唯一 lease-identity preimage 与 recovery lease portable codec。u64、digest、canonical JSON、自摘要、state-MAC 形状、固定 event sequence、policy/head 闭合与 lease expiry/revocation 等号边界均在 codec 层拒绝。
+- `RegistrationBrokerAuthPrivateKeySlotV1` 只可由既打开的只读 regular-file FD 加载 32-byte Ed25519 seed；它不可 copy/pickle/serialize，关闭后不可再签。startup challenge 使用固定 domain + NUL + canonical `{keyId, nonce, registryDigest}`，并在本地以解析后的 public key复验。测试采用固定 RFC 8032 seed、固定 nonce 与固定 128-char lower-hex signature。
+- 只实现 E.1 的 portable/in-memory contract；没有实现 E.2/E.3 的 SCM_RIGHTS/envelope、Linux root broker、journal durable crash protocol、worker spawn 或 repository mutation runtime。Task 2 仍未完成。
+- 完整 acceptance 本次实际结果：`311 passed, 1 failed in 253.00s`。失败仍是既有 `.scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_e2.py::test_e2_kills_the_process_group_when_the_parent_exits_before_a_pipe_holding_child`：测试读取尚未创建的 `background.pid`，与本切片无共享改动文件；未扩大修复范围。
+
 ### 范围
 
 - 未进入 D/E/F；broker-auth 启动能力仍由 slice E 负责。

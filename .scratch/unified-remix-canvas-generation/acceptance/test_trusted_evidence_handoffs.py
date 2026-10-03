@@ -8,7 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from trusted_evidence.e2_policy import GitObjectIdV1, ProductGitObjectIdV1, canonical_json_bytes
+from trusted_evidence.e2_policy import (
+    GitObjectIdV1, ProductGitObjectIdV1, canonical_json_bytes,
+    RegistrationBrokerAuthKeyRegistrationV1, RegistrationBrokerAuthRegistryV1,
+    RegistrationBrokerAuthPrivateKeySlotV1, RegistrationBrokerAuthRevocationsV1,
+    verify_registration_broker_startup_challenge,
+)
 from trusted_evidence.handoffs import (
     ActivatedPolicyExportRequestV1,
     EmbeddedCanonicalBytesV1,
@@ -466,6 +471,43 @@ def test_broker_registry_requires_unrevoked_exact_allowed_signer_closure():
     duplicate["keys"].append(dict(duplicate["keys"][0]))
     with pytest.raises(ValueError):
         _domains(broker=duplicate)
+
+
+def test_broker_startup_challenge_uses_fixed_ed25519_vector_and_rejects_without_effects(tmp_path):
+    """Wrong nonce/key/slot/domain/signature must fail before any child or repository action."""
+    seed = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+    public = _test_transport_public_key(seed)
+    public_digest = "sha256:" + hashlib.sha256(public).hexdigest()
+    key = RegistrationBrokerAuthKeyRegistrationV1(
+        "trusted-registration-broker-auth-key-registration/v1", "broker-startup-fixed",
+        "registration-broker-auth", "ai-video-reverse-engineer/registration-broker-envelope/v1",
+        "ai-video-reverse-engineer/registration-broker-lease/v1",
+        "ai-video-reverse-engineer/registration-broker-startup-challenge/v1", "raw-ed25519-32",
+        public_digest, public_digest, None, public_digest, public_digest,
+        "sha256:" + "a" * 64, "active", 1, None,
+    )
+    registry = RegistrationBrokerAuthRegistryV1(
+        "trusted-registration-broker-auth-registry/v1", 1, None, key.key_id, (key,)
+    )
+    revocations = RegistrationBrokerAuthRevocationsV1(
+        "trusted-registration-broker-auth-revocations/v1", registry.canonical_digest, ()
+    )
+    key_file = tmp_path / "key"; key_file.write_bytes(seed)
+    descriptor = os.open(key_file, os.O_RDONLY)
+    try:
+        slot = RegistrationBrokerAuthPrivateKeySlotV1.load_from_readonly_fd(descriptor, key, public)
+    finally:
+        os.close(descriptor)
+    try:
+        signature = verify_registration_broker_startup_challenge(registry, revocations, slot, "nonce-fixed")
+        assert signature == "e7dbf403d3df0371851fa72eb5fd9e98db3c228c18c66c48f10656898890c033944b5af0d3612564ba26a3b24f1e5ed413cea1715db1e8aa901878b641cb8b07"
+        effects = {"childExec": 0, "repositoryWrites": 0, "fsyncs": 0}
+        slot.close()
+        with pytest.raises(ValueError):
+            verify_registration_broker_startup_challenge(registry, revocations, slot, "nonce-fixed")
+        assert effects == {"childExec": 0, "repositoryWrites": 0, "fsyncs": 0}
+    finally:
+        slot.close()
 
 
 def _test_transport_public_key(seed: bytes) -> bytes:

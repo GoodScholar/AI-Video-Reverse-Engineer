@@ -33,6 +33,17 @@ from trusted_evidence.e2_policy import (
     RegistrationTransactionStateV1,
     Task26CompletionPayloadV1,
     Task26CompletionRecordV1,
+    BrokerAuthLeaseIssueRequestV1,
+    BrokerAuthLeaseIssueEventPayloadV1,
+    BrokerAuthSequenceJournalEntryV1,
+    BrokerAuthSequenceJournalV1,
+    BrokerAuthSequenceStateV1,
+    RegistrationBrokerAuthKeyRegistrationV1,
+    RegistrationBrokerAuthRegistryV1,
+    RegistrationBrokerAuthRevocationEntryV1,
+    RegistrationBrokerAuthRevocationsV1,
+    RegistrationRecoveryLeaseIdentityPreimageV1,
+    RegistrationWorkerSessionFamilyAuthorizationV1,
 )
 from trusted_evidence.handoffs import PolicyActivationMarkerV1
 
@@ -453,3 +464,86 @@ def test_lifecycle_completion_and_policy_journal_bind_full_forward_chain_without
     recorder.assert_rejected(lambda: proof.validate_staged_artifacts((NamedDigest("record-payload", DIGEST_B), NamedDigest("staged/report", DIGEST_B))))
     recorder.assert_rejected(lambda: Task26CompletionPayloadV1("ai-video-reverse-engineer", 26, BASE, BASE, BASE, "refs/heads/main", "fail", NamedDigest("review", DIGEST_A), NamedDigest("plan", DIGEST_B), NamedDigest("spec", DIGEST_C), "task26-review-controller/v1", "executor-1", DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A))
     recorder.assert_rejected(lambda: PolicyPublishTransactionJournalV1.validate_forward_sequence(tuple(entries[:-1]), marker))
+
+
+# E.1 uses literals deliberately.  A production change that accepts an
+# unlinked head, non-contiguous sequence, or a post-state field in an issue
+# request must make this test fail before it can reach authorization writes.
+def test_broker_auth_issue_chain_is_prestate_only_and_contiguous_without_writes():
+    recorder = VisibleAuthorizationWriteRecorder()
+    key = RegistrationBrokerAuthKeyRegistrationV1(
+        "trusted-registration-broker-auth-key-registration/v1", "broker-fixed",
+        "registration-broker-auth", "ai-video-reverse-engineer/registration-broker-envelope/v1",
+        "ai-video-reverse-engineer/registration-broker-lease/v1",
+        "ai-video-reverse-engineer/registration-broker-startup-challenge/v1",
+        "raw-ed25519-32", DIGEST_A, DIGEST_A, None, DIGEST_A, DIGEST_A, DIGEST_B,
+        "active", 1, None,
+    )
+    registry = RegistrationBrokerAuthRegistryV1(
+        "trusted-registration-broker-auth-registry/v1", 1, None, "broker-fixed", (key,)
+    )
+    revocations = RegistrationBrokerAuthRevocationsV1(
+        "trusted-registration-broker-auth-revocations/v1", registry.canonical_digest, ()
+    )
+    family = RegistrationWorkerSessionFamilyAuthorizationV1(
+        "trusted-registration-worker-session-family-authorization/v1", "op-1", DIGEST_A,
+        DIGEST_B, DIGEST_C, DIGEST_A, DIGEST_B, "broker-fixed", key.canonical_digest,
+        ("register", "recover"), "register-to-recover", DIGEST_C, DIGEST_A, DIGEST_B,
+        DIGEST_C, DIGEST_A,
+    )
+    request = BrokerAuthLeaseIssueRequestV1(
+        "trusted-registration-broker-auth-lease-issue-request/v1", "op-1", "lifecycle-1",
+        family.canonical_digest, "broker-fixed", 0, DIGEST_A, registry.canonical_digest,
+        revocations.canonical_digest, DIGEST_B, DIGEST_C, 2,
+    )
+    payload = BrokerAuthLeaseIssueEventPayloadV1(
+        "trusted-registration-broker-auth-lease-issue-payload/v1", "issue-lease", DIGEST_A,
+        request, request.request_digest, "op-1", "broker-fixed", 1, 2, 3, DIGEST_B, DIGEST_B,
+    )
+    entry = BrokerAuthSequenceJournalEntryV1(
+        "trusted-registration-broker-auth-sequence-entry/v1", 1, None, DIGEST_A, "issue-lease",
+        DIGEST_C, len(payload.canonical_bytes), payload.canonical_digest, DIGEST_B, DIGEST_B,
+        registry.canonical_digest, revocations.canonical_digest, "broker-fixed", "a" * 64,
+    )
+    journal = BrokerAuthSequenceJournalV1(
+        "trusted-registration-broker-auth-sequence-journal/v1", DIGEST_A, 1, (entry,), "b" * 64
+    )
+    state = BrokerAuthSequenceStateV1(
+        "trusted-registration-broker-auth-sequence-state/v1", DIGEST_A, 1, entry.canonical_digest,
+        DIGEST_C, payload.canonical_digest, DIGEST_B, registry.canonical_digest,
+        revocations.canonical_digest, "c" * 64,
+    )
+    journal.validate_state(state, {DIGEST_C: payload})
+    recorder.assert_rejected(lambda: BrokerAuthLeaseIssueRequestV1(
+        "trusted-registration-broker-auth-lease-issue-request/v1", "op-1", "lifecycle-1",
+        family.canonical_digest, "broker-fixed", 1, entry.canonical_digest, registry.canonical_digest,
+        revocations.canonical_digest, DIGEST_B, DIGEST_C, 0,
+    ))
+    recorder.assert_rejected(lambda: BrokerAuthSequenceJournalV1(
+        "trusted-registration-broker-auth-sequence-journal/v1", DIGEST_A, 1,
+        (BrokerAuthSequenceJournalEntryV1(
+            "trusted-registration-broker-auth-sequence-entry/v1", 2, None, DIGEST_A, "issue-lease",
+            DIGEST_C, len(payload.canonical_bytes), payload.canonical_digest, DIGEST_B, DIGEST_B,
+            registry.canonical_digest, revocations.canonical_digest, "broker-fixed", "a" * 64,
+        ),), "b" * 64,
+    ))
+
+
+def test_lease_identity_preimage_rejects_session_fields_and_binds_family_authorization():
+    recorder = VisibleAuthorizationWriteRecorder()
+    family = RegistrationWorkerSessionFamilyAuthorizationV1(
+        "trusted-registration-worker-session-family-authorization/v1", "op-identity", DIGEST_A,
+        DIGEST_B, DIGEST_C, DIGEST_A, DIGEST_B, "broker-fixed", DIGEST_C,
+        ("register", "recover"), "register-to-recover", DIGEST_A, DIGEST_B, DIGEST_C,
+        DIGEST_A, DIGEST_B,
+    )
+    preimage = RegistrationRecoveryLeaseIdentityPreimageV1(
+        "trusted-registration-recovery-lease-identity-preimage/v1", "ai-video-reverse-engineer",
+        "op-identity", "stable-lifecycle", family.canonical_digest, DIGEST_A, "broker-fixed", 7,
+        DIGEST_B, DIGEST_C, 3, DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A, DIGEST_B,
+        9, DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A, DIGEST_B, DIGEST_C,
+    )
+    assert preimage.lease_identity_digest == "sha256:3b8f8ce786f10f13eb93aee652286cf8383b52a16005d49d6afda559f7f9808f"
+    recorder.assert_rejected(lambda: RegistrationRecoveryLeaseIdentityPreimageV1.from_canonical_bytes(
+        preimage.canonical_bytes.replace(b"}", b',\"workerSessionId\":\"forbidden\"}', 1)
+    ))
