@@ -38,6 +38,7 @@ from trusted_evidence.e2_policy import (
     Task26CompletionRecordV1,
     BrokerAuthLeaseIssueRequestV1,
     BrokerAuthLeaseIssueEventPayloadV1,
+    BrokerAuthAuthoritativeIssuerV1,
     BrokerAuthSequenceJournalEntryV1,
     BrokerAuthSequenceJournalV1,
     BrokerAuthSequenceStateV1,
@@ -643,6 +644,165 @@ def test_signed_lease_wire_is_canonical_and_respects_expiry_and_global_revocatio
         replace(lease, broker_signature_hex="0" * 128).verify_signature(
             registry, revocations, {"broker-fixed": public}, 3
         )
+
+
+def test_authoritative_broker_issuer_commits_a_verified_issue_chain_and_preserves_state_on_rejection(tmp_path):
+    """Changing a request/head/event or signing key must not consume broker state."""
+    seed = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+    public = bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+    public_digest = "sha256:" + hashlib.sha256(public).hexdigest()
+    key = RegistrationBrokerAuthKeyRegistrationV1(
+        "trusted-registration-broker-auth-key-registration/v1", "broker-fixed",
+        "registration-broker-auth", "ai-video-reverse-engineer/registration-broker-envelope/v1",
+        "ai-video-reverse-engineer/registration-broker-lease/v1",
+        "ai-video-reverse-engineer/registration-broker-startup-challenge/v1", "raw-ed25519-32",
+        public_digest, public_digest, None, public_digest, public_digest, DIGEST_B, "active", 1, None,
+    )
+    registry = RegistrationBrokerAuthRegistryV1(
+        "trusted-registration-broker-auth-registry/v1", 1, None, "broker-fixed", (key,)
+    )
+    revocations = RegistrationBrokerAuthRevocationsV1(
+        "trusted-registration-broker-auth-revocations/v1", registry.canonical_digest, ()
+    )
+    family = RegistrationWorkerSessionFamilyAuthorizationV1(
+        "trusted-registration-worker-session-family-authorization/v1", "op-issuer", DIGEST_A,
+        DIGEST_B, DIGEST_C, DIGEST_A, DIGEST_B, "broker-fixed", key.canonical_digest,
+        ("register", "recover"), "register-to-recover", DIGEST_C, DIGEST_A, DIGEST_B,
+        DIGEST_C, DIGEST_A,
+    )
+    request = BrokerAuthLeaseIssueRequestV1(
+        "trusted-registration-broker-auth-lease-issue-request/v1", "op-issuer", "lifecycle-issuer",
+        family.canonical_digest, "broker-fixed", 0, DIGEST_A, registry.canonical_digest,
+        revocations.canonical_digest, DIGEST_B, DIGEST_C, 2,
+    )
+    template = RegistrationRecoveryLeaseV1(
+        "trusted-registration-recovery-lease/v1", "ai-video-reverse-engineer", "op-issuer", "lifecycle-issuer",
+        family.canonical_digest, 1, DIGEST_A, "transaction-root", DIGEST_B, DIGEST_C, DIGEST_A,
+        DIGEST_B, DIGEST_C, DIGEST_A, DIGEST_B, DIGEST_C, 1, registry.canonical_digest,
+        revocations.canonical_digest, DIGEST_B, DIGEST_C, "broker-fixed", request.request_digest,
+        DIGEST_A, DIGEST_B, DIGEST_C, 1, 3, DIGEST_A, "OPEN", "a" * 128, "b" * 64,
+    )
+    key_file = tmp_path / "broker-key"
+    key_file.write_bytes(seed)
+    descriptor = os.open(key_file, os.O_RDONLY)
+    try:
+        signer = RegistrationBrokerAuthPrivateKeySlotV1.load_from_readonly_fd(descriptor, key, public)
+    finally:
+        os.close(descriptor)
+    try:
+        issuer = BrokerAuthAuthoritativeIssuerV1.create(
+            registry, revocations, DIGEST_A, DIGEST_B, DIGEST_C, signer, {"broker-fixed": public}
+        )
+        before = issuer.state
+        with pytest.raises(ValueError):
+            issuer.issue_lease(replace(request, expected_current_head_digest=DIGEST_B), family, template, DIGEST_A)
+        assert issuer.state == before and issuer.entries == () and issuer.payloads == {}
+
+        issued = issuer.issue_lease(request, family, template, DIGEST_A)
+        assert issued.entry.sequence == issued.payload.issued_sequence == issued.state.current_sequence == 1
+        assert issued.entry.event_payload_ref == issued.payload.canonical_digest
+        issued.entry.verify_state_mac(seed)
+        issued.state.verify_state_mac(seed)
+        issued.journal.verify_state_mac(seed)
+        issued.journal.validate_state(issued.state, issued.payloads)
+        issued.lease.verify_signature(registry, revocations, {"broker-fixed": public}, 1)
+        assert issued.lease.broker_auth_lease_request_digest == request.request_digest
+        assert issued.lease.lease_identity_digest == issued.lease.identity_preimage().lease_identity_digest
+
+        signed = issuer.sign_envelope(
+            "op-issuer", issued.lease.lease_identity_digest, request.request_digest, DIGEST_B, DIGEST_C
+        )
+        assert signed.entry.sequence == signed.payload.sign_sequence == signed.state.current_sequence == 2
+        signed.journal.validate_state(signed.state, signed.payloads)
+
+        stable = issuer.state
+        with pytest.raises(ValueError):
+            issuer.issue_lease(request, family, template, DIGEST_B)
+        assert issuer.state == stable and len(issuer.entries) == 2
+        with pytest.raises(ValueError):
+            issuer.issue_lease(replace(request, expected_current_sequence=1, expected_current_head_digest=stable.head_entry_digest), family, template, DIGEST_A)
+        assert issuer.state == stable and len(issuer.entries) == 2
+    finally:
+        signer.close()
+
+
+def test_authoritative_broker_issuer_rotates_and_revokes_without_partial_state(tmp_path):
+    """Rotation changes the sole issuer; revoke stops the named key at its event sequence."""
+    seeds = (
+        bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"),
+        bytes.fromhex("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"),
+    )
+    publics = (
+        bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"),
+        bytes.fromhex("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"),
+    )
+    def key(key_id, public, state, effective, retire_after):
+        digest = "sha256:" + hashlib.sha256(public).hexdigest()
+        return RegistrationBrokerAuthKeyRegistrationV1(
+            "trusted-registration-broker-auth-key-registration/v1", key_id,
+            "registration-broker-auth", "ai-video-reverse-engineer/registration-broker-envelope/v1",
+            "ai-video-reverse-engineer/registration-broker-lease/v1",
+            "ai-video-reverse-engineer/registration-broker-startup-challenge/v1", "raw-ed25519-32",
+            digest, digest, None, digest, digest, DIGEST_B, state, effective, retire_after,
+        )
+    old_key = key("old", publics[0], "active", 1, None)
+    registry = RegistrationBrokerAuthRegistryV1(
+        "trusted-registration-broker-auth-registry/v1", 1, None, "old", (old_key,)
+    )
+    revocations = RegistrationBrokerAuthRevocationsV1(
+        "trusted-registration-broker-auth-revocations/v1", registry.canonical_digest, ()
+    )
+    path = tmp_path / "old-key"; path.write_bytes(seeds[0])
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        old_signer = RegistrationBrokerAuthPrivateKeySlotV1.load_from_readonly_fd(descriptor, old_key, publics[0])
+    finally:
+        os.close(descriptor)
+    new_signer = None
+    try:
+        issuer = BrokerAuthAuthoritativeIssuerV1.create(
+            registry, revocations, DIGEST_A, DIGEST_B, DIGEST_C, old_signer, {"old": publics[0]}
+        )
+        new_key = key("new", publics[1], "active", 1, None)
+        retired_old = key("old", publics[0], "retiring", 1, 2)
+        next_registry = RegistrationBrokerAuthRegistryV1(
+            "trusted-registration-broker-auth-registry/v1", 2, registry.canonical_digest,
+            "new", (new_key, retired_old),
+        )
+        next_revocations = RegistrationBrokerAuthRevocationsV1(
+            "trusted-registration-broker-auth-revocations/v1", next_registry.canonical_digest, ()
+        )
+        before = issuer.state
+        with pytest.raises(ValueError):
+            issuer.rotate_registry(next_registry, revocations, DIGEST_A, DIGEST_C)
+        assert issuer.state == before and issuer.entries == ()
+        rotated = issuer.rotate_registry(next_registry, next_revocations, DIGEST_A, DIGEST_C)
+        assert rotated.entry.sequence == rotated.payload.effective_lease_sequence == 1
+        assert issuer.registry == next_registry and issuer.revocations == next_revocations
+
+        new_path = tmp_path / "new-key"; new_path.write_bytes(seeds[1])
+        descriptor = os.open(new_path, os.O_RDONLY)
+        try:
+            new_signer = RegistrationBrokerAuthPrivateKeySlotV1.load_from_readonly_fd(descriptor, new_key, publics[1])
+        finally:
+            os.close(descriptor)
+        issuer.replace_signer(new_signer, {"new": publics[1]})
+
+        stale = issuer.state
+        with pytest.raises(ValueError):
+            issuer.revoke_key("not-registered", next_revocations, DIGEST_B, DIGEST_A)
+        assert issuer.state == stale and issuer.revocations == next_revocations
+        revoked = RegistrationBrokerAuthRevocationsV1(
+            "trusted-registration-broker-auth-revocations/v1", next_registry.canonical_digest,
+            (RegistrationBrokerAuthRevocationEntryV1("old", 2, DIGEST_A),),
+        )
+        result = issuer.revoke_key("old", revoked, DIGEST_B, DIGEST_A)
+        assert result.entry.sequence == result.payload.revoked_at_broker_sequence == 2
+        assert issuer.revocations == revoked
+    finally:
+        if new_signer is not None:
+            new_signer.close()
+        old_signer.close()
 
 
 # E.2: these fixtures deliberately do not consult the codec under test to
