@@ -1279,6 +1279,7 @@ class RegistrationTransactionCapabilityV1:
 class BrokerLifecycleProofV1:
     schema: str
     broker_key_id: str
+    operation_id: str
     lifecycle_id: str
     lease_id: str
     subject_commit: ProductGitObjectIdV1
@@ -1289,22 +1290,39 @@ class BrokerLifecycleProofV1:
     shared_object_store_baseline_digest: str
     proof_payload_digest: str
     broker_signature: str
+    broker_auth_public_key_digest: str
+    broker_auth_registry_generation: int
+    broker_auth_registry_digest: str
+    broker_auth_revocation_digest: str
+    broker_auth_allowed_signers_digest: str
+    broker_auth_sign_sequence: int
 
     def __post_init__(self) -> None:
         if self.schema != "trusted-broker-lifecycle-proof/v1" or type(self.subject_commit) is not ProductGitObjectIdV1:
             raise ValueError("lifecycle proof identity is invalid")
-        for field in ("broker_key_id", "lifecycle_id", "lease_id"):
+        for field in ("broker_key_id", "operation_id", "lifecycle_id", "lease_id"):
             _require_text(getattr(self, field), field)
         staged = _ordered(self.staged_artifact_digests, lambda item: (item.name.encode("utf-8"), item.digest.encode("ascii")), "staged_artifact_digests")
         if not staged or not all(type(item) is NamedDigest for item in staged) or not any(item.name == "record-payload" for item in staged):
             raise ValueError("lifecycle proof must bind record payload and staged artifacts")
         for field in ("producer_exit_digest", "destroyed_resources_digest", "shared_control_baseline_digest", "shared_object_store_baseline_digest", "proof_payload_digest"):
             _require_digest(getattr(self, field), field)
+        for field in ("broker_auth_public_key_digest", "broker_auth_registry_digest", "broker_auth_revocation_digest", "broker_auth_allowed_signers_digest"):
+            _require_digest(getattr(self, field), field)
+        _u64(self.broker_auth_registry_generation, "broker_auth_registry_generation", positive=True)
+        _u64(self.broker_auth_sign_sequence, "broker_auth_sign_sequence", positive=True)
         _signature(self.broker_signature, "broker_signature")
         object.__setattr__(self, "staged_artifact_digests", staged)
 
     def to_wire(self) -> dict[str, object]:
-        return {"brokerKeyId": self.broker_key_id, "brokerSignature": self.broker_signature, "destroyedResourcesDigest": self.destroyed_resources_digest, "leaseId": self.lease_id, "lifecycleId": self.lifecycle_id, "producerExitDigest": self.producer_exit_digest, "proofPayloadDigest": self.proof_payload_digest, "schema": self.schema, "sharedControlBaselineDigest": self.shared_control_baseline_digest, "sharedObjectStoreBaselineDigest": self.shared_object_store_baseline_digest, "stagedArtifactDigests": [_wire(item) for item in self.staged_artifact_digests], "subjectCommit": self.subject_commit.to_wire()}
+        return {**self.unsigned_wire(), "brokerSignature": self.broker_signature}
+
+    def unsigned_wire(self) -> dict[str, object]:
+        return {"brokerAuthAllowedSignersDigest": self.broker_auth_allowed_signers_digest, "brokerAuthPublicKeyDigest": self.broker_auth_public_key_digest, "brokerAuthRegistryDigest": self.broker_auth_registry_digest, "brokerAuthRegistryGeneration": self.broker_auth_registry_generation, "brokerAuthRevocationDigest": self.broker_auth_revocation_digest, "brokerAuthSignSequence": self.broker_auth_sign_sequence, "brokerKeyId": self.broker_key_id, "destroyedResourcesDigest": self.destroyed_resources_digest, "leaseId": self.lease_id, "lifecycleId": self.lifecycle_id, "operationId": self.operation_id, "producerExitDigest": self.producer_exit_digest, "proofPayloadDigest": self.proof_payload_digest, "schema": self.schema, "sharedControlBaselineDigest": self.shared_control_baseline_digest, "sharedObjectStoreBaselineDigest": self.shared_object_store_baseline_digest, "stagedArtifactDigests": [_wire(item) for item in self.staged_artifact_digests], "subjectCommit": self.subject_commit.to_wire()}
+
+    @property
+    def unsigned_bytes(self) -> bytes:
+        return canonical_json_bytes(self.unsigned_wire())
 
     @property
     def canonical_bytes(self) -> bytes:
@@ -1319,13 +1337,23 @@ class BrokerLifecycleProofV1:
         if tuple(expected_values) != self.staged_artifact_digests:
             raise ValueError("lifecycle proof staged artifact set changed")
 
+    def verify_signature(self, registry: "RegistrationBrokerAuthRegistryV1", revocations: "RegistrationBrokerAuthRevocationsV1", allowed_signers: Mapping[str, bytes], allowed_signers_digest: str, current_sequence: int) -> None:
+        _verify_broker_signed_record(
+            registry, revocations, allowed_signers, allowed_signers_digest, current_sequence,
+            self.broker_key_id, self.broker_auth_public_key_digest,
+            self.broker_auth_registry_generation, self.broker_auth_registry_digest,
+            self.broker_auth_revocation_digest, self.broker_auth_allowed_signers_digest,
+            self.broker_auth_sign_sequence, self.broker_signature,
+            _BROKER_LIFECYCLE_PROOF_DOMAIN, self.unsigned_bytes,
+        )
+
     @classmethod
     def from_canonical_bytes(cls, payload: bytes) -> "BrokerLifecycleProofV1":
-        fields = {"brokerKeyId", "brokerSignature", "destroyedResourcesDigest", "leaseId", "lifecycleId", "producerExitDigest", "proofPayloadDigest", "schema", "sharedControlBaselineDigest", "sharedObjectStoreBaselineDigest", "stagedArtifactDigests", "subjectCommit"}
+        fields = {"brokerAuthAllowedSignersDigest", "brokerAuthPublicKeyDigest", "brokerAuthRegistryDigest", "brokerAuthRegistryGeneration", "brokerAuthRevocationDigest", "brokerAuthSignSequence", "brokerKeyId", "brokerSignature", "destroyedResourcesDigest", "leaseId", "lifecycleId", "operationId", "producerExitDigest", "proofPayloadDigest", "schema", "sharedControlBaselineDigest", "sharedObjectStoreBaselineDigest", "stagedArtifactDigests", "subjectCommit"}
         raw = _strict_object(payload, fields, "lifecycle proof")
         if not isinstance(raw["stagedArtifactDigests"], list):
             raise ValueError("lifecycle proof staged artifacts are invalid")
-        return cls(raw["schema"], raw["brokerKeyId"], raw["lifecycleId"], raw["leaseId"], ProductGitObjectIdV1(**raw["subjectCommit"]), tuple(_named_digest(item, "staged artifact") for item in raw["stagedArtifactDigests"]), raw["producerExitDigest"], raw["destroyedResourcesDigest"], raw["sharedControlBaselineDigest"], raw["sharedObjectStoreBaselineDigest"], raw["proofPayloadDigest"], raw["brokerSignature"])
+        return cls(raw["schema"], raw["brokerKeyId"], raw["operationId"], raw["lifecycleId"], raw["leaseId"], ProductGitObjectIdV1(**raw["subjectCommit"]), tuple(_named_digest(item, "staged artifact") for item in raw["stagedArtifactDigests"]), raw["producerExitDigest"], raw["destroyedResourcesDigest"], raw["sharedControlBaselineDigest"], raw["sharedObjectStoreBaselineDigest"], raw["proofPayloadDigest"], raw["brokerSignature"], raw["brokerAuthPublicKeyDigest"], raw["brokerAuthRegistryGeneration"], raw["brokerAuthRegistryDigest"], raw["brokerAuthRevocationDigest"], raw["brokerAuthAllowedSignersDigest"], raw["brokerAuthSignSequence"])
 
 
 @dataclass(frozen=True, slots=True)
@@ -1386,18 +1414,48 @@ class Task26CompletionRecordV1:
     payload: Task26CompletionPayloadV1
     payload_digest: str
     broker_key_id: str
+    operation_id: str
+    lifecycle_id: str
     broker_signature: str
+    broker_auth_public_key_digest: str
+    broker_auth_registry_generation: int
+    broker_auth_registry_digest: str
+    broker_auth_revocation_digest: str
+    broker_auth_allowed_signers_digest: str
+    broker_auth_sign_sequence: int
 
     def __post_init__(self) -> None:
         if self.schema != "trusted-task-completion-record/v1" or type(self.payload) is not Task26CompletionPayloadV1:
             raise ValueError("Task 26 completion record identity is invalid")
         if self.payload_digest != canonical_digest(self.payload.to_wire()):
             raise ValueError("Task 26 payload digest is invalid")
-        _require_text(self.broker_key_id, "broker_key_id")
+        for field in ("broker_key_id", "operation_id", "lifecycle_id"):
+            _require_text(getattr(self, field), field)
+        for field in ("broker_auth_public_key_digest", "broker_auth_registry_digest", "broker_auth_revocation_digest", "broker_auth_allowed_signers_digest"):
+            _require_digest(getattr(self, field), field)
+        _u64(self.broker_auth_registry_generation, "broker_auth_registry_generation", positive=True)
+        _u64(self.broker_auth_sign_sequence, "broker_auth_sign_sequence", positive=True)
         _signature(self.broker_signature, "broker_signature")
 
     def to_wire(self) -> dict[str, object]:
-        return {"brokerKeyId": self.broker_key_id, "brokerSignature": self.broker_signature, "payload": self.payload.to_wire(), "payloadDigest": self.payload_digest, "schema": self.schema}
+        return {**self.unsigned_wire(), "brokerSignature": self.broker_signature}
+
+    def unsigned_wire(self) -> dict[str, object]:
+        return {"brokerAuthAllowedSignersDigest": self.broker_auth_allowed_signers_digest, "brokerAuthPublicKeyDigest": self.broker_auth_public_key_digest, "brokerAuthRegistryDigest": self.broker_auth_registry_digest, "brokerAuthRegistryGeneration": self.broker_auth_registry_generation, "brokerAuthRevocationDigest": self.broker_auth_revocation_digest, "brokerAuthSignSequence": self.broker_auth_sign_sequence, "brokerKeyId": self.broker_key_id, "lifecycleId": self.lifecycle_id, "operationId": self.operation_id, "payload": self.payload.to_wire(), "payloadDigest": self.payload_digest, "schema": self.schema}
+
+    @property
+    def unsigned_bytes(self) -> bytes:
+        return canonical_json_bytes(self.unsigned_wire())
+
+    def verify_signature(self, registry: "RegistrationBrokerAuthRegistryV1", revocations: "RegistrationBrokerAuthRevocationsV1", allowed_signers: Mapping[str, bytes], allowed_signers_digest: str, current_sequence: int) -> None:
+        _verify_broker_signed_record(
+            registry, revocations, allowed_signers, allowed_signers_digest, current_sequence,
+            self.broker_key_id, self.broker_auth_public_key_digest,
+            self.broker_auth_registry_generation, self.broker_auth_registry_digest,
+            self.broker_auth_revocation_digest, self.broker_auth_allowed_signers_digest,
+            self.broker_auth_sign_sequence, self.broker_signature,
+            _TASK26_COMPLETION_RECORD_DOMAIN, self.unsigned_bytes,
+        )
 
     @property
     def canonical_bytes(self) -> bytes:
@@ -1409,8 +1467,8 @@ class Task26CompletionRecordV1:
 
     @classmethod
     def from_canonical_bytes(cls, payload: bytes) -> "Task26CompletionRecordV1":
-        raw = _strict_object(payload, {"brokerKeyId", "brokerSignature", "payload", "payloadDigest", "schema"}, "Task 26 completion record")
-        return cls(raw["schema"], Task26CompletionPayloadV1._from_wire(raw["payload"]), raw["payloadDigest"], raw["brokerKeyId"], raw["brokerSignature"])
+        raw = _strict_object(payload, {"brokerAuthAllowedSignersDigest", "brokerAuthPublicKeyDigest", "brokerAuthRegistryDigest", "brokerAuthRegistryGeneration", "brokerAuthRevocationDigest", "brokerAuthSignSequence", "brokerKeyId", "brokerSignature", "lifecycleId", "operationId", "payload", "payloadDigest", "schema"}, "Task 26 completion record")
+        return cls(raw["schema"], Task26CompletionPayloadV1._from_wire(raw["payload"]), raw["payloadDigest"], raw["brokerKeyId"], raw["operationId"], raw["lifecycleId"], raw["brokerSignature"], raw["brokerAuthPublicKeyDigest"], raw["brokerAuthRegistryGeneration"], raw["brokerAuthRegistryDigest"], raw["brokerAuthRevocationDigest"], raw["brokerAuthAllowedSignersDigest"], raw["brokerAuthSignSequence"])
 
 
 _POLICY_STATES = ("PREPARED", "QUARANTINED", "OBJECTS_PROMOTED", "REFS_INSTALLED", "HANDOFF_INSTALLED", "ACTIVATED")
@@ -1519,6 +1577,8 @@ _BROKER_AUTH_PURPOSE = "registration-broker-auth"
 _BROKER_ENVELOPE_DOMAIN = "ai-video-reverse-engineer/registration-broker-envelope/v1"
 _BROKER_LEASE_DOMAIN = "ai-video-reverse-engineer/registration-broker-lease/v1"
 _BROKER_CHALLENGE_DOMAIN = "ai-video-reverse-engineer/registration-broker-startup-challenge/v1"
+_BROKER_LIFECYCLE_PROOF_DOMAIN = "ai-video-reverse-engineer/broker-lifecycle-proof/v1"
+_TASK26_COMPLETION_RECORD_DOMAIN = "ai-video-reverse-engineer/task26-completion-record/v1"
 _LEASE_IDENTITY_DOMAIN = "ai-video-reverse-engineer/registration-recovery-lease-identity/v1"
 _U64_MAX = 2**64 - 1
 
@@ -1719,6 +1779,54 @@ def verify_registration_broker_governance(
         public_key = allowed_signers[key.key_id]
         if not isinstance(public_key, bytes) or len(public_key) != 32 or "sha256:" + hashlib.sha256(public_key).hexdigest() != key.public_key_digest:
             raise ValueError("broker allowed signer is invalid")
+
+
+def _verify_broker_signed_record(
+    registry: RegistrationBrokerAuthRegistryV1,
+    revocations: RegistrationBrokerAuthRevocationsV1,
+    allowed_signers: Mapping[str, bytes],
+    allowed_signers_digest: str,
+    current_sequence: int,
+    key_id: str,
+    public_key_digest: str,
+    registry_generation: int,
+    registry_digest: str,
+    revocation_digest: str,
+    recorded_allowed_signers_digest: str,
+    sign_sequence: int,
+    signature: str,
+    domain: str,
+    unsigned_bytes: bytes,
+) -> None:
+    """Verify a portable broker record before any later durable-write layer uses it."""
+    _require_digest(allowed_signers_digest, "allowed_signers_digest")
+    _u64(current_sequence, "current_sequence", positive=True)
+    verify_registration_broker_governance(registry, revocations, allowed_signers)
+    if (registry_generation, registry_digest, revocation_digest, recorded_allowed_signers_digest) != (
+        registry.generation,
+        registry.canonical_digest,
+        revocations.canonical_digest,
+        allowed_signers_digest,
+    ):
+        raise ValueError("broker record trust state changed")
+    key = registry.key(key_id)
+    if (
+        key.purpose != _BROKER_AUTH_PURPOSE
+        or key.state != "active"
+        or key.public_key_digest != public_key_digest
+        or sign_sequence < key.effective_lease_sequence
+        or sign_sequence > current_sequence
+    ):
+        raise ValueError("broker record signing key is not eligible")
+    revoked_at = revocations.revoked_at(key_id)
+    if revoked_at is not None and current_sequence >= revoked_at:
+        raise ValueError("broker record signing key is globally revoked")
+    public_key = allowed_signers.get(key_id)
+    if not isinstance(public_key, bytes) or len(public_key) != 32 or "sha256:" + hashlib.sha256(public_key).hexdigest() != public_key_digest:
+        raise ValueError("broker record allowed signer is invalid")
+    from .handoffs import _ed25519_verify
+    if not _ed25519_verify(public_key, domain.encode("utf-8") + b"\0" + unsigned_bytes, bytes.fromhex(signature)):
+        raise ValueError("broker record signature is invalid")
 
 
 def _broker_identity_fields(value: object, field: str) -> str:

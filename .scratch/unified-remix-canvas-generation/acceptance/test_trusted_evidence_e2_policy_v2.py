@@ -72,6 +72,7 @@ from trusted_evidence.e2_policy import (
     RegistrationForwardOnlyRecoveryAuthorityV1,
     verify_registration_forward_only_recovery,
     validate_task_output_repository_state,
+    _ed_sign,
 )
 from trusted_evidence.handoffs import PolicyActivationMarkerV1
 
@@ -806,10 +807,10 @@ def test_precreated_transaction_capability_rejects_unsafe_layouts_and_rebinds_wi
 
 def test_lifecycle_completion_and_policy_journal_bind_full_forward_chain_without_writes():
     recorder = VisibleAuthorizationWriteRecorder()
-    proof = BrokerLifecycleProofV1("trusted-broker-lifecycle-proof/v1", "broker-key", "lifecycle-1", "lease-1", ProductGitObjectIdV1("sha1", "1" * 40), (NamedDigest("record-payload", DIGEST_A), NamedDigest("staged/report", DIGEST_B)), DIGEST_C, DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A, "a" * 128)
+    proof = BrokerLifecycleProofV1("trusted-broker-lifecycle-proof/v1", "broker-key", "operation-1", "lifecycle-1", "lease-1", ProductGitObjectIdV1("sha1", "1" * 40), (NamedDigest("record-payload", DIGEST_A), NamedDigest("staged/report", DIGEST_B)), DIGEST_C, DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A, "a" * 128, DIGEST_A, 1, DIGEST_B, DIGEST_C, DIGEST_A, 1)
     proof.validate_staged_artifacts((NamedDigest("record-payload", DIGEST_A), NamedDigest("staged/report", DIGEST_B)))
     payload = Task26CompletionPayloadV1("ai-video-reverse-engineer", 26, BASE, BASE, BASE, "refs/heads/main", "pass", NamedDigest("review", DIGEST_A), NamedDigest("plan", DIGEST_B), NamedDigest("spec", DIGEST_C), "task26-review-controller/v1", "executor-1", DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A)
-    record = Task26CompletionRecordV1("trusted-task-completion-record/v1", payload, "sha256:" + hashlib.sha256(payload.canonical_bytes).hexdigest(), "broker-key", "b" * 128)
+    record = Task26CompletionRecordV1("trusted-task-completion-record/v1", payload, "sha256:" + hashlib.sha256(payload.canonical_bytes).hexdigest(), "broker-key", "operation-1", "lifecycle-1", "b" * 128, DIGEST_A, 1, DIGEST_B, DIGEST_C, DIGEST_A, 1)
     assert Task26CompletionRecordV1.from_canonical_bytes(record.canonical_bytes) == record
     entries, previous = [], None
     for state, transition in (("PREPARED", "QUARANTINE"), ("QUARANTINED", "PROMOTE_OBJECTS"), ("OBJECTS_PROMOTED", "INSTALL_REFS"), ("REFS_INSTALLED", "INSTALL_HANDOFF"), ("HANDOFF_INSTALLED", "ACTIVATE")):
@@ -822,6 +823,87 @@ def test_lifecycle_completion_and_policy_journal_bind_full_forward_chain_without
     recorder.assert_rejected(lambda: proof.validate_staged_artifacts((NamedDigest("record-payload", DIGEST_B), NamedDigest("staged/report", DIGEST_B))))
     recorder.assert_rejected(lambda: Task26CompletionPayloadV1("ai-video-reverse-engineer", 26, BASE, BASE, BASE, "refs/heads/main", "fail", NamedDigest("review", DIGEST_A), NamedDigest("plan", DIGEST_B), NamedDigest("spec", DIGEST_C), "task26-review-controller/v1", "executor-1", DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A))
     recorder.assert_rejected(lambda: PolicyPublishTransactionJournalV1.validate_forward_sequence(tuple(entries[:-1]), marker))
+
+
+def test_lifecycle_and_completion_signatures_close_governance_before_durable_writes():
+    """Tampering a broker-signed lifecycle or completion record never reaches a write."""
+    recorder = VisibleAuthorizationWriteRecorder()
+    seed = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+    public = bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+    public_digest = "sha256:" + hashlib.sha256(public).hexdigest()
+    allowed_signers_digest = "sha256:" + "d" * 64
+    key = RegistrationBrokerAuthKeyRegistrationV1(
+        "trusted-registration-broker-auth-key-registration/v1", "broker-fixed",
+        "registration-broker-auth", "ai-video-reverse-engineer/registration-broker-envelope/v1",
+        "ai-video-reverse-engineer/registration-broker-lease/v1",
+        "ai-video-reverse-engineer/registration-broker-startup-challenge/v1", "raw-ed25519-32",
+        public_digest, public_digest, None, public_digest, public_digest, DIGEST_B, "active", 1, None,
+    )
+    registry = RegistrationBrokerAuthRegistryV1(
+        "trusted-registration-broker-auth-registry/v1", 1, None, "broker-fixed", (key,)
+    )
+    revocations = RegistrationBrokerAuthRevocationsV1(
+        "trusted-registration-broker-auth-revocations/v1", registry.canonical_digest, ()
+    )
+    proof = BrokerLifecycleProofV1(
+        "trusted-broker-lifecycle-proof/v1", "broker-fixed", "operation-1", "lifecycle-1", "lease-1",
+        ProductGitObjectIdV1("sha1", "1" * 40),
+        (NamedDigest("record-payload", DIGEST_A), NamedDigest("staged/report", DIGEST_B)),
+        DIGEST_C, DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A, "0" * 128,
+        broker_auth_public_key_digest=public_digest,
+        broker_auth_registry_generation=registry.generation,
+        broker_auth_registry_digest=registry.canonical_digest,
+        broker_auth_revocation_digest=revocations.canonical_digest,
+        broker_auth_allowed_signers_digest=allowed_signers_digest,
+        broker_auth_sign_sequence=1,
+    )
+    proof = replace(
+        proof,
+        broker_signature=_ed_sign(
+            seed,
+            b"ai-video-reverse-engineer/broker-lifecycle-proof/v1\0" + proof.unsigned_bytes,
+        ).hex(),
+    )
+    payload = Task26CompletionPayloadV1(
+        "ai-video-reverse-engineer", 26, BASE, BASE, BASE, "refs/heads/main", "pass",
+        NamedDigest("review", DIGEST_A), NamedDigest("plan", DIGEST_B), NamedDigest("spec", DIGEST_C),
+        "task26-review-controller/v1", "executor-1", DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A,
+    )
+    record = Task26CompletionRecordV1(
+        "trusted-task-completion-record/v1", payload,
+        "sha256:" + hashlib.sha256(payload.canonical_bytes).hexdigest(), "broker-fixed", "operation-1", "lifecycle-1", "0" * 128,
+        broker_auth_public_key_digest=public_digest,
+        broker_auth_registry_generation=registry.generation,
+        broker_auth_registry_digest=registry.canonical_digest,
+        broker_auth_revocation_digest=revocations.canonical_digest,
+        broker_auth_allowed_signers_digest=allowed_signers_digest,
+        broker_auth_sign_sequence=1,
+    )
+    record = replace(
+        record,
+        broker_signature=_ed_sign(
+            seed,
+            b"ai-video-reverse-engineer/task26-completion-record/v1\0" + record.unsigned_bytes,
+        ).hex(),
+    )
+    proof.verify_signature(registry, revocations, {"broker-fixed": public}, allowed_signers_digest, 1)
+    record.verify_signature(registry, revocations, {"broker-fixed": public}, allowed_signers_digest, 1)
+    recorder.assert_rejected(lambda: replace(proof, subject_commit=ProductGitObjectIdV1("sha1", "2" * 40)).verify_signature(
+        registry, revocations, {"broker-fixed": public}, allowed_signers_digest, 1
+    ))
+    recorder.assert_rejected(lambda: replace(proof, staged_artifact_digests=(NamedDigest("record-payload", DIGEST_A), NamedDigest("staged/report", DIGEST_C))).verify_signature(
+        registry, revocations, {"broker-fixed": public}, allowed_signers_digest, 1
+    ))
+    recorder.assert_rejected(lambda: replace(record, payload=replace(payload, reviewed_commit=GitObjectIdV1("sha1", "2" * 40)), payload_digest="sha256:" + hashlib.sha256(replace(payload, reviewed_commit=GitObjectIdV1("sha1", "2" * 40)).canonical_bytes).hexdigest()).verify_signature(
+        registry, revocations, {"broker-fixed": public}, allowed_signers_digest, 1
+    ))
+    recorder.assert_rejected(lambda: proof.verify_signature(registry, revocations, {"broker-fixed": bytes(32)}, allowed_signers_digest, 1))
+    recorder.assert_rejected(lambda: proof.verify_signature(registry, revocations, {"broker-fixed": public}, DIGEST_A, 1))
+    revoked = RegistrationBrokerAuthRevocationsV1(
+        "trusted-registration-broker-auth-revocations/v1", registry.canonical_digest,
+        (RegistrationBrokerAuthRevocationEntryV1("broker-fixed", 1, DIGEST_A),),
+    )
+    recorder.assert_rejected(lambda: proof.verify_signature(registry, revoked, {"broker-fixed": public}, allowed_signers_digest, 1))
 
 
 # E.1 uses literals deliberately.  A production change that accepts an
