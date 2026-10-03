@@ -45,6 +45,9 @@ from trusted_evidence.e2_policy import (
     Task26CompletionRecordV1,
     BrokerAuthLeaseIssueRequestV1,
     BrokerAuthLeaseIssueEventPayloadV1,
+    BrokerAuthEnvelopeSignEventPayloadV1,
+    BrokerAuthRotatePolicyEventPayloadV1,
+    BrokerAuthRevokePolicyEventPayloadV1,
     BrokerAuthAuthoritativeIssuerV1,
     BrokerAuthSequenceJournalEntryV1,
     BrokerAuthSequenceJournalV1,
@@ -79,6 +82,7 @@ from trusted_evidence.e2_policy import (
     PinnedTaskOutputRepositoryObservationV1,
     verify_registration_forward_only_recovery,
     validate_task_output_repository_state,
+    _read_bounded_broker_sequence_payload_fd,
     _ed_sign,
 )
 from trusted_evidence.handoffs import PolicyActivationMarkerV1
@@ -1074,6 +1078,56 @@ def test_broker_auth_issue_chain_is_prestate_only_and_contiguous_without_writes(
     ))
 
 
+def test_broker_sequence_payload_and_entry_reject_the_fixed_256_kib_budget_before_decode():
+    """A producer cannot create a broker object the durable reader must reject."""
+    boundary = BrokerAuthEnvelopeSignEventPayloadV1(
+        "trusted-registration-broker-auth-envelope-sign-payload/v1", "sign-envelope",
+        DIGEST_A, "x", DIGEST_B, DIGEST_C, DIGEST_A, "broker-fixed", 1, DIGEST_B, DIGEST_B,
+    )
+    boundary = BrokerAuthEnvelopeSignEventPayloadV1(
+        "trusted-registration-broker-auth-envelope-sign-payload/v1", "sign-envelope",
+        DIGEST_A, "x" * (256 * 1024 - len(boundary.canonical_bytes) + 1),
+        DIGEST_B, DIGEST_C, DIGEST_A, "broker-fixed", 1, DIGEST_B, DIGEST_B,
+    )
+    assert len(boundary.canonical_bytes) == 256 * 1024
+    oversized_operation = "o" * (256 * 1024)
+    with pytest.raises(ValueError, match="256 KiB"):
+        BrokerAuthEnvelopeSignEventPayloadV1(
+            "trusted-registration-broker-auth-envelope-sign-payload/v1", "sign-envelope",
+            DIGEST_A, oversized_operation, DIGEST_B, DIGEST_C, DIGEST_A,
+            "broker-fixed", 1, DIGEST_B, DIGEST_B,
+        )
+    oversized_wire = b"{" + b" " * (256 * 1024) + b"}"
+    for payload_type in (
+        BrokerAuthLeaseIssueEventPayloadV1,
+        BrokerAuthEnvelopeSignEventPayloadV1,
+        BrokerAuthRotatePolicyEventPayloadV1,
+        BrokerAuthRevokePolicyEventPayloadV1,
+    ):
+        with pytest.raises(ValueError, match="too large"):
+            payload_type.from_canonical_bytes(oversized_wire)
+    with pytest.raises(ValueError, match="256 KiB"):
+        BrokerAuthSequenceJournalEntryV1(
+            "trusted-registration-broker-auth-sequence-entry/v1", 1, None, DIGEST_A,
+            "sign-envelope", DIGEST_B, 256 * 1024 + 1, DIGEST_C, DIGEST_A,
+            DIGEST_A, DIGEST_B, DIGEST_C, "broker-fixed", "a" * 64,
+        )
+
+
+def test_broker_sequence_sparse_oversize_carrier_is_rejected_before_content_read(tmp_path, monkeypatch):
+    """The codec's future durable reader receives no bytes from an oversize carrier."""
+    carrier = tmp_path / "oversize-sequence-payload"
+    carrier.write_bytes(b"x")
+    os.truncate(carrier, 256 * 1024 + 1)
+    fd = os.open(carrier, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        monkeypatch.setattr(os, "pread", lambda *_args: pytest.fail("oversize payload was read"))
+        with pytest.raises(ValueError, match="too large"):
+            _read_bounded_broker_sequence_payload_fd(fd)
+    finally:
+        os.close(fd)
+
+
 def test_lease_identity_preimage_rejects_session_fields_and_binds_family_authorization():
     recorder = VisibleAuthorizationWriteRecorder()
     family = RegistrationWorkerSessionFamilyAuthorizationV1(
@@ -1575,6 +1629,48 @@ def test_e2_rebuilds_regular_fd_identity_from_kernel_facts(tmp_path):
         fcntl.fcntl(fd, fcntl.F_SETFD, fcntl.fcntl(fd, fcntl.F_GETFD) & ~fcntl.FD_CLOEXEC)
         with pytest.raises(ValueError, match="FD_CLOEXEC"):
             RegistrationRecoveryCapabilityV1._verify_observable_fd(fd, expected)
+    finally:
+        os.close(fd)
+
+
+def test_e2_regular_fd_rejects_size_or_role_budget_before_any_content_read(tmp_path, monkeypatch):
+    """A huge carrier is rejected from fstat facts, before its first content read."""
+    source = tmp_path / "oversize-worker-input"
+    source.write_bytes(b"x")
+    fd = os.open(source, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        expected = _expected_regular_observable(fd, b"x")
+        os.truncate(source, 256 * 1024 * 1024 + 1)
+        expected = replace(expected, byte_length=256 * 1024 * 1024 + 1)
+        monkeypatch.setattr(os, "pread", lambda *_args: pytest.fail("regular content was read"))
+        with pytest.raises(ValueError, match="budget"):
+            RegistrationRecoveryCapabilityV1._verify_observable_fd(
+                fd, expected, role="worker-input",
+            )
+    finally:
+        os.close(fd)
+
+
+def test_e2_regular_fd_hashes_only_the_exact_length_then_proves_eof(tmp_path, monkeypatch):
+    """The worker must hash the signed size, then use a one-byte EOF probe."""
+    source = tmp_path / "exact-worker-input"
+    content = b"exact worker input"
+    source.write_bytes(content)
+    fd = os.open(source, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    original_pread = os.pread
+    calls = []
+
+    def counted_pread(descriptor, size, offset):
+        calls.append((size, offset))
+        return original_pread(descriptor, size, offset)
+
+    monkeypatch.setattr(os, "pread", counted_pread)
+    try:
+        RegistrationRecoveryCapabilityV1._verify_observable_fd(
+            fd, _expected_regular_observable(fd, content), role="worker-input",
+        )
+        assert calls[-1] == (1, len(content))
+        assert all(offset + size <= len(content) for size, offset in calls[:-1])
     finally:
         os.close(fd)
 

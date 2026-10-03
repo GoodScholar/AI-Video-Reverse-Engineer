@@ -24,6 +24,8 @@ from types import MappingProxyType
 
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _HEX = re.compile(r"^[0-9a-f]+$")
+_MAX_BROKER_AUTH_SEQUENCE_PAYLOAD_BYTES = 256 * 1024
+_FD_HASH_CHUNK_BYTES = 64 * 1024
 
 
 def _require_digest(value: object, field: str) -> str:
@@ -1687,6 +1689,44 @@ def _broker_from_bytes(payload: bytes, fields: set[str], label: str) -> dict[str
     return _strict_object(payload, fields, label)
 
 
+def _broker_payload_from_bytes(payload: bytes, fields: set[str], label: str) -> dict[str, object]:
+    if not isinstance(payload, bytes) or len(payload) > _MAX_BROKER_AUTH_SEQUENCE_PAYLOAD_BYTES:
+        raise ValueError(f"{label} is too large")
+    return _broker_from_bytes(payload, fields, label)
+
+
+def _require_broker_payload_budget(payload: object) -> None:
+    if not isinstance(payload, _SelfDigestRecord) or len(payload.canonical_bytes) > _MAX_BROKER_AUTH_SEQUENCE_PAYLOAD_BYTES:
+        raise ValueError("broker auth sequence payload exceeds the fixed 256 KiB budget")
+
+
+def _read_bounded_broker_sequence_payload_fd(fd: int) -> bytes:
+    """Read one stable payload carrier without exceeding the portable codec budget."""
+    try:
+        before = os.fstat(fd)
+        identity = (before.st_dev, before.st_ino, before.st_size)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("broker auth payload carrier is not regular")
+        if before.st_size > _MAX_BROKER_AUTH_SEQUENCE_PAYLOAD_BYTES:
+            raise ValueError("broker auth payload carrier is too large")
+        payload = bytearray()
+        offset = 0
+        while offset < before.st_size:
+            chunk = os.pread(fd, min(_FD_HASH_CHUNK_BYTES, before.st_size - offset), offset)
+            if not chunk:
+                raise ValueError("broker auth payload carrier changed")
+            payload.extend(chunk)
+            offset += len(chunk)
+        if os.pread(fd, 1, before.st_size):
+            raise ValueError("broker auth payload carrier changed")
+        after = os.fstat(fd)
+        if (after.st_dev, after.st_ino, after.st_size) != identity or not stat.S_ISREG(after.st_mode):
+            raise ValueError("broker auth payload carrier changed")
+        return bytes(payload)
+    except OSError as error:
+        raise ValueError("broker auth payload carrier is invalid") from error
+
+
 @dataclass(frozen=True, slots=True)
 class RegistrationBrokerAuthKeyRegistrationV1(_SelfDigestRecord):
     schema: str
@@ -2171,6 +2211,7 @@ class BrokerAuthLeaseIssueEventPayloadV1(_SelfDigestRecord):
             raise ValueError("broker auth issue payload sequence or policy is invalid")
         if self.pre_policy_digest != self.lease_request.expected_policy_digest:
             raise ValueError("broker auth issue payload policy does not bind request")
+        _require_broker_payload_budget(self)
 
     def _unsigned_wire(self) -> dict[str, object]:
         return {"brokerAuthKeyId": self.broker_auth_key_id, "eventIdDigest": self.event_id_digest, "eventKind": self.event_kind, "expirySequence": self.expiry_sequence, "issuedSequence": self.issued_sequence, "leaseRequest": self.lease_request.to_wire(), "leaseRequestDigest": self.lease_request_digest, "leaseTtlSequences": self.lease_ttl_sequences, "operationId": self.operation_id, "postPolicyDigest": self.post_policy_digest, "prePolicyDigest": self.pre_policy_digest, "schema": self.schema}
@@ -2178,7 +2219,7 @@ class BrokerAuthLeaseIssueEventPayloadV1(_SelfDigestRecord):
     @classmethod
     def from_canonical_bytes(cls, payload: bytes) -> "BrokerAuthLeaseIssueEventPayloadV1":
         fields = {"brokerAuthKeyId", "canonicalDigest", "eventIdDigest", "eventKind", "expirySequence", "issuedSequence", "leaseRequest", "leaseRequestDigest", "leaseTtlSequences", "operationId", "postPolicyDigest", "prePolicyDigest", "schema"}
-        raw = _broker_from_bytes(payload, fields, "broker auth issue payload")
+        raw = _broker_payload_from_bytes(payload, fields, "broker auth issue payload")
         request = BrokerAuthLeaseIssueRequestV1.from_canonical_bytes(canonical_json_bytes(raw["leaseRequest"]))
         item = cls(raw["schema"], raw["eventKind"], raw["eventIdDigest"], request, raw["leaseRequestDigest"], raw["operationId"], raw["brokerAuthKeyId"], raw["issuedSequence"], raw["leaseTtlSequences"], raw["expirySequence"], raw["prePolicyDigest"], raw["postPolicyDigest"])
         if raw["canonicalDigest"] != item.canonical_digest:
@@ -2198,6 +2239,7 @@ class BrokerAuthEnvelopeSignEventPayloadV1(_SelfDigestRecord):
         _require_text(self.operation_id, "operation_id"); _require_text(self.broker_auth_key_id, "broker_auth_key_id"); _u64(self.sign_sequence, "sign_sequence", positive=True)
         if self.pre_policy_digest != self.post_policy_digest:
             raise ValueError("envelope signing cannot change policy")
+        _require_broker_payload_budget(self)
 
     def _unsigned_wire(self) -> dict[str, object]:
         return {"brokerAuthKeyId": self.broker_auth_key_id, "eventIdDigest": self.event_id_digest, "eventKind": self.event_kind, "leaseIdentityDigest": self.lease_identity_digest, "leaseRequestDigest": self.lease_request_digest, "operationId": self.operation_id, "postPolicyDigest": self.post_policy_digest, "prePolicyDigest": self.pre_policy_digest, "schema": self.schema, "signSequence": self.sign_sequence, "unsignedEnvelopeDigest": self.unsigned_envelope_digest}
@@ -2205,7 +2247,7 @@ class BrokerAuthEnvelopeSignEventPayloadV1(_SelfDigestRecord):
     @classmethod
     def from_canonical_bytes(cls, payload: bytes) -> "BrokerAuthEnvelopeSignEventPayloadV1":
         fields = {"brokerAuthKeyId", "canonicalDigest", "eventIdDigest", "eventKind", "leaseIdentityDigest", "leaseRequestDigest", "operationId", "postPolicyDigest", "prePolicyDigest", "schema", "signSequence", "unsignedEnvelopeDigest"}
-        raw = _broker_from_bytes(payload, fields, "broker auth envelope payload")
+        raw = _broker_payload_from_bytes(payload, fields, "broker auth envelope payload")
         item = cls(raw["schema"], raw["eventKind"], raw["eventIdDigest"], raw["operationId"], raw["leaseIdentityDigest"], raw["leaseRequestDigest"], raw["unsignedEnvelopeDigest"], raw["brokerAuthKeyId"], raw["signSequence"], raw["prePolicyDigest"], raw["postPolicyDigest"])
         if raw["canonicalDigest"] != item.canonical_digest:
             raise ValueError("broker auth envelope payload digest is invalid")
@@ -2224,6 +2266,7 @@ class BrokerAuthRotatePolicyEventPayloadV1(_SelfDigestRecord):
         _require_text(self.activated_key_id, "activated_key_id"); _require_text(self.retiring_key_id, "retiring_key_id"); _u64(self.effective_lease_sequence, "effective_lease_sequence", positive=True)
         if self.next_registry.previous_registry_digest != self.previous_registry_digest or self.next_registry.active_key_id != self.activated_key_id or self.next_registry.key(self.retiring_key_id).state != "retiring" or self.next_registry.key(self.activated_key_id).effective_lease_sequence != self.effective_lease_sequence or self.next_revocations.registry_digest != self.next_registry.canonical_digest or self.pre_policy_digest == self.post_policy_digest or self.post_policy_digest != _broker_auth_policy_digest(self.next_registry, self.next_revocations):
             raise ValueError("broker auth rotate closure is invalid")
+        _require_broker_payload_budget(self)
 
     def _unsigned_wire(self) -> dict[str, object]:
         return {"activatedKeyId": self.activated_key_id, "effectiveLeaseSequence": self.effective_lease_sequence, "eventIdDigest": self.event_id_digest, "eventKind": self.event_kind, "nextRegistry": self.next_registry.to_wire(), "nextRevocations": self.next_revocations.to_wire(), "postPolicyDigest": self.post_policy_digest, "prePolicyDigest": self.pre_policy_digest, "previousRegistryDigest": self.previous_registry_digest, "previousRevocationsDigest": self.previous_revocations_digest, "retiringKeyId": self.retiring_key_id, "schema": self.schema}
@@ -2231,7 +2274,7 @@ class BrokerAuthRotatePolicyEventPayloadV1(_SelfDigestRecord):
     @classmethod
     def from_canonical_bytes(cls, payload: bytes) -> "BrokerAuthRotatePolicyEventPayloadV1":
         fields = {"activatedKeyId", "canonicalDigest", "effectiveLeaseSequence", "eventIdDigest", "eventKind", "nextRegistry", "nextRevocations", "postPolicyDigest", "prePolicyDigest", "previousRegistryDigest", "previousRevocationsDigest", "retiringKeyId", "schema"}
-        raw = _broker_from_bytes(payload, fields, "broker auth rotate payload")
+        raw = _broker_payload_from_bytes(payload, fields, "broker auth rotate payload")
         registry = RegistrationBrokerAuthRegistryV1.from_canonical_bytes(canonical_json_bytes(raw["nextRegistry"]))
         revocations = RegistrationBrokerAuthRevocationsV1.from_canonical_bytes(canonical_json_bytes(raw["nextRevocations"]))
         item = cls(raw["schema"], raw["eventKind"], raw["eventIdDigest"], raw["previousRegistryDigest"], raw["previousRevocationsDigest"], registry, revocations, raw["activatedKeyId"], raw["retiringKeyId"], raw["effectiveLeaseSequence"], raw["prePolicyDigest"], raw["postPolicyDigest"])
@@ -2252,6 +2295,7 @@ class BrokerAuthRevokePolicyEventPayloadV1(_SelfDigestRecord):
         _require_text(self.revoked_key_id, "revoked_key_id"); _u64(self.revoked_at_broker_sequence, "revoked_at_broker_sequence", positive=True)
         if self.next_revocations.registry_digest != self.unchanged_registry_digest or self.next_revocations.revoked_at(self.revoked_key_id) != self.revoked_at_broker_sequence or self.pre_policy_digest == self.post_policy_digest or self.post_policy_digest != _broker_auth_policy_digest_from_digests(self.unchanged_registry_digest, self.next_revocations.canonical_digest):
             raise ValueError("broker auth revoke closure is invalid")
+        _require_broker_payload_budget(self)
 
     def _unsigned_wire(self) -> dict[str, object]:
         return {"eventIdDigest": self.event_id_digest, "eventKind": self.event_kind, "nextRevocations": self.next_revocations.to_wire(), "postPolicyDigest": self.post_policy_digest, "prePolicyDigest": self.pre_policy_digest, "previousRevocationsDigest": self.previous_revocations_digest, "revokedAtBrokerSequence": self.revoked_at_broker_sequence, "revokedKeyId": self.revoked_key_id, "schema": self.schema, "unchangedRegistryDigest": self.unchanged_registry_digest}
@@ -2259,7 +2303,7 @@ class BrokerAuthRevokePolicyEventPayloadV1(_SelfDigestRecord):
     @classmethod
     def from_canonical_bytes(cls, payload: bytes) -> "BrokerAuthRevokePolicyEventPayloadV1":
         fields = {"canonicalDigest", "eventIdDigest", "eventKind", "nextRevocations", "postPolicyDigest", "prePolicyDigest", "previousRevocationsDigest", "revokedAtBrokerSequence", "revokedKeyId", "schema", "unchangedRegistryDigest"}
-        raw = _broker_from_bytes(payload, fields, "broker auth revoke payload")
+        raw = _broker_payload_from_bytes(payload, fields, "broker auth revoke payload")
         revocations = RegistrationBrokerAuthRevocationsV1.from_canonical_bytes(canonical_json_bytes(raw["nextRevocations"]))
         item = cls(raw["schema"], raw["eventKind"], raw["eventIdDigest"], raw["unchangedRegistryDigest"], raw["previousRevocationsDigest"], revocations, raw["revokedKeyId"], raw["revokedAtBrokerSequence"], raw["prePolicyDigest"], raw["postPolicyDigest"])
         if raw["canonicalDigest"] != item.canonical_digest:
@@ -2309,6 +2353,8 @@ class BrokerAuthSequenceJournalEntryV1(_BrokerStateRecord):
         if self.schema != "trusted-registration-broker-auth-sequence-entry/v1" or self.event_kind not in {"issue-lease", "sign-envelope", "rotate-registry", "revoke-key"}:
             raise ValueError("broker auth sequence entry identity is invalid")
         _u64(self.sequence, "sequence", positive=True); _u64(self.event_payload_length, "event_payload_length", positive=True)
+        if self.event_payload_length > _MAX_BROKER_AUTH_SEQUENCE_PAYLOAD_BYTES:
+            raise ValueError("broker auth sequence entry exceeds the fixed 256 KiB payload budget")
         if self.previous_entry_digest is not None:
             _require_digest(self.previous_entry_digest, "previous_entry_digest")
         for field in ("event_id_digest", "event_payload_ref", "event_payload_digest", "pre_policy_digest", "post_policy_digest", "post_broker_auth_registry_digest", "post_broker_auth_revocation_digest"):
@@ -2399,10 +2445,12 @@ class BrokerAuthSequenceJournalV1(_BrokerStateRecord):
         prior_registry: str | None = None
         prior_revocations: str | None = None
         for entry in self.entries:
+            if entry.event_payload_length > _MAX_BROKER_AUTH_SEQUENCE_PAYLOAD_BYTES:
+                raise ValueError("broker auth event entry exceeds the fixed 256 KiB payload budget")
             payload = payloads.get(entry.event_payload_ref)
             if payload is None or type(payload) not in {BrokerAuthLeaseIssueEventPayloadV1, BrokerAuthEnvelopeSignEventPayloadV1, BrokerAuthRotatePolicyEventPayloadV1, BrokerAuthRevokePolicyEventPayloadV1}:
                 raise ValueError("broker auth event payload is missing or typed incorrectly")
-            if (entry.event_kind, entry.event_id_digest, entry.event_payload_digest, entry.event_payload_length, entry.pre_policy_digest, entry.post_policy_digest) != (payload.event_kind, payload.event_id_digest, payload.canonical_digest, len(payload.canonical_bytes), payload.pre_policy_digest, payload.post_policy_digest):
+            if len(payload.canonical_bytes) > _MAX_BROKER_AUTH_SEQUENCE_PAYLOAD_BYTES or (entry.event_kind, entry.event_id_digest, entry.event_payload_digest, entry.event_payload_length, entry.pre_policy_digest, entry.post_policy_digest) != (payload.event_kind, payload.event_id_digest, payload.canonical_digest, len(payload.canonical_bytes), payload.pre_policy_digest, payload.post_policy_digest):
                 raise ValueError("broker auth event entry does not close payload")
             if prior_policy is not None and entry.pre_policy_digest != prior_policy:
                 raise ValueError("broker auth policy chain is broken")
@@ -2565,6 +2613,14 @@ _FD_ROLES = {
     "worker-input", "input-snapshot", "transaction-record", "quarantine-object",
     "toolchain-build-record", "toolchain-artifact", "broker-control",
 }
+_FROZEN_FD_ROLE_PROFILE_BUDGETS = {
+    "worker-input": 1024 * 1024,
+    "input-snapshot": 1024 * 1024,
+    "transaction-record": 1024 * 1024,
+    "quarantine-object": 1024 * 1024,
+    "toolchain-build-record": 1024 * 1024,
+    "toolchain-artifact": 256 * 1024 * 1024,
+}
 _REGISTER_FD_CLOSURE = (
     ("worker-input", "registration-worker-input", "worker-input-inbox"),
     ("input-snapshot", "product-handoff-cache", "worker-input-inbox"),
@@ -2604,6 +2660,12 @@ _RECOVER_FD_CLOSURE = (
     ("broker-control", "registration-mutation-control", None),
 )
 _ENVELOPE_DOMAIN = "ai-video-reverse-engineer/registration-broker-envelope/v1"
+
+
+def _fd_role_profile_budget(role: object) -> int:
+    if not isinstance(role, str) or role not in _FROZEN_FD_ROLE_PROFILE_BUDGETS:
+        raise ValueError("regular FD role has no frozen profile budget")
+    return _FROZEN_FD_ROLE_PROFILE_BUDGETS[role]
 
 
 @dataclass(frozen=True, slots=True)
@@ -2726,7 +2788,13 @@ class FdObservableIdentityV1(_SelfDigestRecord):
     def to_wire(self) -> dict[str, object]: return {**self._unsigned_wire(), "canonicalDigest": self.canonical_digest}
 
     @classmethod
-    def from_open_fd(cls, fd: int) -> "FdObservableIdentityV1":
+    def from_open_fd(
+        cls,
+        fd: int,
+        *,
+        expected_byte_length: int | None = None,
+        maximum_byte_length: int | None = None,
+    ) -> "FdObservableIdentityV1":
         """Rebuild only observable FD facts; broker-open provenance remains unobservable."""
         try:
             if not isinstance(fd, int) or fd < 0:
@@ -2738,17 +2806,41 @@ class FdObservableIdentityV1(_SelfDigestRecord):
             if stat.S_ISREG(info.st_mode):
                 if flags & os.O_ACCMODE != os.O_RDONLY:
                     raise ValueError("received regular FD state is invalid")
+                expected_length = info.st_size if expected_byte_length is None else _u64(
+                    expected_byte_length, "expected_byte_length",
+                )
+                maximum_length = expected_length if maximum_byte_length is None else _u64(
+                    maximum_byte_length, "maximum_byte_length",
+                )
+                initial_identity = (info.st_dev, info.st_ino, info.st_size)
+                if info.st_size != expected_length:
+                    raise ValueError("received regular FD length differs from its descriptor")
+                if expected_length > maximum_length:
+                    raise ValueError("received regular FD exceeds its frozen role budget")
                 filesystem_id = getattr(os.fstatvfs(fd), "f_fsid", None)
                 if not isinstance(filesystem_id, int):
                     raise ValueError("received regular FD mount identity is unavailable")
                 digest = hashlib.sha256()
                 offset = 0
-                while True:
-                    chunk = os.pread(fd, 65536, offset)
+                remaining = expected_length
+                while remaining:
+                    chunk = os.pread(fd, min(_FD_HASH_CHUNK_BYTES, remaining), offset)
                     if not chunk:
-                        break
+                        raise ValueError("received regular FD changed while hashing")
                     digest.update(chunk)
                     offset += len(chunk)
+                    remaining -= len(chunk)
+                if os.pread(fd, 1, expected_length):
+                    raise ValueError("received regular FD changed while hashing")
+                after = os.fstat(fd)
+                if (
+                    (after.st_dev, after.st_ino, after.st_size) != initial_identity
+                    or not stat.S_ISREG(after.st_mode)
+                    or not fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
+                    or fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY
+                    or getattr(os.fstatvfs(fd), "f_fsid", None) != filesystem_id
+                ):
+                    raise ValueError("received regular FD changed while hashing")
                 content_digest = "sha256:" + digest.hexdigest()
                 mount_identity_digest = canonical_digest({"filesystemId": filesystem_id, "kind": "fstatvfs-fsid/v1"})
                 wire = {"accessMode": "read-only", "byteLength": info.st_size, "contentDigest": content_digest, "device": info.st_dev, "fdFlags": list(fd_flags), "fileType": "regular", "inode": info.st_ino, "mountIdentityDigest": mount_identity_digest, "socketIdentityDigest": None, "socketOptions": [], "statusFlags": ["O_RDONLY"]}
@@ -2799,6 +2891,8 @@ class FdDescriptorV1(_SelfDigestRecord):
             valid = self.provenance_fields.broker_open_policy == "openat2-beneath-no-symlinks" and self.observable_fields.file_type == "regular"
         if not valid:
             raise ValueError("FD descriptor mixes provenance and observable types")
+        if not control and self.observable_fields.byte_length > _fd_role_profile_budget(self.role):
+            raise ValueError("FD descriptor exceeds its frozen role/profile budget")
 
     def _unsigned_wire(self) -> dict[str, object]:
         return {"cardinality": self.cardinality, "logicalName": self.logical_name, "observableFields": self.observable_fields.to_wire(), "ordinal": self.ordinal, "provenanceFields": self.provenance_fields.to_wire(), "role": self.role}
@@ -3019,7 +3113,7 @@ class RegistrationRecoveryCapabilityV1:
             raise ValueError("SCM_RIGHTS FD closure count is invalid")
         identities: set[tuple[str, object, object]] = set()
         for descriptor, fd in zip(descriptors, received):
-            cls._verify_observable_fd(fd, descriptor.observable_fields)
+            cls._verify_observable_fd(fd, descriptor.observable_fields, role=descriptor.role)
             observed = descriptor.observable_fields
             identity = (
                 ("regular", observed.device, observed.inode)
@@ -3031,10 +3125,24 @@ class RegistrationRecoveryCapabilityV1:
             identities.add(identity)
 
     @staticmethod
-    def _verify_observable_fd(fd: int, expected: FdObservableIdentityV1) -> None:
+    def _verify_observable_fd(
+        fd: int,
+        expected: FdObservableIdentityV1,
+        *,
+        role: str | None = None,
+    ) -> None:
         if type(expected) is not FdObservableIdentityV1:
             raise ValueError("expected FD observable identity is invalid")
-        observed = FdObservableIdentityV1.from_open_fd(fd)
+        maximum = (
+            _fd_role_profile_budget(role)
+            if expected.file_type == "regular" and role is not None
+            else expected.byte_length
+        )
+        observed = FdObservableIdentityV1.from_open_fd(
+            fd,
+            expected_byte_length=expected.byte_length if expected.file_type == "regular" else None,
+            maximum_byte_length=maximum if expected.file_type == "regular" else None,
+        )
         if observed != expected:
             if expected.file_type == "regular":
                 raise ValueError("received regular FD identity changed")
