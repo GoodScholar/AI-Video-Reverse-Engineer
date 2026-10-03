@@ -1547,7 +1547,7 @@ def test_e2_rebuilds_socket_identity_and_rejects_non_seqpacket_control_fd():
     sys.platform != "linux" or not hasattr(socket, "MSG_CMSG_CLOEXEC") or not hasattr(socket, "SO_PASSCRED"),
     reason="requires Linux SCM_RIGHTS, MSG_CMSG_CLOEXEC, and SO_PASSCRED",
 )
-def test_e2_linux_recvmsg_accepts_only_a_real_exact_register_closure(tmp_path):
+def test_e2_linux_recvmsg_accepts_a_real_exact_register_closure(tmp_path):
     """Linux-only: the real recvmsg gate consumes exactly one signed 14-FD closure."""
     sender, receiver, opened, control, control_peer, signer, expected = _linux_delivery(tmp_path, "register")
     try:

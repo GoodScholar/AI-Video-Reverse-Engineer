@@ -25,10 +25,51 @@ from .e2_policy import (
 
 _DIGEST_PREFIX = "sha256:"
 _MAX_CANONICAL_WIRE_BYTES = 1024 * 1024
+_CARRIER_READ_CHUNK_BYTES = 64 * 1024
 
 
 def _digest(payload: bytes) -> str:
     return _DIGEST_PREFIX + hashlib.sha256(payload).hexdigest()
+
+
+def _read_bounded_regular_at(parent_fd: int, name: str, *, limit: int = _MAX_CANONICAL_WIRE_BYTES) -> tuple[bytes, tuple[int, int, int]]:
+    """Read one stable regular-file carrier without allocating past its wire budget."""
+    before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("handoff carrier is unsafe")
+    if before.st_size > limit:
+        raise ValueError("handoff carrier is too large")
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=parent_fd)
+    try:
+        opened = os.fstat(descriptor)
+        identity = (opened.st_dev, opened.st_ino, opened.st_size)
+        if not stat.S_ISREG(opened.st_mode) or identity != (before.st_dev, before.st_ino, before.st_size):
+            raise ValueError("handoff carrier changed")
+        payload = bytearray()
+        while len(payload) <= limit:
+            block = os.read(descriptor, min(_CARRIER_READ_CHUNK_BYTES, limit + 1 - len(payload)))
+            if not block:
+                break
+            payload.extend(block)
+        if len(payload) > limit:
+            raise ValueError("handoff carrier is too large")
+        after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (after.st_dev, after.st_ino, after.st_size) != identity:
+            raise ValueError("handoff carrier changed")
+        return bytes(payload), identity
+    finally:
+        os.close(descriptor)
+
+
+def read_bounded_regular_file(path: Path, *, limit: int = _MAX_CANONICAL_WIRE_BYTES) -> bytes:
+    """Read a caller-approved filesystem carrier through the shared bounded reader."""
+    path = Path(path)
+    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    try:
+        payload, _identity = _read_bounded_regular_at(parent_fd, path.name, limit=limit)
+        return payload
+    finally:
+        os.close(parent_fd)
 
 
 def _require_digest(value: object, field: str) -> str:
@@ -537,27 +578,7 @@ class TrustedHandoffStoreV1:
             os.close(descriptor)
 
     def _read_at(self, parent_fd: int, name: str) -> tuple[bytes, tuple[int, int, int]]:
-        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if not stat.S_ISREG(before.st_mode):
-            raise ValueError("handoff store entry is unsafe")
-        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-        descriptor = os.open(name, flags, dir_fd=parent_fd)
-        try:
-            opened = os.fstat(descriptor)
-            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino) or not stat.S_ISREG(opened.st_mode):
-                raise ValueError("handoff store entry changed")
-            payload = bytearray()
-            while True:
-                block = os.read(descriptor, 65536)
-                if not block:
-                    break
-                payload.extend(block)
-            after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            if (after.st_dev, after.st_ino, after.st_size) != (opened.st_dev, opened.st_ino, opened.st_size):
-                raise ValueError("handoff store entry changed")
-            return bytes(payload), (opened.st_dev, opened.st_ino, opened.st_size)
-        finally:
-            os.close(descriptor)
+        return _read_bounded_regular_at(parent_fd, name)
 
     def _publish_parts(self, parts: tuple[str, ...], payload: bytes) -> bool:
         if not isinstance(payload, bytes):
@@ -795,9 +816,9 @@ def _require_policy_transport_record(record: TrustedHandoffRecordV1) -> None:
 class TransportJobV1:
     """In-memory only complete invocation input for the four transport stages."""
 
-    source_store_root: Path
-    target_store_root: Path
-    stage_root: Path
+    source_store_root: str
+    target_store_root: str
+    stage_root: str
     export_request_ref: str
     handoff_id: str
     transport_id: str
@@ -816,7 +837,7 @@ class TransportJobV1:
 
     def __post_init__(self) -> None:
         for path in (self.source_store_root, self.target_store_root, self.stage_root):
-            if not isinstance(path, Path) or not path.is_absolute():
+            if not isinstance(path, str) or not Path(path).is_absolute():
                 raise ValueError("transport roots must be absolute paths")
         for field in ("export_request_ref",):
             _require_digest(getattr(self, field), field)

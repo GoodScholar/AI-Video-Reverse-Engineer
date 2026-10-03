@@ -10,7 +10,7 @@ import stat
 import sys
 import json
 
-from trusted_evidence.handoffs import HandoffExportRequestV1, HandoffPointerV1, HandoffRegistryV1, TrustedHandoffRecordV1, TrustedHandoffStoreV1, load_disjoint_signing_domains, verify_policy_activation_proof, verify_policy_transport_source_closure, verify_transport_closure
+from trusted_evidence.handoffs import HandoffExportRequestV1, HandoffPointerV1, HandoffRegistryV1, TrustedHandoffRecordV1, TrustedHandoffStoreV1, load_disjoint_signing_domains, read_bounded_regular_file, verify_policy_activation_proof, verify_policy_transport_source_closure, verify_transport_closure
 
 
 def _store(root: str | None) -> TrustedHandoffStoreV1:
@@ -273,7 +273,7 @@ def _domains(args: argparse.Namespace):
     values = (args.transport_registry, args.activation_registry, args.broker_auth_registry, args.broker_auth_revocations, args.broker_auth_allowed_signers)
     if any(value is None for value in values):
         raise ValueError("authenticated transport requires all signing-domain inputs")
-    return load_disjoint_signing_domains(*(Path(value).read_bytes() for value in values))
+    return load_disjoint_signing_domains(*(read_bounded_regular_file(Path(value)) for value in values))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -333,15 +333,15 @@ def main(argv: list[str] | None = None) -> int:
             if args.record is None or args.pointer is None:
                 raise ValueError("record and pointer are required")
             registry = HandoffRegistryV1(_store(None))
-            record = TrustedHandoffRecordV1.from_canonical_bytes(args.record.read_bytes())
-            pointer = HandoffPointerV1.from_canonical_bytes(args.pointer.read_bytes())
+            record = TrustedHandoffRecordV1.from_canonical_bytes(read_bounded_regular_file(args.record))
+            pointer = HandoffPointerV1.from_canonical_bytes(read_bounded_regular_file(args.pointer))
             if record.producer_task != args.producer_task:
                 raise ValueError("producer task does not match record")
-            registry.publish_local(record, pointer, tuple(item.read_bytes() for item in args.blob))
+            registry.publish_local(record, pointer, tuple(read_bounded_regular_file(item) for item in args.blob))
         elif args.command == "publish-export-request":
             if args.producer_task in {22, 27}:
                 raise ValueError("reserved producer")
-            request = HandoffExportRequestV1.from_canonical_bytes(args.request.read_bytes())
+            request = HandoffExportRequestV1.from_canonical_bytes(read_bounded_regular_file(args.request))
             print(HandoffRegistryV1(_store(None)).publish_export_request(request))
         elif args.command == "fetch":
             if not args.cache_root or not args.store_root or not args.handoff_id or not args.consumer_task:

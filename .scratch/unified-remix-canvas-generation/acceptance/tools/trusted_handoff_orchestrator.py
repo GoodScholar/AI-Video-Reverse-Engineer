@@ -33,11 +33,13 @@ from trusted_evidence.handoffs import (
     _ED_L,
     _ED_Q,
     load_disjoint_signing_domains,
+    read_bounded_regular_file,
     verify_policy_transport_source_closure,
 )
 
 
-def _stage_path(stage_root: Path, name: str) -> Path:
+def _stage_path(stage_root: Path | str, name: str) -> Path:
+    stage_root = Path(stage_root)
     if not stage_root.is_absolute() or stage_root.is_symlink() or not stage_root.is_dir() or stat.S_IMODE(stage_root.stat().st_mode) != 0o700:
         raise ValueError("transport stage root must be an absolute 0700 non-symlink directory")
     return stage_root / name
@@ -46,7 +48,7 @@ def _stage_path(stage_root: Path, name: str) -> Path:
 def _stage_publish(stage_root: Path, name: str, payload: bytes) -> None:
     path = _stage_path(stage_root, name)
     if path.exists():
-        if path.is_symlink() or path.read_bytes() != payload:
+        if read_bounded_regular_file(path) != payload:
             raise ValueError("transport stage bytes differ")
         return
     descriptor, temporary_name = tempfile.mkstemp(prefix=".transport-", dir=stage_root)
@@ -59,7 +61,7 @@ def _stage_publish(stage_root: Path, name: str, payload: bytes) -> None:
         try:
             os.link(temporary, path)
         except FileExistsError:
-            if path.is_symlink() or path.read_bytes() != payload:
+            if read_bounded_regular_file(path) != payload:
                 raise ValueError("concurrent transport stage bytes differ")
         directory = os.open(stage_root, os.O_RDONLY | os.O_DIRECTORY)
         try:
@@ -72,9 +74,10 @@ def _stage_publish(stage_root: Path, name: str, payload: bytes) -> None:
 
 def _stage_read(stage_root: Path, name: str) -> bytes:
     path = _stage_path(stage_root, name)
-    if path.is_symlink() or not path.is_file():
-        raise ValueError("transport stage payload is missing")
-    return path.read_bytes()
+    try:
+        return read_bounded_regular_file(path)
+    except FileNotFoundError as error:
+        raise ValueError("transport stage payload is missing") from error
 
 
 def _closure(source: TrustedHandoffStoreV1, export_request_ref: str, handoff_id: str, consumer_task: int):
@@ -252,7 +255,7 @@ def install_transport(job: TransportJobV1, target_store: TrustedHandoffStoreV1, 
 
 
 def run_transport(*, source_store: TrustedHandoffStoreV1, target_store: TrustedHandoffStoreV1, stage_root: Path, export_request_ref: str, handoff_id: str, transport_id: str, consumer_task: int, store_namespace: str, source_executor_id: str, destination_executor_id: str, nonce: str, sequence: int, expires_at: str | None, signing_key_fd: int, key_id: str, signing_key_purpose: str, signature_domain: str, signing_domains: VerifiedSigningDomainsV1) -> TransportReadyMarkerV1:
-    job = TransportJobV1(source_store.root, target_store.root, stage_root, export_request_ref, handoff_id, transport_id, consumer_task, store_namespace, source_executor_id, destination_executor_id, nonce, sequence, expires_at, None, None, key_id, signing_key_purpose, signature_domain)
+    job = TransportJobV1(str(source_store.root), str(target_store.root), str(stage_root), export_request_ref, handoff_id, transport_id, consumer_task, store_namespace, source_executor_id, destination_executor_id, nonce, sequence, expires_at, None, None, key_id, signing_key_purpose, signature_domain)
     _closure(source_store, export_request_ref, handoff_id, consumer_task)
     manifest = export(job, source_store, signing_domains)
     receipt = upload(job, source_store, target_store, manifest, signing_domains)
@@ -263,7 +266,7 @@ def run_transport(*, source_store: TrustedHandoffStoreV1, target_store: TrustedH
 def run_policy_transport(*, source_store: TrustedHandoffStoreV1, target_store: TrustedHandoffStoreV1, stage_root: Path, export_request_ref: str, handoff_id: str, transport_id: str, consumer_task: int, store_namespace: str, source_executor_id: str, destination_executor_id: str, nonce: str, sequence: int, expires_at: str | None, signing_key_fd: int, key_id: str, signing_key_purpose: str, signature_domain: str, signing_domains: VerifiedSigningDomainsV1) -> TransportReadyMarkerV1:
     activated, _bytes, _record, _pointer, _record_bytes, _pointer_bytes, _refs, _blobs, _core = _policy_closure(source_store, export_request_ref, handoff_id, consumer_task, destination_executor_id, signing_domains)
     job = TransportJobV1(
-        source_store.root, target_store.root, stage_root, export_request_ref, handoff_id,
+        str(source_store.root), str(target_store.root), str(stage_root), export_request_ref, handoff_id,
         transport_id, consumer_task, store_namespace, source_executor_id,
         destination_executor_id, nonce, sequence, expires_at,
         activated.policy_activation_proof_ref,
@@ -277,7 +280,7 @@ def run_policy_transport(*, source_store: TrustedHandoffStoreV1, target_store: T
 
 
 def _domains_from_args(args: argparse.Namespace) -> VerifiedSigningDomainsV1:
-    return load_disjoint_signing_domains(*(Path(getattr(args, name)).read_bytes() for name in ("transport_registry", "activation_registry", "broker_auth_registry", "broker_auth_revocations", "broker_auth_allowed_signers")))
+    return load_disjoint_signing_domains(*(read_bounded_regular_file(Path(getattr(args, name))) for name in ("transport_registry", "activation_registry", "broker_auth_registry", "broker_auth_revocations", "broker_auth_allowed_signers")))
 
 
 def _add_domains_arguments(parser: argparse.ArgumentParser) -> None:
@@ -291,7 +294,7 @@ def _role_lease_bytes(args: argparse.Namespace, role: str) -> bytes:
         path = Path(lease_path)
         if not path.is_absolute() or path.is_symlink() or not path.is_file():
             raise ValueError(f"{role} handoff store lease path is invalid")
-        return path.read_bytes()
+        return read_bounded_regular_file(path)
     lease = os.environ.get(f"TRUSTED_HANDOFF_{role.upper()}_STORE_LEASE")
     if lease is None:
         raise ValueError(f"{role} handoff store role lease is required")
@@ -332,8 +335,8 @@ def _add_job_arguments(parser: argparse.ArgumentParser, *, target: bool, signing
 
 
 def _job_from_args(args: argparse.Namespace) -> TransportJobV1:
-    target = Path(getattr(args, "target_store_root", args.source_store_root))
-    return TransportJobV1(Path(args.source_store_root), target, Path(args.stage_root), args.export_request_ref, args.handoff_id, args.transport_id, args.consumer_task, args.store_namespace, args.source_executor_id, args.destination_executor_id, args.nonce, args.sequence, args.expires_at, None, None, args.key_id, args.signing_key_purpose, args.signature_domain)
+    target = getattr(args, "target_store_root", args.source_store_root)
+    return TransportJobV1(args.source_store_root, target, args.stage_root, args.export_request_ref, args.handoff_id, args.transport_id, args.consumer_task, args.store_namespace, args.source_executor_id, args.destination_executor_id, args.nonce, args.sequence, args.expires_at, None, None, args.key_id, args.signing_key_purpose, args.signature_domain)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -399,7 +402,7 @@ def main(argv: list[str] | None = None) -> int:
                 if request.handoff_id != job.handoff_id or record.kind == "policy" or record.producer_task == 27:
                     raise ValueError("policy handoffs require the activated policy transport")
                 runner = run_transport
-            runner(source_store=source, target_store=target, stage_root=job.stage_root, export_request_ref=job.export_request_ref, handoff_id=job.handoff_id, transport_id=job.transport_id, consumer_task=job.consumer_task, store_namespace=job.store_namespace, source_executor_id=job.source_executor_id, destination_executor_id=job.destination_executor_id, nonce=job.nonce, sequence=job.sequence, expires_at=job.expires_at, signing_key_fd=args.signing_key_fd, key_id=job.key_id, signing_key_purpose=job.signing_key_purpose, signature_domain=job.signature_domain, signing_domains=_domains_from_args(args))
+            runner(source_store=source, target_store=target, stage_root=Path(job.stage_root), export_request_ref=job.export_request_ref, handoff_id=job.handoff_id, transport_id=job.transport_id, consumer_task=job.consumer_task, store_namespace=job.store_namespace, source_executor_id=job.source_executor_id, destination_executor_id=job.destination_executor_id, nonce=job.nonce, sequence=job.sequence, expires_at=job.expires_at, signing_key_fd=args.signing_key_fd, key_id=job.key_id, signing_key_purpose=job.signing_key_purpose, signature_domain=job.signature_domain, signing_domains=_domains_from_args(args))
         return 0
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(str(error), file=sys.stderr)

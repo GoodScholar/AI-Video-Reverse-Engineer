@@ -72,8 +72,8 @@ _BLOCKED_CODES = frozenset(
     }
 )
 
-# The set is deliberately explicit: it is the complete Section 9 error-code
-# vocabulary, while unknown codes remain fail-closed as "阻塞".
+# The set is deliberately explicit: it is the approved error-code vocabulary,
+# while unknown codes remain fail-closed as "阻塞".
 KNOWN_ERROR_CODES = _FAILURE_CODES | _BLOCKED_CODES
 
 

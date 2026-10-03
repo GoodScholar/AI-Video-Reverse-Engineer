@@ -2,6 +2,7 @@ import hashlib
 import base64
 import copy
 import importlib.util
+import argparse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 import inspect
@@ -45,6 +46,7 @@ from trusted_evidence.handoffs import (
     TrustedHandoffStoreV1,
     TransportReadyMarkerV1,
     TransportSealV1,
+    TransportJobV1,
     load_disjoint_signing_domains,
     verify_transport_closure,
     verify_policy_activation_proof,
@@ -2417,3 +2419,150 @@ def test_policy_activation_rejects_embedded_chain_state_and_authorization_mutati
             expected_destination_executor_id="executor-28", signing_domains=domains,
         )
     assert not any(cache_root.iterdir())
+
+
+def test_store_rejects_a_sparse_oversize_blob_before_reading_its_carrier(tmp_path, monkeypatch):
+    """A store blob above the wire budget must be rejected before any payload read."""
+    root = (tmp_path / "store").resolve()
+    shard = root / "sha256" / "aa"
+    shard.mkdir(parents=True, mode=0o700)
+    for directory in (root, root / "sha256", shard):
+        directory.chmod(0o700)
+    ref = "sha256:" + "a" * 64
+    carrier = shard / ref[9:]
+    with carrier.open("wb") as handle:
+        handle.truncate(1024 * 1024 + 1)
+    store = TrustedHandoffStoreV1(root)
+    try:
+        monkeypatch.setattr(os, "read", lambda *_args: pytest.fail("oversize carrier was read"))
+        with pytest.raises(ValueError, match="too large"):
+            store.read_blob(ref)
+    finally:
+        store.close()
+
+
+def test_stage_rejects_a_sparse_oversize_manifest_before_sealing(tmp_path, monkeypatch):
+    """A staged manifest over budget cannot be read into a later seal/install step."""
+    from tools.trusted_handoff_orchestrator import _stage_read
+
+    stage = (tmp_path / "stage").resolve()
+    stage.mkdir(mode=0o700)
+    carrier = stage / "export-manifest.json"
+    with carrier.open("wb") as handle:
+        handle.truncate(1024 * 1024 + 1)
+    monkeypatch.setattr(os, "read", lambda *_args: pytest.fail("oversize stage carrier was read"))
+    with pytest.raises(ValueError, match="too large"):
+        _stage_read(stage, "export-manifest.json")
+
+
+def test_store_discards_a_blob_when_its_carrier_grows_during_the_read(tmp_path, monkeypatch):
+    """A size-changing carrier race cannot return bytes to later closure processing."""
+    root = (tmp_path / "store").resolve()
+    shard = root / "sha256" / "aa"
+    shard.mkdir(parents=True, mode=0o700)
+    for directory in (root, root / "sha256", shard):
+        directory.chmod(0o700)
+    ref = "sha256:" + "a" * 64
+    carrier = shard / ref[9:]
+    carrier.write_bytes(b"initial")
+    store = TrustedHandoffStoreV1(root)
+    original_read = os.read
+    changed = False
+
+    def grow_after_first_block(descriptor, count):
+        nonlocal changed
+        block = original_read(descriptor, count)
+        if block and not changed:
+            changed = True
+            with carrier.open("ab") as handle:
+                handle.write(b"+")
+        return block
+
+    try:
+        monkeypatch.setattr(os, "read", grow_after_first_block)
+        with pytest.raises(ValueError, match="changed"):
+            store.read_blob(ref)
+    finally:
+        store.close()
+
+
+def test_orchestrator_governance_and_role_lease_reject_sparse_oversize_carriers(tmp_path, monkeypatch):
+    """Governance and role-lease files are bounded before strict decoders receive bytes."""
+    from tools.trusted_handoff_orchestrator import _domains_from_args, _role_lease_bytes
+
+    trust = ACCEPTANCE_ROOT / "trust"
+    names = (
+        "handoff-transport-registry.json", "policy-activation-registry.json",
+        "registration-broker-auth-registry.json", "registration-broker-auth-revocations.json",
+        "registration-broker-auth-allowed-signers",
+    )
+    copied = {}
+    for name in names:
+        target = tmp_path / name
+        target.write_bytes((trust / name).read_bytes())
+        copied[name] = target
+    with copied[names[0]].open("r+b") as handle:
+        handle.truncate(1024 * 1024 + 1)
+    args = argparse.Namespace(
+        transport_registry=str(copied[names[0]]), activation_registry=str(copied[names[1]]),
+        broker_auth_registry=str(copied[names[2]]), broker_auth_revocations=str(copied[names[3]]),
+        broker_auth_allowed_signers=str(copied[names[4]]), source_store_lease=str(copied[names[0]]),
+    )
+    monkeypatch.setattr(Path, "read_bytes", lambda *_args: pytest.fail("carrier used Path.read_bytes"))
+    monkeypatch.setattr(os, "read", lambda *_args: pytest.fail("oversize governance carrier was read"))
+    with pytest.raises(ValueError, match="too large"):
+        _domains_from_args(args)
+    with pytest.raises(ValueError, match="too large"):
+        _role_lease_bytes(args, "source")
+
+
+def test_transport_job_roots_are_absolute_strings_not_path_objects(tmp_path):
+    """The frozen in-memory transport interface accepts only absolute root strings."""
+    values = (
+        str((tmp_path / "source").resolve()), str((tmp_path / "target").resolve()),
+        str((tmp_path / "stage").resolve()), "sha256:" + "a" * 64,
+        "ticket-23-product-v1", "ticket-23-product-v1-c23", 23,
+        "ai-video-reverse-engineer/ticket-23", "source", "target", "nonce", 0,
+        None, None, None, "transport-fixed", "transport-seal",
+        "ai-video-reverse-engineer/transport-seal/v1",
+    )
+    assert TransportJobV1(*values).source_store_root == values[0]
+    with pytest.raises(ValueError, match="absolute"):
+        TransportJobV1(Path(values[0]), *values[1:])
+    relative = ("source",) + values[1:]
+    with pytest.raises(ValueError, match="absolute"):
+        TransportJobV1(*relative)
+
+
+@pytest.mark.parametrize("carrier", ("record", "pointer", "blob", "request"))
+def test_store_cli_rejects_each_sparse_oversize_input_before_a_visible_write(tmp_path, monkeypatch, carrier):
+    """Every CLI carrier is bounded before a decoder or store write consumes it."""
+    module = _cleanup_tool_module()
+    root = (tmp_path / "store").resolve()
+    root.mkdir(mode=0o700)
+    monkeypatch.setenv("TRUSTED_HANDOFF_STORE_ROOT", str(root))
+    monkeypatch.setenv("TRUSTED_HANDOFF_STORE_LEASE", _store_lease(root))
+    record = _record()
+    record_path = tmp_path / "record.json"
+    record_path.write_bytes(record.canonical_bytes)
+    pointer_path = tmp_path / "pointer.json"
+    pointer_path.write_bytes(HandoffPointerV1(
+        "trusted-acceptance-handoff-pointer/v1", record.handoff_id,
+        record.record_digest, record.record_digest, record.producer_task,
+        record.producer_commit,
+    ).canonical_bytes)
+    oversized = tmp_path / "oversize.json"
+    with oversized.open("wb") as handle:
+        handle.truncate(1024 * 1024 + 1)
+    monkeypatch.setattr(Path, "read_bytes", lambda *_args: pytest.fail("CLI used Path.read_bytes"))
+    if carrier == "request":
+        result = module.main(["publish-export-request", "--producer-task", "23", "--request", str(oversized)])
+    else:
+        record_arg = oversized if carrier == "record" else record_path
+        pointer_arg = oversized if carrier == "pointer" else pointer_path
+        arguments = ["publish-local", "--producer-task", "23", "--record", str(record_arg), "--pointer", str(pointer_arg)]
+        if carrier == "blob":
+            arguments.extend(("--blob", str(oversized)))
+        result = module.main(arguments)
+    assert result == 2
+    assert not any(root.iterdir())
