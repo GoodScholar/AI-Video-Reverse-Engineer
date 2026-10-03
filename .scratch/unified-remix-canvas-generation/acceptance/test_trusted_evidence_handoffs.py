@@ -66,8 +66,16 @@ def test_tracked_governance_inputs_are_canonical_and_keep_broker_auth_unprovisio
         payloads["registration-broker-auth-revocations.json"],
         payloads["registration-broker-auth-allowed-signers"],
     )
-    assert len(domains.transport_keys) == len(domains.activation_keys) == 1
-    assert json.loads(payloads["registration-broker-auth-registry.json"]) == {"keys": []}
+    registry = RegistrationBrokerAuthRegistryV1.from_canonical_bytes(
+        payloads["registration-broker-auth-registry.json"]
+    )
+    revocations = RegistrationBrokerAuthRevocationsV1.from_canonical_bytes(
+        payloads["registration-broker-auth-revocations.json"]
+    )
+    assert len(domains.transport_keys) == len(domains.activation_keys) == len(domains.broker_keys) == 1
+    assert registry.active_key_id == "broker-unprovisioned-v1"
+    assert revocations.registry_digest == registry.canonical_digest
+    assert b"private" not in b"".join(payloads[name] for name in inputs[5:8])
     output_policy = json.loads(payloads["task-output-policy.json"])
     assert output_policy["schema"] == "trusted-task-output-policy/v1"
     assert [(item["task"], item["phase"]) for item in output_policy["tasks"]] == [
@@ -82,6 +90,24 @@ def test_tracked_governance_inputs_are_canonical_and_keep_broker_auth_unprovisio
         "precondition": "equals-base-bytes",
         "role": "contract",
     }]
+
+
+def test_production_broker_governance_rejects_the_repository_rfc8032_test_seed(tmp_path):
+    """A public production governance key must not be recoverable from a repository test seed."""
+    registry = RegistrationBrokerAuthRegistryV1.from_canonical_bytes(
+        (ACCEPTANCE_ROOT / "trust" / "registration-broker-auth-registry.json").read_bytes()
+    )
+    seed = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+    key_file = tmp_path / "rfc8032-seed"
+    key_file.write_bytes(seed)
+    descriptor = os.open(key_file, os.O_RDONLY)
+    try:
+        with pytest.raises(ValueError):
+            RegistrationBrokerAuthPrivateKeySlotV1.load_from_readonly_fd(
+                descriptor, registry.key(registry.active_key_id), _test_transport_public_key(seed),
+            )
+    finally:
+        os.close(descriptor)
 
 
 def test_tracked_broker_auth_goldens_have_fixed_unsigned_and_lease_identity_bytes():
@@ -654,7 +680,8 @@ def _transport_registry(public_key=bytes.fromhex("11" * 32), *, key_id="transpor
     }
 
 
-def _broker_registry(public_key=bytes.fromhex("22" * 32), *, key_id="broker-fixed", wrapper="broker-wrapper-fixed"):
+def _broker_registry(public_key=bytes.fromhex("22" * 32), *, key_id="broker-fixed", wrapper="broker-wrapper-fixed", resolved_public_key=None):
+    resolved_public_key = public_key if resolved_public_key is None else resolved_public_key
     return {
         "keys": [{
             "keyId": key_id,
@@ -662,9 +689,33 @@ def _broker_registry(public_key=bytes.fromhex("22" * 32), *, key_id="broker-fixe
             "signatureDomain": "ai-video-reverse-engineer/registration-broker-envelope/v1",
             "rawPublicKey": base64.b64encode(public_key).decode("ascii"),
             "wrapperIdentity": wrapper,
-            "resolvedPublicKey": base64.b64encode(public_key).decode("ascii"),
+            "resolvedPublicKey": base64.b64encode(resolved_public_key).decode("ascii"),
         }],
     }
+
+
+def _strict_broker_inputs(public_key=bytes.fromhex("22" * 32), *, key_id="broker-fixed", wrapper="broker-wrapper-fixed", resolved_public_key=None):
+    resolved_public_key = public_key if resolved_public_key is None else resolved_public_key
+    allowed = _broker_registry(public_key, key_id=key_id, wrapper=wrapper, resolved_public_key=resolved_public_key)
+    entry = allowed["keys"][0]
+    public_digest = "sha256:" + hashlib.sha256(public_key).hexdigest()
+    resolved_digest = "sha256:" + hashlib.sha256(resolved_public_key).hexdigest()
+    key = RegistrationBrokerAuthKeyRegistrationV1(
+        "trusted-registration-broker-auth-key-registration/v1", key_id,
+        "registration-broker-auth", "ai-video-reverse-engineer/registration-broker-envelope/v1",
+        "ai-video-reverse-engineer/registration-broker-lease/v1",
+        "ai-video-reverse-engineer/registration-broker-startup-challenge/v1", "raw-ed25519-32",
+        public_digest, public_digest, "sha256:" + hashlib.sha256(wrapper.encode("utf-8")).hexdigest(),
+        resolved_digest, resolved_digest,
+        "sha256:" + hashlib.sha256(canonical_json_bytes(entry)).hexdigest(), "active", 1, None,
+    )
+    registry = RegistrationBrokerAuthRegistryV1(
+        "trusted-registration-broker-auth-registry/v1", 1, None, key_id, (key,)
+    )
+    revocations = RegistrationBrokerAuthRevocationsV1(
+        "trusted-registration-broker-auth-revocations/v1", registry.canonical_digest, ()
+    )
+    return registry.canonical_bytes, revocations.canonical_bytes, canonical_json_bytes(allowed)
 
 
 def _allowed(registry):
@@ -675,13 +726,63 @@ def _domains(transport=None, activation=None, broker=None):
     transport = transport or _transport_registry()
     activation = activation or _activation_registry()
     broker = broker or _broker_registry()
+    broker_registry, broker_revocations, broker_allowed = _strict_broker_inputs(
+        base64.b64decode(broker["keys"][0]["rawPublicKey"]),
+        key_id=broker["keys"][0]["keyId"],
+        wrapper=broker["keys"][0]["wrapperIdentity"],
+    )
     return load_disjoint_signing_domains(
         transport,
         activation,
-        broker,
-        {"revokedKeyIds": []},
-        _allowed(broker),
+        broker_registry,
+        broker_revocations,
+        broker_allowed,
     )
+
+
+def test_signing_domains_accept_only_the_strict_broker_governance_closure():
+    """Accepting a simplified broker registry would fork startup and loader trust state."""
+    registry, revocations, allowed = _strict_broker_inputs()
+    domains = load_disjoint_signing_domains(
+        _transport_registry(), _activation_registry(), registry, revocations, allowed,
+    )
+    assert len(domains.broker_keys) == 1
+    assert domains.broker_keys[0].key_id == "broker-fixed"
+    with pytest.raises(ValueError):
+        load_disjoint_signing_domains(
+            _transport_registry(), _activation_registry(), b'{"keys":[]}', revocations, allowed,
+        )
+
+
+@pytest.mark.parametrize(
+    "dimension",
+    (
+        "key-id",
+        "raw-public-key",
+        "raw-public-key-digest",
+        "raw-public-key-fingerprint",
+        "wrapper-identity",
+        "resolved-leaf-public-key",
+        "resolved-leaf-public-key-digest",
+        "resolved-leaf-public-key-fingerprint",
+    ),
+)
+def test_signing_domains_reject_each_broker_identity_dimension_collision(dimension):
+    """Each broker identity projection must independently block a cross-domain collision."""
+    options = {}
+    if dimension == "key-id":
+        options["key_id"] = "transport-fixed"
+    elif dimension.startswith("raw-public"):
+        options["public_key"] = bytes.fromhex("11" * 32)
+    elif dimension == "wrapper-identity":
+        options["wrapper"] = "transport-wrapper-fixed"
+    else:
+        options["resolved_public_key"] = bytes.fromhex("11" * 32)
+    registry, revocations, allowed = _strict_broker_inputs(**options)
+    with pytest.raises(ValueError):
+        load_disjoint_signing_domains(
+            _transport_registry(), _activation_registry(), registry, revocations, allowed,
+        )
 
 
 def test_fixed_activation_signer_verifies_complete_canonical_chain():
@@ -759,15 +860,15 @@ def test_activation_registry_rejects_missing_or_wrong_purpose_domain(field, valu
 
 def test_broker_registry_requires_unrevoked_exact_allowed_signer_closure():
     """Unknown, revoked, duplicate, or substituted broker keys cannot start a signing domain."""
-    broker = _broker_registry()
+    registry, revocations, allowed = _strict_broker_inputs()
     with pytest.raises(ValueError):
-        load_disjoint_signing_domains(_transport_registry(), _activation_registry(), broker, {"revokedKeyIds": ["broker-fixed"]}, _allowed(broker))
+        load_disjoint_signing_domains(_transport_registry(), _activation_registry(), b'{"keys":[]}', revocations, allowed)
     with pytest.raises(ValueError):
-        load_disjoint_signing_domains(_transport_registry(), _activation_registry(), broker, {"revokedKeyIds": []}, {"keys": []})
-    duplicate = _broker_registry()
+        load_disjoint_signing_domains(_transport_registry(), _activation_registry(), registry, revocations, b'{"keys":[]}')
+    duplicate = json.loads(allowed)
     duplicate["keys"].append(dict(duplicate["keys"][0]))
     with pytest.raises(ValueError):
-        _domains(broker=duplicate)
+        load_disjoint_signing_domains(_transport_registry(), _activation_registry(), registry, revocations, canonical_json_bytes(duplicate))
 
 
 def test_broker_startup_challenge_uses_fixed_ed25519_vector_and_rejects_without_effects(tmp_path):
@@ -796,12 +897,16 @@ def test_broker_startup_challenge_uses_fixed_ed25519_vector_and_rejects_without_
     finally:
         os.close(descriptor)
     try:
-        signature = verify_registration_broker_startup_challenge(registry, revocations, slot, "nonce-fixed")
+        signature = verify_registration_broker_startup_challenge(
+            registry, revocations, {"broker-startup-fixed": public}, slot, "nonce-fixed"
+        )
         assert signature == "e7dbf403d3df0371851fa72eb5fd9e98db3c228c18c66c48f10656898890c033944b5af0d3612564ba26a3b24f1e5ed413cea1715db1e8aa901878b641cb8b07"
         effects = {"childExec": 0, "repositoryWrites": 0, "fsyncs": 0}
         slot.close()
         with pytest.raises(ValueError):
-            verify_registration_broker_startup_challenge(registry, revocations, slot, "nonce-fixed")
+            verify_registration_broker_startup_challenge(
+                registry, revocations, {"broker-startup-fixed": public}, slot, "nonce-fixed"
+            )
         assert effects == {"childExec": 0, "repositoryWrites": 0, "fsyncs": 0}
     finally:
         slot.close()
@@ -1222,18 +1327,18 @@ def test_policy_activation_cli_verifies_the_cached_proof_and_source_closure(tmp_
 
     transport = _transport_registry(_test_transport_public_key(transport_seed))
     activation = _activation_registry(_test_transport_public_key(bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")))
-    broker = _broker_registry()
+    broker_registry, broker_revocations, broker_allowed = _strict_broker_inputs()
     files = {
         "transport": transport,
         "activation": activation,
-        "broker": broker,
-        "revocations": {"revokedKeyIds": []},
-        "allowed": _allowed(broker),
+        "broker": broker_registry,
+        "revocations": broker_revocations,
+        "allowed": broker_allowed,
     }
     paths = {}
     for name, payload in files.items():
         path = tmp_path / f"{name}.json"
-        path.write_bytes(canonical_json_bytes(payload))
+        path.write_bytes(payload if isinstance(payload, bytes) else canonical_json_bytes(payload))
         paths[name] = path
     cli = Path(__file__).parent / "tools" / "trusted_handoff_store.py"
     command = [

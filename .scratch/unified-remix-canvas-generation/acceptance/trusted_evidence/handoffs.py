@@ -13,7 +13,14 @@ import stat
 import json
 from collections.abc import Mapping
 
-from .e2_policy import GitObjectIdV1, ProductGitObjectIdV1, canonical_json_bytes
+from .e2_policy import (
+    GitObjectIdV1,
+    ProductGitObjectIdV1,
+    RegistrationBrokerAuthRegistryV1,
+    RegistrationBrokerAuthRevocationsV1,
+    canonical_json_bytes,
+    verify_registration_broker_governance,
+)
 
 
 _DIGEST_PREFIX = "sha256:"
@@ -1375,26 +1382,60 @@ def _registrations(value: object, *, purpose: str, domain: str, label: str, allo
 class VerifiedSigningDomainsV1:
     transport_keys: tuple[SigningKeyRegistrationV1, ...]
     activation_keys: tuple[SigningKeyRegistrationV1, ...]
+    broker_keys: tuple[SigningKeyRegistrationV1, ...]
     canonical_digest: str
+
+
+def _strict_broker_governance(
+    registry_wire: object,
+    revocations_wire: object,
+    allowed_signers_wire: object,
+) -> tuple[SigningKeyRegistrationV1, ...]:
+    if not isinstance(registry_wire, bytes) or not isinstance(revocations_wire, bytes):
+        raise ValueError("broker-auth governance must use canonical bytes")
+    registry = RegistrationBrokerAuthRegistryV1.from_canonical_bytes(registry_wire)
+    revocations = RegistrationBrokerAuthRevocationsV1.from_canonical_bytes(revocations_wire)
+    if revocations.registry_digest != registry.canonical_digest:
+        raise ValueError("broker-auth revocations do not bind the registry")
+    allowed = _registrations(
+        allowed_signers_wire,
+        purpose=_BROKER_PURPOSE,
+        domain=_BROKER_DOMAIN,
+        label="broker-auth allowed signers",
+    )
+    if {item.key_id for item in allowed} != {item.key_id for item in registry.keys}:
+        raise ValueError("broker-auth allowed signers do not close the registry")
+    if {entry.key_id for entry in revocations.entries} - {item.key_id for item in registry.keys}:
+        raise ValueError("broker-auth revocations contain an unknown key")
+    verify_registration_broker_governance(
+        registry,
+        revocations,
+        {item.key_id: item.resolved_public_key for item in allowed},
+    )
+    verified: list[SigningKeyRegistrationV1] = []
+    for registered in registry.keys:
+        signer = next(item for item in allowed if item.key_id == registered.key_id)
+        if (
+            signer.raw_public_key_bytes_digest != registered.public_key_digest
+            or signer.raw_public_key_fingerprint != registered.public_key_fingerprint
+            or signer.wrapper_identity_digest != registered.certificate_wrapper_digest
+            or signer.resolved_public_key_bytes_digest != registered.resolved_leaf_public_key_digest
+            or signer.resolved_public_key_fingerprint != registered.resolved_leaf_public_key_fingerprint
+            or signer.registry_entry_bytes_digest != registered.allowed_signers_entry_digest
+        ):
+            raise ValueError("broker-auth signer does not match strict governance")
+        verified.append(signer)
+    return tuple(verified)
 
 
 def load_disjoint_signing_domains(transport_registry: object, activation_registry: object, broker_auth_registry: object, broker_auth_revocations: object, broker_auth_allowed_signers: object) -> VerifiedSigningDomainsV1:
     transport = _registrations(transport_registry, purpose=_TRANSPORT_PURPOSE, domain=_TRANSPORT_DOMAIN, label="transport registry")
     activation = _registrations(activation_registry, purpose=_ACTIVATION_PURPOSE, domain=_ACTIVATION_DOMAIN, label="activation registry")
-    # Task 2 checks in an explicit empty broker-auth production profile.  It is
-    # not a fallback: both files must be the exact canonical empty registries.
-    broker = _registrations(broker_auth_registry, purpose=_BROKER_PURPOSE, domain=_BROKER_DOMAIN, label="broker-auth registry", allow_empty=True)
-    allowed = _registrations(broker_auth_allowed_signers, purpose=_BROKER_PURPOSE, domain=_BROKER_DOMAIN, label="broker-auth allowed signers", allow_empty=True)
-    if broker != allowed:
-        raise ValueError("broker-auth allowed signers do not close the registry")
-    if isinstance(broker_auth_revocations, bytes):
-        revoked = _strict_wire(broker_auth_revocations, {"revokedKeyIds"}, "broker-auth revocations")
-    else:
-        revoked = broker_auth_revocations
-    if not isinstance(revoked, dict) or set(revoked) != {"revokedKeyIds"} or not isinstance(revoked["revokedKeyIds"], list) or any(not isinstance(key_id, str) for key_id in revoked["revokedKeyIds"]) or len(set(revoked["revokedKeyIds"])) != len(revoked["revokedKeyIds"]):
-        raise ValueError("broker-auth revocations are invalid")
-    if {key.key_id for key in broker} & set(revoked["revokedKeyIds"]):
-        raise ValueError("broker-auth registry includes a revoked key")
+    broker = _strict_broker_governance(
+        broker_auth_registry,
+        broker_auth_revocations,
+        broker_auth_allowed_signers,
+    )
     domains = (transport, activation, broker)
     for left_index, left in enumerate(domains):
         for right in domains[left_index + 1:]:
@@ -1402,7 +1443,7 @@ def load_disjoint_signing_domains(transport_registry: object, activation_registr
                 if {getattr(key, attribute) for key in left} & {getattr(key, attribute) for key in right}:
                     raise ValueError(f"signing domains collide on {attribute}")
     digest_wire = {"activation": [key.registry_entry_bytes_digest for key in activation], "broker": [key.registry_entry_bytes_digest for key in broker], "transport": [key.registry_entry_bytes_digest for key in transport]}
-    return VerifiedSigningDomainsV1(transport, activation, _digest_bytes(canonical_json_bytes(digest_wire)))
+    return VerifiedSigningDomainsV1(transport, activation, broker, _digest_bytes(canonical_json_bytes(digest_wire)))
 
 
 # RFC 8032 Ed25519 verification expressed with Python integers.  The verifier

@@ -1428,6 +1428,26 @@ class RegistrationBrokerAuthRevocationsV1(_SelfDigestRecord):
         return None if item is None else item.revoked_at_broker_sequence
 
 
+def verify_registration_broker_governance(
+    registry: RegistrationBrokerAuthRegistryV1,
+    revocations: RegistrationBrokerAuthRevocationsV1,
+    allowed_signers: Mapping[str, bytes],
+) -> None:
+    """Close broker public keys to one strict registry and revocation generation."""
+    if type(registry) is not RegistrationBrokerAuthRegistryV1 or type(revocations) is not RegistrationBrokerAuthRevocationsV1:
+        raise ValueError("broker governance records are invalid")
+    if revocations.registry_digest != registry.canonical_digest:
+        raise ValueError("broker revocations do not bind the registry")
+    if not isinstance(allowed_signers, Mapping) or set(allowed_signers) != {key.key_id for key in registry.keys}:
+        raise ValueError("broker allowed signers do not close the registry")
+    if {entry.key_id for entry in revocations.entries} - {key.key_id for key in registry.keys}:
+        raise ValueError("broker revocations contain an unknown key")
+    for key in registry.keys:
+        public_key = allowed_signers[key.key_id]
+        if not isinstance(public_key, bytes) or len(public_key) != 32 or "sha256:" + hashlib.sha256(public_key).hexdigest() != key.public_key_digest:
+            raise ValueError("broker allowed signer is invalid")
+
+
 def _broker_identity_fields(value: object, field: str) -> str:
     return _require_digest(value, field)
 
@@ -1913,13 +1933,14 @@ class RegistrationBrokerAuthPrivateKeySlotV1:
         raise TypeError("private key slots are non-serializable")
 
 
-def verify_registration_broker_startup_challenge(registry: RegistrationBrokerAuthRegistryV1, revocations: RegistrationBrokerAuthRevocationsV1, slot: RegistrationBrokerAuthPrivateKeySlotV1, nonce: str) -> str:
+def verify_registration_broker_startup_challenge(registry: RegistrationBrokerAuthRegistryV1, revocations: RegistrationBrokerAuthRevocationsV1, allowed_signers: Mapping[str, bytes], slot: RegistrationBrokerAuthPrivateKeySlotV1, nonce: str) -> str:
     """Sign and independently verify the exact startup challenge before child creation."""
-    if type(registry) is not RegistrationBrokerAuthRegistryV1 or type(revocations) is not RegistrationBrokerAuthRevocationsV1 or type(slot) is not RegistrationBrokerAuthPrivateKeySlotV1:
+    if type(slot) is not RegistrationBrokerAuthPrivateKeySlotV1:
         raise ValueError("broker startup trust closure is invalid")
+    verify_registration_broker_governance(registry, revocations, allowed_signers)
     _require_text(nonce, "nonce")
     active = registry.key(registry.active_key_id)
-    if revocations.registry_digest != registry.canonical_digest or revocations.revoked_at(active.key_id) is not None or (slot.key_id, slot.purpose, slot.signature_domain, slot.challenge_domain, slot.public_key_digest) != (active.key_id, _BROKER_AUTH_PURPOSE, _BROKER_ENVELOPE_DOMAIN, _BROKER_CHALLENGE_DOMAIN, active.public_key_digest):
+    if active.state != "active" or revocations.revoked_at(active.key_id) is not None or (slot.key_id, slot.purpose, slot.signature_domain, slot.challenge_domain, slot.public_key_digest) != (active.key_id, _BROKER_AUTH_PURPOSE, _BROKER_ENVELOPE_DOMAIN, _BROKER_CHALLENGE_DOMAIN, active.public_key_digest):
         raise ValueError("broker startup key closure is invalid")
     message = canonical_json_bytes({"keyId": active.key_id, "nonce": nonce, "registryDigest": registry.canonical_digest})
     signature = slot.sign(_BROKER_CHALLENGE_DOMAIN, message)
@@ -2398,8 +2419,7 @@ class RegistrationRecoveryLeaseV1:
 
     def verify_signature(self, registry: RegistrationBrokerAuthRegistryV1, revocations: RegistrationBrokerAuthRevocationsV1, allowed_signers: Mapping[str, bytes], current_sequence: int) -> None:
         """Verify the public lease signature and its frozen trust-state facts."""
-        if type(registry) is not RegistrationBrokerAuthRegistryV1 or type(revocations) is not RegistrationBrokerAuthRevocationsV1:
-            raise ValueError("lease trust state is invalid")
+        verify_registration_broker_governance(registry, revocations, allowed_signers)
         if (registry.generation, registry.canonical_digest, revocations.canonical_digest, revocations.registry_digest) != (self.broker_auth_registry_generation, self.broker_auth_registry_digest, self.broker_auth_revocation_digest, registry.canonical_digest):
             raise ValueError("lease trust state changed")
         key = registry.key(self.broker_auth_key_id)

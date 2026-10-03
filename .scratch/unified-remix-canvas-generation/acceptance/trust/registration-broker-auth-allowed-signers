@@ -1,1 +1,1 @@
-{"keys":[]}
+{"keys":[{"keyId":"broker-unprovisioned-v1","purpose":"registration-broker-auth","rawPublicKey":"q3MAczrL09ECUI3Qj4CjtFrs5ocQeq2My4//ZuXa7y8=","resolvedPublicKey":"q3MAczrL09ECUI3Qj4CjtFrs5ocQeq2My4//ZuXa7y8=","signatureDomain":"ai-video-reverse-engineer/registration-broker-envelope/v1","wrapperIdentity":"broker-unprovisioned-wrapper-v1"}]}
