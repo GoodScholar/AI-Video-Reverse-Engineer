@@ -2295,6 +2295,34 @@ def _test_receive_lease(governance, signer):
     )
 
 
+def _issued_startup_issuer(tmp_path):
+    """Create one real issuer closure suitable for startup and revocation tests."""
+    governance, signer = _test_broker_signer(tmp_path)
+    state_mac = _state_mac_capability(tmp_path, b"state-mac-key-is-independent-32!!!"[:32])
+    registry, revocations = governance.registry, governance.revocations
+    policy_digest = _broker_policy_digest(registry, revocations)
+    family = RegistrationWorkerSessionFamilyAuthorizationV1(
+        "trusted-registration-worker-session-family-authorization/v1", "startup-owner-op", DIGEST_A,
+        DIGEST_B, DIGEST_C, DIGEST_A, DIGEST_B, "broker-fixed", registry.key("broker-fixed").canonical_digest,
+        ("register", "recover"), "register-to-recover", DIGEST_C, DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A,
+    )
+    request = BrokerAuthLeaseIssueRequestV1(
+        "trusted-registration-broker-auth-lease-issue-request/v1", "startup-owner-op", "startup-owner-life",
+        family.canonical_digest, "broker-fixed", 0, DIGEST_A, registry.canonical_digest,
+        revocations.canonical_digest, policy_digest, governance.allowed_signers_digest, 2,
+    )
+    template = RegistrationRecoveryLeaseV1(
+        "trusted-registration-recovery-lease/v1", "ai-video-reverse-engineer", "startup-owner-op", "startup-owner-life",
+        family.canonical_digest, 1, DIGEST_A, "transaction-root", DIGEST_B, DIGEST_C, DIGEST_A,
+        DIGEST_B, DIGEST_A, DIGEST_B, DIGEST_C, DIGEST_A, registry.generation, registry.canonical_digest,
+        revocations.canonical_digest, policy_digest, governance.allowed_signers_digest, "broker-fixed", request.request_digest,
+        DIGEST_A, DIGEST_B, DIGEST_C, 1, 3, DIGEST_A, "OPEN", "a" * 128, "b" * 64,
+    )
+    issuer = BrokerAuthAuthoritativeIssuerV1.create(governance, DIGEST_A, policy_digest, signer, state_mac, 2)
+    issuer.issue_lease(request, family, template)
+    return issuer, registry, state_mac, signer
+
+
 def test_startup_replays_only_the_authority_current_closure_and_rejects_legacy_family(tmp_path):
     """A detached replay or family-less payload must never authorize startup."""
     governance, signer = _test_broker_signer(tmp_path)
@@ -2371,6 +2399,69 @@ def test_startup_replays_only_the_authority_current_closure_and_rejects_legacy_f
         assert issuer.state.broker_auth_revocation_digest == revoked.canonical_digest
         with pytest.raises(ValueError, match="startup key closure"):
             verify_registration_broker_startup_challenge(issuer, "startup-nonce")
+    finally:
+        state_mac.close()
+        signer.close()
+
+
+def test_authoritative_issuer_rejects_copy_serialization_reduce_and_subclassing(tmp_path):
+    """A second issuer shell must never be a second signing authority."""
+    issuer, _, state_mac, signer = _issued_startup_issuer(tmp_path)
+    try:
+        state_before = issuer.state
+        with pytest.raises(TypeError, match="issuer"):
+            copy.copy(issuer)
+        with pytest.raises(TypeError, match="issuer"):
+            copy.deepcopy(issuer)
+        with pytest.raises(TypeError, match="issuer"):
+            pickle.dumps(issuer)
+        with pytest.raises(TypeError, match="issuer"):
+            issuer.__reduce__()
+        with pytest.raises(TypeError, match="issuer"):
+            issuer.__reduce_ex__(4)
+        with pytest.raises(TypeError, match="issuer"):
+            type("IssuerSubclass", (BrokerAuthAuthoritativeIssuerV1,), {})
+        assert issuer.state == state_before
+        assert verify_registration_broker_startup_challenge(issuer, "owner-copy-rejected")
+    finally:
+        state_mac.close()
+        signer.close()
+
+
+def test_authoritative_issuer_rejects_slot_snapshot_after_owner_revocation(tmp_path):
+    """A pre-revocation all-slot snapshot cannot sign after its owner advances."""
+    issuer, registry, state_mac, signer = _issued_startup_issuer(tmp_path)
+    try:
+        snapshot = object.__new__(BrokerAuthAuthoritativeIssuerV1)
+        for slot in BrokerAuthAuthoritativeIssuerV1.__slots__:
+            if slot == "__weakref__":
+                continue
+            object.__setattr__(snapshot, slot, getattr(issuer, slot))
+        with pytest.raises(ValueError, match="authority|freshness|closure"):
+            verify_registration_broker_startup_challenge(snapshot, "snapshot-before-revoke")
+
+        revoked = RegistrationBrokerAuthRevocationsV1(
+            "trusted-registration-broker-auth-revocations/v1", registry.canonical_digest,
+            (RegistrationBrokerAuthRevocationEntryV1("broker-fixed", 2, DIGEST_B),),
+        )
+        issuer.revoke_key("broker-fixed", revoked, DIGEST_B, _broker_policy_digest(registry, revoked))
+        with pytest.raises(ValueError, match="authority|freshness|closure"):
+            verify_registration_broker_startup_challenge(snapshot, "snapshot-after-revoke")
+        with pytest.raises(ValueError, match="startup key closure"):
+            verify_registration_broker_startup_challenge(issuer, "owner-after-revoke")
+    finally:
+        state_mac.close()
+        signer.close()
+
+
+def test_authoritative_issuer_rejects_direct_internal_freshness_reassignment(tmp_path):
+    """Its mutable authority closure is write-protected outside its transitions."""
+    issuer, _, state_mac, signer = _issued_startup_issuer(tmp_path)
+    try:
+        for name in ("_state", "_journal", "_governance", "_freshness_epoch", "_freshness_cell"):
+            with pytest.raises(AttributeError, match="issuer"):
+                setattr(issuer, name, getattr(issuer, name))
+        assert verify_registration_broker_startup_challenge(issuer, "owner-fields-rejected")
     finally:
         state_mac.close()
         signer.close()

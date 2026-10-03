@@ -3872,6 +3872,38 @@ class BrokerAuthSignedEnvelopeResultV1:
     envelope: CapabilityEnvelopeV1
 
 
+class _BrokerAuthIssuerFreshnessCellV1:
+    """Shared, process-local currentness for exactly one issuer shell."""
+
+    __slots__ = ("_owner_ref", "_epoch", "_sequence", "_head")
+
+    def __init__(self, owner: "BrokerAuthAuthoritativeIssuerV1", state: BrokerAuthSequenceStateV1) -> None:
+        self._owner_ref = weakref.ref(owner)
+        self._epoch = 0
+        self._sequence = state.current_sequence
+        self._head = state.head_entry_digest
+
+    def require_current(
+        self,
+        owner: "BrokerAuthAuthoritativeIssuerV1",
+        epoch: int,
+        state: BrokerAuthSequenceStateV1,
+    ) -> None:
+        if (
+            self._owner_ref() is not owner
+            or epoch != self._epoch
+            or (state.current_sequence, state.head_entry_digest) != (self._sequence, self._head)
+        ):
+            raise ValueError("broker issuer authority freshness is invalid")
+
+    def advance(self, owner: "BrokerAuthAuthoritativeIssuerV1", state: BrokerAuthSequenceStateV1) -> int:
+        if self._owner_ref() is not owner:
+            raise ValueError("broker issuer authority freshness is invalid")
+        self._epoch = _checked_add(self._epoch, 1)
+        self._sequence, self._head = state.current_sequence, state.head_entry_digest
+        return self._epoch
+
+
 class BrokerAuthAuthoritativeIssuerV1:
     """The sole portable authority for request → payload → head → signed lease.
 
@@ -3883,9 +3915,18 @@ class BrokerAuthAuthoritativeIssuerV1:
         "_registry", "_revocations", "_state", "_entries", "_payloads", "_journal",
         "_root_identity_digest", "_allowed_signers_digest", "_signer", "_allowed_signers",
         "_governance", "_baseline", "_state_mac", "_frozen_profile_ttl_sequences", "_event_ids",
-        "_issued_families", "_issued_preimages", "_sign_lifecycles",
+        "_issued_families", "_issued_preimages", "_sign_lifecycles", "_freshness_cell",
+        "_freshness_epoch", "_issuer_sealed", "__weakref__",
     )
     _ENVELOPE_TOKEN = object()
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("broker issuer subclassing is forbidden")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_issuer_sealed", False):
+            raise AttributeError("broker issuer state is immutable outside authoritative transitions")
+        object.__setattr__(self, name, value)
 
     def __init__(
         self,
@@ -3909,6 +3950,9 @@ class BrokerAuthAuthoritativeIssuerV1:
         self._issued_families: dict[str, RegistrationWorkerSessionFamilyAuthorizationV1] = {}
         self._issued_preimages: dict[str, RegistrationRecoveryLeaseIdentityPreimageV1] = {}
         self._sign_lifecycles: dict[str, tuple[str, int]] = {}
+        self._freshness_cell = _BrokerAuthIssuerFreshnessCellV1(self, state)
+        self._freshness_epoch = 0
+        self._issuer_sealed = True
 
     @classmethod
     def create(
@@ -3959,10 +4003,26 @@ class BrokerAuthAuthoritativeIssuerV1:
     def payloads(self) -> dict[str, BrokerAuthSequenceEventPayloadV1]:
         return dict(self._payloads)
 
+    def __copy__(self):
+        raise TypeError("broker issuer is non-copyable")
+
+    def __deepcopy__(self, memo: object):
+        raise TypeError("broker issuer is non-copyable")
+
+    def __reduce__(self):
+        raise TypeError("broker issuer is non-serializable")
+
+    def __reduce_ex__(self, protocol: int):
+        raise TypeError("broker issuer is non-serializable")
+
+    def _require_current_authority(self) -> None:
+        self._freshness_cell.require_current(self, self._freshness_epoch, self._state)
+
     def _replay_current_startup_closure(
         self,
     ) -> tuple[RegistrationBrokerAuthGovernanceV1, BrokerAuthSequenceStateV1, str]:
         """Revalidate the only current closure held by this authority before signing."""
+        self._require_current_authority()
         if self._journal is None:
             raise ValueError("broker startup trust closure is invalid")
         payloads = MappingProxyType(dict(self._payloads))
@@ -4007,6 +4067,7 @@ class BrokerAuthAuthoritativeIssuerV1:
         return governance, self._state, closure_digest
 
     def replace_signer(self, signer: RegistrationBrokerAuthPrivateKeySlotV1, governance: RegistrationBrokerAuthGovernanceV1) -> None:
+        self._require_current_authority()
         if type(signer) is not RegistrationBrokerAuthPrivateKeySlotV1 or type(governance) is not RegistrationBrokerAuthGovernanceV1:
             raise ValueError("broker signer is invalid")
         if (
@@ -4028,10 +4089,11 @@ class BrokerAuthAuthoritativeIssuerV1:
             != (key.key_id, _BROKER_AUTH_PURPOSE, key.lease_signature_domain, key.public_key_digest)
         ):
             raise ValueError("broker signer does not match current governance")
-        self._signer = signer
-        self._allowed_signers = dict(governance.allowed_signers)
-        self._allowed_signers_digest = governance.allowed_signers_digest
-        self._governance = governance
+        object.__setattr__(self, "_signer", signer)
+        object.__setattr__(self, "_allowed_signers", dict(governance.allowed_signers))
+        object.__setattr__(self, "_allowed_signers_digest", governance.allowed_signers_digest)
+        object.__setattr__(self, "_governance", governance)
+        object.__setattr__(self, "_freshness_epoch", self._freshness_cell.advance(self, self._state))
 
     def _require_active_signer(self, event_sequence: int) -> RegistrationBrokerAuthKeyRegistrationV1:
         key = self._registry.key(self._registry.active_key_id)
@@ -4044,6 +4106,7 @@ class BrokerAuthAuthoritativeIssuerV1:
         return key
 
     def _next_sequence(self) -> int:
+        self._require_current_authority()
         return _checked_add(self._state.current_sequence, 1)
 
     def _transition(
@@ -4127,10 +4190,18 @@ class BrokerAuthAuthoritativeIssuerV1:
         result: BrokerAuthStateTransitionResultV1,
         governance: RegistrationBrokerAuthGovernanceV1,
     ) -> None:
-        self._governance, self._registry, self._revocations, self._state = governance, governance.registry, governance.revocations, result.state
-        self._allowed_signers, self._allowed_signers_digest = dict(governance.allowed_signers), governance.allowed_signers_digest
-        self._entries, self._payloads, self._journal = (*self._entries, result.entry), dict(result.payloads), result.journal
+        self._require_current_authority()
+        object.__setattr__(self, "_governance", governance)
+        object.__setattr__(self, "_registry", governance.registry)
+        object.__setattr__(self, "_revocations", governance.revocations)
+        object.__setattr__(self, "_state", result.state)
+        object.__setattr__(self, "_allowed_signers", dict(governance.allowed_signers))
+        object.__setattr__(self, "_allowed_signers_digest", governance.allowed_signers_digest)
+        object.__setattr__(self, "_entries", (*self._entries, result.entry))
+        object.__setattr__(self, "_payloads", dict(result.payloads))
+        object.__setattr__(self, "_journal", result.journal)
         self._event_ids.add(result.payload.event_id_digest)
+        object.__setattr__(self, "_freshness_epoch", self._freshness_cell.advance(self, result.state))
 
     def issue_lease(
         self,
