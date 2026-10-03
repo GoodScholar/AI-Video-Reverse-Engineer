@@ -28,16 +28,21 @@ from trusted_evidence.e2_policy import (
 from trusted_evidence.handoffs import (
     ActivatedPolicyExportRequestV1,
     EmbeddedCanonicalBytesV1,
+    HandoffTransferManifestV1,
     HandoffRegistryV1,
     HandoffPointerV1,
     HandoffExportRequestV1,
     PolicyHandoffPointerV1,
     PolicyHandoffRecordV1,
+    PolicyActivationProofV1,
     ProductSourceBudgetV1,
     ProductRepositorySourceV1,
+    PolicyActivationMarkerV1,
     Ticket23ProductSourceHandoffV1,
     TrustedHandoffRecordV1,
     TrustedHandoffStoreV1,
+    TransportReadyMarkerV1,
+    TransportSealV1,
     load_disjoint_signing_domains,
     verify_transport_closure,
     verify_policy_activation_proof,
@@ -1231,7 +1236,13 @@ def test_fixed_activation_signer_verifies_complete_canonical_chain():
 
 @pytest.mark.parametrize(
     "field",
-    ("activateIntent", "activationMarker", "activatedEntry", "policyCommit", "completionRecordRef", "brokerSignature"),
+    (
+        "activateIntent", "activationMarker", "activatedEntry", "policyCommit", "completionRecordRef",
+        "brokerSignature", "operationId", "state", "targetHeadRef", "fixedRef", "profileDigest",
+        "toolchainBuildRecordRef", "trustedGitExecutableDigest", "trustedGitViewDigest",
+        "activationTrustRootDigest", "policyRecordRef", "policyPointerBytesDigest",
+        "policyCoreExportRequestRef",
+    ),
 )
 def test_activation_proof_tampering_fails_closed(field):
     """Every signed proof component is authenticated before a policy handoff can be trusted."""
@@ -1242,8 +1253,10 @@ def test_activation_proof_tampering_fails_closed(field):
         proof[field]["hex"] = "4" * 40
     elif field == "completionRecordRef":
         proof[field] = _fixed_digest("c")
-    else:
+    elif field in {"activateIntent", "activationMarker", "activatedEntry"}:
         proof[field]["digest"] = _fixed_digest("f")
+    else:
+        proof[field] = "tampered"
     with pytest.raises(ValueError):
         verify_policy_activation_proof(
             _fixed_canonical(proof), _domains(),
@@ -1576,20 +1589,38 @@ def test_run_transport_creates_distinct_sealed_ready_closures_for_two_consumers(
         transport_root = tmp_path / "target-23" / "transports" / record.handoff_id / "ticket-23-product-v1-c23"
         original = {name: (transport_root / name).read_bytes() for name in ("manifest.json", "seal.json", "ready.json")}
         mutations = (
+            ("ready.json", "storeNamespace", "other-namespace"),
             ("ready.json", "consumerTask", 25),
             ("ready.json", "destinationExecutorId", "executor-other"),
+            ("ready.json", "sourceExecutorId", "source-other"),
+            ("ready.json", "handoffId", "other-handoff"),
+            ("ready.json", "transportId", "other-transport"),
+            ("ready.json", "nonce", "other-nonce"),
+            ("ready.json", "sequence", 2),
             ("seal.json", "signingKeyPurpose", "policy-activation"),
             ("seal.json", "signatureDomain", "ai-video-reverse-engineer/policy-activation/v1"),
             ("seal.json", "keyId", "activation-fixed"),
             ("seal.json", "nonce", "other-nonce"),
             ("seal.json", "sequence", 2),
+            ("seal.json", "sourceExecutorId", "source-other"),
+            ("seal.json", "recordRef", "sha256:" + "0" * 64),
+            ("seal.json", "pointerBytesDigest", "sha256:" + "1" * 64),
+            ("seal.json", "signature", "0" * 128),
+            ("manifest.json", "storeNamespace", "other-namespace"),
+            ("manifest.json", "handoffId", "other-handoff"),
+            ("manifest.json", "transportId", "other-transport"),
+            ("manifest.json", "sourceExecutorId", "source-other"),
+            ("manifest.json", "recordRef", "sha256:" + "0" * 64),
+            ("manifest.json", "recordFullBytesDigest", "sha256:" + "1" * 64),
+            ("manifest.json", "pointerBytesDigest", "sha256:" + "2" * 64),
+            ("manifest.json", "blobRefs", ["sha256:" + "3" * 64]),
             ("manifest.json", "expiresAt", "2020-01-01T00:00:00Z"),
         )
-        for name, field, value in mutations:
+        for index, (name, field, value) in enumerate(mutations):
             payload = json.loads(original[name])
             payload[field] = value
             (transport_root / name).write_bytes(canonical_json_bytes(payload))
-            rejected_cache = (tmp_path / f"rejected-{field}").resolve()
+            rejected_cache = (tmp_path / f"rejected-{index}-{field}").resolve()
             rejected_cache.mkdir(mode=0o700)
             with pytest.raises(ValueError):
                 HandoffRegistryV1(TrustedHandoffStoreV1(rejected_cache)).fetch(
@@ -1855,3 +1886,124 @@ def test_policy_transport_rejects_proof_binding_tamper_at_every_durable_location
         path.write_bytes(b"tampered policy closure")
     with pytest.raises(ValueError):
         verify_transport_closure(target, record.handoff_id, "ticket-23-policy-v1-c28", 28, "executor-28", domains)
+
+
+def test_transport_and_policy_wires_reject_oversize_canonical_bytes_before_use():
+    """An oversized canonical manifest or activation marker must not reach closure processing."""
+    digest = "sha256:" + "a" * 64
+    blob_refs = tuple(sorted(f"sha256:{index:064x}" for index in range(15_000)))
+    manifest = HandoffTransferManifestV1(
+        "trusted-handoff-transfer/v1", digest, digest, "ticket-23", "handoff", "transport",
+        23, digest, digest, "handoff", digest, "source", "destination", "nonce", 0,
+        None, None, None, blob_refs,
+    )
+    marker = PolicyActivationMarkerV1(
+        "trusted-policy-activation/v1", "operation-" + "x" * (1024 * 1024), digest,
+        GitObjectIdV1("sha256", "b" * 64), "refs/tags/trusted-acceptance/ticket-23-policy-v1",
+        digest, digest, digest,
+    )
+
+    assert len(manifest.canonical_bytes) > 1024 * 1024
+    assert len(marker.canonical_bytes) > 1024 * 1024
+    with pytest.raises(ValueError, match="too large"):
+        HandoffTransferManifestV1.from_canonical_bytes(manifest.canonical_bytes)
+    with pytest.raises(ValueError, match="too large"):
+        PolicyActivationMarkerV1.from_canonical_bytes(marker.canonical_bytes)
+
+
+def test_transport_manifest_rejects_an_oversize_handoff_identity():
+    """A transport ID binding longer than the wire identity budget must fail before sealing."""
+    digest = "sha256:" + "a" * 64
+    with pytest.raises(ValueError, match="invalid"):
+        HandoffTransferManifestV1(
+            "trusted-handoff-transfer/v1", digest, digest, "ticket-23", "h" * 257, "transport",
+            23, digest, digest, "h" * 257, digest, "source", "destination", "nonce", 0,
+            None, None, None, (digest,),
+        )
+    with pytest.raises(ValueError, match="invalid"):
+        HandoffTransferManifestV1(
+            "trusted-handoff-transfer/v1", digest, digest, "ticket-23", "你" * 86, "transport",
+            23, digest, digest, "你" * 86, digest, "source", "destination", "nonce", 0,
+            None, None, None, (digest,),
+        )
+
+
+@pytest.mark.parametrize(
+    ("decoder", "payload"),
+    (
+        (HandoffTransferManifestV1.from_canonical_bytes, None),
+        (PolicyActivationMarkerV1.from_canonical_bytes, "not-bytes"),
+    ),
+)
+def test_handoff_and_policy_decoders_reject_nonbytes_inputs(decoder, payload):
+    """Untrusted non-byte decoder inputs must fail through the stable ValueError boundary."""
+    with pytest.raises(ValueError):
+        decoder(payload)
+
+
+def test_handoff_transport_and_policy_decoders_reject_closed_wire_mutations(tmp_path):
+    """Record, transport, and activation decoders reject unknown, missing, duplicate, and noncanonical JSON."""
+    from trusted_evidence.handoffs import Ticket23PolicyHandoffV1
+
+    digest = "sha256:" + "a" * 64
+    record = TrustedHandoffRecordV1(
+        "trusted-acceptance-handoff/v1", "handoff", "product-source", 22,
+        ProductGitObjectIdV1("sha1", "b" * 40), (23,), (("source", digest),),
+    )
+    pointer = HandoffPointerV1(
+        "trusted-acceptance-handoff-pointer/v1", record.handoff_id, record.record_digest,
+        record.record_digest, 22, record.producer_commit,
+    )
+    request = HandoffExportRequestV1(
+        "trusted-handoff-export-request/v1", record.handoff_id, record.record_digest,
+        record.record_digest, "sha256:" + hashlib.sha256(pointer.canonical_bytes).hexdigest(),
+        (23,), record.binding_set_digest,
+    )
+    manifest = HandoffTransferManifestV1(
+        "trusted-handoff-transfer/v1", digest, digest, "ticket-23", "handoff", "transport",
+        23, record.record_digest, record.record_digest, "handoff",
+        "sha256:" + hashlib.sha256(pointer.canonical_bytes).hexdigest(), "source", "destination",
+        "nonce", 0, None, None, None, (digest,),
+    )
+    seal = TransportSealV1(
+        "trusted-handoff-transport-seal/v1", "ticket-23", "handoff", "transport", 23,
+        record.record_digest, record.record_digest, "handoff",
+        "sha256:" + hashlib.sha256(pointer.canonical_bytes).hexdigest(), manifest.digest,
+        "source", "destination", "nonce", 0, None, None, None, "transport-seal",
+        "ai-video-reverse-engineer/transport-seal/v1", "ssh-ed25519", "transport-key", "c" * 128,
+    )
+    ready = TransportReadyMarkerV1(
+        "trusted-handoff-transport-ready/v1", "ticket-23", "handoff", "transport", 23,
+        "source", "destination", "nonce", 0, manifest.digest,
+        "sha256:" + hashlib.sha256(seal.canonical_bytes).hexdigest(), None, None,
+    )
+    marker = PolicyActivationMarkerV1(
+        "trusted-policy-activation/v1", "operation", digest,
+        GitObjectIdV1("sha256", "d" * 64), "refs/tags/trusted-acceptance/ticket-23-policy-v1",
+        digest, digest, digest,
+    )
+    source, _policy_record, request_ref, _seed, _domains_value = _policy_transport_fixture(tmp_path)
+    activated = ActivatedPolicyExportRequestV1.from_canonical_bytes(source.read_blob(request_ref))
+    policy_handoff = Ticket23PolicyHandoffV1.from_canonical_bytes(source.read_blob(activated.policy_handoff_ref))
+    proof = PolicyActivationProofV1.from_canonical_bytes(source.read_blob(activated.policy_activation_proof_ref))
+
+    for decoder, payload in (
+        (TrustedHandoffRecordV1.from_canonical_bytes, record.canonical_bytes),
+        (HandoffPointerV1.from_canonical_bytes, pointer.canonical_bytes),
+        (HandoffExportRequestV1.from_canonical_bytes, request.canonical_bytes),
+        (HandoffTransferManifestV1.from_canonical_bytes, manifest.canonical_bytes),
+        (TransportSealV1.from_canonical_bytes, seal.canonical_bytes),
+        (TransportReadyMarkerV1.from_canonical_bytes, ready.canonical_bytes),
+        (PolicyActivationMarkerV1.from_canonical_bytes, marker.canonical_bytes),
+        (Ticket23PolicyHandoffV1.from_canonical_bytes, policy_handoff.canonical_bytes),
+        (ActivatedPolicyExportRequestV1.from_canonical_bytes, activated.canonical_bytes),
+        (PolicyActivationProofV1.from_canonical_bytes, proof.canonical_bytes),
+    ):
+        decoded = json.loads(payload)
+        unknown = {**decoded, "unexpected": True}
+        missing = dict(decoded)
+        missing.pop(next(iter(missing)))
+        duplicate = payload[:-1] + b',"schema":"duplicate"}'
+        for mutated in (canonical_json_bytes(unknown), canonical_json_bytes(missing), duplicate, b" " + payload):
+            with pytest.raises(ValueError):
+                decoder(mutated)

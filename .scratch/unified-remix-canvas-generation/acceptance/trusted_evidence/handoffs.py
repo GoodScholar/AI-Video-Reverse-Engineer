@@ -24,6 +24,7 @@ from .e2_policy import (
 
 
 _DIGEST_PREFIX = "sha256:"
+_MAX_CANONICAL_WIRE_BYTES = 1024 * 1024
 
 
 def _digest(payload: bytes) -> str:
@@ -38,6 +39,10 @@ def _require_digest(value: object, field: str) -> str:
 
 def _strict_object(payload: bytes, fields: set[str]) -> dict[str, object]:
     """Decode one exact canonical JSON object with a closed field set."""
+    if not isinstance(payload, bytes):
+        raise ValueError("handoff JSON must be bytes")
+    if len(payload) > _MAX_CANONICAL_WIRE_BYTES:
+        raise ValueError("handoff JSON is too large")
     try:
         value = json.loads(payload.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
@@ -697,7 +702,7 @@ class TrustedHandoffStoreV1:
 
 
 def _require_transport_identity(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value or "/" in value or "\x00" in value:
+    if not isinstance(value, str) or not value or len(value.encode("utf-8")) > 256 or "/" in value or "\x00" in value:
         raise ValueError(f"{field} is invalid")
     return value
 
@@ -1227,6 +1232,10 @@ def _hex_signature(value: object, field: str) -> bytes:
 
 
 def _strict_wire(payload: bytes, fields: set[str], label: str) -> dict[str, object]:
+    if not isinstance(payload, bytes):
+        raise ValueError(f"{label} must be bytes")
+    if len(payload) > _MAX_CANONICAL_WIRE_BYTES:
+        raise ValueError(f"{label} is too large")
     try:
         decoded = json.loads(payload.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:

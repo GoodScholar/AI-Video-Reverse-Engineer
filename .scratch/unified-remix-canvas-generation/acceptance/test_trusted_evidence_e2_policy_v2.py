@@ -1374,6 +1374,24 @@ def test_e2_signed_wire_has_one_lowercase_signature_and_no_unsigned_signature_fi
             CapabilityEnvelopeV1.from_canonical_bytes(signed.canonical_bytes.replace(b'"brokerSignatureHex":"', b'"brokerSignatureHex":"0x', 1))
         with pytest.raises(ValueError):
             CapabilityEnvelopeV1.from_canonical_bytes(signed.canonical_bytes.replace(b'"brokerSignatureHex":', b'"unexpected":null,"brokerSignatureHex":', 1))
+        for signature in (
+            "0" * 127,
+            "0" * 129,
+            "0" * 127 + "g",
+            "A" * 128,
+            "  " + "0" * 124 + "  ",
+            "c2lnbmF0dXJl",
+        ):
+            malformed = dict(wire)
+            malformed["brokerSignatureHex"] = signature
+            with pytest.raises(ValueError):
+                CapabilityEnvelopeV1.from_canonical_bytes(canonical_json_bytes(malformed))
+        with pytest.raises(ValueError):
+            CapabilityEnvelopeV1.from_canonical_bytes(
+                signed.canonical_bytes[:-1] + b',"brokerSignatureHex":"' + b"0" * 128 + b'"}'
+            )
+        with pytest.raises(ValueError):
+            CapabilityEnvelopeV1.from_canonical_bytes(b" " + signed.canonical_bytes)
     finally:
         signer.close()
     # A signer is deliberately required; no caller supplied signature or public
