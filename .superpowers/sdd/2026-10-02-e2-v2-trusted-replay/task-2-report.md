@@ -222,3 +222,22 @@ binding spec 没有重列下列类型；补充授权明确由实施计划第 99�
 
 - 修改：`.scratch/unified-remix-canvas-generation/acceptance/trusted_evidence/e2_policy.py`、`.scratch/unified-remix-canvas-generation/acceptance/test_trusted_evidence_e2_policy_v2.py`。
 - Scoped commit：本切片提交后在交付消息记录。
+
+## E.2 — worker input, fixed FD closures and signed capability envelope
+
+### RED / GREEN
+
+- RED：先在 `test_trusted_evidence_e2_policy_v2.py` 导入并用固定 14/20 行闭包、canonical worker-input、Ed25519 wire 与 macOS fail-closed receive 行为描述契约；定向命令在收集阶段以 `ImportError: cannot import name 'RegistrationWorkerInputObjectV1'` 失败，确认断言命中缺失 E.2 contract。
+- GREEN（定向）：同一 E.2 测试选择器为 `33 passed in 0.34s`。
+- GREEN（Task 2 两文件）：policy 与 handoffs 合计 `70 passed in 12.09s`。
+- GREEN（受影响回归）：models、registry、registration、policy、handoffs 合计 `196 passed in 12.26s`。
+- 全量 acceptance：`314 passed, 1 failed in 225.80s`。失败是既有的 `test_trusted_evidence_e2.py::test_e2_kills_the_process_group_when_the_parent_exits_before_a_pipe_holding_child`，因 `background.pid` 尚未创建就读取；本切片未修改 E2 runner/进程组逻辑。
+- `backend/.venv/bin/python -m py_compile trusted_evidence/e2_policy.py` 与 `git diff --check` 均为 exit 0。
+
+### 实现与边界
+
+- 新增严格、immutable `RegistrationWorkerInputObjectV1` / `RegistrationWorkerInputV1`、`FdOpenProvenanceV1`、`FdObservableIdentityV1`、`FdDescriptorV1`、unsigned/signed `CapabilityEnvelopeV1` codecs；所有 canonical decoder 拒绝未知、缺失、重复和非 canonical JSON。输入对象角色内 ordinal 连续，候选引用恰为七个、按 digest 排序且与 candidate entries 一一闭合。
+- register 固定 14 行、recover 固定 20 行闭包直接写入 validator；数量、ordinal、role、logical name、approved-root role、descriptor 顺序与 control/regular 类型均逐项关闭。provenance 与 observable 字段独立编码，worker path 不会以 FD 声称重建 openat2/root provenance 或 pidfd identity。
+- envelope 的 unsigned canonical bytes 不存在 `brokerSignatureHex`；final wire 只增加一个 128 位 lower-hex Ed25519 signature。签名消息固定 registration broker envelope domain + NUL + unsigned bytes，验签只接受 pinned key ID 与同一 raw public-key digest。
+- `RegistrationRecoveryCapabilityV1` 没有 path/JSON constructor，且不可 copy/pickle；Linux capable host 的 receive path只用 `recvmsg(MSG_CMSG_CLOEXEC)`、拒绝 truncation、验证 FD CLOEXEC、closure 与可观测 regular/socket state，并在错误时关闭已接收 FD。当前 macOS 不暴露 `MSG_CMSG_CLOEXEC`（且 AF_UNIX `SOCK_SEQPACKET` 不可用），因此稳定报 `MSG_CMSG_CLOEXEC unavailable`，没有模拟或降级安全保证。
+- 此切片不进入 Task14 root broker、worker exec/seccomp、mutation RPC、lease journal durable runtime或 repository mutation；Task 2 仍为 PARTIAL。

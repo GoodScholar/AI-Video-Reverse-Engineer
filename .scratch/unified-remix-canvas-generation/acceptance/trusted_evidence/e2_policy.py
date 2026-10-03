@@ -15,6 +15,7 @@ import re
 import stat
 import unicodedata
 import fcntl
+import socket
 from collections.abc import Mapping
 
 
@@ -1831,6 +1832,368 @@ def verify_registration_broker_startup_challenge(registry: RegistrationBrokerAut
     if not _ed25519_verify(slot._public, _BROKER_CHALLENGE_DOMAIN.encode("utf-8") + b"\0" + message, bytes.fromhex(signature)):
         raise ValueError("broker startup challenge signature is invalid")
     return signature
+
+
+# E.2 worker bootstrap contracts.  Provenance is a broker assertion carried by
+# the signed envelope; the worker verifies only the observable FD facts below.
+_WORKER_INPUT_ROLES = (
+    "product-handoff-cache", "policy-handoff-cache", "task-output-policy",
+    "transaction-record", "quarantine-object", "toolchain-build-record",
+    "toolchain-artifact", "candidate",
+)
+_FD_ROLES = {
+    "worker-input", "input-snapshot", "transaction-record", "quarantine-object",
+    "toolchain-build-record", "toolchain-artifact", "broker-control",
+}
+_REGISTER_FD_CLOSURE = (
+    ("worker-input", "registration-worker-input", "worker-input-inbox"),
+    ("input-snapshot", "product-handoff-cache", "worker-input-inbox"),
+    ("input-snapshot", "policy-handoff-cache", "worker-input-inbox"),
+    ("input-snapshot", "task-output-policy", "worker-input-inbox"),
+    ("input-snapshot", "e1.ticket23.toonflow-source.v1", "worker-input-inbox"),
+    ("input-snapshot", "e1.ticket23.product-adaptation.v1", "worker-input-inbox"),
+    ("input-snapshot", "e2.ticket23.backend-persistence.v2", "worker-input-inbox"),
+    ("input-snapshot", "e2.ticket23.frontend-persistence.v2", "worker-input-inbox"),
+    ("input-snapshot", "e2.ticket23.api.v2", "worker-input-inbox"),
+    ("input-snapshot", "e2.ticket23.canvas-structure.v2", "worker-input-inbox"),
+    ("input-snapshot", "e4.ticket23.canvas-review.v1", "worker-input-inbox"),
+    ("toolchain-build-record", "registration-toolchain-build-record", "trusted-toolchain-root"),
+    ("toolchain-artifact", "registration-launcher-runtime-closure", "trusted-toolchain-root"),
+    ("broker-control", "registration-mutation-control", None),
+)
+_RECOVER_FD_CLOSURE = (
+    ("worker-input", "registration-worker-input", "recovery-inbox"),
+    ("transaction-record", "trusted-registration-pre-state", "transaction-operation-root"),
+    ("transaction-record", "staged-candidate-set", "transaction-operation-root"),
+    ("transaction-record", "quarantine-object-set", "transaction-operation-root"),
+    ("transaction-record", "repository-recovery-binding", "transaction-operation-root"),
+    ("transaction-record", "registration-transaction-intent", "transaction-operation-root"),
+    ("transaction-record", "registration-plan", "transaction-operation-root"),
+    ("transaction-record", "registration-journal-head", "transaction-operation-root"),
+    ("quarantine-object", "planned-catalog", "transaction-quarantine-root"),
+    ("quarantine-object", "registration-audit", "transaction-quarantine-root"),
+    ("quarantine-object", "e1.ticket23.toonflow-source.v1", "transaction-quarantine-root"),
+    ("quarantine-object", "e1.ticket23.product-adaptation.v1", "transaction-quarantine-root"),
+    ("quarantine-object", "e2.ticket23.backend-persistence.v2", "transaction-quarantine-root"),
+    ("quarantine-object", "e2.ticket23.frontend-persistence.v2", "transaction-quarantine-root"),
+    ("quarantine-object", "e2.ticket23.api.v2", "transaction-quarantine-root"),
+    ("quarantine-object", "e2.ticket23.canvas-structure.v2", "transaction-quarantine-root"),
+    ("quarantine-object", "e4.ticket23.canvas-review.v1", "transaction-quarantine-root"),
+    ("toolchain-build-record", "registration-toolchain-build-record", "trusted-toolchain-root"),
+    ("toolchain-artifact", "registration-launcher-runtime-closure", "trusted-toolchain-root"),
+    ("broker-control", "registration-mutation-control", None),
+)
+_ENVELOPE_DOMAIN = "ai-video-reverse-engineer/registration-broker-envelope/v1"
+
+
+@dataclass(frozen=True, slots=True)
+class RegistrationWorkerInputObjectV1:
+    role: str; ordinal: int; display_path: str; expected_file_type: str; expected_byte_length: int; expected_content_digest: str; candidate_ref: str | None
+
+    def __post_init__(self) -> None:
+        if self.role not in _WORKER_INPUT_ROLES or self.expected_file_type != "regular":
+            raise ValueError("worker input object role or type is invalid")
+        _u64(self.ordinal, "ordinal"); _relative_path(self.display_path, "display_path")
+        _u64(self.expected_byte_length, "expected_byte_length"); _require_digest(self.expected_content_digest, "expected_content_digest")
+        if (self.role == "candidate") != (self.candidate_ref is not None):
+            raise ValueError("candidate inputs must bind exactly one candidate ref")
+        if self.candidate_ref is not None:
+            _candidate_ref(self.candidate_ref)
+
+    def to_wire(self) -> dict[str, object]:
+        return {"candidateRef": self.candidate_ref, "displayPath": self.display_path, "expectedByteLength": self.expected_byte_length, "expectedContentDigest": self.expected_content_digest, "expectedFileType": self.expected_file_type, "ordinal": self.ordinal, "role": self.role}
+
+    @classmethod
+    def _from_wire(cls, raw: object) -> "RegistrationWorkerInputObjectV1":
+        fields = {"candidateRef", "displayPath", "expectedByteLength", "expectedContentDigest", "expectedFileType", "ordinal", "role"}
+        if not isinstance(raw, dict) or set(raw) != fields:
+            raise ValueError("worker input object fields are invalid")
+        return cls(raw["role"], raw["ordinal"], raw["displayPath"], raw["expectedFileType"], raw["expectedByteLength"], raw["expectedContentDigest"], raw["candidateRef"])
+
+
+@dataclass(frozen=True, slots=True)
+class RegistrationWorkerInputV1(_SelfDigestRecord):
+    schema: str; project_id: str; operation_id: str; worker_mode: str; expected_worker_sequence: int; registration_profile: str; subject: str; expected_policy_commit: GitObjectIdV1; fixed_ref_name: str; expected_fixed_ref_commit: GitObjectIdV1; expected_repository_display_path: str; expected_git_executable_digest: str; inputs: tuple[RegistrationWorkerInputObjectV1, ...]; candidate_refs: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.schema != "trusted-registration-worker-input/v1" or self.project_id != "ai-video-reverse-engineer" or self.worker_mode not in {"register", "recover"} or self.registration_profile != "ticket-23/v1" or type(self.expected_policy_commit) is not GitObjectIdV1 or type(self.expected_fixed_ref_commit) is not GitObjectIdV1:
+            raise ValueError("worker input identity is invalid")
+        for field in ("operation_id", "subject", "fixed_ref_name", "expected_repository_display_path"):
+            _require_text(getattr(self, field), field)
+        _u64(self.expected_worker_sequence, "expected_worker_sequence", positive=True); _require_digest(self.expected_git_executable_digest, "expected_git_executable_digest")
+        values = tuple(self.inputs)
+        if not values or not all(type(item) is RegistrationWorkerInputObjectV1 for item in values):
+            raise ValueError("worker inputs are invalid")
+        keys = tuple((_WORKER_INPUT_ROLES.index(item.role), item.ordinal) for item in values)
+        if keys != tuple(sorted(keys)) or any(item.ordinal != sum(prior.role == item.role for prior in values[:index]) for index, item in enumerate(values)):
+            raise ValueError("worker inputs are not in fixed role/ordinal order")
+        refs = tuple(self.candidate_refs)
+        if len(refs) != 7 or refs != tuple(sorted(refs)) or len(set(refs)) != 7:
+            raise ValueError("worker input candidate refs must be seven sorted unique digests")
+        if any(_candidate_ref(ref) != ref for ref in refs) or tuple(item.candidate_ref for item in values if item.role == "candidate") != refs:
+            raise ValueError("worker input candidates do not close candidate refs")
+        object.__setattr__(self, "inputs", values); object.__setattr__(self, "candidate_refs", refs)
+
+    def _unsigned_wire(self) -> dict[str, object]:
+        return {"candidateRefs": list(self.candidate_refs), "expectedFixedRefCommit": self.expected_fixed_ref_commit.to_wire(), "expectedGitExecutableDigest": self.expected_git_executable_digest, "expectedPolicyCommit": self.expected_policy_commit.to_wire(), "expectedRepositoryDisplayPath": self.expected_repository_display_path, "expectedWorkerSequence": self.expected_worker_sequence, "fixedRefName": self.fixed_ref_name, "inputs": [item.to_wire() for item in self.inputs], "operationId": self.operation_id, "projectId": self.project_id, "registrationProfile": self.registration_profile, "schema": self.schema, "subject": self.subject, "workerMode": self.worker_mode}
+
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "RegistrationWorkerInputV1":
+        fields = {"candidateRefs", "canonicalDigest", "expectedFixedRefCommit", "expectedGitExecutableDigest", "expectedPolicyCommit", "expectedRepositoryDisplayPath", "expectedWorkerSequence", "fixedRefName", "inputs", "operationId", "projectId", "registrationProfile", "schema", "subject", "workerMode"}
+        raw = _strict_object(payload, fields, "worker input")
+        if not isinstance(raw["inputs"], list) or not isinstance(raw["candidateRefs"], list):
+            raise ValueError("worker input list fields are invalid")
+        result = cls(raw["schema"], raw["projectId"], raw["operationId"], raw["workerMode"], raw["expectedWorkerSequence"], raw["registrationProfile"], raw["subject"], _oid(raw["expectedPolicyCommit"], "expectedPolicyCommit"), raw["fixedRefName"], _oid(raw["expectedFixedRefCommit"], "expectedFixedRefCommit"), raw["expectedRepositoryDisplayPath"], raw["expectedGitExecutableDigest"], tuple(RegistrationWorkerInputObjectV1._from_wire(item) for item in raw["inputs"]), tuple(raw["candidateRefs"]))
+        if raw[_SELF_DIGEST] != result.canonical_digest:
+            raise ValueError("worker input self digest is invalid")
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class FdOpenProvenanceV1(_SelfDigestRecord):
+    broker_open_policy: str; approved_root_role: str | None; approved_root_identity_digest: str | None; relative_logical_path_digest: str | None; requested_flags: tuple[str, ...]; resolve_flags: tuple[str, ...]; boundary_identity_digest: str | None
+
+    def __post_init__(self) -> None:
+        if self.broker_open_policy not in {"openat2-beneath-no-symlinks", "broker-created-seqpacket"}:
+            raise ValueError("FD provenance policy is invalid")
+        if self.broker_open_policy == "broker-created-seqpacket":
+            if any(value is not None for value in (self.approved_root_role, self.approved_root_identity_digest, self.relative_logical_path_digest, self.boundary_identity_digest)) or tuple(self.resolve_flags) or tuple(self.requested_flags) != ("SOCK_CLOEXEC", "SOCK_SEQPACKET"):
+                raise ValueError("control FD provenance is invalid")
+        else:
+            if not isinstance(self.approved_root_role, str) or any(value is None for value in (self.approved_root_identity_digest, self.relative_logical_path_digest, self.boundary_identity_digest)) or tuple(self.requested_flags) != ("O_CLOEXEC", "O_NOFOLLOW", "O_RDONLY") or tuple(self.resolve_flags) != ("RESOLVE_BENEATH", "RESOLVE_NO_MAGICLINKS", "RESOLVE_NO_SYMLINKS", "RESOLVE_NO_XDEV"):
+                raise ValueError("regular FD provenance is invalid")
+            for value in (self.approved_root_identity_digest, self.relative_logical_path_digest, self.boundary_identity_digest): _require_digest(value, "FD provenance digest")
+        object.__setattr__(self, "requested_flags", tuple(self.requested_flags)); object.__setattr__(self, "resolve_flags", tuple(self.resolve_flags))
+
+    def _unsigned_wire(self) -> dict[str, object]:
+        return {"approvedRootIdentityDigest": self.approved_root_identity_digest, "approvedRootRole": self.approved_root_role, "boundaryIdentityDigest": self.boundary_identity_digest, "brokerOpenPolicy": self.broker_open_policy, "relativeLogicalPathDigest": self.relative_logical_path_digest, "requestedFlags": list(self.requested_flags), "resolveFlags": list(self.resolve_flags)}
+
+    def to_wire(self) -> dict[str, object]: return {**self._unsigned_wire(), "canonicalDigest": self.canonical_digest}
+
+    @classmethod
+    def _from_wire(cls, raw: object) -> "FdOpenProvenanceV1":
+        fields = {"approvedRootIdentityDigest", "approvedRootRole", "boundaryIdentityDigest", "brokerOpenPolicy", "canonicalDigest", "relativeLogicalPathDigest", "requestedFlags", "resolveFlags"}
+        if not isinstance(raw, dict) or set(raw) != fields or not isinstance(raw["requestedFlags"], list) or not isinstance(raw["resolveFlags"], list): raise ValueError("FD provenance wire is invalid")
+        result = cls(raw["brokerOpenPolicy"], raw["approvedRootRole"], raw["approvedRootIdentityDigest"], raw["relativeLogicalPathDigest"], tuple(raw["requestedFlags"]), tuple(raw["resolveFlags"]), raw["boundaryIdentityDigest"])
+        if raw["canonicalDigest"] != result.canonical_digest: raise ValueError("FD provenance digest is invalid")
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class FdObservableIdentityV1(_SelfDigestRecord):
+    file_type: str; access_mode: str; status_flags: tuple[str, ...]; fd_flags: tuple[str, ...]; device: int | None; inode: int | None; byte_length: int | None; content_digest: str | None; mount_identity_digest: str | None; socket_options: tuple[str, ...]; socket_identity_digest: str | None; identity_digest: str
+
+    def __post_init__(self) -> None:
+        if (self.file_type, self.access_mode) not in {("regular", "read-only"), ("socket-seqpacket", "bidirectional-control")} or tuple(self.fd_flags) != ("FD_CLOEXEC",):
+            raise ValueError("FD observable identity is invalid")
+        if self.file_type == "regular":
+            if tuple(self.status_flags) != ("O_RDONLY",) or any(value is None for value in (self.device, self.inode, self.byte_length, self.content_digest, self.mount_identity_digest)) or self.socket_options or self.socket_identity_digest is not None:
+                raise ValueError("regular FD observable identity is invalid")
+            for field in ("device", "inode", "byte_length"): _u64(getattr(self, field), field)
+            _require_digest(self.content_digest, "content_digest"); _require_digest(self.mount_identity_digest, "mount_identity_digest")
+        else:
+            if any(value is not None for value in (self.device, self.inode, self.byte_length, self.content_digest, self.mount_identity_digest)) or tuple(self.socket_options) != ("SO_PASSCRED=1", "SO_TYPE=SOCK_SEQPACKET") or self.socket_identity_digest is None:
+                raise ValueError("control FD observable identity is invalid")
+            _require_digest(self.socket_identity_digest, "socket_identity_digest")
+        _require_digest(self.identity_digest, "identity_digest")
+        object.__setattr__(self, "status_flags", tuple(self.status_flags)); object.__setattr__(self, "fd_flags", tuple(self.fd_flags)); object.__setattr__(self, "socket_options", tuple(self.socket_options))
+
+    def _identity_wire(self) -> dict[str, object]:
+        return {"accessMode": self.access_mode, "byteLength": self.byte_length, "contentDigest": self.content_digest, "device": self.device, "fdFlags": list(self.fd_flags), "fileType": self.file_type, "inode": self.inode, "mountIdentityDigest": self.mount_identity_digest, "socketIdentityDigest": self.socket_identity_digest, "socketOptions": list(self.socket_options), "statusFlags": list(self.status_flags)}
+
+    def _unsigned_wire(self) -> dict[str, object]: return {**self._identity_wire(), "identityDigest": self.identity_digest}
+    def to_wire(self) -> dict[str, object]: return {**self._unsigned_wire(), "canonicalDigest": self.canonical_digest}
+
+    @classmethod
+    def _from_wire(cls, raw: object) -> "FdObservableIdentityV1":
+        fields = {"accessMode", "byteLength", "canonicalDigest", "contentDigest", "device", "fdFlags", "fileType", "identityDigest", "inode", "mountIdentityDigest", "socketIdentityDigest", "socketOptions", "statusFlags"}
+        if not isinstance(raw, dict) or set(raw) != fields or any(not isinstance(raw[key], list) for key in ("fdFlags", "socketOptions", "statusFlags")): raise ValueError("FD observable wire is invalid")
+        result = cls(raw["fileType"], raw["accessMode"], tuple(raw["statusFlags"]), tuple(raw["fdFlags"]), raw["device"], raw["inode"], raw["byteLength"], raw["contentDigest"], raw["mountIdentityDigest"], tuple(raw["socketOptions"]), raw["socketIdentityDigest"], raw["identityDigest"])
+        if raw["canonicalDigest"] != result.canonical_digest: raise ValueError("FD observable digest is invalid")
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class FdDescriptorV1(_SelfDigestRecord):
+    role: str; ordinal: int; logical_name: str; cardinality: str; provenance_fields: FdOpenProvenanceV1; observable_fields: FdObservableIdentityV1
+
+    def __post_init__(self) -> None:
+        if self.role not in _FD_ROLES or self.cardinality != "exactly-one" or not isinstance(self.logical_name, str) or not self.logical_name or type(self.provenance_fields) is not FdOpenProvenanceV1 or type(self.observable_fields) is not FdObservableIdentityV1:
+            raise ValueError("FD descriptor is invalid")
+        _u64(self.ordinal, "ordinal")
+        control = self.role == "broker-control"
+        if control != (self.provenance_fields.broker_open_policy == "broker-created-seqpacket") or control != (self.observable_fields.file_type == "socket-seqpacket"):
+            raise ValueError("FD descriptor mixes provenance and observable types")
+
+    def _unsigned_wire(self) -> dict[str, object]:
+        return {"cardinality": self.cardinality, "logicalName": self.logical_name, "observableFields": self.observable_fields.to_wire(), "ordinal": self.ordinal, "provenanceFields": self.provenance_fields.to_wire(), "role": self.role}
+
+    @classmethod
+    def _from_wire(cls, raw: object) -> "FdDescriptorV1":
+        fields = {"canonicalDigest", "cardinality", "logicalName", "observableFields", "ordinal", "provenanceFields", "role"}
+        if not isinstance(raw, dict) or set(raw) != fields: raise ValueError("FD descriptor wire is invalid")
+        result = cls(raw["role"], raw["ordinal"], raw["logicalName"], raw["cardinality"], FdOpenProvenanceV1._from_wire(raw["provenanceFields"]), FdObservableIdentityV1._from_wire(raw["observableFields"]))
+        if raw["canonicalDigest"] != result.canonical_digest: raise ValueError("FD descriptor digest is invalid")
+        return result
+
+
+def _validate_fd_closure(worker_mode: str, descriptors: object) -> tuple[FdDescriptorV1, ...]:
+    expected = _REGISTER_FD_CLOSURE if worker_mode == "register" else _RECOVER_FD_CLOSURE if worker_mode == "recover" else None
+    values = tuple(descriptors) if isinstance(descriptors, (tuple, list)) else ()
+    if expected is None or len(values) != len(expected) or not all(type(item) is FdDescriptorV1 for item in values):
+        raise ValueError("FD closure count is invalid")
+    for ordinal, (descriptor, (role, logical_name, root_role)) in enumerate(zip(values, expected)):
+        if (descriptor.ordinal, descriptor.role, descriptor.logical_name) != (ordinal, role, logical_name):
+            raise ValueError("FD closure order or name is invalid")
+        if role == "broker-control":
+            if descriptor.provenance_fields.broker_open_policy != "broker-created-seqpacket": raise ValueError("control FD closure is invalid")
+        elif descriptor.provenance_fields.approved_root_role != root_role or descriptor.provenance_fields.broker_open_policy != "openat2-beneath-no-symlinks":
+            raise ValueError("regular FD closure root is invalid")
+    return values
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityEnvelopeUnsignedV1(_SelfDigestRecord):
+    schema: str; broker_lease_identity_digest: str; operation_id: str; lifecycle_nonce: str; worker_mode: str; worker_session_id: str; worker_executable_digest: str; worker_process_identity_digest: str; worker_pidfd_identity_digest: str; worker_sequence: int; broker_session_nonce: str; worker_input_digest: str; fd_descriptors: tuple[FdDescriptorV1, ...]; broker_auth_key_id: str; broker_auth_public_key_digest: str; broker_auth_registry_generation: int; broker_auth_registry_digest: str; broker_auth_revocation_digest: str; broker_auth_allowed_signers_digest: str; broker_auth_lease_issued_sequence: int; broker_auth_lease_expiry_sequence: int; broker_auth_sign_sequence: int
+
+    def __post_init__(self) -> None:
+        if self.schema != "trusted-registration-capability-envelope/v1" or self.worker_mode not in {"register", "recover"}:
+            raise ValueError("capability envelope identity is invalid")
+        for field in ("operation_id", "lifecycle_nonce", "worker_session_id", "broker_session_nonce", "broker_auth_key_id"): _require_text(getattr(self, field), field)
+        for field in ("broker_lease_identity_digest", "worker_executable_digest", "worker_process_identity_digest", "worker_pidfd_identity_digest", "worker_input_digest", "broker_auth_public_key_digest", "broker_auth_registry_digest", "broker_auth_revocation_digest", "broker_auth_allowed_signers_digest"): _require_digest(getattr(self, field), field)
+        for field in ("worker_sequence", "broker_auth_registry_generation", "broker_auth_lease_issued_sequence", "broker_auth_lease_expiry_sequence", "broker_auth_sign_sequence"): _u64(getattr(self, field), field, positive=True)
+        if self.broker_auth_lease_issued_sequence > self.broker_auth_sign_sequence or self.broker_auth_sign_sequence > self.broker_auth_lease_expiry_sequence: raise ValueError("capability envelope lease sequence is invalid")
+        object.__setattr__(self, "fd_descriptors", _validate_fd_closure(self.worker_mode, self.fd_descriptors))
+
+    def _unsigned_wire(self) -> dict[str, object]:
+        return {"brokerAuthAllowedSignersDigest": self.broker_auth_allowed_signers_digest, "brokerAuthKeyId": self.broker_auth_key_id, "brokerAuthLeaseExpirySequence": self.broker_auth_lease_expiry_sequence, "brokerAuthLeaseIssuedSequence": self.broker_auth_lease_issued_sequence, "brokerAuthPublicKeyDigest": self.broker_auth_public_key_digest, "brokerAuthRegistryDigest": self.broker_auth_registry_digest, "brokerAuthRegistryGeneration": self.broker_auth_registry_generation, "brokerAuthRevocationDigest": self.broker_auth_revocation_digest, "brokerAuthSignSequence": self.broker_auth_sign_sequence, "brokerLeaseIdentityDigest": self.broker_lease_identity_digest, "brokerSessionNonce": self.broker_session_nonce, "fdDescriptors": [item.to_wire() for item in self.fd_descriptors], "lifecycleNonce": self.lifecycle_nonce, "operationId": self.operation_id, "schema": self.schema, "workerExecutableDigest": self.worker_executable_digest, "workerInputDigest": self.worker_input_digest, "workerMode": self.worker_mode, "workerPidfdIdentityDigest": self.worker_pidfd_identity_digest, "workerProcessIdentityDigest": self.worker_process_identity_digest, "workerSequence": self.worker_sequence, "workerSessionId": self.worker_session_id}
+
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "CapabilityEnvelopeUnsignedV1":
+        fields = set(cls.__annotations__) | {"canonicalDigest"}
+        wire = {"broker_lease_identity_digest": "brokerLeaseIdentityDigest", "operation_id": "operationId", "lifecycle_nonce": "lifecycleNonce", "worker_mode": "workerMode", "worker_session_id": "workerSessionId", "worker_executable_digest": "workerExecutableDigest", "worker_process_identity_digest": "workerProcessIdentityDigest", "worker_pidfd_identity_digest": "workerPidfdIdentityDigest", "worker_sequence": "workerSequence", "broker_session_nonce": "brokerSessionNonce", "worker_input_digest": "workerInputDigest", "fd_descriptors": "fdDescriptors", "broker_auth_key_id": "brokerAuthKeyId", "broker_auth_public_key_digest": "brokerAuthPublicKeyDigest", "broker_auth_registry_generation": "brokerAuthRegistryGeneration", "broker_auth_registry_digest": "brokerAuthRegistryDigest", "broker_auth_revocation_digest": "brokerAuthRevocationDigest", "broker_auth_allowed_signers_digest": "brokerAuthAllowedSignersDigest", "broker_auth_lease_issued_sequence": "brokerAuthLeaseIssuedSequence", "broker_auth_lease_expiry_sequence": "brokerAuthLeaseExpirySequence", "broker_auth_sign_sequence": "brokerAuthSignSequence"}
+        fields = {"schema", "canonicalDigest", *wire.values()}; raw = _strict_object(payload, fields, "unsigned capability envelope")
+        if not isinstance(raw["fdDescriptors"], list): raise ValueError("capability envelope FD descriptors are invalid")
+        result = cls(raw["schema"], *(raw[wire[name]] if name != "fd_descriptors" else tuple(FdDescriptorV1._from_wire(item) for item in raw["fdDescriptors"]) for name in wire))
+        if raw["canonicalDigest"] != result.canonical_digest: raise ValueError("capability envelope self digest is invalid")
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityEnvelopeV1:
+    unsigned: CapabilityEnvelopeUnsignedV1
+    broker_signature_hex: str
+
+    def __post_init__(self) -> None:
+        if type(self.unsigned) is not CapabilityEnvelopeUnsignedV1:
+            raise ValueError("signed capability envelope requires an unsigned envelope")
+        _signature(self.broker_signature_hex, "broker_signature_hex")
+
+    @classmethod
+    def create(cls, unsigned_envelope: CapabilityEnvelopeUnsignedV1, broker_signer: RegistrationBrokerAuthPrivateKeySlotV1) -> "CapabilityEnvelopeV1":
+        if type(unsigned_envelope) is not CapabilityEnvelopeUnsignedV1 or type(broker_signer) is not RegistrationBrokerAuthPrivateKeySlotV1:
+            raise TypeError("capability envelope must be signed by a broker private-key slot")
+        if (broker_signer.key_id, broker_signer.signature_domain, broker_signer.public_key_digest) != (unsigned_envelope.broker_auth_key_id, _ENVELOPE_DOMAIN, unsigned_envelope.broker_auth_public_key_digest):
+            raise ValueError("broker signer does not close capability envelope")
+        return cls(unsigned_envelope, broker_signer.sign(_ENVELOPE_DOMAIN, unsigned_envelope.canonical_bytes))
+
+    @property
+    def canonical_digest(self) -> str: return canonical_digest(self.to_wire())
+    @property
+    def canonical_bytes(self) -> bytes: return canonical_json_bytes(self.to_wire())
+
+    def to_wire(self) -> dict[str, object]:
+        return {**self.unsigned.to_wire(), "brokerSignatureHex": self.broker_signature_hex}
+
+    def verify(self, pinned_broker_allowed_signers: Mapping[str, bytes]) -> None:
+        if not isinstance(pinned_broker_allowed_signers, Mapping): raise ValueError("pinned broker allowed signers are invalid")
+        key = pinned_broker_allowed_signers.get(self.unsigned.broker_auth_key_id)
+        if not isinstance(key, bytes) or len(key) != 32 or "sha256:" + hashlib.sha256(key).hexdigest() != self.unsigned.broker_auth_public_key_digest:
+            raise ValueError("capability envelope signer is not pinned")
+        from .handoffs import _ed25519_verify
+        if not _ed25519_verify(key, _ENVELOPE_DOMAIN.encode("utf-8") + b"\0" + self.unsigned.canonical_bytes, bytes.fromhex(self.broker_signature_hex)):
+            raise ValueError("capability envelope signature is invalid")
+
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "CapabilityEnvelopeV1":
+        raw = _strict_object(payload, set(CapabilityEnvelopeUnsignedV1.from_canonical_bytes.__func__.__annotations__) if False else {"brokerAuthAllowedSignersDigest", "brokerAuthKeyId", "brokerAuthLeaseExpirySequence", "brokerAuthLeaseIssuedSequence", "brokerAuthPublicKeyDigest", "brokerAuthRegistryDigest", "brokerAuthRegistryGeneration", "brokerAuthRevocationDigest", "brokerAuthSignSequence", "brokerLeaseIdentityDigest", "brokerSessionNonce", "brokerSignatureHex", "canonicalDigest", "fdDescriptors", "lifecycleNonce", "operationId", "schema", "workerExecutableDigest", "workerInputDigest", "workerMode", "workerPidfdIdentityDigest", "workerProcessIdentityDigest", "workerSequence", "workerSessionId"}, "signed capability envelope")
+        signature = raw.pop("brokerSignatureHex")
+        unsigned = CapabilityEnvelopeUnsignedV1.from_canonical_bytes(canonical_json_bytes(raw))
+        return cls(unsigned, signature)
+
+
+class RegistrationRecoveryCapabilityV1:
+    """Worker-only one-shot ownership of received descriptors; no path recovery."""
+    __slots__ = ("envelope", "_ordered_fds", "_consumed")
+    _TOKEN = object()
+
+    def __init__(self, token: object, envelope: CapabilityEnvelopeV1, ordered_fds: tuple[int, ...]) -> None:
+        if token is not self._TOKEN: raise TypeError("registration capability is received only through SCM_RIGHTS")
+        self.envelope, self._ordered_fds, self._consumed = envelope, ordered_fds, False
+
+    @classmethod
+    def receive_once(cls, authenticated_seqpacket_fd: object, self_process_identity: str, pinned_broker_allowed_signers: Mapping[str, bytes]) -> "RegistrationRecoveryCapabilityV1":
+        if not hasattr(socket, "MSG_CMSG_CLOEXEC"):
+            raise ValueError("MSG_CMSG_CLOEXEC unavailable")
+        if not isinstance(authenticated_seqpacket_fd, socket.socket): raise ValueError("authenticated seqpacket socket is required")
+        _require_digest(self_process_identity, "self_process_identity")
+        received: list[int] = []
+        try:
+            message, ancillary, flags, _address = authenticated_seqpacket_fd.recvmsg(1024 * 1024, socket.CMSG_SPACE(20 * 4), socket.MSG_CMSG_CLOEXEC)
+            if flags & socket.MSG_CTRUNC: raise ValueError("SCM_RIGHTS message is truncated")
+            if len(ancillary) != 1 or ancillary[0][0:2] != (socket.SOL_SOCKET, socket.SCM_RIGHTS): raise ValueError("SCM_RIGHTS message is invalid")
+            import array
+            values = array.array("i"); values.frombytes(ancillary[0][2][:len(ancillary[0][2]) - len(ancillary[0][2]) % values.itemsize]); received = list(values)
+            envelope = CapabilityEnvelopeV1.from_canonical_bytes(message); envelope.verify(pinned_broker_allowed_signers)
+            if envelope.unsigned.worker_process_identity_digest != self_process_identity: raise ValueError("capability process identity is invalid")
+            if len(received) != len(envelope.unsigned.fd_descriptors): raise ValueError("SCM_RIGHTS FD closure count is invalid")
+            for descriptor, fd in zip(envelope.unsigned.fd_descriptors, received): cls._verify_observable_fd(fd, descriptor.observable_fields)
+            capability = cls(cls._TOKEN, envelope, tuple(received)); received = []
+            authenticated_seqpacket_fd.close()
+            return capability
+        except Exception:
+            for fd in received:
+                try: os.close(fd)
+                except OSError: pass
+            raise
+
+    @staticmethod
+    def _verify_observable_fd(fd: int, expected: FdObservableIdentityV1) -> None:
+        try:
+            if not fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC: raise ValueError("received FD lacks FD_CLOEXEC")
+            flags = fcntl.fcntl(fd, fcntl.F_GETFL); info = os.fstat(fd)
+            if expected.file_type == "regular":
+                if flags & os.O_ACCMODE != os.O_RDONLY or not stat.S_ISREG(info.st_mode): raise ValueError("received regular FD state is invalid")
+                copied = os.dup(fd)
+                try:
+                    os.lseek(copied, 0, os.SEEK_SET); digest = "sha256:" + hashlib.sha256(b"".join(iter(lambda: os.read(copied, 65536), b""))).hexdigest()
+                finally: os.close(copied)
+                if (info.st_dev, info.st_ino, info.st_size, digest) != (expected.device, expected.inode, expected.byte_length, expected.content_digest): raise ValueError("received regular FD identity changed")
+            else:
+                if not stat.S_ISSOCK(info.st_mode) or authenticated_type(fd) != socket.SOCK_SEQPACKET: raise ValueError("received control FD state is invalid")
+        except OSError as error:
+            raise ValueError("received FD cannot be observed") from error
+
+    def take_once(self) -> tuple[int, ...]:
+        if self._consumed: raise ValueError("registration capability was already consumed")
+        self._consumed = True; values, self._ordered_fds = self._ordered_fds, (); return values
+
+    def close(self) -> None:
+        for fd in self._ordered_fds:
+            try: os.close(fd)
+            except OSError: pass
+        self._ordered_fds = (); self._consumed = True
+
+    def __copy__(self): raise TypeError("registration capability is non-copyable")
+    def __deepcopy__(self, memo): raise TypeError("registration capability is non-copyable")
+    def __reduce__(self): raise TypeError("registration capability is non-serializable")
+
+
+def authenticated_type(fd: int) -> int:
+    """Read the kernel socket type only; no provenance claim is made here."""
+    duplicate = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try: return duplicate.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+    finally: duplicate.close()
 
 
 @dataclass(frozen=True, slots=True)

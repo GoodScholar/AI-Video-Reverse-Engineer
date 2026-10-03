@@ -3,6 +3,7 @@ import json
 import copy
 import os
 import pickle
+import socket
 
 import pytest
 
@@ -42,8 +43,17 @@ from trusted_evidence.e2_policy import (
     RegistrationBrokerAuthRegistryV1,
     RegistrationBrokerAuthRevocationEntryV1,
     RegistrationBrokerAuthRevocationsV1,
+    RegistrationBrokerAuthPrivateKeySlotV1,
     RegistrationRecoveryLeaseIdentityPreimageV1,
     RegistrationWorkerSessionFamilyAuthorizationV1,
+    RegistrationWorkerInputObjectV1,
+    RegistrationWorkerInputV1,
+    FdOpenProvenanceV1,
+    FdObservableIdentityV1,
+    FdDescriptorV1,
+    CapabilityEnvelopeUnsignedV1,
+    CapabilityEnvelopeV1,
+    RegistrationRecoveryCapabilityV1,
 )
 from trusted_evidence.handoffs import PolicyActivationMarkerV1
 
@@ -547,3 +557,168 @@ def test_lease_identity_preimage_rejects_session_fields_and_binds_family_authori
     recorder.assert_rejected(lambda: RegistrationRecoveryLeaseIdentityPreimageV1.from_canonical_bytes(
         preimage.canonical_bytes.replace(b"}", b',\"workerSessionId\":\"forbidden\"}', 1)
     ))
+
+
+# E.2: these fixtures deliberately do not consult the codec under test to
+# derive names, ordering, or expected wire fields.  A production change which
+# accepts an altered closure must fail these boundary assertions.
+_REGISTER_CLOSURE = (
+    ("worker-input", "registration-worker-input", "worker-input-inbox"),
+    ("input-snapshot", "product-handoff-cache", "worker-input-inbox"),
+    ("input-snapshot", "policy-handoff-cache", "worker-input-inbox"),
+    ("input-snapshot", "task-output-policy", "worker-input-inbox"),
+    ("input-snapshot", "e1.ticket23.toonflow-source.v1", "worker-input-inbox"),
+    ("input-snapshot", "e1.ticket23.product-adaptation.v1", "worker-input-inbox"),
+    ("input-snapshot", "e2.ticket23.backend-persistence.v2", "worker-input-inbox"),
+    ("input-snapshot", "e2.ticket23.frontend-persistence.v2", "worker-input-inbox"),
+    ("input-snapshot", "e2.ticket23.api.v2", "worker-input-inbox"),
+    ("input-snapshot", "e2.ticket23.canvas-structure.v2", "worker-input-inbox"),
+    ("input-snapshot", "e4.ticket23.canvas-review.v1", "worker-input-inbox"),
+    ("toolchain-build-record", "registration-toolchain-build-record", "trusted-toolchain-root"),
+    ("toolchain-artifact", "registration-launcher-runtime-closure", "trusted-toolchain-root"),
+    ("broker-control", "registration-mutation-control", None),
+)
+
+_RECOVER_CLOSURE = (
+    ("worker-input", "registration-worker-input", "recovery-inbox"),
+    ("transaction-record", "trusted-registration-pre-state", "transaction-operation-root"),
+    ("transaction-record", "staged-candidate-set", "transaction-operation-root"),
+    ("transaction-record", "quarantine-object-set", "transaction-operation-root"),
+    ("transaction-record", "repository-recovery-binding", "transaction-operation-root"),
+    ("transaction-record", "registration-transaction-intent", "transaction-operation-root"),
+    ("transaction-record", "registration-plan", "transaction-operation-root"),
+    ("transaction-record", "registration-journal-head", "transaction-operation-root"),
+    ("quarantine-object", "planned-catalog", "transaction-quarantine-root"),
+    ("quarantine-object", "registration-audit", "transaction-quarantine-root"),
+    ("quarantine-object", "e1.ticket23.toonflow-source.v1", "transaction-quarantine-root"),
+    ("quarantine-object", "e1.ticket23.product-adaptation.v1", "transaction-quarantine-root"),
+    ("quarantine-object", "e2.ticket23.backend-persistence.v2", "transaction-quarantine-root"),
+    ("quarantine-object", "e2.ticket23.frontend-persistence.v2", "transaction-quarantine-root"),
+    ("quarantine-object", "e2.ticket23.api.v2", "transaction-quarantine-root"),
+    ("quarantine-object", "e2.ticket23.canvas-structure.v2", "transaction-quarantine-root"),
+    ("quarantine-object", "e4.ticket23.canvas-review.v1", "transaction-quarantine-root"),
+    ("toolchain-build-record", "registration-toolchain-build-record", "trusted-toolchain-root"),
+    ("toolchain-artifact", "registration-launcher-runtime-closure", "trusted-toolchain-root"),
+    ("broker-control", "registration-mutation-control", None),
+)
+
+
+def _fd_descriptor(ordinal, entry):
+    role, logical_name, root_role = entry
+    if role == "broker-control":
+        provenance = FdOpenProvenanceV1("broker-created-seqpacket", None, None, None, ("SOCK_CLOEXEC", "SOCK_SEQPACKET"), (), None)
+        observable = FdObservableIdentityV1("socket-seqpacket", "bidirectional-control", (), ("FD_CLOEXEC",), None, None, None, None, None, ("SO_PASSCRED=1", "SO_TYPE=SOCK_SEQPACKET"), DIGEST_A, DIGEST_B)
+    else:
+        provenance = FdOpenProvenanceV1("openat2-beneath-no-symlinks", root_role, DIGEST_A, DIGEST_B, ("O_CLOEXEC", "O_NOFOLLOW", "O_RDONLY"), ("RESOLVE_BENEATH", "RESOLVE_NO_MAGICLINKS", "RESOLVE_NO_SYMLINKS", "RESOLVE_NO_XDEV"), DIGEST_C)
+        observable = FdObservableIdentityV1("regular", "read-only", ("O_RDONLY",), ("FD_CLOEXEC",), 1, ordinal + 100, 7, DIGEST_A, DIGEST_B, (), None, DIGEST_C)
+    return FdDescriptorV1(role, ordinal, logical_name, "exactly-one", provenance, observable)
+
+
+def _worker_input(**overrides):
+    input_roles = (
+        "product-handoff-cache", "policy-handoff-cache", "task-output-policy",
+        "transaction-record", "quarantine-object", "toolchain-build-record", "toolchain-artifact",
+        *("candidate",) * 7,
+    )
+    inputs = tuple(
+        RegistrationWorkerInputObjectV1(role, 0 if role != "candidate" else ordinal - 7,
+            f"audit/{ordinal}", "regular", 7, DIGEST_A,
+            REFS[ordinal - 7] if role == "candidate" else None)
+        for ordinal, role in enumerate(input_roles)
+    )
+    values = dict(
+        schema="trusted-registration-worker-input/v1", project_id="ai-video-reverse-engineer",
+        operation_id="operation-e2", worker_mode="register", expected_worker_sequence=1,
+        registration_profile="ticket-23/v1", subject="git://product@" + "1" * 40,
+        expected_policy_commit=BASE, fixed_ref_name="refs/tags/trusted-acceptance/ticket-23-policy-v1",
+        expected_fixed_ref_commit=BASE, expected_repository_display_path="/audit/repository",
+        expected_git_executable_digest=DIGEST_A, inputs=inputs, candidate_refs=REFS,
+    )
+    values.update(overrides)
+    return RegistrationWorkerInputV1(**values)
+
+
+def _unsigned_envelope(mode="register", **overrides):
+    closure = _REGISTER_CLOSURE if mode == "register" else _RECOVER_CLOSURE
+    values = dict(
+        schema="trusted-registration-capability-envelope/v1", broker_lease_identity_digest=DIGEST_A,
+        operation_id="operation-e2", lifecycle_nonce="lifecycle-e2", worker_mode=mode,
+        worker_session_id="session-e2", worker_executable_digest=DIGEST_B,
+        worker_process_identity_digest=DIGEST_C, worker_pidfd_identity_digest=DIGEST_A,
+        worker_sequence=1, broker_session_nonce="broker-session-e2",
+        worker_input_digest=_worker_input().canonical_digest,
+        fd_descriptors=tuple(_fd_descriptor(index, item) for index, item in enumerate(closure)),
+        broker_auth_key_id="broker-fixed", broker_auth_public_key_digest=DIGEST_B,
+        broker_auth_registry_generation=1, broker_auth_registry_digest=DIGEST_C,
+        broker_auth_revocation_digest=DIGEST_A, broker_auth_allowed_signers_digest=DIGEST_B,
+        broker_auth_lease_issued_sequence=1, broker_auth_lease_expiry_sequence=3,
+        broker_auth_sign_sequence=2,
+    )
+    values.update(overrides)
+    return CapabilityEnvelopeUnsignedV1(**values)
+
+
+def test_e2_worker_input_and_fixed_14_20_fd_closures_reject_any_shape_drift_without_writes():
+    recorder = VisibleAuthorizationWriteRecorder()
+    worker_input = _worker_input()
+    register, recover = _unsigned_envelope(), _unsigned_envelope("recover")
+    assert len(register.fd_descriptors) == 14
+    assert len(recover.fd_descriptors) == 20
+    assert [item.logical_name for item in register.fd_descriptors] == [item[1] for item in _REGISTER_CLOSURE]
+    assert [item.logical_name for item in recover.fd_descriptors] == [item[1] for item in _RECOVER_CLOSURE]
+    assert RegistrationWorkerInputV1.from_canonical_bytes(worker_input.canonical_bytes) == worker_input
+    assert CapabilityEnvelopeUnsignedV1.from_canonical_bytes(register.canonical_bytes) == register
+    for changed in (
+        tuple(reversed(register.fd_descriptors)), register.fd_descriptors[:-1],
+        register.fd_descriptors + (register.fd_descriptors[-1],),
+        tuple((*register.fd_descriptors[:-1], _fd_descriptor(13, ("broker-control", "renamed-control", None)))),
+    ):
+        recorder.assert_rejected(lambda changed=changed: _unsigned_envelope(fd_descriptors=changed))
+    recorder.assert_rejected(lambda: _worker_input(inputs=tuple(reversed(worker_input.inputs))))
+    recorder.assert_rejected(lambda: RegistrationWorkerInputV1.from_canonical_bytes(worker_input.canonical_bytes + b"\n"))
+
+
+def test_e2_signed_wire_has_one_lowercase_signature_and_no_unsigned_signature_field(tmp_path):
+    seed = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+    public = bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+    public_digest = "sha256:" + hashlib.sha256(public).hexdigest()
+    unsigned = _unsigned_envelope(broker_auth_public_key_digest=public_digest)
+    assert b"brokerSignatureHex" not in unsigned.canonical_bytes
+    key = RegistrationBrokerAuthKeyRegistrationV1(
+        "trusted-registration-broker-auth-key-registration/v1", "broker-fixed",
+        "registration-broker-auth", "ai-video-reverse-engineer/registration-broker-envelope/v1",
+        "ai-video-reverse-engineer/registration-broker-lease/v1",
+        "ai-video-reverse-engineer/registration-broker-startup-challenge/v1", "raw-ed25519-32",
+        public_digest, public_digest, None, public_digest, public_digest, DIGEST_A, "active", 1, None,
+    )
+    key_file = tmp_path / "broker-key"; key_file.write_bytes(seed)
+    descriptor = os.open(key_file, os.O_RDONLY)
+    try:
+        signer = RegistrationBrokerAuthPrivateKeySlotV1.load_from_readonly_fd(descriptor, key, public)
+    finally:
+        os.close(descriptor)
+    try:
+        signed = CapabilityEnvelopeV1.create(unsigned, signer)
+        assert CapabilityEnvelopeV1.from_canonical_bytes(signed.canonical_bytes) == signed
+        signed.verify({"broker-fixed": public})
+        wire = json.loads(signed.canonical_bytes)
+        assert set(wire) == set(json.loads(unsigned.canonical_bytes)) | {"brokerSignatureHex"}
+        assert wire["brokerSignatureHex"] == signed.broker_signature_hex
+        assert len(signed.broker_signature_hex) == 128 and signed.broker_signature_hex == signed.broker_signature_hex.lower()
+        with pytest.raises(ValueError):
+            CapabilityEnvelopeV1.from_canonical_bytes(signed.canonical_bytes.replace(b'"brokerSignatureHex":"', b'"brokerSignatureHex":"0x', 1))
+        with pytest.raises(ValueError):
+            CapabilityEnvelopeV1.from_canonical_bytes(signed.canonical_bytes.replace(b'"brokerSignatureHex":', b'"unexpected":null,"brokerSignatureHex":', 1))
+    finally:
+        signer.close()
+    # A signer is deliberately required; no caller supplied signature or public
+    # key may turn unsigned bytes into an authority-bearing wire value.
+    with pytest.raises((TypeError, ValueError)):
+        CapabilityEnvelopeV1.create(unsigned, object())
+
+
+def test_e2_receive_once_fails_closed_when_msg_cmsg_cloexec_is_unavailable():
+    if hasattr(socket, "MSG_CMSG_CLOEXEC"):
+        pytest.skip("platform can exercise the SCM_RIGHTS green path")
+    with pytest.raises(ValueError, match="MSG_CMSG_CLOEXEC unavailable"):
+        RegistrationRecoveryCapabilityV1.receive_once(object(), DIGEST_C, {})
