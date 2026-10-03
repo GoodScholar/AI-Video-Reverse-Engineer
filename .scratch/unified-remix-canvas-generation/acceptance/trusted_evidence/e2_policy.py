@@ -2079,7 +2079,7 @@ class FdObservableIdentityV1(_SelfDigestRecord):
     file_type: str; access_mode: str; status_flags: tuple[str, ...]; fd_flags: tuple[str, ...]; device: int | None; inode: int | None; byte_length: int | None; content_digest: str | None; mount_identity_digest: str | None; socket_options: tuple[str, ...]; socket_identity_digest: str | None; identity_digest: str
 
     def __post_init__(self) -> None:
-        if (self.file_type, self.access_mode) not in {("regular", "read-only"), ("socket-seqpacket", "bidirectional-control")} or tuple(self.fd_flags) != ("FD_CLOEXEC",):
+        if (self.file_type, self.access_mode) not in {("regular", "read-only"), ("socket-seqpacket", "bidirectional-control"), ("socket-stream", "bidirectional-control")} or tuple(self.fd_flags) != ("FD_CLOEXEC",):
             raise ValueError("FD observable identity is invalid")
         if self.file_type == "regular":
             if tuple(self.status_flags) != ("O_RDONLY",) or any(value is None for value in (self.device, self.inode, self.byte_length, self.content_digest, self.mount_identity_digest)) or self.socket_options or self.socket_identity_digest is not None:
@@ -2087,7 +2087,8 @@ class FdObservableIdentityV1(_SelfDigestRecord):
             for field in ("device", "inode", "byte_length"): _u64(getattr(self, field), field)
             _require_digest(self.content_digest, "content_digest"); _require_digest(self.mount_identity_digest, "mount_identity_digest")
         else:
-            if any(value is not None for value in (self.device, self.inode, self.byte_length, self.content_digest, self.mount_identity_digest)) or tuple(self.socket_options) != ("SO_PASSCRED=1", "SO_TYPE=SOCK_SEQPACKET") or self.socket_identity_digest is None:
+            expected_options = ("SO_PASSCRED=1", "SO_TYPE=SOCK_SEQPACKET") if self.file_type == "socket-seqpacket" else ("SO_TYPE=SOCK_STREAM",)
+            if any(value is not None for value in (self.device, self.inode, self.byte_length, self.content_digest, self.mount_identity_digest)) or tuple(self.socket_options) != expected_options or self.socket_identity_digest is None:
                 raise ValueError("control FD observable identity is invalid")
             _require_digest(self.socket_identity_digest, "socket_identity_digest")
         _require_digest(self.identity_digest, "identity_digest")
@@ -2098,6 +2099,56 @@ class FdObservableIdentityV1(_SelfDigestRecord):
 
     def _unsigned_wire(self) -> dict[str, object]: return {**self._identity_wire(), "identityDigest": self.identity_digest}
     def to_wire(self) -> dict[str, object]: return {**self._unsigned_wire(), "canonicalDigest": self.canonical_digest}
+
+    @classmethod
+    def from_open_fd(cls, fd: int) -> "FdObservableIdentityV1":
+        """Rebuild only observable FD facts; broker-open provenance remains unobservable."""
+        try:
+            if not isinstance(fd, int) or fd < 0:
+                raise ValueError("received FD is invalid")
+            if not fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC:
+                raise ValueError("received FD lacks FD_CLOEXEC")
+            flags, info = fcntl.fcntl(fd, fcntl.F_GETFL), os.fstat(fd)
+            fd_flags = ("FD_CLOEXEC",)
+            if stat.S_ISREG(info.st_mode):
+                if flags != os.O_RDONLY:
+                    raise ValueError("received regular FD state is invalid")
+                filesystem_id = getattr(os.fstatvfs(fd), "f_fsid", None)
+                if not isinstance(filesystem_id, int):
+                    raise ValueError("received regular FD mount identity is unavailable")
+                digest = hashlib.sha256()
+                offset = 0
+                while True:
+                    chunk = os.pread(fd, 65536, offset)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    offset += len(chunk)
+                content_digest = "sha256:" + digest.hexdigest()
+                mount_identity_digest = canonical_digest({"filesystemId": filesystem_id, "kind": "fstatvfs-fsid/v1"})
+                wire = {"accessMode": "read-only", "byteLength": info.st_size, "contentDigest": content_digest, "device": info.st_dev, "fdFlags": list(fd_flags), "fileType": "regular", "inode": info.st_ino, "mountIdentityDigest": mount_identity_digest, "socketIdentityDigest": None, "socketOptions": [], "statusFlags": ["O_RDONLY"]}
+                return cls("regular", "read-only", ("O_RDONLY",), fd_flags, info.st_dev, info.st_ino, info.st_size, content_digest, mount_identity_digest, (), None, canonical_digest(wire))
+            if not stat.S_ISSOCK(info.st_mode) or flags != os.O_RDWR:
+                raise ValueError("received control FD state is invalid")
+            probe = socket.socket(fileno=os.dup(fd))
+            try:
+                socket_type = probe.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+                family = probe.family
+                if socket_type == socket.SOCK_SEQPACKET:
+                    if family != socket.AF_UNIX or not hasattr(socket, "SO_PASSCRED") or probe.getsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED) != 1:
+                        raise ValueError("received control FD state is invalid")
+                    file_type, options = "socket-seqpacket", ("SO_PASSCRED=1", "SO_TYPE=SOCK_SEQPACKET")
+                elif socket_type == socket.SOCK_STREAM:
+                    file_type, options = "socket-stream", ("SO_TYPE=SOCK_STREAM",)
+                else:
+                    raise ValueError("received control FD state is invalid")
+            finally:
+                probe.close()
+            socket_identity_digest = canonical_digest({"family": family, "inode": info.st_ino, "socketType": socket_type})
+            wire = {"accessMode": "bidirectional-control", "byteLength": None, "contentDigest": None, "device": None, "fdFlags": list(fd_flags), "fileType": file_type, "inode": None, "mountIdentityDigest": None, "socketIdentityDigest": socket_identity_digest, "socketOptions": list(options), "statusFlags": []}
+            return cls(file_type, "bidirectional-control", (), fd_flags, None, None, None, None, None, options, socket_identity_digest, canonical_digest(wire))
+        except OSError as error:
+            raise ValueError("received FD cannot be observed") from error
 
     @classmethod
     def _from_wire(cls, raw: object) -> "FdObservableIdentityV1":
@@ -2117,7 +2168,11 @@ class FdDescriptorV1(_SelfDigestRecord):
             raise ValueError("FD descriptor is invalid")
         _u64(self.ordinal, "ordinal")
         control = self.role == "broker-control"
-        if control != (self.provenance_fields.broker_open_policy == "broker-created-seqpacket") or control != (self.observable_fields.file_type == "socket-seqpacket"):
+        if control:
+            valid = self.provenance_fields.broker_open_policy == "broker-created-seqpacket" and self.observable_fields.file_type == "socket-seqpacket"
+        else:
+            valid = self.provenance_fields.broker_open_policy == "openat2-beneath-no-symlinks" and self.observable_fields.file_type == "regular"
+        if not valid:
             raise ValueError("FD descriptor mixes provenance and observable types")
 
     def _unsigned_wire(self) -> dict[str, object]:
@@ -2254,20 +2309,13 @@ class RegistrationRecoveryCapabilityV1:
 
     @staticmethod
     def _verify_observable_fd(fd: int, expected: FdObservableIdentityV1) -> None:
-        try:
-            if not fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC: raise ValueError("received FD lacks FD_CLOEXEC")
-            flags = fcntl.fcntl(fd, fcntl.F_GETFL); info = os.fstat(fd)
+        if type(expected) is not FdObservableIdentityV1:
+            raise ValueError("expected FD observable identity is invalid")
+        observed = FdObservableIdentityV1.from_open_fd(fd)
+        if observed != expected:
             if expected.file_type == "regular":
-                if flags & os.O_ACCMODE != os.O_RDONLY or not stat.S_ISREG(info.st_mode): raise ValueError("received regular FD state is invalid")
-                copied = os.dup(fd)
-                try:
-                    os.lseek(copied, 0, os.SEEK_SET); digest = "sha256:" + hashlib.sha256(b"".join(iter(lambda: os.read(copied, 65536), b""))).hexdigest()
-                finally: os.close(copied)
-                if (info.st_dev, info.st_ino, info.st_size, digest) != (expected.device, expected.inode, expected.byte_length, expected.content_digest): raise ValueError("received regular FD identity changed")
-            else:
-                if not stat.S_ISSOCK(info.st_mode) or authenticated_type(fd) != socket.SOCK_SEQPACKET: raise ValueError("received control FD state is invalid")
-        except OSError as error:
-            raise ValueError("received FD cannot be observed") from error
+                raise ValueError("received regular FD identity changed")
+            raise ValueError("received control FD state is invalid")
 
     def take_once(self) -> tuple[int, ...]:
         if self._consumed: raise ValueError("registration capability was already consumed")

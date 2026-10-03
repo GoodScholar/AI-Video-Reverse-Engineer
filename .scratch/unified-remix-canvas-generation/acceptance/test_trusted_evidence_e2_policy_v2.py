@@ -6,6 +6,9 @@ from dataclasses import replace
 import os
 import pickle
 import socket
+import fcntl
+import array
+import sys
 
 import pytest
 
@@ -968,6 +971,129 @@ def test_e2_receive_once_fails_closed_when_msg_cmsg_cloexec_is_unavailable():
         pytest.skip("platform can exercise the SCM_RIGHTS green path")
     with pytest.raises(ValueError, match="MSG_CMSG_CLOEXEC unavailable"):
         RegistrationRecoveryCapabilityV1.receive_once(object(), DIGEST_C, {})
+
+
+def _fd_digest(value):
+    return "sha256:" + hashlib.sha256(
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _expected_regular_observable(fd, content):
+    info = os.fstat(fd)
+    mount_digest = _fd_digest({"filesystemId": os.fstatvfs(fd).f_fsid, "kind": "fstatvfs-fsid/v1"})
+    wire = {
+        "accessMode": "read-only", "byteLength": len(content),
+        "contentDigest": "sha256:" + hashlib.sha256(content).hexdigest(), "device": info.st_dev,
+        "fdFlags": ["FD_CLOEXEC"], "fileType": "regular", "inode": info.st_ino,
+        "mountIdentityDigest": mount_digest, "socketIdentityDigest": None, "socketOptions": [],
+        "statusFlags": ["O_RDONLY"],
+    }
+    return FdObservableIdentityV1(
+        "regular", "read-only", ("O_RDONLY",), ("FD_CLOEXEC",), info.st_dev, info.st_ino,
+        len(content), wire["contentDigest"], mount_digest, (), None, _fd_digest(wire),
+    )
+
+
+def test_e2_rebuilds_regular_fd_identity_from_kernel_facts(tmp_path):
+    """Dropping mount/content/identity reconstruction must reject a real input FD."""
+    source = tmp_path / "worker-input"
+    content = b"verified regular worker input\n"
+    source.write_bytes(content)
+    fd = os.open(source, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        expected = _expected_regular_observable(fd, content)
+        assert FdObservableIdentityV1.from_open_fd(fd) == expected
+        RegistrationRecoveryCapabilityV1._verify_observable_fd(fd, expected)
+        source.write_bytes(b"tampered regular worker input\n")
+        with pytest.raises(ValueError, match="identity changed"):
+            RegistrationRecoveryCapabilityV1._verify_observable_fd(fd, expected)
+        fcntl.fcntl(fd, fcntl.F_SETFD, fcntl.fcntl(fd, fcntl.F_GETFD) & ~fcntl.FD_CLOEXEC)
+        with pytest.raises(ValueError, match="FD_CLOEXEC"):
+            RegistrationRecoveryCapabilityV1._verify_observable_fd(fd, expected)
+    finally:
+        os.close(fd)
+
+
+def test_e2_rebuilds_socket_identity_and_rejects_non_seqpacket_control_fd():
+    """A control descriptor must use kernel socket family/type/options, never envelope claims."""
+    local, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        observed = FdObservableIdentityV1.from_open_fd(local.fileno())
+        assert observed.file_type == "socket-stream"
+        assert observed.socket_options == ("SO_TYPE=SOCK_STREAM",)
+        with pytest.raises(ValueError, match="control FD state"):
+            RegistrationRecoveryCapabilityV1._verify_observable_fd(
+                local.fileno(),
+                FdObservableIdentityV1(
+                    "socket-seqpacket", "bidirectional-control", (), ("FD_CLOEXEC",),
+                    None, None, None, None, None, ("SO_PASSCRED=1", "SO_TYPE=SOCK_SEQPACKET"),
+                    observed.socket_identity_digest, observed.identity_digest,
+                ),
+            )
+        local.setblocking(False)
+        with pytest.raises(ValueError, match="control FD state"):
+            RegistrationRecoveryCapabilityV1._verify_observable_fd(local.fileno(), observed)
+    finally:
+        local.close()
+        peer.close()
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or not hasattr(socket, "MSG_CMSG_CLOEXEC") or not hasattr(socket, "SO_PASSCRED"),
+    reason="requires Linux SCM_RIGHTS, MSG_CMSG_CLOEXEC, and SO_PASSCRED",
+)
+def test_e2_linux_recvmsg_accepts_only_a_real_exact_register_closure(tmp_path):
+    """Linux-only: the real recvmsg gate consumes exactly one signed 14-FD closure."""
+    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    control, control_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    opened = []
+    signer = None
+    try:
+        control.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+        for ordinal in range(13):
+            source = tmp_path / f"input-{ordinal}"
+            source.write_bytes(f"input-{ordinal}".encode())
+            opened.append(os.open(source, os.O_RDONLY | os.O_CLOEXEC))
+        public = bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+        public_digest = "sha256:" + hashlib.sha256(public).hexdigest()
+        key = RegistrationBrokerAuthKeyRegistrationV1(
+            "trusted-registration-broker-auth-key-registration/v1", "broker-fixed",
+            "registration-broker-auth", "ai-video-reverse-engineer/registration-broker-envelope/v1",
+            "ai-video-reverse-engineer/registration-broker-lease/v1",
+            "ai-video-reverse-engineer/registration-broker-startup-challenge/v1", "raw-ed25519-32",
+            public_digest, public_digest, None, public_digest, public_digest, DIGEST_A, "active", 1, None,
+        )
+        seed_path = tmp_path / "broker-seed"
+        seed_path.write_bytes(bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"))
+        seed_fd = os.open(seed_path, os.O_RDONLY)
+        try:
+            signer = RegistrationBrokerAuthPrivateKeySlotV1.load_from_readonly_fd(seed_fd, key, public)
+        finally:
+            os.close(seed_fd)
+        descriptors = tuple(
+            replace(item, observable_fields=FdObservableIdentityV1.from_open_fd(fd))
+            for item, fd in zip(_unsigned_envelope().fd_descriptors[:-1], opened)
+        ) + (replace(_unsigned_envelope().fd_descriptors[-1], observable_fields=FdObservableIdentityV1.from_open_fd(control.fileno())),)
+        envelope = CapabilityEnvelopeV1.create(
+            _unsigned_envelope(fd_descriptors=descriptors, broker_auth_public_key_digest=public_digest), signer
+        )
+        sender.sendmsg([envelope.canonical_bytes], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [*opened, control.fileno()]))])
+        capability = RegistrationRecoveryCapabilityV1.receive_once(receiver, DIGEST_C, {"broker-fixed": public})
+        received = capability.take_once()
+        assert len(received) == 14
+        with pytest.raises(ValueError, match="already consumed"):
+            capability.take_once()
+        for fd in received:
+            os.close(fd)
+    finally:
+        if signer is not None:
+            signer.close()
+        for fd in opened:
+            os.close(fd)
+        sender.close()
+        control.close()
+        control_peer.close()
 
 
 # E.3 deliberately exercises the portable contract only.  It must not grow a
