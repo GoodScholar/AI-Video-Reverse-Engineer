@@ -24,7 +24,7 @@ from trusted_evidence.e2_policy import (
     RegistrationRecoveryLeaseIdentityPreimageV1,
     RegistrationBrokerAuthKeyRegistrationV1, RegistrationBrokerAuthRegistryV1,
     RegistrationBrokerAuthPrivateKeySlotV1, RegistrationBrokerAuthRevocationsV1,
-    RegistrationBrokerAuthGovernanceV1,
+    RegistrationBrokerAuthGovernanceV1, RegistrationBrokerStateMacCapabilityV1,
     RegistrationWorkerSessionFamilyAuthorizationV1,
     verify_registration_broker_startup_challenge,
 )
@@ -1493,18 +1493,66 @@ def test_broker_startup_challenge_uses_fixed_ed25519_vector_and_rejects_without_
     finally:
         os.close(descriptor)
     try:
+        state_mac = None
+        state_mac_path = tmp_path / "startup-state-mac"; state_mac_path.write_bytes(b"s" * 32)
+        state_mac_fd = os.open(state_mac_path, os.O_RDONLY)
+        try:
+            state_mac = RegistrationBrokerStateMacCapabilityV1.load_from_readonly_fd(state_mac_fd)
+        finally:
+            os.close(state_mac_fd)
+        policy_digest = canonical_json_bytes({"registryDigest": governance.registry.canonical_digest, "revocationsDigest": governance.revocations.canonical_digest, "schema": "trusted-registration-broker-auth-policy-state/v1"})
+        policy_digest = "sha256:" + hashlib.sha256(policy_digest).hexdigest()
+        baseline = BrokerAuthSequenceReplayBaselineV1("sha256:" + "a" * 64, governance, policy_digest)
+        provisional_state = BrokerAuthSequenceStateV1(
+            "trusted-registration-broker-auth-sequence-state/v1", baseline.root_identity_digest,
+            0, None, None, None, policy_digest, governance.registry.canonical_digest,
+            governance.revocations.canonical_digest, "0" * 64,
+        )
+        state = replace(
+            provisional_state,
+            broker_state_mac_hex=state_mac.mac(canonical_json_bytes(provisional_state._unsigned_wire())),
+        )
         signature = verify_registration_broker_startup_challenge(
-            governance, slot, "nonce-fixed"
+            governance, slot, baseline, state, state_mac, "nonce-fixed"
         )
         assert signature == "d56cbe8efa82d802a168d4c879d317f85a18d1353a63bce50db609323a31e993ae271827a6a15001ae563b1ec749e49c1d2d31b244dbf9c75dda84a8b11f8b0a"
         effects = {"childExec": 0, "repositoryWrites": 0, "fsyncs": 0}
+        future_key = replace(key, effective_lease_sequence=2)
+        future_registry = replace(governance.registry, keys=(future_key,))
+        future_revocations = RegistrationBrokerAuthRevocationsV1(
+            "trusted-registration-broker-auth-revocations/v1", future_registry.canonical_digest, (),
+        )
+        future_governance = RegistrationBrokerAuthGovernanceV1.from_canonical_bytes(
+            future_registry.canonical_bytes, future_revocations.canonical_bytes, allowed_signers_bytes,
+        )
+        future_policy = canonical_json_bytes({"registryDigest": future_registry.canonical_digest, "revocationsDigest": future_revocations.canonical_digest, "schema": "trusted-registration-broker-auth-policy-state/v1"})
+        future_baseline = BrokerAuthSequenceReplayBaselineV1(
+            baseline.root_identity_digest, future_governance,
+            "sha256:" + hashlib.sha256(future_policy).hexdigest(),
+        )
+        future_state = replace(
+            state, current_policy_digest=future_baseline.policy_digest,
+            broker_auth_registry_digest=future_registry.canonical_digest,
+            broker_auth_revocation_digest=future_revocations.canonical_digest,
+            broker_state_mac_hex="0" * 64,
+        )
+        future_state = replace(
+            future_state,
+            broker_state_mac_hex=state_mac.mac(canonical_json_bytes(future_state._unsigned_wire())),
+        )
+        with pytest.raises(ValueError, match="startup key"):
+            verify_registration_broker_startup_challenge(
+                future_governance, slot, future_baseline, future_state, state_mac, "nonce-fixed",
+            )
         slot.close()
         with pytest.raises(ValueError):
             verify_registration_broker_startup_challenge(
-                governance, slot, "nonce-fixed"
+                governance, slot, baseline, state, state_mac, "nonce-fixed"
             )
         assert effects == {"childExec": 0, "repositoryWrites": 0, "fsyncs": 0}
     finally:
+        if state_mac is not None:
+            state_mac.close()
         slot.close()
 
 

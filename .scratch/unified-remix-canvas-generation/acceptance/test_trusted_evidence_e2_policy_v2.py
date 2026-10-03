@@ -1375,6 +1375,68 @@ def test_authoritative_broker_issuer_commits_a_verified_issue_chain_and_preserve
             issued.state, issued.payloads,
             BrokerAuthSequenceReplayBaselineV1(DIGEST_A, governance, policy_digest),
         )
+        # A valid state-MAC chain must not manufacture a sign event for an
+        # operation that the preceding issue event never leased.
+        unissued_preimage = replace(issued.lease.identity_preimage(), operation_id="op-never-issued")
+        unissued_unsigned = _unsigned_envelope(
+            broker_lease_identity_digest=unissued_preimage.lease_identity_digest,
+            operation_id=unissued_preimage.operation_id,
+            lifecycle_nonce=unissued_preimage.lifecycle_nonce,
+            broker_auth_key_id=unissued_preimage.broker_auth_key_id,
+            broker_auth_public_key_digest=key.public_key_digest,
+            broker_auth_registry_generation=registry.generation,
+            broker_auth_registry_digest=registry.canonical_digest,
+            broker_auth_revocation_digest=revocations.canonical_digest,
+            broker_auth_allowed_signers_digest=governance.allowed_signers_digest,
+            broker_auth_lease_issued_sequence=1,
+            broker_auth_lease_expiry_sequence=3,
+            broker_auth_sign_sequence=2,
+        )
+        unissued_sign = BrokerAuthEnvelopeSignEventPayloadV1(
+            "trusted-registration-broker-auth-envelope-sign-payload/v1", "sign-envelope",
+            DIGEST_C, "op-never-issued", unissued_preimage.lease_identity_digest,
+            issued.payload.lease_request_digest, unissued_unsigned.canonical_digest,
+            key.key_id, 2, policy_digest, policy_digest,
+            issued.entry.canonical_digest, 1, issued.entry.canonical_digest,
+            unissued_preimage, "sha256:" + hashlib.sha256(unissued_unsigned.canonical_bytes).hexdigest(),
+            len(unissued_unsigned.canonical_bytes),
+            base64.b64encode(unissued_unsigned.canonical_bytes).decode("ascii"),
+        )
+        unissued_entry = BrokerAuthSequenceJournalEntryV1(
+            "trusted-registration-broker-auth-sequence-entry/v1", 2, issued.entry.canonical_digest,
+            unissued_sign.event_id_digest, unissued_sign.event_kind,
+            unissued_sign.full_bytes_digest, len(unissued_sign.canonical_bytes),
+            unissued_sign.full_bytes_digest, policy_digest, policy_digest,
+            registry.canonical_digest, revocations.canonical_digest, key.key_id, "0" * 64,
+        )
+        unissued_entry = replace(
+            unissued_entry,
+            broker_state_mac_hex=state_mac.mac(canonical_json_bytes(unissued_entry._unsigned_wire())),
+        )
+        unissued_state = BrokerAuthSequenceStateV1(
+            "trusted-registration-broker-auth-sequence-state/v1", DIGEST_A, 2,
+            unissued_entry.canonical_digest, unissued_sign.full_bytes_digest,
+            unissued_sign.full_bytes_digest, policy_digest, registry.canonical_digest,
+            revocations.canonical_digest, "0" * 64,
+        )
+        unissued_state = replace(
+            unissued_state,
+            broker_state_mac_hex=state_mac.mac(canonical_json_bytes(unissued_state._unsigned_wire())),
+        )
+        unissued_journal = BrokerAuthSequenceJournalV1(
+            "trusted-registration-broker-auth-sequence-journal/v1", DIGEST_A, 1,
+            (issued.entry, unissued_entry), "0" * 64,
+        )
+        unissued_journal = replace(
+            unissued_journal,
+            broker_state_mac_hex=state_mac.mac(canonical_json_bytes(unissued_journal._unsigned_wire())),
+        )
+        with pytest.raises(ValueError, match="issued lease"):
+            unissued_journal.validate_state(
+                unissued_state,
+                {**issued.payloads, unissued_sign.full_bytes_digest: unissued_sign},
+                BrokerAuthSequenceReplayBaselineV1(DIGEST_A, governance, policy_digest),
+            )
         # Payload storage is the exact replay closure, not a bag of otherwise
         # well-formed content-addressed values.  The second payload belongs to
         # a different event and is therefore an orphan for this one-entry
