@@ -1730,13 +1730,30 @@ def verify_policy_activation_proof(proof_bytes: bytes, signing_domains: Verified
     intent = _journal_entry(proof.activate_intent, "activation intent")
     marker = PolicyActivationMarkerV1.from_canonical_bytes(proof.activation_marker.canonical_bytes)
     activated = _journal_entry(proof.activated_entry, "activated entry")
-    if intent["operationId"] != proof.operation_id or marker.operation_id != proof.operation_id or activated["operationId"] != proof.operation_id or intent["pendingTransition"] != "ACTIVATE" or activated["state"] != "ACTIVATED" or marker.activation_intent_digest != proof.activate_intent.digest or activated["activationMarkerDigest"] != proof.activation_marker.digest or activated["previousEntryDigest"] != proof.activate_intent.digest:
+    if (
+        intent["operationId"] != proof.operation_id
+        or marker.operation_id != proof.operation_id
+        or activated["operationId"] != proof.operation_id
+        or intent["state"] != "HANDOFF_INSTALLED"
+        or intent["pendingTransition"] != "ACTIVATE"
+        or intent["fixedRefMustBeAbsent"] is not True
+        or intent["activationMarkerDigest"] is not None
+        or activated["state"] != "ACTIVATED"
+        or activated["pendingTransition"] is not None
+        or activated["fixedRefMustBeAbsent"] is not True
+        or marker.activation_intent_digest != proof.activate_intent.digest
+        or activated["activationMarkerDigest"] != proof.activation_marker.digest
+        or activated["previousEntryDigest"] != proof.activate_intent.digest
+        or activated["stagedPayloadDigest"] != intent["stagedPayloadDigest"]
+    ):
         raise ValueError("activation proof chain is invalid")
     if marker.policy_commit != proof.policy_commit or marker.fixed_ref != proof.fixed_ref or marker.record_ref != proof.policy_record_ref or marker.pointer_digest != proof.policy_pointer_bytes_digest or marker.export_request_ref != proof.policy_core_export_request_ref:
         raise ValueError("activation marker does not bind proof core fields")
     for field, expected in (("completionRecordRef", proof.completion_record_ref), ("completionRecordDigest", proof.completion_record_digest), ("recordRef", proof.policy_record_ref), ("pointerDigest", proof.policy_pointer_bytes_digest), ("exportRequestRef", proof.policy_core_export_request_ref), ("fixedRef", proof.fixed_ref), ("targetHeadRef", proof.target_head_ref)):
-        if activated[field] != expected:
+        if intent[field] != expected or activated[field] != expected:
             raise ValueError("activated entry does not bind proof fields")
+    if _policy_oid(intent["policyCommit"], "activation intent policyCommit") != proof.policy_commit:
+        raise ValueError("activation intent does not bind policy commit")
     if _policy_oid(activated["policyCommit"], "activated policyCommit") != proof.policy_commit or _policy_oid(proof.target_head_value.to_wire(), "targetHeadValue") != proof.policy_commit or _policy_oid(proof.fixed_ref_value.to_wire(), "fixedRefValue") != proof.policy_commit:
         raise ValueError("activation proof final Git values are inconsistent")
     for key in ("consumerTask", "destinationExecutorId"):

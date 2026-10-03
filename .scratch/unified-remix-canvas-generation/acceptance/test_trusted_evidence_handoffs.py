@@ -2007,3 +2007,96 @@ def test_handoff_transport_and_policy_decoders_reject_closed_wire_mutations(tmp_
         for mutated in (canonical_json_bytes(unknown), canonical_json_bytes(missing), duplicate, b" " + payload):
             with pytest.raises(ValueError):
                 decoder(mutated)
+
+
+def _resigned_policy_proof_with_embedded_field(
+    proof_bytes: bytes, embedded_name: str, field: str, value: object,
+) -> bytes:
+    """Return a correctly signed proof whose embedded chain has one semantic mutation."""
+    proof = json.loads(proof_bytes)
+
+    def mutate_embedded(name: str, nested_field: str, nested_value: object) -> dict[str, object]:
+        embedded = dict(proof[name])
+        nested = json.loads(base64.b64decode(embedded["canonicalBytesB64"]))
+        nested[nested_field] = nested_value
+        encoded = canonical_json_bytes(nested)
+        embedded["canonicalBytesB64"] = base64.b64encode(encoded).decode("ascii")
+        embedded["digest"] = "sha256:" + hashlib.sha256(encoded).hexdigest()
+        proof[name] = embedded
+        return embedded
+
+    changed = mutate_embedded(embedded_name, field, value)
+    if embedded_name == "activateIntent":
+        marker = mutate_embedded("activationMarker", "activationIntentDigest", changed["digest"])
+        mutate_embedded("activatedEntry", "previousEntryDigest", changed["digest"])
+        mutate_embedded("activatedEntry", "activationMarkerDigest", marker["digest"])
+    unsigned = dict(proof)
+    del unsigned["brokerSignature"]
+    seed = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+    proof["brokerSignature"] = _test_ed25519_signature(
+        seed,
+        b"ai-video-reverse-engineer/policy-activation/v1\0" + canonical_json_bytes(unsigned),
+    )
+    return canonical_json_bytes(proof)
+
+
+@pytest.mark.parametrize(
+    ("embedded_name", "field", "value"),
+    (
+        ("activateIntent", "state", "PREPARED"),
+        ("activateIntent", "fixedRefMustBeAbsent", False),
+        ("activateIntent", "completionRecordDigest", "sha256:" + "f" * 64),
+        ("activatedEntry", "pendingTransition", "ACTIVATE"),
+        ("activatedEntry", "fixedRefMustBeAbsent", False),
+    ),
+)
+def test_policy_activation_rejects_embedded_chain_state_and_authorization_mutations(
+    tmp_path, embedded_name, field, value,
+):
+    """A valid activation signature cannot authorize an invalid intent/marker/entry chain."""
+    source, _record, request_ref, _transport_seed, domains = _policy_transport_fixture(tmp_path)
+    activated = ActivatedPolicyExportRequestV1.from_canonical_bytes(source.read_blob(request_ref))
+    mutated = _resigned_policy_proof_with_embedded_field(
+        source.read_blob(activated.policy_activation_proof_ref), embedded_name, field, value,
+    )
+
+    with pytest.raises(ValueError):
+        verify_policy_activation_proof(
+            mutated, domains,
+            expected_transport={"consumerTask": 28, "destinationExecutorId": "executor-28"},
+        )
+
+    from tools.trusted_handoff_orchestrator import run_policy_transport
+
+    transport_root = (tmp_path / f"transport-{embedded_name}-{field}").resolve()
+    stage_root = (tmp_path / f"stage-{embedded_name}-{field}").resolve()
+    transport_root.mkdir(mode=0o700)
+    stage_root.mkdir(mode=0o700)
+    key_path = tmp_path / f"transport-key-{embedded_name}-{field}"
+    key_path.write_bytes(_transport_seed)
+    key_path.chmod(0o400)
+    key_fd = os.open(key_path, os.O_RDONLY)
+    try:
+        run_policy_transport(
+            source_store=source, target_store=TrustedHandoffStoreV1(transport_root), stage_root=stage_root,
+            export_request_ref=request_ref, handoff_id="ticket-23-policy-v1",
+            transport_id="ticket-23-policy-v1-c28", consumer_task=28,
+            store_namespace="ai-video-reverse-engineer/ticket-23", source_executor_id="policy-source",
+            destination_executor_id="executor-28", nonce="policy-nonce-28", sequence=1,
+            expires_at=None, signing_key_fd=key_fd, key_id="transport-fixed",
+            signing_key_purpose="transport-seal",
+            signature_domain="ai-video-reverse-engineer/transport-seal/v1", signing_domains=domains,
+        )
+    finally:
+        os.close(key_fd)
+    proof_path = transport_root / "sha256" / activated.policy_activation_proof_ref[7:9] / activated.policy_activation_proof_ref[9:]
+    proof_path.write_bytes(mutated)
+    cache_root = (tmp_path / f"cache-{embedded_name}-{field}").resolve()
+    cache_root.mkdir(mode=0o700)
+    with pytest.raises(ValueError):
+        HandoffRegistryV1(TrustedHandoffStoreV1(cache_root)).fetch(
+            TrustedHandoffStoreV1(transport_root), request_ref, "ticket-23-policy-v1", consumer_task=28,
+            transport_id="ticket-23-policy-v1-c28",
+            expected_destination_executor_id="executor-28", signing_domains=domains,
+        )
+    assert not any(cache_root.iterdir())
