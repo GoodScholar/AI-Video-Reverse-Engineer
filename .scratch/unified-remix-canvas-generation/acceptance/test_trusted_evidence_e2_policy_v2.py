@@ -1672,7 +1672,7 @@ def test_e3_forward_only_authority_is_root_only_and_exactly_two_actions(tmp_path
     state_mac.close()
 
 
-def test_e3_forward_only_recovery_requires_rename_head_as_authenticated_ancestor(tmp_path):
+def test_e3_forward_only_recovery_authenticates_every_broker_state_record_before_replay(tmp_path):
     key = RegistrationBrokerAuthKeyRegistrationV1(
         "trusted-registration-broker-auth-key-registration/v1", "broker-fixed",
         "registration-broker-auth", "ai-video-reverse-engineer/registration-broker-envelope/v1",
@@ -1719,17 +1719,77 @@ def test_e3_forward_only_recovery_requires_rename_head_as_authenticated_ancestor
         registration_transaction_intent_digest=DIGEST_C, expected_catalog_digest=DIGEST_A,
         catalog_parent_identity_digest=DIGEST_B, registration_journal_identity_digest=DIGEST_C,
     )
-    verify_registration_forward_only_recovery(
-        authority, state_mac, journal, state, {DIGEST_C: payload},
-        registry=registry, revocations=revocations, operation_id="operation-e2",
-        lease_identity_digest=DIGEST_A, lease_request_digest=DIGEST_B,
-        registration_transaction_intent_digest=DIGEST_C, catalog_digest=DIGEST_A,
-        catalog_parent_identity_digest=DIGEST_B, registration_journal_identity_digest=DIGEST_C,
-        action="append-terminal",
+    def verify(candidate_authority, candidate_journal, candidate_state, candidate_state_mac=state_mac):
+        verify_registration_forward_only_recovery(
+            candidate_authority, candidate_state_mac, candidate_journal, candidate_state,
+            {DIGEST_C: payload}, registry=registry, revocations=revocations,
+            operation_id="operation-e2", lease_identity_digest=DIGEST_A,
+            lease_request_digest=DIGEST_B,
+            registration_transaction_intent_digest=DIGEST_C, catalog_digest=DIGEST_A,
+            catalog_parent_identity_digest=DIGEST_B,
+            registration_journal_identity_digest=DIGEST_C, action="append-terminal",
+        )
+
+    # Shape-valid MACs are not authentication.  This reproduces the original
+    # bypass: before the fix, this call returns despite all three chain MACs
+    # being attacker-selected hex strings.
+    with pytest.raises(ValueError):
+        verify(authority, journal, state)
+
+    authenticated_entry = replace(
+        entry,
+        broker_state_mac_hex=state_mac.mac(canonical_json_bytes(entry._unsigned_wire())),
+    )
+    unsigned_journal = replace(journal, entries=(authenticated_entry,))
+    authenticated_journal = replace(
+        unsigned_journal,
+        broker_state_mac_hex=state_mac.mac(canonical_json_bytes(unsigned_journal._unsigned_wire())),
+    )
+    authenticated_state = replace(
+        state,
+        broker_state_mac_hex=state_mac.mac(canonical_json_bytes(state._unsigned_wire())),
+    )
+    verify(authority, authenticated_journal, authenticated_state)
+
+    tampered_entry = replace(authenticated_entry, broker_state_mac_hex="0" * 64)
+    journal_with_tampered_entry = replace(authenticated_journal, entries=(tampered_entry,))
+    journal_with_tampered_entry = replace(
+        journal_with_tampered_entry,
+        broker_state_mac_hex=state_mac.mac(
+            canonical_json_bytes(journal_with_tampered_entry._unsigned_wire())
+        ),
     )
     with pytest.raises(ValueError):
+        verify(authority, journal_with_tampered_entry, authenticated_state)
+    with pytest.raises(ValueError):
+        verify(authority, replace(authenticated_journal, broker_state_mac_hex="0" * 64), authenticated_state)
+    with pytest.raises(ValueError):
+        verify(authority, authenticated_journal, replace(authenticated_state, broker_state_mac_hex="0" * 64))
+
+    other_state_mac = _state_mac_capability(tmp_path, b"other state MAC capability key!!!!"[:32])
+    try:
+        with pytest.raises(ValueError):
+            verify(authority, authenticated_journal, authenticated_state, other_state_mac)
+        with pytest.raises(ValueError):
+            verify(authority, authenticated_journal, authenticated_state, b"0123456789abcdef0123456789abcdef")
+    finally:
+        other_state_mac.close()
+
+    tampered_authority = RegistrationForwardOnlyRecoveryAuthorityV1.create(
+        state_mac, operation_id="operation-e2",
+        lease_identity_digest=DIGEST_A, lease_request_digest=DIGEST_B,
+        broker_auth_key_id="broker-fixed", broker_auth_key_registration_digest=key.canonical_digest,
+        rename_sequence=1, rename_head_digest=entry.canonical_digest, rename_policy_digest=DIGEST_B,
+        registration_transaction_intent_digest=DIGEST_C, expected_catalog_digest=DIGEST_A,
+        catalog_parent_identity_digest=DIGEST_B, registration_journal_identity_digest=DIGEST_C,
+    )
+    tampered_authority._broker_state_mac = "0" * 64
+    with pytest.raises(ValueError):
+        verify(tampered_authority, authenticated_journal, authenticated_state)
+
+    with pytest.raises(ValueError):
         verify_registration_forward_only_recovery(
-            authority, state_mac, journal, state, {DIGEST_C: payload},
+            authority, state_mac, authenticated_journal, authenticated_state, {DIGEST_C: payload},
             registry=registry, revocations=revocations, operation_id="operation-e2",
             lease_identity_digest=DIGEST_A, lease_request_digest=DIGEST_B,
             registration_transaction_intent_digest=DIGEST_C, catalog_digest=DIGEST_A,
@@ -1738,7 +1798,7 @@ def test_e3_forward_only_recovery_requires_rename_head_as_authenticated_ancestor
         )
     with pytest.raises(ValueError):
         verify_registration_forward_only_recovery(
-            authority, state_mac, journal, state, {DIGEST_C: payload},
+            authority, state_mac, authenticated_journal, authenticated_state, {DIGEST_C: payload},
             registry=registry, revocations=revocations, operation_id="operation-e2",
             lease_identity_digest=DIGEST_A, lease_request_digest=DIGEST_B,
             registration_transaction_intent_digest=DIGEST_C, catalog_digest=DIGEST_A,

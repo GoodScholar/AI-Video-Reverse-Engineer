@@ -3611,6 +3611,10 @@ def verify_registration_forward_only_recovery(
     if type(registry) is not RegistrationBrokerAuthRegistryV1 or type(revocations) is not RegistrationBrokerAuthRevocationsV1:
         raise ValueError("forward-only broker policy is invalid")
     authority.verify_state_mac(state_mac)
+    state_mac.verify(canonical_json_bytes(journal._unsigned_wire()), journal.broker_state_mac_hex)
+    state_mac.verify(canonical_json_bytes(state._unsigned_wire()), state.broker_state_mac_hex)
+    for entry in journal.entries:
+        state_mac.verify(canonical_json_bytes(entry._unsigned_wire()), entry.broker_state_mac_hex)
     if action not in _FORWARD_ONLY_ACTIONS:
         raise ValueError("forward-only action is not authorized")
     if (operation_id, lease_identity_digest, lease_request_digest, registration_transaction_intent_digest, catalog_digest, catalog_parent_identity_digest, registration_journal_identity_digest) != (
