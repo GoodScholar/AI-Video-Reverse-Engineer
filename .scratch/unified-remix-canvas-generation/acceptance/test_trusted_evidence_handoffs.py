@@ -110,9 +110,8 @@ def test_tracked_governance_inputs_are_canonical_and_keep_broker_auth_unprovisio
         (28, "task28-register"),
         (29, "task29-promote"),
     ]
-    assert {item["role"] for item in output_policy["tasks"][0]["transitions"]} == {
-        "audit", "catalog", "evidence-cas"
-    }
+    assert {item["role"] for item in output_policy["tasks"][0]["transitions"]} == {"audit", "catalog"}
+    assert output_policy["tasks"][0]["candidateCasPathPrefix"] == ".scratch/unified-remix-canvas-generation/acceptance/evidence/sha256"
     assert output_policy["tasks"][1]["transitions"] == [{
         "allowedTransition": "replace-with-exact-bytes",
         "precondition": "equals-base-bytes",

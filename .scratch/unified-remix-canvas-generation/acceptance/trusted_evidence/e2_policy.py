@@ -14,12 +14,10 @@ import base64
 import os
 import re
 import stat
-import subprocess
 import unicodedata
 import fcntl
 import socket
 from collections.abc import Mapping
-from pathlib import Path
 from types import MappingProxyType
 
 
@@ -497,7 +495,8 @@ def _task_output_policy(policy_bytes: bytes) -> dict[str, object]:
 
     tasks: list[dict[str, object]] = []
     for task in raw["tasks"]:
-        if not isinstance(task, dict) or set(task) != {"phase", "sourceDirtyInputs", "task", "transitions"}:
+        expected_fields = {"candidateCasPathPrefix", "phase", "sourceDirtyInputs", "task", "transitions"} if isinstance(task, dict) and task.get("task") == 28 else {"phase", "sourceDirtyInputs", "task", "transitions"}
+        if not isinstance(task, dict) or set(task) != expected_fields:
             raise ValueError("task output policy task is invalid")
         if type(task["task"]) is not int or _PHASES.get(task["task"]) != task["phase"] or not isinstance(task["sourceDirtyInputs"], list) or not isinstance(task["transitions"], list):
             raise ValueError("task output policy task identity is invalid")
@@ -529,100 +528,187 @@ def _task_output_policy(policy_bytes: bytes) -> dict[str, object]:
             transitions.append((path, _require_text(item["role"], "transition role"), options))
         if dirty != sorted(dirty) or len(set(dirty)) != len(dirty) or transitions != sorted(transitions) or len({item[0] for item in transitions}) != len(transitions):
             raise ValueError("task output policy entries must be uniquely ordered")
-        tasks.append({"phase": task["phase"], "task": task["task"], "sourceDirtyInputs": tuple(dirty), "transitions": tuple(transitions)})
+        candidate_cas_path_prefix = None
+        if task["task"] == 28:
+            candidate_cas_path_prefix = _relative_path(task["candidateCasPathPrefix"], "candidate CAS path prefix")
+            if not candidate_cas_path_prefix.endswith("/sha256"):
+                raise ValueError("candidate CAS path prefix is invalid")
+        tasks.append({"candidateCasPathPrefix": candidate_cas_path_prefix, "phase": task["phase"], "task": task["task"], "sourceDirtyInputs": tuple(dirty), "transitions": tuple(transitions)})
     if tuple(item["task"] for item in tasks) != (28, 29):
         raise ValueError("task output policy must freeze Task 28 and Task 29")
     return {"protectedPaths": tuple(protected), "tasks": tuple(tasks)}
 
 
-def _git_read(repository: Path, *arguments: str) -> bytes:
-    try:
-        result = subprocess.run(("git", *arguments), cwd=repository, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except (OSError, subprocess.CalledProcessError) as error:
-        raise ValueError("Git repository inspection failed") from error
-    return result.stdout
+@dataclass(frozen=True, slots=True)
+class PinnedTaskOutputPathV1:
+    """One Task 7 snapshot fact; it never contains a repository pathname."""
+
+    repository_relative_path: str
+    base_content_digest: str | None
+    current_status: str
+    current_content_digest: str | None
+    current_device: int | None
+    current_inode: int | None
+    current_byte_length: int | None
+    residual_intent_digest: str | None
+
+    def __post_init__(self) -> None:
+        _relative_path(self.repository_relative_path, "repository_relative_path")
+        if self.base_content_digest is not None:
+            _require_digest(self.base_content_digest, "base_content_digest")
+        if self.current_status not in {"absent", "unchanged", "modified", "untracked", "added"}:
+            raise ValueError("pinned path status is invalid")
+        identity = (self.current_content_digest, self.current_device, self.current_inode, self.current_byte_length)
+        if self.current_status == "absent":
+            if any(value is not None for value in identity) or self.residual_intent_digest is not None:
+                raise ValueError("absent pinned path cannot carry file identity")
+            return
+        if any(value is None for value in identity):
+            raise ValueError("present pinned path needs complete file identity")
+        _require_digest(self.current_content_digest, "current_content_digest")
+        _int(self.current_device, "current_device")
+        _int(self.current_inode, "current_inode")
+        _int(self.current_byte_length, "current_byte_length")
+        if self.residual_intent_digest is not None:
+            _require_digest(self.residual_intent_digest, "residual_intent_digest")
+
+    def to_wire(self) -> dict[str, object]:
+        return {"baseContentDigest": self.base_content_digest, "currentByteLength": self.current_byte_length, "currentContentDigest": self.current_content_digest, "currentDevice": self.current_device, "currentInode": self.current_inode, "currentStatus": self.current_status, "repositoryRelativePath": self.repository_relative_path, "residualIntentDigest": self.residual_intent_digest}
+
+    @classmethod
+    def _from_wire(cls, raw: object) -> "PinnedTaskOutputPathV1":
+        fields = {"baseContentDigest", "currentByteLength", "currentContentDigest", "currentDevice", "currentInode", "currentStatus", "repositoryRelativePath", "residualIntentDigest"}
+        if not isinstance(raw, dict) or set(raw) != fields:
+            raise ValueError("pinned path observation is invalid")
+        return cls(raw["repositoryRelativePath"], raw["baseContentDigest"], raw["currentStatus"], raw["currentContentDigest"], raw["currentDevice"], raw["currentInode"], raw["currentByteLength"], raw["residualIntentDigest"])
 
 
-def _repository_regular_file(repository: Path, relative_path: str, *, required: bool) -> Path | None:
-    current = repository
-    for component in relative_path.split("/"):
-        current = current / component
+@dataclass(frozen=True, slots=True)
+class PinnedTaskOutputRepositoryObservationV1(_SelfDigestRecord):
+    """A bounded, single-use Task 7 view exported as immutable facts only."""
+
+    schema: str
+    base_commit: GitObjectIdV1
+    trusted_git_view_digest: str
+    allowed_outputs_digest: str
+    index_is_clean: bool
+    unmerged_paths: tuple[str, ...]
+    paths: tuple[PinnedTaskOutputPathV1, ...]
+    persistent_intent_digest: str | None
+
+    def __post_init__(self) -> None:
+        if self.schema != "trusted-pinned-task-output-observation/v1" or type(self.base_commit) is not GitObjectIdV1 or type(self.index_is_clean) is not bool:
+            raise ValueError("pinned repository observation identity is invalid")
+        _require_digest(self.trusted_git_view_digest, "trusted_git_view_digest")
+        _require_digest(self.allowed_outputs_digest, "allowed_outputs_digest")
+        if self.persistent_intent_digest is not None:
+            _require_digest(self.persistent_intent_digest, "persistent_intent_digest")
+        unmerged = _ordered(self.unmerged_paths, lambda value: value.encode("utf-8"), "unmerged_paths")
+        if not all(isinstance(value, str) and _relative_path(value, "unmerged path") for value in unmerged):
+            raise ValueError("unmerged paths are invalid")
+        paths = _ordered(self.paths, lambda value: value.repository_relative_path.encode("utf-8"), "pinned_paths", count=None)
+        if not paths or len(paths) > 64 or not all(type(value) is PinnedTaskOutputPathV1 for value in paths):
+            raise ValueError("pinned path observations are invalid")
+        object.__setattr__(self, "unmerged_paths", unmerged)
+        object.__setattr__(self, "paths", paths)
+
+    def _unsigned_wire(self) -> dict[str, object]:
+        return {"allowedOutputsDigest": self.allowed_outputs_digest, "baseCommit": self.base_commit.to_wire(), "indexIsClean": self.index_is_clean, "paths": [item.to_wire() for item in self.paths], "persistentIntentDigest": self.persistent_intent_digest, "schema": self.schema, "trustedGitViewDigest": self.trusted_git_view_digest, "unmergedPaths": list(self.unmerged_paths)}
+
+    @classmethod
+    def from_canonical_bytes(cls, payload: bytes) -> "PinnedTaskOutputRepositoryObservationV1":
+        fields = {"allowedOutputsDigest", "baseCommit", _SELF_DIGEST, "indexIsClean", "paths", "persistentIntentDigest", "schema", "trustedGitViewDigest", "unmergedPaths"}
+        raw = _strict_object(payload, fields, "pinned repository observation")
+        if not isinstance(raw["paths"], list) or not isinstance(raw["unmergedPaths"], list):
+            raise ValueError("pinned repository observation collections are invalid")
+        result = cls(raw["schema"], _oid(raw["baseCommit"], "base_commit"), raw["trustedGitViewDigest"], raw["allowedOutputsDigest"], raw["indexIsClean"], tuple(raw["unmergedPaths"]), tuple(PinnedTaskOutputPathV1._from_wire(item) for item in raw["paths"]), raw["persistentIntentDigest"])
+        if raw[_SELF_DIGEST] != result.canonical_digest:
+            raise ValueError("pinned repository observation self digest is invalid")
+        return result
+
+
+class HeldCandidateFdV1:
+    """Non-serializable ownership of one no-follow, read-only candidate FD."""
+
+    __slots__ = ("_candidate_ref", "_fd", "_closed")
+
+    def __init__(self, token: object, candidate_ref: str, fd: int) -> None:
+        if token is not HeldCandidateFdV1:
+            raise ValueError("held candidate FDs are created only from an existing descriptor")
+        self._candidate_ref = _candidate_ref(candidate_ref)
+        self._fd, self._closed = fd, False
+
+    @classmethod
+    def from_fd(cls, candidate_ref: str, fd: int) -> "HeldCandidateFdV1":
+        if type(fd) is not int or fd < 0:
+            raise ValueError("candidate FD is invalid")
+        duplicated = os.dup(fd)
         try:
-            metadata = current.lstat()
-        except FileNotFoundError:
-            if required:
-                raise ValueError("required repository path is absent")
-            return None
-        if stat.S_ISLNK(metadata.st_mode):
-            raise ValueError("repository path contains a symlink")
-    if not stat.S_ISREG(metadata.st_mode):
-        raise ValueError("repository path is not a regular file")
-    return current
+            flags = fcntl.fcntl(duplicated, fcntl.F_GETFL)
+            info = os.fstat(duplicated)
+            if flags & os.O_ACCMODE != os.O_RDONLY or not stat.S_ISREG(info.st_mode):
+                raise ValueError("candidate FD must be a read-only regular file")
+            return cls(cls, candidate_ref, duplicated)
+        except Exception:
+            os.close(duplicated)
+            raise
 
+    def __copy__(self):
+        raise TypeError("held candidate FD cannot be copied")
 
-def _file_digest(path: Path) -> str:
-    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    def __deepcopy__(self, memo):
+        raise TypeError("held candidate FD cannot be copied")
 
+    def __reduce__(self):
+        raise TypeError("held candidate FD cannot be serialized")
 
-def _git_blob_digest(repository: Path, base_commit: GitObjectIdV1, relative_path: str) -> str | None:
-    result = subprocess.run(
-        ("git", "cat-file", "-e", f"{base_commit.hex}:{relative_path}"), cwd=repository,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    if result.returncode != 0:
-        return None
-    return "sha256:" + hashlib.sha256(_git_read(repository, "show", f"{base_commit.hex}:{relative_path}")).hexdigest()
+    @property
+    def candidate_ref(self) -> str:
+        return self._candidate_ref
 
+    def close(self) -> None:
+        if not self._closed:
+            os.close(self._fd)
+            self._closed = True
 
-def _git_worktree_changes(repository: Path) -> dict[str, str]:
-    raw = _git_read(repository, "diff", "--name-status", "-z", "-M")
-    values = raw.split(b"\0")
-    changes: dict[str, str] = {}
-    position = 0
-    while position < len(values) - 1:
-        status = values[position].decode("utf-8")
-        position += 1
-        if status.startswith(("R", "C")):
-            raise ValueError("renames and copies are forbidden")
-        if position >= len(values) or status not in {"M", "A", "D", "T"}:
-            raise ValueError("worktree change is invalid")
-        path = values[position].decode("utf-8")
-        position += 1
-        _relative_path(path, "Git worktree path")
-        if status != "M":
-            raise ValueError("deletes and type changes are forbidden")
-        if path in changes:
-            raise ValueError("duplicate Git worktree path")
-        changes[path] = "modified"
-    for raw_path in _git_read(repository, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0")[:-1]:
-        path = raw_path.decode("utf-8")
-        _relative_path(path, "Git untracked path")
-        if path in changes:
-            raise ValueError("worktree path is both tracked and untracked")
-        changes[path] = "untracked"
-    return changes
+    def _verify(self, identity: StagedCandidateIdentityV1) -> None:
+        if self._closed or self._candidate_ref != identity.candidate_ref:
+            raise ValueError("held candidate FD is closed or rebound")
+        flags = fcntl.fcntl(self._fd, fcntl.F_GETFL)
+        info = os.fstat(self._fd)
+        if flags & os.O_ACCMODE != os.O_RDONLY or not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino, info.st_size) != (identity.device, identity.inode, identity.byte_length):
+            raise ValueError("held candidate FD identity drifted")
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < identity.byte_length:
+            block = os.pread(self._fd, min(64 * 1024, identity.byte_length - offset), offset)
+            if not block:
+                raise ValueError("held candidate FD was truncated")
+            digest.update(block)
+            offset += len(block)
+        if os.pread(self._fd, 1, identity.byte_length) or "sha256:" + digest.hexdigest() != identity.content_digest:
+            raise ValueError("held candidate FD content drifted")
 
 
 def validate_task_output_repository_state(
-    repository_root: str | Path,
     allowed_outputs: AllowedTaskOutputsV1,
     policy_bytes: bytes,
-    candidate_paths: Mapping[str, str | Path],
+    observation: PinnedTaskOutputRepositoryObservationV1,
+    held_candidates: tuple[HeldCandidateFdV1, ...],
     *,
     expected_allowed_outputs_digest: str,
+    expected_trusted_git_view_digest: str,
+    persistent_intent_digest: str | None = None,
 ) -> None:
-    """Validate Task 28/29's real Git pre-state without mutating it.
-
-    The caller supplies only already-held candidate paths.  Every mutable
-    repository value is checked against the immutable manifest and canonical
-    policy; no current observation can widen either authority.
-    """
-    repository = Path(repository_root)
-    if not repository.is_absolute() or repository.is_symlink() or not repository.is_dir():
-        raise ValueError("repository root must be an absolute non-symlink directory")
+    """Consume a Task 7 pinned view without reopening Git, paths, or candidate files."""
+    if type(allowed_outputs) is not AllowedTaskOutputsV1 or type(observation) is not PinnedTaskOutputRepositoryObservationV1:
+        raise ValueError("task output validator needs typed pinned facts")
     _require_digest(expected_allowed_outputs_digest, "expected_allowed_outputs_digest")
-    if allowed_outputs.canonical_digest != expected_allowed_outputs_digest:
+    _require_digest(expected_trusted_git_view_digest, "expected_trusted_git_view_digest")
+    if allowed_outputs.canonical_digest != expected_allowed_outputs_digest or observation.allowed_outputs_digest != expected_allowed_outputs_digest or observation.trusted_git_view_digest != expected_trusted_git_view_digest or observation.base_commit != allowed_outputs.base_commit:
         raise ValueError("allowed task outputs were refreshed or substituted")
+    if not observation.index_is_clean or observation.unmerged_paths:
+        raise ValueError("pinned index is not clean")
     policy = _task_output_policy(policy_bytes)
     if allowed_outputs.task_output_policy_digest != "sha256:" + hashlib.sha256(policy_bytes).hexdigest() or allowed_outputs.protected_paths_digest != canonical_digest([{"repositoryRelativePath": path, "role": role} for path, role in policy["protectedPaths"]]):
         raise ValueError("task output policy digest is not bound to the manifest")
@@ -632,52 +718,54 @@ def validate_task_output_repository_state(
     planned_dirty = tuple(item.repository_relative_path for item in allowed_outputs.source_dirty_inputs)
     planned_transitions = tuple((item.repository_relative_path, item.output_kind, item.precondition, item.allowed_transition) for item in allowed_outputs.transitions)
     allowed_transitions = {path: (role, options) for path, role, options in task_policy["transitions"]}
+    if allowed_outputs.task_id == 28:
+        prefix = task_policy["candidateCasPathPrefix"]
+        if not isinstance(prefix, str):
+            raise ValueError("Task 28 candidate CAS policy is absent")
+        for ref in allowed_outputs.candidate_refs:
+            allowed_transitions[f"{prefix}/{ref[7:9]}/{ref[7:]}"] = ("evidence-cas", (("must-not-exist-or-same-intent-recovery", "create-or-resume-exact-cas"), ("equals-base-bytes", "retain-exact-cas")))
     if planned_dirty != tuple(item[0] for item in task_policy["sourceDirtyInputs"]) or set(item[0] for item in planned_transitions) != set(allowed_transitions) or any(allowed_transitions[path][0] != role or (precondition, transition) not in allowed_transitions[path][1] for path, role, precondition, transition in planned_transitions):
         raise ValueError("manifest paths or transitions exceed frozen policy")
     protected_paths = {item[0] for item in policy["protectedPaths"]}
-    if protected_paths & (set(planned_dirty) | {item[0] for item in planned_transitions}):
-        raise ValueError("protected paths cannot be mutable manifest paths")
-    if _git_read(repository, "rev-parse", "--verify", "HEAD").decode("ascii").strip() != allowed_outputs.base_commit.hex:
-        raise ValueError("repository HEAD is not the fixed base commit")
-    if subprocess.run(("git", "diff", "--cached", "--quiet"), cwd=repository).returncode != 0 or _git_read(repository, "ls-files", "-u"):
-        raise ValueError("staged or unmerged index changes are forbidden")
-    changes = _git_worktree_changes(repository)
-    if set(changes) != set(planned_dirty):
-        raise ValueError("worktree changes are not exactly the manifest source dirty set")
+    required_paths = protected_paths | set(planned_dirty) | {item[0] for item in planned_transitions}
+    observed = {item.repository_relative_path: item for item in observation.paths}
+    if set(observed) != required_paths or protected_paths & (set(planned_dirty) | {item[0] for item in planned_transitions}):
+        raise ValueError("pinned path set is not the frozen policy closure")
     for allowance in allowed_outputs.source_dirty_inputs:
-        if changes[allowance.repository_relative_path] != allowance.expected_status:
-            raise ValueError("source dirty status changed")
-        source = _repository_regular_file(repository, allowance.repository_relative_path, required=True)
-        if _file_digest(source) != allowance.expected_content_digest:
-            raise ValueError("source dirty content changed")
+        fact = observed[allowance.repository_relative_path]
+        if fact.current_status != allowance.expected_status or fact.current_content_digest != allowance.expected_content_digest:
+            raise ValueError("pinned source dirty fact changed")
+    for protected_path in protected_paths:
+        fact = observed[protected_path]
+        if fact.current_status != "unchanged" or fact.base_content_digest is None or fact.current_content_digest != fact.base_content_digest:
+            raise ValueError("pinned protected path changed")
     if allowed_outputs.task_id == 28:
-        if set(candidate_paths) != set(allowed_outputs.candidate_refs):
-            raise ValueError("candidate path set is not closed")
-        held = {item.candidate_ref: item for item in allowed_outputs.staged_candidates}
-        for ref in allowed_outputs.candidate_refs:
-            path = Path(candidate_paths[ref])
-            if path.is_symlink() or not path.is_file():
-                raise ValueError("candidate is not a regular held file")
-            metadata = path.stat()
-            identity = held.get(ref)
-            if identity is None or (metadata.st_dev, metadata.st_ino, metadata.st_size, _file_digest(path)) != (identity.device, identity.inode, identity.byte_length, identity.content_digest):
-                raise ValueError("candidate identity drifted")
-    elif candidate_paths:
-        raise ValueError("Task 29 must not receive candidate files")
+        if type(held_candidates) is not tuple or len(held_candidates) != 7 or {item.candidate_ref for item in held_candidates if type(item) is HeldCandidateFdV1} != set(allowed_outputs.candidate_refs):
+            raise ValueError("held candidate FD set is not closed")
+        held = {item.candidate_ref: item for item in held_candidates}
+        for identity in allowed_outputs.staged_candidates:
+            held[identity.candidate_ref]._verify(identity)
+    elif held_candidates:
+        raise ValueError("Task 29 must not receive candidate FDs")
+    if persistent_intent_digest is not None:
+        _require_digest(persistent_intent_digest, "persistent_intent_digest")
     for transition in allowed_outputs.transitions:
-        current = _repository_regular_file(repository, transition.repository_relative_path, required=False)
-        base_digest = _git_blob_digest(repository, allowed_outputs.base_commit, transition.repository_relative_path)
+        fact = observed[transition.repository_relative_path]
         if transition.allowed_transition == "create-or-resume-exact-cas":
-            if current is not None or base_digest is not None:
-                raise ValueError("new candidate CAS must be absent")
+            if fact.base_content_digest is not None:
+                raise ValueError("new candidate CAS is base tracked")
+            if fact.current_status == "absent":
+                continue
+            if (fact.current_status != "added" or fact.current_content_digest != transition.expected_post.content_digest or fact.current_byte_length != transition.expected_post.byte_length or persistent_intent_digest is None or observation.persistent_intent_digest != persistent_intent_digest or fact.residual_intent_digest != persistent_intent_digest):
+                raise ValueError("candidate CAS residual is not exact same-intent recovery")
         elif transition.allowed_transition == "retain-exact-cas":
-            if current is None or base_digest != transition.expected_pre_digest or _file_digest(current) != base_digest:
+            if fact.current_status != "unchanged" or fact.base_content_digest != transition.expected_pre_digest or fact.current_content_digest != fact.base_content_digest:
                 raise ValueError("retained candidate CAS drifted from fixed base bytes")
         elif transition.precondition == "must-not-exist":
-            if current is not None or base_digest is not None:
-                raise ValueError("create output must be absent")
+            if fact.base_content_digest is not None or fact.current_status != "absent":
+                raise ValueError("create output is not absent")
         elif transition.precondition == "equals-base-bytes":
-            if current is None or base_digest != transition.expected_pre_digest or _file_digest(current) != base_digest:
+            if fact.current_status != "unchanged" or fact.base_content_digest != transition.expected_pre_digest or fact.current_content_digest != fact.base_content_digest:
                 raise ValueError("base-byte output precondition failed")
         else:
             raise ValueError("unsupported output transition")

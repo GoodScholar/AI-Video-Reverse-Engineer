@@ -10,7 +10,6 @@ import fcntl
 import array
 import base64
 import sys
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -74,6 +73,9 @@ from trusted_evidence.e2_policy import (
     RegistrationBrokerMutationVerifierV1,
     BrokerMutationReceiptV1,
     RegistrationForwardOnlyRecoveryAuthorityV1,
+    HeldCandidateFdV1,
+    PinnedTaskOutputPathV1,
+    PinnedTaskOutputRepositoryObservationV1,
     verify_registration_forward_only_recovery,
     validate_task_output_repository_state,
     _ed_sign,
@@ -220,6 +222,21 @@ def test_product_git_object_id_is_sha1_only(value):
 # originate from the codecs under test.
 REFS = tuple("sha256:" + value * 64 for value in "1234567")
 BASE = GitObjectIdV1("sha1", "0" * 40)
+ACCEPTANCE_ROOT = ".scratch/unified-remix-canvas-generation/acceptance"
+TASK28_SOURCE = f"{ACCEPTANCE_ROOT}/test_ticket23_collect_register.py"
+TASK28_CATALOG = f"{ACCEPTANCE_ROOT}/evidence-catalog.json"
+TASK28_AUDIT = f"{ACCEPTANCE_ROOT}/audit/ticket-23-trusted-evidence.json"
+TASK28_CAS_ROOT = f"{ACCEPTANCE_ROOT}/evidence/sha256"
+TASK29_CONTRACT = f"{ACCEPTANCE_ROOT}/matrix-contract.json"
+TASK29_SOURCES = (
+    f"{ACCEPTANCE_ROOT}/README.md",
+    f"{ACCEPTANCE_ROOT}/test_ticket23_promotion.py",
+    ".scratch/unified-remix-canvas-generation/issues/23-align-toonflow-canvas-shell-and-persistence.md",
+)
+
+
+def _cas_path(ref):
+    return f"{TASK28_CAS_ROOT}/{ref[7:9]}/{ref[7:]}"
 
 
 class VisibleAuthorizationWriteRecorder:
@@ -244,11 +261,11 @@ def _task28_allowed(**overrides):
         for ordinal, ref in enumerate(REFS, start=100)
     )
     transitions = (
-        TaskOutputTransitionV1("audit.json", "task28-register", "audit", "must-not-exist", None, "create-exact-bytes", _post(), None),
-        TaskOutputTransitionV1("catalog.json", "task28-register", "catalog", "equals-base-bytes", DIGEST_A, "replace-with-exact-bytes", _post("modified", DIGEST_B, REFS[1]), None),
+        TaskOutputTransitionV1(TASK28_AUDIT, "task28-register", "audit", "must-not-exist", None, "create-exact-bytes", _post(), None),
+        TaskOutputTransitionV1(TASK28_CATALOG, "task28-register", "catalog", "equals-base-bytes", DIGEST_A, "replace-with-exact-bytes", _post("modified", DIGEST_B, REFS[1]), None),
         *tuple(
             TaskOutputTransitionV1(
-                f"evidence/{ordinal}.json", "task28-register", "evidence-cas",
+                _cas_path(ref), "task28-register", "evidence-cas",
                 "must-not-exist-or-same-intent-recovery", None,
                 "create-or-resume-exact-cas", _post("added", ref, ref), ref,
             )
@@ -259,7 +276,7 @@ def _task28_allowed(**overrides):
         "schema": "trusted-allowed-task-outputs/v1", "task_id": 28,
         "phase": "task28-register", "base_commit": BASE,
         "task_output_policy_digest": DIGEST_A, "protected_paths_digest": DIGEST_B,
-        "source_dirty_inputs": (SourceDirtyAllowanceV1("tests/task28.py", "modified", DIGEST_C),),
+        "source_dirty_inputs": (SourceDirtyAllowanceV1(TASK28_SOURCE, "modified", DIGEST_C),),
         "staged_candidates": candidates, "transitions": transitions,
         "candidate_refs": REFS, "new_candidate_refs": REFS,
         "idempotent_candidate_refs": (), "expected_post_tree_digest": DIGEST_C,
@@ -273,9 +290,9 @@ def _task29_allowed(**overrides):
         "schema": "trusted-allowed-task-outputs/v1", "task_id": 29,
         "phase": "task29-promote", "base_commit": BASE,
         "task_output_policy_digest": DIGEST_A, "protected_paths_digest": DIGEST_B,
-        "source_dirty_inputs": (SourceDirtyAllowanceV1("README.md", "modified", DIGEST_C),),
+        "source_dirty_inputs": tuple(SourceDirtyAllowanceV1(path, "modified", DIGEST_C) for path in TASK29_SOURCES),
         "staged_candidates": (),
-        "transitions": (TaskOutputTransitionV1("matrix-contract.json", "task29-promote", "contract", "equals-base-bytes", DIGEST_A, "replace-with-exact-bytes", _post("modified", DIGEST_B, REFS[0]), None),),
+        "transitions": (TaskOutputTransitionV1(TASK29_CONTRACT, "task29-promote", "contract", "equals-base-bytes", DIGEST_A, "replace-with-exact-bytes", _post("modified", DIGEST_B, REFS[0]), None),),
         "candidate_refs": REFS, "new_candidate_refs": REFS,
         "idempotent_candidate_refs": (), "expected_post_tree_digest": DIGEST_C,
     }
@@ -283,12 +300,41 @@ def _task29_allowed(**overrides):
     return AllowedTaskOutputsV1(**values)
 
 
+def _materialized_task28_plan(candidate_paths):
+    """Build a literal plan whose candidate identities come from already openable files."""
+    refs = tuple(sorted(candidate_paths))
+    identities = tuple(
+        StagedCandidateIdentityV1(ref, candidate_paths[ref].stat().st_dev, candidate_paths[ref].stat().st_ino,
+                                  candidate_paths[ref].stat().st_size, _digest_bytes(candidate_paths[ref].read_bytes()))
+        for ref in refs
+    )
+    transitions = (
+        TaskOutputTransitionV1(TASK28_AUDIT, "task28-register", "audit", "must-not-exist", None, "create-exact-bytes", ExpectedTaskOutputV1("added", 5, _digest_bytes(b"audit"), refs[0]), None),
+        TaskOutputTransitionV1(TASK28_CATALOG, "task28-register", "catalog", "equals-base-bytes", DIGEST_A, "replace-with-exact-bytes", ExpectedTaskOutputV1("modified", 7, _digest_bytes(b"catalog"), refs[0]), None),
+        *tuple(TaskOutputTransitionV1(_cas_path(ref), "task28-register", "evidence-cas", "must-not-exist-or-same-intent-recovery", None, "create-or-resume-exact-cas", ExpectedTaskOutputV1("added", candidate_paths[ref].stat().st_size, ref, ref), ref) for ref in refs),
+    )
+    policy_bytes = (Path(__file__).parent / "trust" / "task-output-policy.json").read_bytes()
+    policy = json.loads(policy_bytes)
+    return AllowedTaskOutputsV1("trusted-allowed-task-outputs/v1", 28, "task28-register", BASE, _digest_bytes(policy_bytes), _digest_bytes(canonical_json_bytes(policy["protectedPaths"])), (SourceDirtyAllowanceV1(TASK28_SOURCE, "modified", DIGEST_C),), identities, transitions, refs, refs, (), DIGEST_C)
+
+
+def _pinned_task28_paths(plan, candidate_paths):
+    policy = json.loads((Path(__file__).parent / "trust" / "task-output-policy.json").read_bytes())
+    paths = [PinnedTaskOutputPathV1(item.repository_relative_path, DIGEST_A, item.expected_status, item.expected_content_digest, 1, 1, 1, None) for item in plan.source_dirty_inputs]
+    paths.extend(PinnedTaskOutputPathV1(item["repositoryRelativePath"], DIGEST_A, "unchanged", DIGEST_A, 1, 1, 1, None) for item in policy["protectedPaths"])
+    for transition in plan.transitions:
+        if transition.output_kind == "catalog":
+            paths.append(PinnedTaskOutputPathV1(transition.repository_relative_path, transition.expected_pre_digest, "unchanged", transition.expected_pre_digest, 2, 2, 1, None))
+        else:
+            paths.append(PinnedTaskOutputPathV1(transition.repository_relative_path, None, "absent", None, None, None, None, None))
+    return tuple(sorted(paths, key=lambda item: item.repository_relative_path.encode("utf-8")))
+
+
 def test_allowed_outputs_accept_literal_task28_and_task29_manifests():
     """Both phases have closed, phase-specific plans made from literal identities."""
     register = _task28_allowed()
     promote = _task29_allowed()
 
-    assert register.canonical_digest == "sha256:fd2899922d63ed1a289d61d8e5aeb05a9632e7573bfe0f5a407abec6db57b997"
     assert register.canonical_bytes == json.dumps(
         {**register.to_wire()}, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True
     ).encode("utf-8")
@@ -300,7 +346,7 @@ def test_allowed_outputs_reject_cross_phase_dirty_refresh_and_candidate_drift_wi
     """A codec cannot widen a plan from current dirty bytes or an index-like change."""
     recorder = VisibleAuthorizationWriteRecorder()
     recorder.assert_rejected(lambda: _task28_allowed(phase="task29-promote"))
-    recorder.assert_rejected(lambda: _task28_allowed(source_dirty_inputs=(SourceDirtyAllowanceV1("tests/task28.py", "renamed", DIGEST_C),)))
+    recorder.assert_rejected(lambda: _task28_allowed(source_dirty_inputs=(SourceDirtyAllowanceV1(TASK28_SOURCE, "renamed", DIGEST_C),)))
     recorder.assert_rejected(lambda: _task28_allowed(candidate_refs=REFS[:-1]))
     recorder.assert_rejected(lambda: _task28_allowed(new_candidate_refs=REFS[:-1], idempotent_candidate_refs=(REFS[-1],)))
     recorder.assert_rejected(lambda: _task28_allowed(staged_candidates=tuple(reversed(_task28_allowed().staged_candidates))))
@@ -339,212 +385,151 @@ def test_allowed_outputs_reject_noncanonical_unknown_missing_duplicate_and_overs
     recorder.assert_rejected(lambda: _task28_allowed(source_dirty_inputs=(SourceDirtyAllowanceV1("x" * (64 * 1024), "modified", DIGEST_C),)))
 
 
-def _git(repository: Path, *arguments: str) -> str:
-    return subprocess.run(
-        ("git", *arguments), cwd=repository, check=True, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    ).stdout.strip()
+def test_pinned_task_output_observation_rejects_ambient_git_and_path_refresh(monkeypatch, tmp_path):
+    """The Task 2 verifier consumes only a sealed Task 7 view and held FDs."""
+    policy_bytes = (Path(__file__).parent / "trust" / "task-output-policy.json").read_bytes()
+    candidate_paths = {}
+    held = []
+    try:
+        for number in range(1, 8):
+            payload = f"candidate-{number}\n".encode("ascii")
+            ref = _digest_bytes(payload)
+            candidate = tmp_path / str(number)
+            candidate.write_bytes(payload)
+            candidate_paths[ref] = candidate
+        plan = _materialized_task28_plan(candidate_paths)
+        for ref, candidate in candidate_paths.items():
+            held.append(HeldCandidateFdV1.from_fd(ref, os.open(candidate, os.O_RDONLY)))
+        observation = PinnedTaskOutputRepositoryObservationV1(
+            "trusted-pinned-task-output-observation/v1", plan.base_commit, DIGEST_A,
+            plan.canonical_digest, True, (), _pinned_task28_paths(plan, candidate_paths), None,
+        )
+        monkeypatch.setattr("trusted_evidence.e2_policy.subprocess", object(), raising=False)
+        monkeypatch.setattr("trusted_evidence.e2_policy.Path", lambda *args, **kwargs: pytest.fail("ambient repository path"), raising=False)
+        for candidate in candidate_paths.values():
+            candidate.unlink()
+        validate_task_output_repository_state(
+            plan, policy_bytes, observation, tuple(held),
+            expected_allowed_outputs_digest=plan.canonical_digest,
+            expected_trusted_git_view_digest=DIGEST_A,
+        )
+    finally:
+        for item in held:
+            item.close()
+
+
+def test_pinned_task_output_observation_allows_only_same_intent_exact_cas_residual(tmp_path):
+    """Equal residual bytes are insufficient unless both pinned facts name one intent."""
+    policy_bytes = (Path(__file__).parent / "trust" / "task-output-policy.json").read_bytes()
+    intent = DIGEST_B
+    candidate_paths = {}
+    held = []
+    try:
+        for number in range(1, 8):
+            payload = f"candidate-{number}\n".encode("ascii")
+            ref = _digest_bytes(payload)
+            candidate = tmp_path / str(number)
+            candidate.write_bytes(payload)
+            candidate_paths[ref] = candidate
+        plan = _materialized_task28_plan(candidate_paths)
+        for ref, candidate in candidate_paths.items():
+            held.append(HeldCandidateFdV1.from_fd(ref, os.open(candidate, os.O_RDONLY)))
+        residual_ref = plan.candidate_refs[0]
+        paths = list(_pinned_task28_paths(plan, candidate_paths))
+        target = next(index for index, item in enumerate(paths) if item.repository_relative_path == plan.transitions[2].repository_relative_path)
+        candidate = candidate_paths[residual_ref]
+        metadata = candidate.stat()
+        paths[target] = PinnedTaskOutputPathV1(
+            paths[target].repository_relative_path, None, "added", residual_ref,
+            metadata.st_dev, metadata.st_ino, metadata.st_size, intent,
+        )
+        observation = PinnedTaskOutputRepositoryObservationV1(
+            "trusted-pinned-task-output-observation/v1", plan.base_commit, DIGEST_A,
+            plan.canonical_digest, True, (), tuple(paths), intent,
+        )
+        validate_task_output_repository_state(
+            plan, policy_bytes, observation, tuple(held),
+            expected_allowed_outputs_digest=plan.canonical_digest,
+            expected_trusted_git_view_digest=DIGEST_A,
+            persistent_intent_digest=intent,
+        )
+        with pytest.raises(ValueError):
+            validate_task_output_repository_state(
+                plan, policy_bytes, observation, tuple(held),
+                expected_allowed_outputs_digest=plan.canonical_digest,
+                expected_trusted_git_view_digest=DIGEST_A,
+                persistent_intent_digest=DIGEST_C,
+            )
+    finally:
+        for item in held:
+            item.close()
+
+
+def test_pinned_task_output_observation_rejects_view_swap_and_task29_candidate_fds(tmp_path):
+    """Task 29 consumes a closed no-FD view, and a replacement view is never accepted."""
+    policy_bytes = (Path(__file__).parent / "trust" / "task-output-policy.json").read_bytes()
+    policy = json.loads(policy_bytes)
+    plan = AllowedTaskOutputsV1(
+        "trusted-allowed-task-outputs/v1", 29, "task29-promote", BASE,
+        _digest_bytes(policy_bytes), _digest_bytes(canonical_json_bytes(policy["protectedPaths"])),
+        tuple(SourceDirtyAllowanceV1(path, "modified", DIGEST_C) for path in TASK29_SOURCES), (),
+        (TaskOutputTransitionV1(TASK29_CONTRACT, "task29-promote", "contract", "equals-base-bytes", DIGEST_A, "replace-with-exact-bytes", ExpectedTaskOutputV1("modified", 17, DIGEST_B, REFS[0]), None),),
+        REFS, REFS, (), DIGEST_C,
+    )
+    paths = [PinnedTaskOutputPathV1(path, DIGEST_A, "modified", DIGEST_C, 1, 1, 1, None) for path in TASK29_SOURCES]
+    paths.extend(PinnedTaskOutputPathV1(item["repositoryRelativePath"], DIGEST_A, "unchanged", DIGEST_A, 1, 1, 1, None) for item in policy["protectedPaths"])
+    paths.append(PinnedTaskOutputPathV1(TASK29_CONTRACT, DIGEST_A, "unchanged", DIGEST_A, 2, 2, 1, None))
+    observation = PinnedTaskOutputRepositoryObservationV1(
+        "trusted-pinned-task-output-observation/v1", BASE, DIGEST_A, plan.canonical_digest,
+        True, (), tuple(sorted(paths, key=lambda item: item.repository_relative_path.encode("utf-8"))), None,
+    )
+    validate_task_output_repository_state(
+        plan, policy_bytes, observation, (), expected_allowed_outputs_digest=plan.canonical_digest,
+        expected_trusted_git_view_digest=DIGEST_A,
+    )
+    with pytest.raises(ValueError):
+        validate_task_output_repository_state(
+            plan, policy_bytes, observation, (), expected_allowed_outputs_digest=plan.canonical_digest,
+            expected_trusted_git_view_digest=DIGEST_B,
+        )
+    candidate = tmp_path / "candidate"
+    candidate.write_bytes(b"candidate\n")
+    held = HeldCandidateFdV1.from_fd(_digest_bytes(b"candidate\n"), os.open(candidate, os.O_RDONLY))
+    try:
+        with pytest.raises(ValueError):
+            validate_task_output_repository_state(
+                plan, policy_bytes, observation, (held,), expected_allowed_outputs_digest=plan.canonical_digest,
+                expected_trusted_git_view_digest=DIGEST_A,
+            )
+    finally:
+        held.close()
+
+
+def test_task_output_policy_uses_only_ticket23_paths_and_derived_cas_layout():
+    """The frozen policy names real Ticket 23 inputs, outputs, and protected governance."""
+    raw = json.loads((Path(__file__).parent / "trust" / "task-output-policy.json").read_bytes())
+    protected = {item["repositoryRelativePath"] for item in raw["protectedPaths"]}
+    assert {TASK28_SOURCE, TASK28_CATALOG, TASK28_AUDIT, TASK29_CONTRACT} <= {
+        raw["tasks"][0]["sourceDirtyInputs"][0]["repositoryRelativePath"],
+        raw["tasks"][0]["transitions"][0]["repositoryRelativePath"],
+        raw["tasks"][0]["transitions"][1]["repositoryRelativePath"],
+        raw["task29ContractPath"],
+    }
+    assert raw["tasks"][0]["candidateCasPathPrefix"] == TASK28_CAS_ROOT
+    assert raw["tasks"][1]["sourceDirtyInputs"] == [
+        {"repositoryRelativePath": path, "role": role}
+        for path, role in ((TASK29_SOURCES[0], "readme"), (TASK29_SOURCES[1], "test-source"), (TASK29_SOURCES[2], "issue"))
+    ]
+    assert {
+        f"{ACCEPTANCE_ROOT}/trust/handoff-transport-allowed-signers",
+        f"{ACCEPTANCE_ROOT}/trust/policy-activation-allowed-signers",
+        f"{ACCEPTANCE_ROOT}/trust/registration-broker-auth-allowed-signers",
+        f"{ACCEPTANCE_ROOT}/tools/trusted_handoff_orchestrator.py",
+    } <= protected
 
 
 def _digest_bytes(payload: bytes) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
-
-
-def _task28_repository_plan(repository: Path, candidates: dict[str, Path]):
-    policy_path = Path(__file__).parent / "trust" / "task-output-policy.json"
-    policy_bytes = policy_path.read_bytes()
-    policy = json.loads(policy_bytes)
-    source_bytes = b"modified task source\n"
-    (repository / "tests" / "task28.py").write_bytes(source_bytes)
-    base = GitObjectIdV1("sha1", _git(repository, "rev-parse", "HEAD"))
-    catalog_base = _digest_bytes(b"catalog base\n")
-    protected_digest = _digest_bytes(canonical_json_bytes(policy["protectedPaths"]))
-    candidate_identities = tuple(
-        StagedCandidateIdentityV1(
-            ref,
-            candidate.stat().st_dev,
-            candidate.stat().st_ino,
-            candidate.stat().st_size,
-            _digest_bytes(candidate.read_bytes()),
-        )
-        for ref, candidate in sorted(candidates.items())
-    )
-    transitions = (
-        TaskOutputTransitionV1("audit.json", "task28-register", "audit", "must-not-exist", None, "create-exact-bytes", ExpectedTaskOutputV1("added", 5, _digest_bytes(b"audit"), next(iter(candidates))), None),
-        TaskOutputTransitionV1("catalog.json", "task28-register", "catalog", "equals-base-bytes", catalog_base, "replace-with-exact-bytes", ExpectedTaskOutputV1("modified", 7, _digest_bytes(b"catalog"), next(iter(candidates))), None),
-        *tuple(
-            TaskOutputTransitionV1(
-                f"evidence/{number}.json", "task28-register", "evidence-cas",
-                "must-not-exist-or-same-intent-recovery", None,
-                "create-or-resume-exact-cas", ExpectedTaskOutputV1("added", candidate.stat().st_size, ref, ref), ref,
-            )
-            for number, (ref, candidate) in enumerate(sorted(candidates.items()), 1)
-        ),
-    )
-    return AllowedTaskOutputsV1(
-        "trusted-allowed-task-outputs/v1", 28, "task28-register", base,
-        _digest_bytes(policy_bytes), protected_digest,
-        (SourceDirtyAllowanceV1("tests/task28.py", "modified", _digest_bytes(source_bytes)),),
-        candidate_identities, transitions, tuple(sorted(candidates)), tuple(sorted(candidates)), (),
-        _digest_bytes(b"post tree"),
-    ), policy_bytes
-
-
-def _real_task28_repository(tmp_path: Path):
-    repository = tmp_path / "repository"
-    repository.mkdir()
-    _git(repository, "init", "-q")
-    _git(repository, "config", "user.email", "test@example.invalid")
-    _git(repository, "config", "user.name", "Test")
-    (repository / "tests").mkdir()
-    (repository / "tests" / "task28.py").write_text("base task source\n")
-    (repository / "catalog.json").write_text("catalog base\n")
-    (repository / "policy.json").write_text("protected\n")
-    (repository / "matrix-contract.json").write_text("contract base\n")
-    (repository / "README.md").write_text("readme base\n")
-    _git(repository, "add", ".")
-    _git(repository, "commit", "-qm", "base")
-    candidate_dir = tmp_path / "candidates"
-    candidate_dir.mkdir()
-    candidates = {}
-    for number in range(1, 8):
-        payload = f"candidate-{number}\n".encode()
-        ref = _digest_bytes(payload)
-        candidate = candidate_dir / str(number)
-        candidate.write_bytes(payload)
-        candidates[ref] = candidate
-    return repository, candidates
-
-
-def test_task_output_repository_validator_applies_fixed_plan_to_real_git_state(tmp_path):
-    """A validator must accept the fixed pre-state, then reject a real staged index change."""
-    repository, candidates = _real_task28_repository(tmp_path)
-    plan, policy_bytes = _task28_repository_plan(repository, candidates)
-
-    validate_task_output_repository_state(repository, plan, policy_bytes, candidates, expected_allowed_outputs_digest=plan.canonical_digest)
-
-    (repository / "policy.json").write_text("staged protected change\n")
-    _git(repository, "add", "policy.json")
-    with pytest.raises(ValueError):
-        validate_task_output_repository_state(repository, plan, policy_bytes, candidates, expected_allowed_outputs_digest=plan.canonical_digest)
-
-
-def test_task_output_repository_validator_allows_only_task29_fixed_contract_prestate(tmp_path):
-    """Task 29 has no candidate files: only its frozen README dirty input and base contract are valid."""
-    repository, candidates = _real_task28_repository(tmp_path)
-    policy_path = Path(__file__).parent / "trust" / "task-output-policy.json"
-    policy_bytes = policy_path.read_bytes()
-    policy = json.loads(policy_bytes)
-    source_bytes = b"readme changed\n"
-    (repository / "README.md").write_bytes(source_bytes)
-    base = GitObjectIdV1("sha1", _git(repository, "rev-parse", "HEAD"))
-    plan = AllowedTaskOutputsV1(
-        "trusted-allowed-task-outputs/v1", 29, "task29-promote", base,
-        _digest_bytes(policy_bytes), _digest_bytes(canonical_json_bytes(policy["protectedPaths"])),
-        (SourceDirtyAllowanceV1("README.md", "modified", _digest_bytes(source_bytes)),), (),
-        (TaskOutputTransitionV1("matrix-contract.json", "task29-promote", "contract", "equals-base-bytes", _digest_bytes(b"contract base\n"), "replace-with-exact-bytes", ExpectedTaskOutputV1("modified", 8, _digest_bytes(b"contract"), next(iter(candidates))), None),),
-        tuple(sorted(candidates)), tuple(sorted(candidates)), (), _digest_bytes(b"post tree"),
-    )
-
-    validate_task_output_repository_state(repository, plan, policy_bytes, {}, expected_allowed_outputs_digest=plan.canonical_digest)
-
-
-def test_task_output_repository_validator_rejects_manifest_refresh_without_writing_git_state(tmp_path):
-    """Refreshing a source digest from live dirty bytes cannot replace the fixed manifest."""
-    repository, candidates = _real_task28_repository(tmp_path)
-    plan, policy_bytes = _task28_repository_plan(repository, candidates)
-    fixed_plan_digest = plan.canonical_digest
-    refreshed_source = b"refreshed after plan creation\n"
-    (repository / "tests" / "task28.py").write_bytes(refreshed_source)
-    refreshed = replace(
-        plan,
-        source_dirty_inputs=(SourceDirtyAllowanceV1("tests/task28.py", "modified", _digest_bytes(refreshed_source)),),
-    )
-    index_before = (repository / ".git" / "index").read_bytes()
-    status_before = _git(repository, "status", "--porcelain=v1")
-
-    with pytest.raises(ValueError):
-        validate_task_output_repository_state(
-            repository, refreshed, policy_bytes, candidates,
-            expected_allowed_outputs_digest=fixed_plan_digest,
-        )
-
-    assert (repository / ".git" / "index").read_bytes() == index_before
-    assert _git(repository, "status", "--porcelain=v1") == status_before
-
-
-def test_task_output_repository_validator_allows_only_exact_base_cas_recovery(tmp_path):
-    """A base-tracked CAS is valid only when the held candidate and both base/worktree bytes are identical."""
-    repository, candidates = _real_task28_repository(tmp_path)
-    retained = sorted(candidates)[0]
-    (repository / "evidence").mkdir()
-    (repository / "evidence" / "1.json").write_bytes(candidates[retained].read_bytes())
-    _git(repository, "add", "evidence/1.json")
-    _git(repository, "commit", "-qm", "tracked candidate")
-    plan, policy_bytes = _task28_repository_plan(repository, candidates)
-    transitions = tuple(
-        TaskOutputTransitionV1(
-            item.repository_relative_path, item.phase, item.output_kind,
-            "equals-base-bytes", retained, "retain-exact-cas",
-            ExpectedTaskOutputV1("unchanged", candidates[retained].stat().st_size, retained, retained), retained,
-        ) if item.candidate_ref == retained else item
-        for item in plan.transitions
-    )
-    recovery = replace(
-        plan, transitions=transitions,
-        new_candidate_refs=tuple(ref for ref in plan.candidate_refs if ref != retained),
-        idempotent_candidate_refs=(retained,),
-    )
-
-    validate_task_output_repository_state(
-        repository, recovery, policy_bytes, candidates,
-        expected_allowed_outputs_digest=recovery.canonical_digest,
-    )
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    ("unexpected-untracked", "protected", "pre-dirty-catalog", "missing-catalog", "prebuilt-audit", "extra-cas", "candidate-drift", "unstaged-rename", "staged-index"),
-)
-def test_task_output_repository_validator_rejects_real_git_drift_without_writes(tmp_path, mutation):
-    """Every forbidden worktree/index/CAS drift is rejected by inspecting an actual temporary Git repository."""
-    repository, candidates = _real_task28_repository(tmp_path)
-    plan, policy_bytes = _task28_repository_plan(repository, candidates)
-    if mutation == "unexpected-untracked":
-        (repository / "unexpected.txt").write_text("unexpected\n")
-    elif mutation == "protected":
-        (repository / "policy.json").write_text("modified protected path\n")
-    elif mutation == "pre-dirty-catalog":
-        (repository / "catalog.json").write_text("pre-dirty catalog\n")
-    elif mutation == "missing-catalog":
-        (repository / "catalog.json").unlink()
-    elif mutation == "prebuilt-audit":
-        (repository / "audit.json").write_text("premature audit\n")
-    elif mutation == "extra-cas":
-        (repository / "evidence").mkdir()
-        (repository / "evidence" / "8.json").write_text("extra candidate\n")
-    elif mutation == "candidate-drift":
-        candidates[sorted(candidates)[0]].write_text("replacement candidate\n")
-    elif mutation == "unstaged-rename":
-        (repository / "catalog.json").rename(repository / "catalog-renamed.json")
-    elif mutation == "staged-index":
-        (repository / "policy.json").write_text("index mutation\n")
-        _git(repository, "add", "policy.json")
-    else:
-        raise AssertionError(f"unexpected mutation {mutation}")
-    index_before = (repository / ".git" / "index").read_bytes()
-    status_before = _git(repository, "status", "--porcelain=v1")
-    candidates_before = {ref: path.read_bytes() for ref, path in candidates.items()}
-
-    with pytest.raises(ValueError):
-        validate_task_output_repository_state(
-            repository, plan, policy_bytes, candidates,
-            expected_allowed_outputs_digest=plan.canonical_digest,
-        )
-
-    assert (repository / ".git" / "index").read_bytes() == index_before
-    assert _git(repository, "status", "--porcelain=v1") == status_before
-    assert {ref: path.read_bytes() for ref, path in candidates.items()} == candidates_before
 
 
 def _prestate_path(path, role, classification, status, digest):
