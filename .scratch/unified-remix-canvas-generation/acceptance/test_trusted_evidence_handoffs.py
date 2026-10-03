@@ -22,6 +22,7 @@ from trusted_evidence.e2_policy import (
     RegistrationRecoveryLeaseIdentityPreimageV1,
     RegistrationBrokerAuthKeyRegistrationV1, RegistrationBrokerAuthRegistryV1,
     RegistrationBrokerAuthPrivateKeySlotV1, RegistrationBrokerAuthRevocationsV1,
+    RegistrationBrokerAuthGovernanceV1,
     RegistrationWorkerSessionFamilyAuthorizationV1,
     verify_registration_broker_startup_challenge,
 )
@@ -272,7 +273,13 @@ def test_tracked_broker_auth_issue_chain_golden_is_present_without_private_mater
     state.verify_state_mac(state_mac_key)
     journal.verify_state_mac(state_mac_key)
     journal.validate_state(state, {payload.canonical_digest: payload})
-    lease.verify_signature(registry, revocations, {"broker-fixed": bytes.fromhex(chain["publicKeyHex"])}, state.current_sequence)
+    # The historical public fixture intentionally predates the canonical
+    # allowed-signers closure.  Its state MAC remains a decoder vector only;
+    # a typed production lease verifier must reject that ungoverned wire.
+    governance_bytes = _strict_broker_inputs(bytes.fromhex(chain["publicKeyHex"]))
+    governance = RegistrationBrokerAuthGovernanceV1.from_canonical_bytes(*governance_bytes)
+    with pytest.raises(ValueError):
+        lease.verify_signature(governance, state.current_sequence)
 
 
 DIGEST = "sha256:" + "a" * 64
@@ -1318,21 +1325,13 @@ def test_broker_startup_challenge_uses_fixed_ed25519_vector_and_rejects_without_
     """Wrong nonce/key/slot/domain/signature must fail before any child or repository action."""
     seed = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
     public = _test_transport_public_key(seed)
-    public_digest = "sha256:" + hashlib.sha256(public).hexdigest()
-    key = RegistrationBrokerAuthKeyRegistrationV1(
-        "trusted-registration-broker-auth-key-registration/v1", "broker-startup-fixed",
-        "registration-broker-auth", "ai-video-reverse-engineer/registration-broker-envelope/v1",
-        "ai-video-reverse-engineer/registration-broker-lease/v1",
-        "ai-video-reverse-engineer/registration-broker-startup-challenge/v1", "raw-ed25519-32",
-        public_digest, public_digest, None, public_digest, public_digest,
-        "sha256:" + "a" * 64, "active", 1, None,
+    registry_bytes, revocations_bytes, allowed_signers_bytes = _strict_broker_inputs(
+        public, key_id="broker-startup-fixed", wrapper="broker-startup-wrapper-fixed",
     )
-    registry = RegistrationBrokerAuthRegistryV1(
-        "trusted-registration-broker-auth-registry/v1", 1, None, key.key_id, (key,)
+    governance = RegistrationBrokerAuthGovernanceV1.from_canonical_bytes(
+        registry_bytes, revocations_bytes, allowed_signers_bytes,
     )
-    revocations = RegistrationBrokerAuthRevocationsV1(
-        "trusted-registration-broker-auth-revocations/v1", registry.canonical_digest, ()
-    )
+    key = governance.registry.key("broker-startup-fixed")
     key_file = tmp_path / "key"; key_file.write_bytes(seed)
     descriptor = os.open(key_file, os.O_RDONLY)
     try:
@@ -1341,14 +1340,14 @@ def test_broker_startup_challenge_uses_fixed_ed25519_vector_and_rejects_without_
         os.close(descriptor)
     try:
         signature = verify_registration_broker_startup_challenge(
-            registry, revocations, {"broker-startup-fixed": public}, slot, "nonce-fixed"
+            governance, slot, "nonce-fixed"
         )
-        assert signature == "e7dbf403d3df0371851fa72eb5fd9e98db3c228c18c66c48f10656898890c033944b5af0d3612564ba26a3b24f1e5ed413cea1715db1e8aa901878b641cb8b07"
+        assert signature == "d56cbe8efa82d802a168d4c879d317f85a18d1353a63bce50db609323a31e993ae271827a6a15001ae563b1ec749e49c1d2d31b244dbf9c75dda84a8b11f8b0a"
         effects = {"childExec": 0, "repositoryWrites": 0, "fsyncs": 0}
         slot.close()
         with pytest.raises(ValueError):
             verify_registration_broker_startup_challenge(
-                registry, revocations, {"broker-startup-fixed": public}, slot, "nonce-fixed"
+                governance, slot, "nonce-fixed"
             )
         assert effects == {"childExec": 0, "repositoryWrites": 0, "fsyncs": 0}
     finally:
