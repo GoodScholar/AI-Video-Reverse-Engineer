@@ -1,8 +1,9 @@
 import io
 import json
+import subprocess
 import threading
 import zipfile
-import subprocess
+from threading import Event
 
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -447,3 +448,25 @@ def test_damaged_compression_is_rejected_without_creating_a_project(tmp_path):
             assert response.status_code == 422, response.text
             assert len(client.get('/api/projects').json()) == 1
             assert not list(tmp_path.glob('.restore-*'))
+
+
+def test_backup_refuses_canvas_scoped_compute_job(tmp_path):
+    from app.durable_runs import LocalComputeJobQueue
+
+    queue = LocalComputeJobQueue()
+    entered, release = Event(), Event()
+    try:
+        with TestClient(create_app(data_dir=tmp_path, local_compute_queue=queue)) as client:
+            project_id = create(client)
+
+            def keep_running(_owner_id):
+                entered.set()
+                release.wait(timeout=2)
+
+            assert queue.submit("creative-canvas", f"{project_id}:canvas-a", keep_running, project_id=project_id)
+            assert entered.wait(timeout=2)
+            response = client.post(f"/api/projects/{project_id}/backup", json={})
+            assert response.status_code == 409
+    finally:
+        release.set()
+        queue.shutdown()

@@ -7,12 +7,14 @@ import inspect
 import math
 import os
 import shutil
+import shutil
 import stat
 import subprocess
 import tempfile
 import zipfile
 from copy import deepcopy
 from contextlib import nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, RLock
 from types import SimpleNamespace
@@ -29,9 +31,11 @@ from .aigc_content_api import load_aigc_content_state
 from .asset_references import (
     aigc_content_asset_references,
     batch_asset_references,
+    derived_asset_references,
     preproduction_asset_references,
     timeline_asset_references,
 )
+from .creative_canvas import creative_canvas_asset_references
 from .batch_editing_api import BatchStore
 from .canvas_layout import CanvasLayoutConflict, CanvasLayoutStore, validate_layout
 from .durable_runs import LOCAL_RUN_POLICY, freeze_run_input
@@ -335,11 +339,13 @@ def create_preproduction_router(
     workspace_transaction = WorkspaceTransaction(store, layout_store)
     project_assets = ProjectAssets(root, reference_facts=(
         lambda project_id, asset_id: preproduction_asset_references(store.load(project_id), asset_id),
+        lambda project_id, asset_id: derived_asset_references(store.load(project_id), asset_id),
         lambda project_id, asset_id: timeline_asset_references(TimelineStore(root).load(project_id), asset_id),
         lambda project_id, asset_id: aigc_content_asset_references(
             load_aigc_content_state(root, project_id), asset_id,
         ),
         lambda project_id, asset_id: batch_asset_references(batch_store.load(project_id), asset_id),
+        lambda project_id, asset_id: creative_canvas_asset_references(root, project_id, asset_id),
     ))
     lock = source_lock or RLock()
     youtube_adapter = youtube_adapter or YtDlpYoutubeAdapter()
@@ -630,7 +636,6 @@ def create_preproduction_router(
                     reconcile_douyin_imports(project_id)
             except (OSError, ValueError):
                 continue
-
         for path in base.glob("*/preproduction/xiaohongshu-import/runs.json"):
             try:
                 if not path.is_symlink():
@@ -1192,7 +1197,6 @@ def create_preproduction_router(
             if temporary is not None: temporary.unlink(missing_ok=True)
             shutil.rmtree(staging, ignore_errors=True)
             bilibili_cancel_events.pop(run_id, None)
-
     def douyin_error(error: DouyinImportError) -> None:
         messages = {
             "requires_login": "该抖音内容需要已授权会话；系统不会自动登录、读取浏览器 Cookie 或绕过访问限制。",
@@ -1375,6 +1379,7 @@ def create_preproduction_router(
             if temporary is not None: temporary.unlink(missing_ok=True)
             shutil.rmtree(staging, ignore_errors=True)
             douyin_cancel_events.pop(run_id, None)
+
     def xiaohongshu_error(error: XiaohongshuImportError) -> None:
         messages = {
             "requires_login": "该小红书内容需要已授权会话；系统不会自动登录、读取浏览器 Cookie 或绕过访问限制。",
@@ -1707,14 +1712,23 @@ def create_preproduction_router(
                 state = state_for(project_id)
                 production = production_for(project_id, state)
                 if resultForShot is not None:
+                    if derivation is not None:
+                        fail("preproduction_derivation_result_unsupported", "派生图片不能作为镜头结果上传。", 422)
                     decide(production.prepare_result_attachment, resultForShot, revision)
+                prepared_derivation = prepare_image_derivation(project_id, state, derivation)
+                if prepared_derivation is not None:
+                    existing = existing_derivation(state, prepared_derivation)
+                    if existing is not None:
+                        return {**response(project_id, state), "uploadedAssetId": existing["id"]}
                 temporary = _receive_upload(root, file, suffix)
                 metadata = _probe_media(temporary, suffix, ffprobe_path, ffmpeg_path)
                 if resultForShot is not None and metadata["kind"] != "video":
                     fail("preproduction_result_invalid", "镜头结果必须上传视频。", 422)
                 if metadata["kind"] == "video" and not rightsConfirmed:
                     fail("local_video_rights_required", "请先确认你拥有该本地视频的使用权，再导入项目。", 422)
-                if metadata["kind"] == "video":
+                if prepared_derivation is not None:
+                    validate_derivation_output(prepared_derivation, metadata)
+                if metadata["kind"] == "video" and prepared_derivation is None:
                     try:
                         installed = project_assets.install_local_video(
                             project_id,
@@ -1742,7 +1756,7 @@ def create_preproduction_router(
                 asset_id = project_assets.new_id()
                 name = asset_id + suffix
                 record = {"id": asset_id, "name": _display_name(file.filename), "kind": metadata["kind"], "role": role,
-                          "file": name, **metadata}
+                          "file": name, **metadata, **({"derivation": prepared_derivation} if prepared_derivation is not None else {})}
                 with project_assets.install(project_id, state, temporary, record, move=True):
                     if resultForShot is not None:
                         decide(production.attach_result, resultForShot, asset_id)
@@ -1755,6 +1769,99 @@ def create_preproduction_router(
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
             await file.close()
+
+    def prepare_image_derivation(project_id: str, state: dict[str, Any], raw: Optional[str]) -> Optional[dict[str, Any]]:
+        if raw is None:
+            return None
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            fail("preproduction_derivation_invalid", "图片派生记录必须是有效 JSON。", 422)
+        if not isinstance(value, dict) or set(value) != {"sourceAssetId", "operation", "params", "operationId", "index", "count"}:
+            fail("preproduction_derivation_invalid", "图片派生记录字段无效。", 422)
+        source_id, operation, operation_id = value.get("sourceAssetId"), value.get("operation"), value.get("operationId")
+        if not all(isinstance(item, str) and item for item in (source_id, operation, operation_id)):
+            fail("preproduction_derivation_invalid", "图片派生记录标识无效。", 422)
+        try:
+            validate_storage_id(source_id); validate_storage_id(operation_id)
+        except ValueError:
+            fail("preproduction_derivation_invalid", "图片派生记录标识无效。", 422)
+        if operation not in {"crop", "split"}:
+            fail("preproduction_derivation_invalid", "图片派生操作无效。", 422)
+        index, count = value.get("index"), value.get("count")
+        if isinstance(index, bool) or isinstance(count, bool) or not isinstance(index, int) or not isinstance(count, int) or count < 1 or count > 144 or index < 0 or index >= count:
+            fail("preproduction_derivation_invalid", "图片派生序号无效。", 422)
+        try:
+            source = project_assets.find_in(state, source_id)
+            source_path = project_assets.file(project_id, source)
+        except (KeyError, OSError, ValueError):
+            fail("preproduction_derivation_source_missing", "图片派生来源不存在或不可用。", 422)
+        if source.get("kind") != "image":
+            fail("preproduction_derivation_source_invalid", "图片派生来源必须是当前项目的图片素材。", 422)
+        source_meta = _probe_media(source_path, Path(source["file"]).suffix.lower(), ffprobe_path, ffmpeg_path)
+        params = validate_derivation_params(operation, value.get("params"), source_meta, index, count)
+        return {"sourceAssetId": source_id, "operation": operation, "params": params, "operationId": operation_id,
+                "index": index, "count": count, "createdAt": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                "_expectedWidth": params.pop("_expectedWidth"), "_expectedHeight": params.pop("_expectedHeight")}
+
+    def existing_derivation(state: dict[str, Any], derivation: dict[str, Any]) -> Optional[dict[str, Any]]:
+        operation_keys = {"sourceAssetId", "operation", "params", "operationId", "count"}
+        current_operation = {key: derivation[key] for key in operation_keys}
+        for asset in state["assets"]:
+            previous = asset.get("derivation") if isinstance(asset, dict) else None
+            if not isinstance(previous, dict) or previous.get("operationId") != derivation["operationId"]:
+                continue
+            if {key: previous.get(key) for key in operation_keys} != current_operation:
+                fail("preproduction_derivation_operation_conflict", "该图片派生操作标识已用于不同内容。", 409)
+            if previous.get("index") == derivation["index"]:
+                return asset
+        return None
+
+    def validate_derivation_output(derivation: dict[str, Any], metadata: dict[str, Any]) -> None:
+        if metadata.get("kind") != "image" or metadata.get("width") != derivation.pop("_expectedWidth") or metadata.get("height") != derivation.pop("_expectedHeight"):
+            fail("preproduction_derivation_dimensions_invalid", "派生图片尺寸与来源操作不一致。", 422)
+
+    def validate_derivation_params(operation: str, raw: Any, source_meta: dict[str, Any], index: int, count: int) -> dict[str, Any]:
+        if not isinstance(raw, dict) or not isinstance(source_meta.get("width"), int) or not isinstance(source_meta.get("height"), int):
+            fail("preproduction_derivation_invalid", "图片派生参数无效。", 422)
+        source_width, source_height = source_meta["width"], source_meta["height"]
+        if operation == "crop":
+            if set(raw) != {"x", "y", "width", "height"} or count != 1 or index != 0:
+                fail("preproduction_derivation_invalid", "裁切参数无效。", 422)
+            values = {key: raw.get(key) for key in ("x", "y", "width", "height")}
+            if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in values.values()):
+                fail("preproduction_derivation_invalid", "裁切参数无效。", 422)
+            x, y, width, height = (float(values[key]) for key in ("x", "y", "width", "height"))
+            if x < 0 or y < 0 or width <= 0 or height <= 0 or x + width > 1 or y + height > 1:
+                fail("preproduction_derivation_invalid", "裁切区域超出来源图片。", 422)
+            return {"x": x, "y": y, "width": width, "height": height,
+                    "_expectedWidth": max(1, math.ceil(width * source_width)), "_expectedHeight": max(1, math.ceil(height * source_height))}
+        if set(raw) != {"rows", "columns", "horizontalLines", "verticalLines"}:
+            fail("preproduction_derivation_invalid", "切分参数无效。", 422)
+        rows, columns = raw.get("rows"), raw.get("columns")
+        if isinstance(rows, bool) or isinstance(columns, bool) or not isinstance(rows, int) or not isinstance(columns, int) or not 1 <= rows <= 12 or not 1 <= columns <= 12 or count != rows * columns:
+            fail("preproduction_derivation_invalid", "切分网格无效。", 422)
+        horizontal = validate_split_lines(raw.get("horizontalLines"), rows)
+        vertical = validate_split_lines(raw.get("verticalLines"), columns)
+        x_cuts = split_cuts(vertical, source_width); y_cuts = split_cuts(horizontal, source_height)
+        row, column = divmod(index, columns)
+        return {"rows": rows, "columns": columns, "horizontalLines": horizontal, "verticalLines": vertical,
+                "_expectedWidth": x_cuts[column + 1] - x_cuts[column], "_expectedHeight": y_cuts[row + 1] - y_cuts[row]}
+
+    def validate_split_lines(value: Any, count: int) -> list[float]:
+        if not isinstance(value, list) or len(value) != count - 1:
+            fail("preproduction_derivation_invalid", "切分线数量无效。", 422)
+        if any(isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item) for item in value):
+            fail("preproduction_derivation_invalid", "切分线无效。", 422)
+        lines = [float(item) for item in value]
+        if any(item <= 0 or item >= 1 for item in lines) or lines != sorted(lines) or len(set(lines)) != len(lines):
+            fail("preproduction_derivation_invalid", "切分线必须严格递增且位于图片内。", 422)
+        return lines
+
+    def split_cuts(lines: list[float], size: int) -> list[int]:
+        # Match browser Canvas's Math.round for positive pixel coordinates;
+        # Python round uses banker's rounding and disagrees at .5 boundaries.
+        return [0, *[math.floor(line * size + 0.5) for line in lines], size]
 
     @router.get("/shots/{shot_id}/results/{asset_id}/cleanup-preview")
     def preview_candidate_removal(project_id: str, shot_id: str, asset_id: str):
@@ -2023,7 +2130,6 @@ def create_preproduction_router(
             return FileResponse(package_path, media_type="application/zip", filename="preproduction.zip", background=BackgroundTask(package_path.unlink, missing_ok=True))
 
     return router
-
 
 def _find_node(state: dict[str, Any], shot_id: str, node_id: str, fail: Callable[..., None]) -> tuple[dict[str, Any], dict[str, Any]]:
     shot = next((item for item in state["shots"] if item["id"] == shot_id), None)

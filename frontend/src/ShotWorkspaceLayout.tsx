@@ -10,6 +10,7 @@ type Props = {
   store: PreproductionWorkspaceStore;
   projectId?: string;
   children: ReactNode;
+  toolbarActions?: ReactNode;
   onCreateShot?: (position?: { x: number; y: number }) => void;
 };
 
@@ -19,7 +20,7 @@ const viewOptions: Array<{ mode: WorkspaceViewMode; label: string; icon: typeof 
   { mode: "list", label: "列表视图", icon: List },
 ];
 
-export function ShotWorkspaceLayout({ store, projectId, children, onCreateShot }: Props) {
+export function ShotWorkspaceLayout({ store, projectId, children, onCreateShot, toolbarActions }: Props) {
   const inspectorToggleRef = useRef<HTMLButtonElement>(null);
   const inspectorTriggerRef = useRef<HTMLElement | null>(null);
   const mode = useStore(store, (state) => state.view.mode);
@@ -73,6 +74,7 @@ export function ShotWorkspaceLayout({ store, projectId, children, onCreateShot }
         <button type="button" aria-label="撤销镜头组织" disabled={!organizationHistory} onClick={() => store.getState().actions.undoOrganization()}><Undo2 size={16} aria-hidden="true" /></button>
         <button type="button" aria-label="重做镜头组织" disabled={!organizationFuture} onClick={() => store.getState().actions.redoOrganization()}><Redo2 size={16} aria-hidden="true" /></button>
       </div>
+      {toolbarActions}
     </header>
     <div className="shot-workspace__body">
       {mode !== "canvas" && <SceneShotList store={store} onCreateShot={() => onCreateShot?.()} />}

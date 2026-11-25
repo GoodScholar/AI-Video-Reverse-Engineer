@@ -161,6 +161,23 @@ def preproduction_asset_references(state: dict[str, Any], asset_id: str) -> list
     return references
 
 
+def derived_asset_references(state: dict[str, Any], asset_id: str) -> list[dict[str, str]]:
+    """Keep a source image while any installed geometry result depends on it."""
+    references = []
+    for asset in state.get("assets", []):
+        derivation = asset.get("derivation") if isinstance(asset, dict) else None
+        if not isinstance(derivation, dict) or derivation.get("sourceAssetId") != asset_id:
+            continue
+        operation = derivation.get("operation")
+        label = "裁切" if operation == "crop" else "切分" if operation == "split" else "图片处理"
+        references.append({
+            "kind": "derived_image",
+            "label": f"派生图片「{asset.get('name') or asset.get('id')}」· {label}来源",
+            "assetId": str(asset.get("id") or ""),
+        })
+    return references
+
+
 def timeline_asset_references(timeline: dict[str, Any], asset_id: str) -> list[dict[str, str]]:
     references = []
 

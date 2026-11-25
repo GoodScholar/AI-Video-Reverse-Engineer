@@ -7,13 +7,14 @@ import { PreproductionWorkspace } from "./PreproductionWorkspace";
 import { SourceSegmentIndexPanel } from "./SourceSegmentIndexPanel";
 import { TranscriptionPanel } from "./TranscriptionPanel";
 import { StudioSteps } from "./StudioPrototypePrimitives";
+import { CreativeCanvas } from "./CreativeCanvas";
 import { getContentWorkflow, type ContentWorkflowProjection } from "./contentWorkflowApi";
 import type { AspectResolution } from "./videoAspect";
 
-export type StudioProjectPage = "create" | "assets" | "review" | "edit" | "reference" | "tools";
-export function ContentProductionWorkspace({ project, page, tools, onNavigate, onDirtyChange, active = true }: {
+export type StudioProjectPage = "create" | "assets" | "shots" | "canvas" | "review" | "edit" | "reference" | "tools";
+export function ContentProductionWorkspace({ project, page, tools, onNavigate, onOpenSettings, onDirtyChange, active = true }: {
   project: Project; page: StudioProjectPage; tools: ReactNode;
-  onNavigate: (page: StudioProjectPage) => void; onDirtyChange: (dirty: boolean) => void; active?:boolean;
+  onNavigate: (page: StudioProjectPage) => void; onOpenSettings?: () => void; onDirtyChange: (dirty: boolean) => void; active?:boolean;
 }) {
   const [projection, setProjection] = useState<ContentWorkflowProjection>();
   const [projectionError, setProjectionError] = useState("");
@@ -26,10 +27,11 @@ export function ContentProductionWorkspace({ project, page, tools, onNavigate, o
   const [aigcDirty, setAigcDirty] = useState(false);
   const [batchDirty, setBatchDirty] = useState(false);
   const [preproductionDirty, setPreproductionDirty] = useState(false);
+  const [canvasDirty, setCanvasDirty] = useState(false);
   const [previewAssetId, setPreviewAssetId] = useState<string | null>(null);
   const [previewAspect, setPreviewAspect] = useState<AspectResolution>({ resolvedAspect: "9:16", width: 720, height: 1280, reason: "商品制作默认比例。" });
   const onPreproductionDirty = useCallback((_id:string,dirty:boolean)=>setPreproductionDirty(dirty),[]);
-  useEffect(()=>onDirtyChange(aigcDirty||batchDirty||preproductionDirty),[aigcDirty,batchDirty,preproductionDirty,onDirtyChange]);
+  useEffect(()=>onDirtyChange(aigcDirty||batchDirty||preproductionDirty||canvasDirty),[aigcDirty,batchDirty,preproductionDirty,canvasDirty,onDirtyChange]);
   const refreshWorkflow = useCallback(async (initialize = false) => {
     const requestId = ++workflowRequestRef.current;
     try {
@@ -47,20 +49,22 @@ export function ContentProductionWorkspace({ project, page, tools, onNavigate, o
     void refreshWorkflow(true);
     return () => { workflowRequestRef.current += 1; };
   }, [project.id, refreshWorkflow]);
+  const mediaAssets = assets?.flatMap(asset => asset.kind === "text" ? [] : [{ ...asset, kind: asset.kind }]);
   const selectedAsset = assets?.find(asset => asset.id === previewAssetId) ?? assets?.find(asset => asset.kind === "image" || asset.kind === "video");
   const batchVisible = page === "review" || page === "edit" || (page === "create" && viewStep >= 2);
-  const oldVisible = page === "assets" || page === "reference" || page === "tools";
+  const oldVisible = page === "shots" || page === "assets" || page === "reference" || page === "tools";
   const mode = page === "edit" ? "edit" : page === "review" || viewStep === 3 ? "review" : "voice";
   const reviewReady = projection ? ["preview_ready","review_pending","approved","rejected","delivered"].includes(projection.stage) : false;
   return <>
-    <div className="sp-work-heading"><div><h2>{project.name}</h2><p>资料、脚本、声音与成片，都留在同一个项目。</p></div><span className="sp-tag">本地项目</span></div>
+    <div hidden={page !== "canvas"}><CreativeCanvas projectId={project.id} projectName={project.name} active={active && page === "canvas"} onBack={()=>onNavigate("create")} onOpenAssets={()=>onNavigate("assets")} onOpenSettings={onOpenSettings} onDirtyChange={setCanvasDirty}/></div>
+    {page !== "shots" && page !== "canvas" && <div className="sp-work-heading"><div><h2>{project.name}</h2><p>资料、脚本、声音与成片，都留在同一个项目。</p></div><span className="sp-tag">本地项目</span></div>}
     {page === "create" && projection && <StudioSteps steps={["准备资料","确认脚本","选声制作","审核导出"]} current={viewStep}
       completed={projection.completedSteps} onStepClick={setViewStep} />}
     {page === "create" && !projection && !projectionError && <p role="status">正在读取制作进度…</p>}
     {page === "create" && projectionError && <p role="alert" className="preproduction-error">{projectionError}</p>}
     <div className={page === "create" && viewStep < 2 ? "sp-workspace" : ""}>
       <div hidden={page !== "create" || viewStep > 1} className="sp-work-panel">
-        <AigcCreator projectId={project.id} guidedStep={viewStep === 1 ? 1 : 0} mediaAssets={assets}
+        <AigcCreator projectId={project.id} guidedStep={viewStep === 1 ? 1 : 0} mediaAssets={mediaAssets}
           onWorkspaceImported={onWorkspaceImported} onDraftChange={setAigcDirty} onStepChange={setViewStep} onPreviewAsset={setPreviewAssetId} onAspectChange={setPreviewAspect}
           onPersistedChange={onPersistedChange}
           onOpenAssets={()=>onNavigate("assets")} onBatchCreated={id=>{setTaskId(id);setViewStep(2);}} />
@@ -72,11 +76,11 @@ export function ContentProductionWorkspace({ project, page, tools, onNavigate, o
         <div className="sp-preview-caption"><h3>{selectedAsset?.name ?? "画面尚未准备"}</h3><p>输出画布 {previewAspect.resolvedAspect} · {previewAspect.width}×{previewAspect.height}。素材会完整适配画布；生成后请在成片与审片中核对真实结果。</p></div>
       </aside>}
     </div>
-    <div hidden={!batchVisible}><BatchEditor projectId={project.id} presentation={mode} focusTaskId={projection?.activeBatchId ?? taskId} projectAssets={assets} visible={active&&batchVisible}
+    <div hidden={!batchVisible}><BatchEditor projectId={project.id} presentation={mode} focusTaskId={projection?.activeBatchId ?? taskId} projectAssets={mediaAssets} visible={active&&batchVisible}
       onDraftChange={setBatchDirty} onPersistedChange={onPersistedChange} onOpenEdit={()=>onNavigate("edit")} />
       {page === "create" && viewStep === 2 && <div className="studio-stage-actions"><p>配音与预览就绪后，逐条审核真实成片。</p><button type="button" className="primary-action" disabled={!reviewReady} onClick={()=>{setViewStep(3);onNavigate("review");}}>进入审核导出</button></div>}
     </div>
-    <div hidden={!oldVisible} className={`studio-existing studio-existing-${page}`}><PreproductionWorkspace project={project} tools={tools} studioMode
+    <div hidden={!oldVisible} className={`studio-existing studio-existing-${page}`}><PreproductionWorkspace project={project} tools={tools} studioMode focusedShots={page === "shots"}
       sectionOverride={page === "assets" ? "assets" : page === "tools" ? "tools" : "shots"}
       importedWorkspace={importedWorkspace} onDraftChange={onPreproductionDirty} onAssetsChanged={setAssets} />
       {page === "assets" && <SourceSegmentIndexPanel projectId={project.id} assets={assets} />}</div>

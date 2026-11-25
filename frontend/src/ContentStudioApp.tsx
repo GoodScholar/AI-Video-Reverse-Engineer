@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import { ArrowRight, Clapperboard, FolderOpen, Image, Layers3, Menu, Plus, Settings2, SlidersHorizontal, WandSparkles, X } from "lucide-react";
+import { ArrowRight, Clapperboard, FolderOpen, Image, Layers3, Menu, Network, Plus, Settings2, SlidersHorizontal, WandSparkles, X } from "lucide-react";
 import type { AnalysisProviderConfiguration, Project } from "./models";
 import type { BatchAsset } from "./batchEditingApi";
 import { getBatchWorkspace } from "./batchEditingApi";
 import { listAnalysisProviders } from "./analysisProviderApi";
 import { AnalysisProviderSettings } from "./AnalysisProviderSettings";
+import { TextGenerationSettings } from "./TextGenerationSettings";
 import { BilibiliSessionSettings } from "./BilibiliSessionSettings";
 import { DouyinSessionSettings } from "./DouyinSessionSettings";
-import { ImageGenerationSettings } from "./ImageGenerationSettings";
 import { KuaishouSessionSettings } from "./KuaishouSessionSettings";
+import { ImageGenerationSettings } from "./ImageGenerationSettings";
 import { ContentProductionWorkspace, type StudioProjectPage } from "./ContentProductionWorkspace";
 import { ProjectBackup } from "./ProjectBackup";
 import { ReferenceMediaPanel } from "./ReferenceMediaPanel";
@@ -22,14 +23,16 @@ import { CharacterMotionPanel } from "./CharacterMotionPanel";
 import { VideoUpscalePanel } from "./VideoUpscalePanel";
 import { VideoToolkitPanel } from "./VideoToolkitPanel";
 import "./contentStudio.css";
+import "./shotArrangement.css";
 
 type Page = StudioProjectPage | "projects" | "settings";
 const projectPages: Array<{id:StudioProjectPage;label:string;icon:typeof Image}> = [
   {id:"create",label:"商品视频制作",icon:WandSparkles},{id:"assets",label:"项目素材",icon:Image},
+  {id:"shots",label:"镜头编排",icon:Network},{id:"canvas",label:"AI 无限画布",icon:WandSparkles},
   {id:"review",label:"成片与审片",icon:Clapperboard},{id:"edit",label:"单条精修",icon:SlidersHorizontal},
   {id:"reference",label:"参考视频复刻",icon:Layers3},
 ];
-const labels:Record<Page,string>={projects:"项目中心",create:"商品视频制作",assets:"项目素材",review:"成片与审片",edit:"单条精修",reference:"参考视频复刻",tools:"本地工具",settings:"应用设置"};
+const labels:Record<Page,string>={projects:"项目中心",create:"商品视频制作",assets:"项目素材",shots:"镜头编排",canvas:"AI 无限画布",review:"成片与审片",edit:"单条精修",reference:"参考视频复刻",tools:"本地工具",settings:"应用设置"};
 async function projectsRequest<T>(init?:RequestInit):Promise<T>{
   const response=await fetch("/api/projects",init);
   if(!response.ok){const body=await response.json().catch(()=>null) as {detail?:string}|null;throw new Error(body?.detail??"无法读取本地项目。");}
@@ -88,7 +91,7 @@ export function ContentStudioApp(){
     <VideoUpscalePanel project={project}/><VideoToolkitPanel project={project}/>
   </div>;
   const media=(asset:BatchAsset)=>asset.kind==="image"?<img src={asset.url} alt={asset.name}/>:<video src={asset.url} preload="metadata" muted playsInline aria-label={`${asset.name} 素材缩略图`}/>;
-  return <div className="cs-root"><aside className={`sp-sidebar ${menuOpen?"is-open":""}`}>
+  return <div className={`cs-root${page === "shots" ? " cs-root--shots" : ""}${page === "canvas" ? " cs-root--canvas" : ""}`}><aside className={`sp-sidebar ${menuOpen?"is-open":""}`}>
     <button type="button" className="sp-brand" onClick={()=>navigate("projects")}><span><Clapperboard size={21}/></span><div><strong>内容工作室</strong><small>AI Video Studio</small></div></button>
     <button type="button" className="sp-mobile-close sp-icon-button" aria-label="关闭导航" onClick={()=>{setMenuOpen(false);navButton.current?.focus();}}><X size={20}/></button>
     <nav className="sp-global-nav" aria-label="应用导航">{([["projects",FolderOpen],["tools",Clapperboard],["settings",Settings2]] as const).map(([id,Icon])=><button key={id} type="button" aria-current={page===id?"page":undefined} onClick={()=>navigate(id)}><Icon size={18}/>{labels[id]}</button>)}</nav>

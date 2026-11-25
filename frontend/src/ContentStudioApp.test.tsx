@@ -25,6 +25,29 @@ beforeEach(() => {
 });
 afterEach(()=>vi.unstubAllGlobals());
 
+it("镜头编排作为独立项目入口，切页保留镜头草稿并与精修分开", async () => {
+  vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
+  render(<App />);
+  const navigation = within(screen.getByRole("navigation", { name: "项目导航" }));
+  expect(navigation.getByRole("button", { name: "镜头编排" })).toBeDisabled();
+  await userEvent.click(await screen.findByRole("button", { name: /打开项目 商品测试项目/ }));
+  await userEvent.click(navigation.getByRole("button", { name: "镜头编排" }));
+  expect(await screen.findByRole("button", { name: "画布视图" })).toHaveAttribute("aria-pressed", "true");
+  expect(screen.queryByRole("heading", { name: "前置工作台" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("navigation", { name: "工作台导航" })).not.toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "在画布新建镜头" }));
+  await userEvent.clear(screen.getByLabelText("镜头名称"));
+  await userEvent.type(screen.getByLabelText("镜头名称"), "保留的镜头草稿");
+  await userEvent.click(navigation.getByRole("button", { name: "参考视频复刻" }));
+  await userEvent.click(within(screen.getByRole("navigation", { name: "工作台导航" })).getByRole("button", { name: "需求" }));
+  await userEvent.click(navigation.getByRole("button", { name: "镜头编排" }));
+  expect(screen.getByLabelText("镜头名称")).toHaveValue("保留的镜头草稿");
+  await userEvent.click(navigation.getByRole("button", { name: "单条精修" }));
+  expect(screen.queryByRole("button", { name: "画布视图" })).not.toBeInTheDocument();
+  await userEvent.click(navigation.getByRole("button", { name: "镜头编排" }));
+  expect(screen.getByLabelText("镜头名称")).toHaveValue("保留的镜头草稿");
+});
+
 it("将历史入口明确标为旧版复刻工作台", async () => {
   render(<App />);
   expect(await screen.findByRole("link", { name: "旧版复刻工作台（兼容）" })).toHaveAttribute("href", "?workspace=legacy");
