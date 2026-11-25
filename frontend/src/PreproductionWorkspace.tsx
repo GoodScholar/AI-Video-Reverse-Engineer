@@ -58,7 +58,7 @@ import { XiaohongshuImportPanel } from "./XiaohongshuImportPanel";
 import { KuaishouImportPanel } from "./KuaishouImportPanel";
 
 type Props = { project: Project; tools: ReactNode; onDraftChange?: (projectId: string, dirty: boolean) => void;
-  importedWorkspace?: {projectId:string;workspace:Workspace}; sectionOverride?: Section; studioMode?: boolean; onAssetsChanged?: (assets: Workspace["assets"]) => void };
+  importedWorkspace?: {projectId:string;workspace:Workspace}; sectionOverride?: Section; studioMode?: boolean; focusedShots?: boolean; onAssetsChanged?: (assets: Workspace["assets"]) => void };
 type Section = "brief" | "assets" | "shots" | "tools" | "timeline" | "batch" | "delivery";
 
 const roleLabels: Record<AssetRole, string> = { character: "角色", scene: "场景", motion: "动作", audio: "音频", reference: "参考" };
@@ -84,12 +84,12 @@ function TextAssetPreview({ url, name }: { url: string; name: string }) {
   return error ? <p role="alert">{error}</p> : <pre aria-label={`${name} 预览`} style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", maxHeight: 240, overflow: "auto" }}>{text ?? "正在读取文本…"}</pre>;
 }
 
-function isVideoFile(file: File) {
-  return file.type.startsWith("video/") || /\.(mp4|mov|webm)$/i.test(file.name);
-}
-
 function errorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
+}
+
+function isVideoFile(file: File) {
+  return file.type.startsWith("video/") || /\.(mp4|mov|webm)$/i.test(file.name);
 }
 
 function createShot(sceneId: string, rank: string): PreproductionShot {
@@ -165,13 +165,13 @@ function NodeParameters({ node, onChange }: { node: PreproductionNode; onChange:
   return null;
 }
 
-export function PreproductionWorkspace({ project, tools, onDraftChange, sectionOverride, studioMode = false, onAssetsChanged, importedWorkspace }: Props) {
+export function PreproductionWorkspace({ project, tools, onDraftChange, sectionOverride, studioMode = false, focusedShots = false, onAssetsChanged, importedWorkspace }: Props) {
   const draftCache = useMemo(() => createDraftCache(draftKey(project.id)), [project.id]);
   const workspaceStore = useMemo(() => createPreproductionWorkspaceStore(emptyWorkspace(project.id)), [project.id]);
   const resultInputRef = useRef<HTMLInputElement>(null);
   const [toolTarget, setToolTarget] = useState<string | null>(null);
   const [section, setSection] = useState<Section>(sectionOverride ?? "shots");
-  useEffect(() => { if (sectionOverride) setSection(sectionOverride); }, [sectionOverride]);
+  useEffect(() => { if (sectionOverride) setSection(sectionOverride); }, [sectionOverride, focusedShots]);
   const workspace = useStore(workspaceStore, selectWorkspaceSnapshot);
   const [savedWorkspace, setSavedWorkspace] = useState<Workspace | null>(null);
   useEffect(() => { if(savedWorkspace) onAssetsChanged?.(savedWorkspace.assets); }, [savedWorkspace,onAssetsChanged]);
@@ -203,6 +203,13 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
   const [douyinDisclosureAccepted, setDouyinDisclosureAccepted] = useState(false);
   const [douyinUseSession, setDouyinUseSession] = useState(false);
   const [loading, setLoading] = useState(true);
+  const canvasEntryProject = useRef<string | null>(null);
+  useEffect(() => {
+    if (loading || !focusedShots || canvasEntryProject.current === project.id) return;
+    canvasEntryProject.current = project.id;
+    workspaceStore.getState().actions.setViewMode("canvas");
+    workspaceStore.getState().actions.setInspectorOpen(false);
+  }, [loading, focusedShots, project.id, workspaceStore]);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState("");
   const uploadInputRef = useRef<HTMLInputElement>(null);
@@ -366,6 +373,8 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
     const shot = createShot(sceneId, String(nextRank).padStart(8, "0"));
     if (!workspaceStore.getState().actions.createShot(shot, position)) {
       setError("无法新建镜头，请刷新工作台后重试。");
+    } else {
+      workspaceStore.getState().actions.setInspectorOpen(true);
     }
   }
 
@@ -598,24 +607,25 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
   if (loading) return <section className="preproduction-workspace preproduction-workspace--loading" aria-label="前置工作台"><LoaderCircle className="loading-spinner" aria-hidden="true" size={18} />正在读取前置工作台…</section>;
   if (!workspace.revision && error) return <section className="preproduction-workspace" aria-label="前置工作台"><p role="alert">{error}</p><button type="button" className="secondary-action" onClick={() => window.location.reload()}>重新读取</button></section>;
 
-  return <section className="preproduction-workspace" aria-label="视频创作前置工作台">
-    <header className="preproduction-header">
+  const saveActions = <div className="preproduction-header-actions">
+    {dirty && <span className="preproduction-dirty" role="status">有未保存更改</span>}
+    <button type="button" className="secondary-action" disabled={!dirty || Boolean(busy) || layoutSaving || hasActiveNodes} onClick={() => void save()}><Save size={16} aria-hidden="true" />{busy === "save" ? "正在保存…" : "保存更改"}</button>
+  </div>;
+  return <section className="preproduction-workspace" aria-label={focusedShots ? "镜头编排工作区" : "视频创作前置工作台"}>
+    {!focusedShots && <header className="preproduction-header">
       <div><p className="preproduction-kicker">VIDEO PREPRODUCTION</p><h2>前置工作台</h2><p>组织需求、素材与可复用的镜头步骤。</p></div>
-      <div className="preproduction-header-actions">
-        {dirty && <span className="preproduction-dirty" role="status">有未保存更改</span>}
-        <button type="button" className="secondary-action" disabled={!dirty || Boolean(busy) || layoutSaving || hasActiveNodes} onClick={() => void save()}><Save size={16} aria-hidden="true" />{busy === "save" ? "正在保存…" : "保存更改"}</button>
-      </div>
-    </header>
+      {saveActions}
+    </header>}
     {draftNotice && <p className="preproduction-draft-notice" role="status">{draftNotice}</p>}
     {error && <div className="preproduction-error" role="alert"><CircleAlert size={17} aria-hidden="true" /><span>{error}</span><button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void reloadSavedWorkspace()}>{dirty ? "放弃修改并重新读取" : "重新读取已保存版本"}</button></div>}
 
-    {(!studioMode || sectionOverride === "shots") && <ReproductionFlow project={project} workspace={savedWorkspace ?? workspace} disabled={Boolean(busy) || hasActiveNodes} dirty={dirty} timelineDirty={timelineDirty} draftInputKind={workspace.brief.inputKind} onImportShots={() => { setSection("shots"); void importAction("shots"); }}
+    {(!focusedShots && (!studioMode || sectionOverride === "shots")) && <ReproductionFlow project={project} workspace={savedWorkspace ?? workspace} disabled={Boolean(busy) || hasActiveNodes} dirty={dirty} timelineDirty={timelineDirty} draftInputKind={workspace.brief.inputKind} onImportShots={() => { setSection("shots"); void importAction("shots"); }}
       onKindChange={(inputKind) => edit((current) => ({ ...current, brief: { ...current.brief, inputKind } }))}
       onNavigate={(next, target) => { setSection(next); setToolTarget(target ?? null); }}
       onLocateCheck={(check) => { if (check.shotId) { if (check.nodeId) workspaceStore.getState().actions.selectNode(check.shotId, check.nodeId); else workspaceStore.getState().actions.selectShot(check.shotId); } setSection(check.shotId ? "shots" : check.code === "brief_incomplete" ? "brief" : "shots"); }}
       onFocusClip={(trackId, clipId) => { setTimelineFocus({ trackId, clipId }); setSection("timeline"); }} />}
     <div className="preproduction-layout">
-      {(!studioMode || sectionOverride === "shots") && <nav className="preproduction-nav" aria-label="工作台导航">
+      {(!focusedShots && (!studioMode || sectionOverride === "shots")) && <nav className="preproduction-nav" aria-label="工作台导航">
         {([ ["brief", "需求"], ["assets", "素材"], ["shots", "镜头"], ["tools", "工具"], ["timeline", "剪辑"], ["batch", "批量混剪"], ["delivery", "交付"] ] as const).map(([id, label]) => <button type="button" key={id} aria-current={section === id ? "page" : undefined} className={section === id ? "is-active" : ""} onClick={() => setSection(id)}>{label}</button>)}
       </nav>}
 
@@ -693,7 +703,7 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
           })()}
         </section>}
 
-        {section === "shots" && <ShotWorkspaceLayout projectId={project.id} store={workspaceStore} onCreateShot={addShot}>
+        {section === "shots" && <ShotWorkspaceLayout projectId={project.id} store={workspaceStore} onCreateShot={addShot} toolbarActions={focusedShots ? saveActions : undefined}>
           <section className="preproduction-workspace-inspector" aria-label="镜头检查器">
           {selectedScene ? <section className="preproduction-selection-summary" aria-label={`${selectedScene.title}场景摘要`}>
             <h3>场景摘要</h3>

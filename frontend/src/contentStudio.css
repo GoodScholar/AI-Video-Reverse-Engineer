@@ -139,6 +139,8 @@
 .cs-root .segment-rerank-disclosure>div:last-child button{margin:0}
 .cs-root .segment-cloud-fallback{margin:0 0 14px;font-size:13px}
 .cs-root .segment-rerank-result{margin-top:18px;padding:16px 18px;border:1px solid #b7d9c9;border-radius:8px;background:#f5faf7}
+.cs-root--canvas>.sp-sidebar,.cs-root--canvas>.sp-menu-backdrop,.cs-root--canvas>.sp-shell>.sp-topbar,.cs-root--canvas>.sp-shell>.sp-footer{display:none}
+.cs-root--canvas>.sp-shell{margin-left:0}
 .cs-root .segment-rerank-result--failed{border-color:#f1cebf;background:#fff8f5}
 .cs-root .segment-rerank-result>header>span{background:#fff2e3;color:#8d571e}
 .cs-root .segment-rerank-result>ol{display:grid;gap:8px;margin:14px 0 0;padding:0;list-style:none}

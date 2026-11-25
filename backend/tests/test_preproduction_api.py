@@ -93,6 +93,14 @@ def test_new_shot_keeps_its_custom_scene_on_legacy_workspace_save(tmp_path):
     assert saved.json()["shots"][0]["sceneId"] == "scene-custom"
 
 
+def test_kuaishou_disclosure_requires_the_dedicated_platform_route(tmp_path):
+    """Deleting the Kuaishou API boundary must fail rather than fall back to another platform."""
+    client, _, _ = setup(tmp_path)
+    response = client.get(BASE + "/kuaishou/disclosure")
+    assert response.status_code == 200
+    assert "v.kuaishou.com" in response.json()["shortLinkPolicy"]
+
+
 def test_save_persists_scene_ownership_and_rank_without_touching_layout_or_timeline(tmp_path):
     client, _, _ = setup(tmp_path)
     store = PreproductionStore(tmp_path)
@@ -476,7 +484,7 @@ def test_rejects_invalid_node_dependency_and_does_not_mutate_reference_media(tmp
 
 def test_upload_validates_real_media_and_serves_only_owned_asset(tmp_path):
     client, _, _ = setup(tmp_path)
-    invalid = client.post(BASE + "/assets?role=character", files={"file": ("bad.mp4", b"not-a-video", "video/mp4")})
+    invalid = client.post(BASE + "/assets?role=character", data={"rightsConfirmed": "true"}, files={"file": ("bad.mp4", b"not-a-video", "video/mp4")})
     assert invalid.status_code == 422
     valid = tmp_path / "input.mp4"
     make_video(valid)
@@ -487,11 +495,12 @@ def test_upload_validates_real_media_and_serves_only_owned_asset(tmp_path):
     box_start = marker - 4
     box_size = int.from_bytes(corrupted[box_start:marker], "big")
     corrupted[marker + 4:box_start + box_size] = b"\xff" * (box_size - 8)
-    unreadable = client.post(BASE + "/assets?role=motion", files={"file": ("broken.mp4", bytes(corrupted), "video/mp4")})
+    unreadable = client.post(BASE + "/assets?role=motion", data={"rightsConfirmed": "true"}, files={"file": ("broken.mp4", bytes(corrupted), "video/mp4")})
     assert unreadable.status_code == 422
     uploaded = client.post(BASE + "/assets?role=motion", data={"rightsConfirmed": "true"}, files={"file": ("motion.mp4", valid.read_bytes(), "video/mp4")})
     assert uploaded.status_code == 200, uploaded.text
     asset = uploaded.json()["assets"][0]
+    assert uploaded.json()["uploadedAssetId"] == asset["id"]
     assert asset["url"] == BASE + f"/assets/{asset['id']}/file"
     assert client.get(BASE + f"/assets/{asset['id']}/file").status_code == 200
     assert client.get(BASE + "/assets/../state/file").status_code == 404
@@ -518,6 +527,145 @@ def test_asset_metadata_and_delete_map_workspace_cas_conflicts_to_409(tmp_path, 
     deleted = client.post(BASE + f"/assets/{asset['id']}/delete", json={"revision": revision})
     assert deleted.status_code == 409
     assert deleted.json()["detail"]["code"] == "preproduction_conflict"
+
+
+def test_image_geometry_upload_persists_source_derivation_is_idempotent_and_protects_source(tmp_path):
+    from PIL import Image
+
+    client, _, _ = setup(tmp_path)
+    source_bytes = io.BytesIO()
+    Image.new("RGB", (64, 48), "orange").save(source_bytes, format="PNG")
+    source = client.post(BASE + "/assets?role=reference", files={"file": ("产品主图.png", source_bytes.getvalue(), "image/png")})
+    assert source.status_code == 200, source.text
+    source_id = source.json()["assets"][0]["id"]
+    output_bytes = io.BytesIO()
+    Image.new("RGB", (32, 48), "orange").save(output_bytes, format="PNG")
+    derivation = {
+        "sourceAssetId": source_id,
+        "operation": "crop",
+        "params": {"x": 0, "y": 0, "width": 0.5, "height": 1},
+        "operationId": "geometry-op-001",
+        "index": 0,
+        "count": 1,
+    }
+
+    created = client.post(BASE + "/assets?role=reference", data={"derivation": json.dumps(derivation)}, files={"file": ("产品主图-裁切.png", output_bytes.getvalue(), "image/png")})
+    assert created.status_code == 200, created.text
+    derived = next(asset for asset in created.json()["assets"] if asset.get("derivation", {}).get("operationId") == "geometry-op-001")
+    assert derived["width"] == 32 and derived["height"] == 48
+    assert derived["derivation"] == {**derivation, "createdAt": derived["derivation"]["createdAt"]}
+    assert derived["derivation"]["createdAt"].endswith("Z")
+
+    repeated = client.post(BASE + "/assets?role=reference", data={"derivation": json.dumps(derivation)}, files={"file": ("重复.png", output_bytes.getvalue(), "image/png")})
+    assert repeated.status_code == 200, repeated.text
+    assert [asset["id"] for asset in repeated.json()["assets"] if asset.get("derivation", {}).get("operationId") == "geometry-op-001"] == [derived["id"]]
+
+    source_state = client.get(BASE).json()
+    deleted = client.post(BASE + f"/assets/{source_id}/delete", json={"revision": source_state["revision"]})
+    assert deleted.status_code == 409
+    assert deleted.json()["detail"]["code"] == "asset_in_use"
+
+
+def test_image_geometry_upload_rejects_non_image_or_geometry_that_does_not_match_source_pixels(tmp_path):
+    from PIL import Image
+
+    client, _, _ = setup(tmp_path)
+    source_bytes = io.BytesIO()
+    Image.new("RGB", (64, 48), "orange").save(source_bytes, format="PNG")
+    source = client.post(BASE + "/assets?role=reference", files={"file": ("source.png", source_bytes.getvalue(), "image/png")})
+    source_id = source.json()["assets"][0]["id"]
+    wrong_size = io.BytesIO()
+    Image.new("RGB", (31, 48), "orange").save(wrong_size, format="PNG")
+
+    response = client.post(BASE + "/assets?role=reference", data={"derivation": json.dumps({
+        "sourceAssetId": source_id,
+        "operation": "crop",
+        "params": {"x": 0, "y": 0, "width": 0.5, "height": 1},
+        "operationId": "geometry-op-bad-size",
+        "index": 0,
+        "count": 1,
+    })}, files={"file": ("wrong.png", wrong_size.getvalue(), "image/png")})
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "preproduction_derivation_dimensions_invalid"
+
+
+def test_image_geometry_crop_allows_a_short_side_when_fixed_ratio_requires_it(tmp_path):
+    from PIL import Image
+
+    client, _, _ = setup(tmp_path)
+    source_image = io.BytesIO()
+    Image.new("RGB", (100, 100), "orange").save(source_image, format="PNG")
+    source = client.post(BASE + "/assets?role=reference", files={"file": ("source.png", source_image.getvalue(), "image/png")})
+    source_id = source.json()["assets"][0]["id"]
+    result_image = io.BytesIO()
+    Image.new("RGB", (6, 4), "orange").save(result_image, format="PNG")
+
+    response = client.post(BASE + "/assets?role=reference", data={"derivation": json.dumps({
+        "sourceAssetId": source_id, "operation": "crop",
+        "params": {"x": 0, "y": 0, "width": 0.06, "height": 0.03375},
+        "operationId": "geometry-extreme-ratio", "index": 0, "count": 1,
+    })}, files={"file": ("portrait-crop.png", result_image.getvalue(), "image/png")})
+
+    assert response.status_code == 200, response.text
+
+
+def test_image_geometry_split_uses_browser_rounding_at_half_pixel_boundaries(tmp_path):
+    from PIL import Image
+
+    client, _, _ = setup(tmp_path)
+    source_bytes = io.BytesIO()
+    Image.new("RGB", (65, 49), "orange").save(source_bytes, format="PNG")
+    source = client.post(BASE + "/assets?role=reference", files={"file": ("odd.png", source_bytes.getvalue(), "image/png")})
+    source_id = source.json()["assets"][0]["id"]
+    output = io.BytesIO()
+    # Canvas uses Math.round(65 * .5) and Math.round(49 * .5): the top-left
+    # piece is 33 × 25, not Python's banker's-rounded 32 × 24.
+    Image.new("RGB", (33, 25), "orange").save(output, format="PNG")
+
+    response = client.post(BASE + "/assets?role=reference", data={"derivation": json.dumps({
+        "sourceAssetId": source_id,
+        "operation": "split",
+        "params": {"rows": 2, "columns": 2, "horizontalLines": [0.5], "verticalLines": [0.5]},
+        "operationId": "geometry-op-half-pixel",
+        "index": 0,
+        "count": 4,
+    })}, files={"file": ("odd-r1-c1.png", output.getvalue(), "image/png")})
+
+    assert response.status_code == 200, response.text
+
+
+def test_image_geometry_split_installs_each_operation_piece_once_and_retries_without_duplicates(tmp_path):
+    from PIL import Image
+
+    client, _, _ = setup(tmp_path)
+    source_bytes = io.BytesIO()
+    Image.new("RGB", (64, 48), "orange").save(source_bytes, format="PNG")
+    source = client.post(BASE + "/assets?role=reference", files={"file": ("source.png", source_bytes.getvalue(), "image/png")})
+    source_id = source.json()["assets"][0]["id"]
+    piece_bytes = io.BytesIO()
+    Image.new("RGB", (32, 24), "orange").save(piece_bytes, format="PNG")
+    params = {"rows": 2, "columns": 2, "horizontalLines": [0.5], "verticalLines": [0.5]}
+
+    for index in range(4):
+        response = client.post(BASE + "/assets?role=reference", data={"derivation": json.dumps({
+            "sourceAssetId": source_id, "operation": "split", "params": params,
+            "operationId": "geometry-op-2x2", "index": index, "count": 4,
+        })}, files={"file": (f"piece-{index}.png", piece_bytes.getvalue(), "image/png")})
+        assert response.status_code == 200, response.text
+
+    first_pass = client.get(BASE).json()["assets"]
+    assert len([asset for asset in first_pass if asset.get("derivation", {}).get("operationId") == "geometry-op-2x2"]) == 4
+
+    for index in range(4):
+        response = client.post(BASE + "/assets?role=reference", data={"derivation": json.dumps({
+            "sourceAssetId": source_id, "operation": "split", "params": params,
+            "operationId": "geometry-op-2x2", "index": index, "count": 4,
+        })}, files={"file": (f"retry-{index}.png", piece_bytes.getvalue(), "image/png")})
+        assert response.status_code == 200, response.text
+
+    retried = client.get(BASE).json()["assets"]
+    assert len([asset for asset in retried if asset.get("derivation", {}).get("operationId") == "geometry-op-2x2"]) == 4
 
 
 def test_result_upload_validates_its_target_before_reading_invalid_media(tmp_path):

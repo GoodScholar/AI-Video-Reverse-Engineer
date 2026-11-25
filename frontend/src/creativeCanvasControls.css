@@ -1,0 +1,53 @@
+/* Adapted from Toonflow-app canvasControls.vue at d86cce6 (MIT).
+ * React/XYFlow interaction and project actions are implemented locally. */
+.cs-root .creative-canvas__topbar--toonflow { justify-content:space-between; }
+.cs-root .creative-canvas__identity, .cs-root .creative-canvas__top-actions, .cs-root .creative-canvas__view-controls { display:flex; align-items:center; gap:4px; }
+.cs-root .creative-canvas__topbar--toonflow > .creative-canvas__identity { margin-left:0; padding:0; border:0; background:transparent; box-shadow:none; pointer-events:auto; }
+.cs-root .creative-canvas__top-actions { margin-left:auto; padding:4px; border:1px solid var(--canvas-border); border-radius:10px; background:var(--canvas-panel); box-shadow:0 4px 14px #2925240a; }
+.cs-root .creative-canvas__top-actions button, .cs-root .creative-canvas__view-controls > button, .cs-root .creative-canvas__zoom > button, .cs-root .creative-canvas__help > button { display:grid; place-items:center; width:34px; height:34px; padding:0; border:0; border-radius:6px; background:transparent; color:var(--canvas-text); }
+.cs-root .creative-canvas__top-actions button:hover, .cs-root .creative-canvas__view-controls button:hover { background:var(--canvas-fill); }
+.cs-root .creative-canvas__project-menu, .cs-root .creative-canvas__zoom, .cs-root .creative-canvas__help { position:relative; }
+.cs-root .creative-canvas__project-menu > button { display:flex; align-items:center; gap:6px; min-height:38px; padding:4px 8px; border:0; border-radius:8px; background:var(--canvas-panel); color:var(--canvas-text); font:inherit; font-size:13px; font-weight:600; }
+.cs-root .creative-canvas__project-menu > button span { color:var(--canvas-muted); font-size:11px; font-weight:400; }
+.cs-root .creative-canvas__quick-add { position:absolute; z-index:8; top:68px; left:16px; }
+.cs-root .creative-canvas__quick-add > button { display:flex; align-items:center; gap:6px; min-height:36px; padding:0 10px; border:1px solid var(--canvas-border); border-radius:8px; background:var(--canvas-panel); color:var(--canvas-text); font:inherit; font-size:13px; box-shadow:0 4px 14px #2925240a; }
+.cs-root .creative-canvas__popup { position:absolute; z-index:32; min-width:190px; padding:5px; border:1px solid var(--canvas-border); border-radius:8px; background:var(--canvas-panel); box-shadow:0 10px 28px #29252424; }
+.cs-root .creative-canvas__popup p { margin:6px 8px; color:var(--canvas-muted); font-size:12px; line-height:1.5; }
+.cs-root .creative-canvas__popup button { display:flex; align-items:center; gap:8px; width:100%; min-height:32px; padding:6px 8px; border:0; border-radius:5px; background:transparent; color:var(--canvas-text); font:inherit; font-size:13px; text-align:left; }
+.cs-root .creative-canvas__popup button:hover { background:var(--canvas-fill); }
+.cs-root .creative-canvas__project-menu .creative-canvas__popup { top:calc(100% + 6px); left:0; }
+.cs-root .creative-canvas__quick-add-menu { top:calc(100% + 6px); left:0; }
+.cs-root .creative-canvas__view-controls { position:absolute; z-index:8; bottom:16px; left:16px; padding:4px; border:1px solid var(--canvas-border); border-radius:9px; background:var(--canvas-panel); box-shadow:0 4px 14px #2925240a; }
+.cs-root .creative-canvas__zoom > button { width:auto; min-width:48px; padding:0 8px; font-size:12px; }
+.cs-root .creative-canvas__zoom-menu, .cs-root .creative-canvas__help-menu { bottom:calc(100% + 8px); left:0; }
+.cs-root .creative-canvas__zoom-menu label { display:grid; gap:4px; padding:5px 8px 8px; color:var(--canvas-muted); font-size:11px; }
+.cs-root .creative-canvas__zoom-menu input { width:100%; height:30px; box-sizing:border-box; border:1px solid var(--canvas-border); border-radius:5px; padding:0 7px; }
+.cs-root .creative-canvas__help-menu { width:220px; left:auto; right:0; }
+.cs-root .creative-canvas__upload-input { display:none; }
+.cs-root .creative-canvas__context-menu { z-index:35; }
+.cs-root .creative-canvas__group-node { position:relative; width:100%; height:100%; box-sizing:border-box; border:1px solid var(--canvas-border); border-radius:6px; background:#409eff0d; }
+.cs-root .creative-canvas__group-node[data-selected] { border-color:#409eff; }
+.cs-root .creative-canvas__group-node:hover .react-flow__resize-control, .cs-root .creative-canvas__group-node[data-selected] .react-flow__resize-control { opacity:1; }
+.cs-root .creative-canvas__group-node .react-flow__resize-control { width:9px; height:9px; border:1px solid #409eff; border-radius:2px; background:var(--canvas-panel); opacity:0; }
+.cs-root .creative-canvas__group-label, .cs-root .creative-canvas__group-label-input { position:absolute; bottom:calc(100% + 8px); left:0; box-sizing:border-box; height:22px; max-width:100%; line-height:20px; }
+.cs-root .creative-canvas__group-label { overflow:hidden; color:var(--canvas-muted); font-size:12px; text-overflow:ellipsis; white-space:nowrap; user-select:none; }
+.cs-root .creative-canvas__group-label-input { width:100%; padding:0 3px; border:1px solid #409eff; border-radius:3px; outline:0; background:var(--canvas-panel); color:var(--canvas-text); font:inherit; font-size:12px; }
+.cs-root .creative-canvas__group-toolbar { position:absolute; z-index:12; display:flex; align-items:center; gap:4px; padding:4px; border:1px solid var(--canvas-border); border-radius:8px; background:var(--canvas-panel); box-shadow:0 4px 14px #29252418; }
+.cs-root .creative-canvas__group-toolbar > span { padding:0 4px; color:var(--canvas-muted); font-size:11px; }
+.cs-root .creative-canvas__group-toolbar button { min-height:28px; padding:3px 8px; border:0; border-radius:5px; background:transparent; font-size:12px; }
+.cs-root .creative-canvas__group-toolbar button:hover:not(:disabled) { background:var(--canvas-fill); }
+.cs-root .creative-canvas .react-flow__edge-path { stroke:#409eff; stroke-dasharray:5 4; }
+@media(max-width:700px) {
+  .cs-root .creative-canvas__identity { gap:2px; }
+  .cs-root .creative-canvas__project-menu > button span { display:none; }
+  .cs-root .creative-canvas__quick-add { top:60px; left:10px; }
+  .cs-root .creative-canvas__view-controls { bottom:10px; left:10px; gap:1px; }
+  .cs-root .creative-canvas__view-controls > button, .cs-root .creative-canvas__zoom > button, .cs-root .creative-canvas__help > button { width:30px; height:30px; }
+  .cs-root .creative-canvas__view-controls > button:nth-child(2), .cs-root .creative-canvas__view-controls > button:nth-child(3) { display:none; }
+}
+
+/* Toonflow canvasControls uses 40px actions inside the 4px card padding. */
+@media(min-width:701px) {
+  .cs-root .creative-canvas__view-controls > button, .cs-root .creative-canvas__zoom > button, .cs-root .creative-canvas__help > button { width:40px; height:40px; }
+  .cs-root .creative-canvas__zoom > button { width:auto; }
+}

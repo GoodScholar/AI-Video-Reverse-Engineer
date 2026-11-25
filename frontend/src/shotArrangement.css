@@ -1,0 +1,24 @@
+/* The dedicated workbench fills the space below the application navigation. */
+.cs-root--shots .sp-main { padding: 0; }
+.cs-root--shots .sp-footer { display: none; }
+.cs-root--shots .studio-existing .preproduction-workspace { margin: 0; border: 0; border-radius: 0; }
+.cs-root--shots .preproduction-layout { display: block; min-height: 0; }
+.cs-root--shots .shot-workspace { --canvas-height: calc(100dvh - 140px); }
+.cs-root--shots .shot-workspace__toolbar { min-height: 64px; flex-wrap: wrap; gap: 8px; }
+.cs-root--shots .shot-workspace__toolbar .preproduction-header-actions { margin-left: auto; background: transparent; }
+.cs-root--shots .shot-workspace__body { min-height: var(--canvas-height); }
+.cs-root--shots .workflow-canvas,
+.cs-root--shots .shot-workspace__inspector { height: var(--canvas-height); }
+.cs-root--shots .shot-workspace--canvas .shot-workspace__body { grid-template-columns: minmax(0, 1fr); }
+.cs-root--shots .shot-workspace--canvas .shot-workspace__inspector { position: absolute; z-index: 9; inset: 0 0 0 auto; width: min(360px, 90%); box-shadow: -8px 0 24px #17202d14; }
+.cs-root--shots .shot-workspace--canvas .shot-workspace__backdrop { display: none; }
+.cs-root--shots .workflow-canvas__toolbar { flex-wrap: wrap; }
+.cs-root--shots .workflow-canvas__toolbar > div { flex-wrap: wrap; }
+.cs-root--shots .workflow-canvas__toolbar button { white-space: nowrap; flex-shrink: 0; }
+@media (max-width: 850px) {
+  .cs-root--shots .shot-workspace { --canvas-height: calc(100dvh - 190px); }
+  .cs-root--shots .shot-workspace__toolbar { padding: 8px; }
+  .cs-root--shots .shot-workspace__toolbar button { padding: 0 8px; }
+  .cs-root--shots .shot-workspace--canvas .shot-workspace__inspector { position: fixed; inset: 12px; width: auto; height: auto; z-index: 81; }
+  .cs-root--shots .shot-workspace--canvas .shot-workspace__backdrop { display: block; position: fixed; inset: 0; z-index: 80; }
+}

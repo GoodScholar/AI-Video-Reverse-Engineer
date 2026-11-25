@@ -1,8 +1,10 @@
 # AI Video Reverse Engineer
 
-本地内容制作与参考复刻工作台：React + TypeScript 前端与 Python + FastAPI 本地服务。内容项目可以承载商品视频制作、项目素材、参考复刻、本地剪辑、审核与交付；参考复刻面向普通视频、灰度深度视频与三维白模视频准备分析、控制素材和可编辑方案。最终 AI 视频生成在外部工具完成。
+本地 AI 视频创作与生产工作台：React + TypeScript 前端与 Python + FastAPI 本地服务。内容项目可以并列承载 AI 内容创作、商品营销短视频、批量混剪、多素材管理、制作镜头与创作画布、Timeline、参考复刻、配音字幕、审核与交付。目标架构由 `RemixEngine`、`CanvasEngine` 和统一 `GenerationService` 组成，应用拥有文本、图片和视频生成的提交、状态协调、取消、结果入库与续创关系，实际模型推理由可替换适配器执行。当前已有能力不等于三引擎和跨引擎闭环已经完成；完成边界见 [ADR 0013](docs/adr/0013-unified-remix-canvas-and-generation-boundaries.md)。
 
 灰度深度输入与三维白模输入须分别处理，两条完整复刻链路仍需逐项实现及验证，现有深度提取不等于已完成白模复刻。
+
+当前产品范围、P0/P1/P2、试点交付标准和冻结规则见[完整产品规划与范围冻结基线](.scratch/product-scope-freeze/spec.md)。v1 只以内部交付团队的商品短视频试点作为黄金流程；AI 商品内容创作、已有素材批量混剪和参考素材复刻仍共享同一个内容项目，但后两者不阻塞 v1。该决策见 [ADR 0011](docs/adr/0011-product-v1-golden-flow-and-scope-freeze.md)。
 
 ## 安装
 
@@ -56,7 +58,7 @@ npm run dev
 
 启动前端和后端后，打开 [内容工作室](http://127.0.0.1:5188/)。默认页面读取真实内容项目；[旧版复刻工作台（兼容）](http://127.0.0.1:5188/?workspace=legacy) 只保留历史复刻流程的访问和原有数据修改能力，不再承接新产品功能。
 
-项目、素材、制作计划、编辑序列、运行、审核与交付的边界见 [ADR 0009](docs/adr/0009-content-project-and-workflow-boundaries.md)；开源项目和成熟产品的一手资料对照见 [模块业务逻辑研究](docs/research/module-business-logic-benchmark-2026-09-27.md)。
+项目、素材、制作计划、编辑序列、运行、审核与交付的边界见 [ADR 0009](docs/adr/0009-content-project-and-workflow-boundaries.md)；v1 黄金流程和范围冻结见 [ADR 0011](docs/adr/0011-product-v1-golden-flow-and-scope-freeze.md)；开源项目和成熟产品的一手资料对照见 [模块业务逻辑研究](docs/research/module-business-logic-benchmark-2026-09-27.md)。
 
 - **四步制作**：资料可独立保存；生成前核对文字与服务；逐条确认当前脚本后交接；选声并确认脚本后提交本地配音，预览后审核导出。
 - **审片交付**：按全部、待审核、已通过、需修改筛选；所选作品与意见、精修对象一致；展示真实导出状态、下载、重试和历史。超过 20 条通过作品按接口上限分次提交。
@@ -198,7 +200,7 @@ macOS 使用 Homebrew 时，可安装 `brew install ffmpeg-full`。它是独立�
 
 无需安装 ComfyUI 即可编辑方案与下载 ZIP。复刻包包含 `workflow-api.json`（ComfyUI API 格式）、中英文提示词、参数、结构化分析、输入首帧、选用的深度控制片段和带模板来源的清单，不包含生成模型、凭据或完整参考视频。项目方案、输入快照和生成记录独立保存在 `<data_dir>/project-files/<project-id>/reproduction/`。
 
-应用当前不提供最终生成入口，两个历史生成提交接口返回 `410 final_generation_disabled`。已有记录和素材保留，离线工作流可继续导出；本地 ComfyUI 不作为前置工作台的依赖。候选模板的真实推理质量仍需在目标环境自行验证。
+参考复刻子工作流的两个历史最终生成提交接口当前仍返回 `410 final_generation_disabled`。已有记录和素材保留，离线工作流可继续导出；这描述的是现有历史接口状态，不否定目标统一 `GenerationService`。本地 ComfyUI 不作为前置工作台或统一生成服务的强制依赖；候选模板的真实推理质量仍需在目标环境验证。
 
 ## 生产预览
 

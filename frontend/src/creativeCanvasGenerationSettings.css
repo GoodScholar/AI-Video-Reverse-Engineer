@@ -1,0 +1,13 @@
+/* Toonflow generationSettings.vue d86cce6 (MIT): React controls retain its size and ratio affordances. */
+.cs-root .creative-node__generation-settings { display:block; width:min(340px,calc(100vw - 24px)); text-align:left; }
+.cs-root .creative-node__generation-settings .creative-node__setting-label { margin-bottom:8px; color:var(--canvas-regular); font-size:12px; font-weight:500; }
+.cs-root .creative-node__size-options { display:flex; gap:8px; margin-bottom:14px; }
+.cs-root .creative-node__size-options button { flex:1; min-height:32px; padding:8px 12px; border:1px solid var(--canvas-border); border-radius:4px; background:var(--canvas-panel); }
+.cs-root .creative-node__size-options button[aria-pressed="true"] { border-color:var(--canvas-regular); background:var(--canvas-fill); }
+.cs-root .creative-node__ratio-options { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:8px; }
+.cs-root .creative-node__ratio-options button { height:60px; padding:8px 4px; border:1px solid transparent; border-radius:4px; background:var(--canvas-light); color:var(--canvas-regular); }
+.cs-root .creative-node__ratio-options button[aria-pressed="true"] { border-color:var(--canvas-regular); background:var(--canvas-fill); color:var(--canvas-text); }
+.cs-root .creative-node__ratio-content { display:flex; flex-direction:column; align-items:center; gap:8px; font-size:12px; }
+.cs-root .creative-node__ratio-shape { display:inline-block; flex-shrink:0; border:1px solid currentColor; border-radius:2px; box-sizing:border-box; }
+.cs-root .creative-node__count-label { display:flex; align-items:center; justify-content:space-between; margin-top:14px; }
+.cs-root .creative-node__count-label select { width:88px; height:32px; padding:0 6px; border:1px solid var(--canvas-border); border-radius:4px; background:var(--canvas-panel); }

@@ -205,20 +205,23 @@ class LocalComputeJobQueue:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="local-compute")
         self._active: set[tuple[str, str]] = set()
         self._futures: dict[tuple[str, str], Future[None]] = {}
+        self._project_owners: dict[tuple[str, str], str] = {}
         self._lock = Lock()
         self._closed = False
 
-    def submit(self, run_kind: str, owner_id: str, handler: Callable[[str], None]) -> bool:
+    def submit(self, run_kind: str, owner_id: str, handler: Callable[[str], None], *, project_id: Optional[str] = None) -> bool:
         key = (run_kind, owner_id)
         with self._lock:
             if self._closed or key in self._active:
                 return False
             self._active.add(key)
+            self._project_owners[key] = project_id or owner_id
         try:
             future = self._executor.submit(handler, owner_id)
         except RuntimeError:
             with self._lock:
                 self._active.discard(key)
+                self._project_owners.pop(key, None)
             return False
         with self._lock:
             self._futures[key] = future
@@ -229,6 +232,7 @@ class LocalComputeJobQueue:
         with self._lock:
             self._active.discard(key)
             self._futures.pop(key, None)
+            self._project_owners.pop(key, None)
 
     def is_active(self, run_kind: str, owner_id: str) -> bool:
         with self._lock:
@@ -237,7 +241,7 @@ class LocalComputeJobQueue:
     def is_project_active(self, owner_id: str) -> bool:
         """Includes cancelled work until its handler and cleanup have exited."""
         with self._lock:
-            return any(project_id == owner_id for _, project_id in self._active)
+            return any(self._project_owners.get(key, key[1]) == owner_id for key in self._active)
 
     def wait(self, run_kind: str, owner_id: str) -> None:
         with self._lock:

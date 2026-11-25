@@ -1,0 +1,11 @@
+.creative-canvas-search { width:min(480px,calc(100vw - 32px)); padding:20px; border:1px solid #e4e7ed; border-radius:8px; background:#fff; color:#303133; font:14px/1.5 "PingFang SC",sans-serif; }
+.creative-canvas-search::backdrop { background:#0006; }
+.creative-canvas-search header { display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; }
+.creative-canvas-search header button { border:0; background:transparent; font-size:22px; cursor:pointer; }
+.creative-canvas-search input { box-sizing:border-box; width:100%; padding:9px 12px; border:1px solid #dcdfe6; border-radius:4px; font:inherit; }
+.creative-canvas-search [role=listbox] { max-height:min(360px,50vh); overflow-y:auto; margin-top:12px; }
+.creative-canvas-search [role=option] { display:flex; align-items:center; justify-content:space-between; gap:12px; width:100%; padding:10px 12px; border:0; border-radius:4px; background:transparent; color:inherit; font:inherit; text-align:left; cursor:pointer; }
+.creative-canvas-search [role=option][aria-selected=true] { background:#ecf5ff; }
+.creative-canvas-search [role=option] span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.creative-canvas-search small { flex-shrink:0; color:#909399; }
+.creative-canvas-search p { margin:24px 0; text-align:center; color:#909399; }

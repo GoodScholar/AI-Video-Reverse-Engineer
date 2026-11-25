@@ -214,6 +214,23 @@ def test_youtube_restart_recovery_discards_an_unregistered_install(tmp_path):
     assert not list(directory.glob("youtube-video-*.pending.json"))
 
 
+def test_youtube_install_rejects_a_staging_symlink_before_hashing_it(tmp_path, monkeypatch):
+    """Hashing before the shared installer validates a staging file follows an attacker-controlled symlink."""
+    from app.project_assets import ProjectAssets
+    import app.project_assets as project_assets
+
+    outside = tmp_path / "outside.mp4"; outside.write_bytes(b"not-a-video")
+    staging = tmp_path / "staging"; staging.mkdir()
+    source = staging / ".youtube-link.mp4"; source.symlink_to(outside)
+    monkeypatch.setattr(project_assets, "_sha256", lambda _path: pytest.fail("must validate before hashing"))
+    with pytest.raises(OSError):
+        ProjectAssets(tmp_path).install_youtube_video(
+            PROJECT_ID, source=source, staging_root=staging,
+            probe=YoutubeProbe("https://www.youtube.com/watch?v=YE7VzlLtp-4", "YE7VzlLtp-4", "样片", 1, "owner"),
+            role="reference", metadata={"duration": 1, "width": 1, "height": 1}, confirmed_at="2026-10-02T00:00:00Z",
+        )
+
+
 def test_youtube_session_is_read_only_from_the_injected_system_storage_seam_and_never_returned(tmp_path):
     """Reading a browser profile or exposing the session in API data must make this fail."""
     class SessionStore:

@@ -49,6 +49,14 @@ describe("PreproductionWorkspace", () => {
     vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
   });
 
+  it("独立镜头编排等待数据加载后仍默认画布并收起检查器", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(response(workspace()));
+    render(<PreproductionWorkspace project={project} tools={null} studioMode focusedShots sectionOverride="shots" />);
+    expect(await screen.findByRole("button", { name: "画布视图" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByRole("complementary", { name: "工作区检查器" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("navigation", { name: "工作台导航" })).not.toBeInTheDocument();
+  });
+
   it("镜头页接入分屏、画布和列表模式，项目切换后恢复新项目默认范围", async () => {
     const secondProject = { ...project, id: "project-002", name: "清晨街景" };
     vi.mocked(fetch)
@@ -544,6 +552,15 @@ describe("PreproductionWorkspace", () => {
     await user.click(screen.getByRole("button", { name: "放弃修改并重新读取" }));
 
     expect(await screen.findByLabelText("画面提示词")).toHaveValue("服务器版本");
+  });
+
+  it("文本素材提供文本文件预览，不显示音频播放器", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(response({ ...workspace(), assets: [{ id: "text-asset", name: "文案.txt", kind: "text", role: "reference", url: "/text.txt" }] })).mockResolvedValueOnce(new Response("文本素材正文"));
+    render(<PreproductionWorkspace project={project} tools={<p>已有工具</p>} />);
+    await userEvent.click(await screen.findByRole("button", { name: "素材" }));
+    await userEvent.click(screen.getByText("预览"));
+    expect(await screen.findByText("文本素材正文")).toBeVisible();
+    expect(screen.getByRole("link", { name: "下载文案.txt" })).toBeVisible();
   });
 
   it("素材行提供可展开预览和文件下载", async () => {

@@ -349,14 +349,14 @@ def create_app(
     semantic_analysis_queue_factory: Optional[Callable] = None,
     semantic_analysis_runner: Optional[Callable] = None,
     source_segment_runner: Optional[Callable] = None,
-    segment_visual_vectorizer=None,
     transcription_runner: Optional[Callable] = None,
+    segment_visual_vectorizer=None,
     segment_reranker=None,
     analysis_provider_registry=None,
     provider_registry=None,
     clock: Optional[Callable[[], datetime]] = None,
 ) -> FastAPI:
-    app = FastAPI(title="AI 视频复刻分析器")
+    app = FastAPI(title="AI 视频创作与生产工作台")
     project_write_lock = RLock()
     dispatching_project_ids: set[str] = set()
     reference_media_path_pattern = re.compile(r"^/api/projects/[^/]+/reference-media$")
@@ -1178,7 +1178,7 @@ def create_app(
             return True
         return (
             request.method in ("POST", "PUT")
-            and bool(re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|preparation|preproduction|image-generation|video-generation|source-segments|transcriptions|segment-searches|timeline|batch-edits|upscale|character-motion|toolkit|backup)(?:/.*)?", path))
+            and bool(re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|preparation|preproduction|creative-canvas|image-generation|video-generation|source-segments|transcriptions|segment-searches|timeline|batch-edits|upscale|character-motion|toolkit|backup)(?:/.*)?", path))
         ) or (
             request.method == "PUT" and bool(re.fullmatch(r"/api/analysis-providers/[^/]+/configuration", path))
         ) or (
@@ -2519,6 +2519,20 @@ def create_app(
     )
     image_generation_service = ImageGenerationService(image_generation_configurations)
     app.include_router(create_image_generation_router(image_generation_configurations))
+    from .text_generation import TextGenerationConfigurations, TextGenerationService, TextGenerationSettings
+    from .text_generation_api import create_text_generation_router
+    text_generation_configurations = TextGenerationConfigurations(
+        TextGenerationSettings(data_dir / "text-generation.json"),
+    )
+    text_generation_service = TextGenerationService(text_generation_configurations, data_dir)
+    app.include_router(create_text_generation_router(text_generation_configurations, text_generation_service))
+    from .creative_canvas_api import create_creative_canvas_router
+    app.include_router(create_creative_canvas_router(
+        data_dir, ensure_project_exists, source_lock=project_write_lock,
+        configurations=image_generation_configurations, image_service=image_generation_service,
+        text_service=text_generation_service,
+        compute_queue=compute_jobs,
+    ))
     from .source_segment_index import create_source_segment_router
     app.include_router(create_source_segment_router(
         data_dir, ensure_project_exists, compute_jobs,

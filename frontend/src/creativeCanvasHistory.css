@@ -1,0 +1,11 @@
+.cs-root .creative-canvas-history { display:block; }
+.cs-root .creative-canvas-history__heading, .cs-root .creative-canvas-history__run > header, .cs-root .creative-canvas-history__batch > header { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.cs-root .creative-canvas-history__run, .cs-root .creative-canvas-history__batch { padding:10px 0; border-top:1px solid var(--canvas-border); }
+.cs-root .creative-canvas-history__run > header, .cs-root .creative-canvas-history__batch > header { margin-bottom:8px; }
+.cs-root .creative-canvas-history__result { display:grid; grid-template-columns:72px minmax(0,1fr); gap:7px; margin-top:8px; padding:7px; border:1px solid var(--canvas-border); border-radius:7px; }
+.cs-root .creative-canvas-history__result img, .cs-root .creative-canvas-history__placeholder { display:block; width:72px; height:56px; border-radius:4px; object-fit:contain; background:var(--canvas-fill); }
+.cs-root .creative-canvas-history__placeholder { display:grid; place-items:center; padding:4px; color:var(--canvas-muted); font-size:11px; text-align:center; }
+.cs-root .creative-canvas-history__result p, .cs-root .creative-canvas-history__batch p { margin:4px 0 0; font-size:11px; }
+.cs-root .creative-canvas-history__actions { grid-column:1/-1; display:flex; flex-wrap:wrap; gap:5px; }
+.cs-root .creative-canvas-history__actions button, .cs-root .creative-canvas-history__run > button, .cs-root .creative-canvas-history__batch > button { display:inline-flex; align-items:center; gap:4px; padding:5px 6px; border:1px solid var(--canvas-border); border-radius:5px; background:transparent; color:var(--canvas-regular); font-size:12px; }
+.cs-root .creative-canvas-history__actions button:hover, .cs-root .creative-canvas-history__run > button:hover, .cs-root .creative-canvas-history__batch > button:hover { color:var(--canvas-primary); background:var(--canvas-light); }
