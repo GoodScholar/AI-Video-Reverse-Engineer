@@ -183,7 +183,7 @@ def test_backup_rejects_a_ready_video_reframe_without_a_person_fact(tmp_path):
                    check=True, capture_output=True)
     with TestClient(create_app(data_dir=tmp_path)) as client:
         pid = create(client)
-        uploaded = client.post(f'/api/projects/{pid}/preproduction/assets?role=motion', files={
+        uploaded = client.post(f'/api/projects/{pid}/preproduction/assets?role=motion', data={'rightsConfirmed': 'true'}, files={
             'file': ('source.mp4', video.read_bytes(), 'video/mp4'),
         }).json()
         asset_id = uploaded['assets'][0]['id']
