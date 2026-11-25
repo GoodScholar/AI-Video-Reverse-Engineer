@@ -152,6 +152,28 @@ def test_configuration_module_uses_one_authoritative_snapshot_for_verification_a
     ]
 
 
+def test_configuration_module_rejects_use_when_disclosed_revision_changed(tmp_path):
+    credentials = InMemoryCredentials()
+    created = []
+    configurations = configuration_module(
+        AnalysisSettings(tmp_path / "analysis-providers.json"), credentials,
+        lambda **kwargs: created.append(kwargs) or object(),
+    )
+    saved = configurations.save(
+        provider="openai", model="gpt-5.6-luna", base_url=None, api_key="stored-secret",
+    )
+
+    with pytest.raises(AnalysisProviderConfigurationChangedError):
+        configurations.use_provider(
+            provider="openai",
+            model="gpt-5.6-luna",
+            expected_configuration_revision=f"old-{saved.configurationRevision}",
+            operation=lambda _provider, _model: None,
+        )
+
+    assert created == []
+
+
 def test_configuration_module_rolls_back_credential_when_settings_commit_fails(tmp_path):
     credentials = InMemoryCredentials()
     credentials.values["openai"] = "previous-secret"

@@ -110,7 +110,9 @@ def test_prompt_failure_preserves_last_success(tmp_path):
 
 
 class FakeComfy:
-    def __init__(self,url): pass
+    instances = 0
+    def __init__(self,url):
+        type(self).instances += 1
     def close(self): pass
     def check(self,workflow): return {'connected':True,'ready':True,'version':'test','missingNodes':[],'missingModels':[],'message':'就绪'}
     def upload_image(self,path,name):
@@ -121,88 +123,40 @@ class FakeComfy:
     def fetch_output(self,item): return b'video-result'
 
 
-def test_explicit_run_persists_outputs_and_disallows_duplicate_submission(tmp_path):
-    client,_=setup(tmp_path,FakeComfy)
-    client.post(BASE+'/prompts',json={'revision':0,'disclosureAccepted':True})
-    assert client.post(BASE+'/runs',json={'revision':1,'disclosureAccepted':False}).status_code==422
-    queued=client.post(BASE+'/runs',json={'revision':1,'disclosureAccepted':True})
-    assert queued.status_code==200, queued.text
-    run=queued.json()['runs'][0]
-    assert run['status']=='queued'
-    assert client.post(BASE+'/runs',json={'revision':1,'disclosureAccepted':True}).status_code==409
-    completed=client.post(BASE+f"/runs/{run['id']}/refresh",json={}).json()
-    assert completed['runs'][0]['status']=='completed'
-    url=completed['runs'][0]['outputs'][0]['url']
-    assert client.get(url).content==b'video-result'
-    assert client.get(BASE).json()['runs'][0]['status']=='completed'
+def test_final_generation_write_routes_are_disabled_without_side_effects(tmp_path):
+    FakeComfy.instances = 0
+    client, _ = setup(tmp_path, FakeComfy)
+    responses = [
+        client.post(BASE + '/runs'),
+        client.post(BASE + '/runs', json={'revision': 0, 'disclosureAccepted': True}),
+        client.post(BASE + '/runs/old-run/refresh', json={}),
+        client.post(BASE + '/runs/old-run/resolve', json={'confirmedNotQueued': True}),
+    ]
+    assert [response.status_code for response in responses] == [410, 410, 410, 410]
+    assert {response.json()['detail']['code'] for response in responses} == {'final_generation_disabled'}
+    assert {response.json()['detail']['message'] for response in responses} == {'当前工作台只准备素材与方案，请导出后在外部工具执行视频生成。'}
+    assert client.get(BASE).json()['runs'] == []
+    assert FakeComfy.instances == 0
 
 
-def test_unknown_submission_requires_explicit_resolution(tmp_path):
-    class TimeoutComfy(FakeComfy):
-        def submit(self,workflow): raise TimeoutError('uncertain')
-    client,_=setup(tmp_path,TimeoutComfy)
-    client.post(BASE+'/prompts',json={'revision':0,'disclosureAccepted':True})
-    assert client.post(BASE+'/runs',json={'revision':1,'disclosureAccepted':True}).status_code==502
-    run=client.get(BASE).json()['runs'][0]
-    assert run['status']=='unknown'
-    endpoint=BASE+f"/runs/{run['id']}/resolve"
-    assert client.post(endpoint,json={}).status_code==422
-    assert client.post(endpoint,json={'confirmedNotQueued':True}).json()['runs'][0]['status']=='failed'
+def test_historical_generation_records_and_outputs_remain_read_only(tmp_path):
+    from app.reproduction import GenerationRun, ReproductionStore
 
+    client, project = setup(tmp_path)
+    store = ReproductionStore(tmp_path)
+    state = store.load(project)
+    state.runs.append(GenerationRun(id='old-run', status='completed', createdAt='2026-09-14T00:00:00Z',
+        revision=1, sourceHash='old-hash', comfyUrl='http://127.0.0.1:8188', workflow={},
+        outputs=[{'filename': 'output-0.mp4'}]))
+    output = store.path(project.id, 'old-run', 'output-0.mp4')
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b'historical-video')
+    store.save(project.id, state)
 
-def test_late_running_response_does_not_erase_completed_output(tmp_path):
-    from threading import Event, Thread
-    entered,release=Event(),Event()
-    class RacingComfy(FakeComfy):
-        calls=0
-        def poll(self,prompt_id):
-            RacingComfy.calls+=1
-            if RacingComfy.calls==1:
-                entered.set()
-                assert release.wait(5)
-                return {'status':'running','outputs':[],'error':None}
-            return super().poll(prompt_id)
-    client,_=setup(tmp_path,RacingComfy)
-    client.post(BASE+'/prompts',json={'revision':0,'disclosureAccepted':True})
-    run=client.post(BASE+'/runs',json={'revision':1,'disclosureAccepted':True}).json()['runs'][0]
-    endpoint=BASE+f"/runs/{run['id']}/refresh"
-    first=Thread(target=lambda:client.post(endpoint,json={}))
-    first.start()
-    try:
-        assert entered.wait(5)
-        assert client.post(endpoint,json={}).json()['runs'][0]['status']=='completed'
-    finally:
-        release.set()
-        first.join(5)
-    final=client.get(BASE).json()['runs'][0]
-    assert final['status']=='completed' and len(final['outputs'])==1
-
-
-def test_explicit_comfy_rejection_is_retryable_not_unknown(tmp_path):
-    from app.comfyui_client import ComfyUIClientError
-    class RejectedComfy(FakeComfy):
-        def submit(self,workflow): raise ComfyUIClientError('Rejected',outcome_unknown=False,status_code=400)
-    client,_=setup(tmp_path,RejectedComfy)
-    client.post(BASE+'/prompts',json={'revision':0,'disclosureAccepted':True})
-    assert client.post(BASE+'/runs',json={'revision':1,'disclosureAccepted':True}).status_code==502
-    assert client.get(BASE).json()['runs'][0]['status']=='failed'
-    assert client.post(BASE+'/runs',json={'revision':1,'disclosureAccepted':True}).status_code==502
-    assert len(client.get(BASE).json()['runs'])==2
-
-
-def test_interrupted_submitting_record_is_recoverable_after_restart(tmp_path):
-    from app.reproduction import ReproductionStore, GenerationRun
-    client,p=setup(tmp_path)
-    client.post(BASE+'/prompts',json={'revision':0,'disclosureAccepted':True})
-    store=ReproductionStore(tmp_path)
-    state=store.load(p)
-    state.runs.append(GenerationRun(id='run-1',status='submitting',createdAt='2026-09-14T00:00:00Z',
-        revision=1,sourceHash=state.sourceHash,comfyUrl=state.comfyUrl,workflow={}))
-    store.save(p.id,state)
-    assert client.get(BASE).json()['runs'][0]['status']=='unknown'
-    response=client.post(BASE+'/runs/run-1/resolve',json={'promptId':'remote-1'})
-    assert response.status_code==200
-    assert response.json()['runs'][0]['status']=='queued'
+    history = client.get(BASE).json()['runs']
+    assert history[0]['id'] == 'old-run'
+    assert history[0]['status'] == 'completed'
+    assert client.get(BASE + '/runs/old-run/output/0').content == b'historical-video'
 
 
 def test_sensitive_reproduction_request_rejects_foreign_origin(tmp_path):
@@ -211,35 +165,6 @@ def test_sensitive_reproduction_request_rejects_foreign_origin(tmp_path):
     response=client.post(BASE+'/prompts',json={'revision':0,'disclosureAccepted':True},
         headers={'origin':'https://untrusted.example','x-aivre-intent':'semantic-analysis'})
     assert response.status_code==403
-
-
-def test_refresh_from_old_prompt_cannot_overwrite_resolved_prompt(tmp_path):
-    from threading import Event, Thread
-    from app.reproduction import ReproductionStore
-    entered,release=Event(),Event()
-    class SlowComfy(FakeComfy):
-        def poll(self,prompt_id):
-            entered.set()
-            assert release.wait(5)
-            return {'status':'failed','outputs':[],'error':'old prompt failed'}
-    client,p=setup(tmp_path,SlowComfy)
-    client.post(BASE+'/prompts',json={'revision':0,'disclosureAccepted':True})
-    run=client.post(BASE+'/runs',json={'revision':1,'disclosureAccepted':True}).json()['runs'][0]
-    endpoint=BASE+f"/runs/{run['id']}"
-    store=ReproductionStore(tmp_path)
-    state=store.load(p)
-    state.runs[0].status='unknown'
-    store.save(p.id,state)
-    first=Thread(target=lambda:client.post(endpoint+'/refresh',json={}))
-    first.start()
-    try:
-        assert entered.wait(5)
-        assert client.post(endpoint+'/resolve',json={'promptId':'new-prompt'}).status_code==200
-    finally:
-        release.set()
-        first.join(5)
-    final=client.get(BASE).json()['runs'][0]
-    assert final['status']=='queued' and final['promptId']=='new-prompt'
 
 
 def test_main_app_reuses_original_provider_for_text_only_prompts(tmp_path):

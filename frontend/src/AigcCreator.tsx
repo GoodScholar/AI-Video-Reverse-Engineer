@@ -54,6 +54,8 @@ export function AigcCreator({ projectId, onDraftChange, onPersistedChange, onBat
   const visibleCandidates = guided ? latestGroup : candidates;
   const availableAssets = guided && mediaAssets ? mediaAssets.filter(asset=>asset.kind === "image" || asset.kind === "video") : assets;
   const usableAssets = availableAssets.filter(asset=>!("available" in asset) || asset.available !== false);
+  const selectedAssets = usableAssets.filter(asset => brief?.assetIds.includes(asset.id));
+  const otherAssets = usableAssets.filter(asset => !brief?.assetIds.includes(asset.id));
   const productAspect = resolveProductAspect(brief?.aspectMode ?? "9:16", usableAssets.filter(asset => brief?.assetIds.includes(asset.id)));
   useEffect(() => { onAspectChange?.(productAspect); }, [onAspectChange, productAspect.resolvedAspect, productAspect.width, productAspect.height, productAspect.reason]);
   const ready = !dirty && !candidateDirty && latestGroup.length === 5 && latestGroup.every(candidate => candidate.briefRevision === brief?.revision && candidate.confirmedRevision === candidate.revision);
@@ -284,13 +286,28 @@ export function AigcCreator({ projectId, onDraftChange, onPersistedChange, onBat
       <label>禁用表达（每行一条）<textarea value={forbiddenText}
         onChange={(event) => { setForbiddenText(event.target.value); change({ forbiddenPhrases: lines(event.target.value) }); }} /></label>
       </details>
-      <fieldset><legend>客户已有画面素材</legend>{usableAssets.map((asset) => <label key={asset.id}>
-        {guided && mediaAssets?.find(item => item.id === asset.id) && <div className="studio-asset-thumb">{asset.kind === "image" ? <img src={mediaAssets.find(item => item.id === asset.id)!.url} alt={asset.name} /> : <video src={mediaAssets.find(item => item.id === asset.id)!.url} preload="metadata" muted aria-label={`${asset.name} 缩略预览`} />}</div>}
-        <input type="checkbox" aria-label={`选择素材 ${asset.name}`} checked={brief.assetIds.includes(asset.id)}
-          onChange={() => change({ assetIds: brief.assetIds.includes(asset.id)
-            ? brief.assetIds.filter((id) => id !== asset.id) : [...brief.assetIds, asset.id] })} />
-        {asset.name} · {asset.kind === "image" ? "图片" : "视频"}{asset.notes ? ` · ${asset.notes}` : ""}
-      </label>)}</fieldset>
+      <fieldset className="studio-asset-choices"><legend>客户已有画面素材</legend>{[
+        { key: "selected", title: "已选画面素材", items: selectedAssets },
+        { key: "other", title: "其他项目素材", items: otherAssets },
+      ].map((group) => <section key={group.key} className={`studio-asset-group studio-asset-group-${group.key}`}
+        aria-label={`${group.title} ${group.items.length} 项`}>
+        <div className="studio-asset-group-heading"><h5>{group.title}</h5><span>{group.items.length} 项</span></div>
+        {group.items.length ? <div className="studio-asset-grid">{group.items.map((asset) => {
+          const mediaAsset = mediaAssets?.find(item => item.id === asset.id);
+          return <article key={asset.id} className="studio-asset-card">
+            <label className="studio-asset-choice">
+              {guided && mediaAsset && <div className="studio-asset-thumb">{asset.kind === "image"
+                ? <img src={mediaAsset.url} alt={asset.name} />
+                : <video src={mediaAsset.url} preload="metadata" muted aria-label={`${asset.name} 缩略预览`} />}</div>}
+              <span className="studio-asset-card-copy"><strong>{asset.name}</strong><small>{asset.kind === "image" ? "图片" : "视频"}</small></span>
+              <input type="checkbox" aria-label={`选择素材 ${asset.name}`} checked={brief.assetIds.includes(asset.id)}
+                onChange={() => change({ assetIds: brief.assetIds.includes(asset.id)
+                  ? brief.assetIds.filter((id) => id !== asset.id) : [...brief.assetIds, asset.id] })} />
+            </label>
+            {asset.notes && <details className="studio-asset-notes"><summary aria-label={`查看${asset.name}的来源与使用说明`}>来源与使用说明</summary><p>{asset.notes}</p></details>}
+          </article>;
+        })}</div> : <p className="studio-asset-group-empty">{group.key === "selected" ? "尚未选择画面素材。" : "没有其他可用素材。"}</p>}
+      </section>)}</fieldset>
       {guided && <button type="button" className="secondary-action" disabled={busy || !brief.productName.trim()} onClick={()=>void findImages()}>自动查找商品图片</button>}
       {guided && imageOperation && <p role="status">{imageOperation === "search" ? "正在按商品名称搜索图片并读取来源，请稍候…" : "正在下载并校验商品图片…"}</p>}
       {guided && imageSearch && <section className="studio-image-search" aria-label="网络商品图片">
@@ -307,23 +324,27 @@ export function AigcCreator({ projectId, onDraftChange, onPersistedChange, onBat
       </section>}
       {guided && onOpenAssets && <button type="button" className="secondary-action" onClick={onOpenAssets}>上传或管理项目素材</button>}
       <button type="button" className={guided ? "secondary-action" : "primary-action"} disabled={busy || !dirty} onClick={() => void save()}>{guided ? "保存资料" : "保存创作简报"}</button>
-      <label>脚本生成服务<select value={providerId} onChange={(event) => { setProviderId(event.target.value); setDisclosure(null); setAccepted(false); }}>
-        <option value="">请选择已验证服务</option>{providers.filter((item) => item.model && item.verificationState === "available").map((item) =>
-          <option key={item.provider} value={item.provider}>{item.label} · {item.model}</option>)}</select></label>
-      {guided && <button type="button" className="secondary-action" disabled={busy} onClick={() => void reloadProviders()}>重新读取脚本服务</button>}
-      {guided ? <button type="button" className="primary-action" disabled={busy || candidateDirty || !providerId || !brief.productName.trim()}
-        onClick={() => void prepareRequest(brief)}>生成 5 条脚本</button> : <button type="button" className="secondary-action" disabled={busy || dirty || !providerId}
-        onClick={() => void preview()}>预览发送内容</button>}
+      <div className={`studio-script-controls${disclosure ? " is-confirming" : ""}`}>
+        <label>脚本生成服务<select value={providerId} onChange={(event) => { setProviderId(event.target.value); setDisclosure(null); setAccepted(false); }}>
+          <option value="">请选择已验证服务</option>{providers.filter((item) => item.model && item.verificationState === "available").map((item) =>
+            <option key={item.provider} value={item.provider}>{item.label} · {item.model}</option>)}</select></label>
+        <div className="studio-script-actions">
+          {guided && <button type="button" className="secondary-action" disabled={busy} onClick={() => void reloadProviders()}>重新读取脚本服务</button>}
+          {guided ? <button type="button" className="primary-action" disabled={busy || candidateDirty || !providerId || !brief.productName.trim()}
+            onClick={() => void prepareRequest(brief)}>生成 5 条脚本</button> : <button type="button" className="secondary-action" disabled={busy || dirty || !providerId}
+            onClick={() => void preview()}>预览发送内容</button>}
+        </div>
+      </div>
       {guided && !providerId && <p role="status">尚无已通过连接验证的脚本服务，请在应用设置中配置并验证后重新读取。</p>}
       {guided && brief.assetIds.length < 2 && <p role="status">已有素材会优先使用；不足两份时会查找商品图片。</p>}
       {guided && candidateDirty && <div className="studio-inline-status"><p>有未保存脚本，请先返回核对并保存，避免重新生成后遗漏修改。</p><button type="button" className="secondary-action" onClick={() => onStepChange?.(1)}>返回未保存脚本</button></div>}
-      {disclosure && <div className="batch-editor-disclosure">
-        <p>目标服务：{providers.find((item) => item.provider === disclosure.provider)?.label ?? disclosure.provider} · {disclosure.model}</p>
-        <p>只发送以下文字；原始图片、视频及本地文件不会发送。</p>
-        <pre>{disclosure.prompt}</pre>
-        <label><input type="checkbox" checked={accepted} onChange={(event) => setAccepted(event.target.checked)} />我已核对本次发送内容</label>
+      {disclosure && <div className="batch-editor-disclosure" role="region" aria-label="发送前核对">
+        <div className="studio-disclosure-heading"><div><h5>发送前核对</h5><p>{providers.find((item) => item.provider === disclosure.provider)?.label ?? disclosure.provider} · {disclosure.model}</p></div><span>简报版本 {disclosure.briefRevision}</span></div>
+        <div className="studio-disclosure-summary"><p>将发送 {brief.facts.length} 条商品事实和 {brief.assetIds.length} 项素材引用</p><p>不会发送原始图片、视频或本地文件。</p></div>
+        <details className="studio-disclosure-details"><summary>查看完整发送文字</summary><pre tabIndex={0}>{disclosure.prompt}</pre></details>
+        <div className="studio-disclosure-actions"><label><input type="checkbox" checked={accepted} onChange={(event) => setAccepted(event.target.checked)} />我已核对本次发送内容</label>
         <button type="button" className="primary-action" disabled={busy || !accepted || candidateDirty}
-          onClick={() => void generate()}>确认发送并生成 5 条候选</button>
+          onClick={() => void generate()}>确认发送并生成 5 条候选</button></div>
       </div>}
       </div>
       {guided && guidedStep === 1 && candidates.length === 0 && <div className="sp-empty"><p>这个项目尚无脚本候选。请先准备资料并生成脚本；已有制作任务可在选声制作或成片与审片中继续。</p><button type="button" className="secondary-action" onClick={() => onStepChange?.(0)}>返回准备资料</button></div>}

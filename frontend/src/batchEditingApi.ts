@@ -1,6 +1,7 @@
 import { readApiError } from "./referenceMediaApi";
 import type { AigcBeat, AigcBrief } from "./aigcContentApi";
-import type { TimelineAsset, TimelineClip, TimelineTrack } from "./timelineApi";
+import type { TimelineAsset, TimelineClip, TimelineTrack, TimelineTransition } from "./timelineApi";
+import type { Packaging, ReframeAnalysis } from "./ReframeControls";
 import type { AspectMode } from "./videoAspect";
 
 export type BatchRun = { id: string; revision: number; contentRevision?: number; subtitleRevision?: number; status: "queued" | "running" | "completed" | "failed" | "cancelled"; error: string | null;
@@ -10,19 +11,29 @@ export type BatchReview = { id: string; runId: string; decision: "approved" | "r
 export type BatchExportRun = { id: string; status: "queued" | "running" | "completed" | "failed" | "cancelled"; error: string | null;
   contentRevision: number; variantRevision: number; subtitleRevision: number; previewRunId: string; review: BatchReview;
   sellingPoint: string; script: string; assets: Array<{ id: string; name: string; kind: string }>;
-  snapshot: { settings: { width: number; height: number; fps: number }; tracks: TimelineTrack[] }; subtitles: BatchCue[]; url?: string };
+  snapshot: { settings: { width: number; height: number; fps: number }; tracks: TimelineTrack[]; transitions?: TimelineTransition[] }; subtitles: BatchCue[]; url?: string };
 export type BatchCue = { id: string; start: number; end: number; text: string };
 export type BatchRecognition = { id: string; status: "queued" | "running" | "completed" | "failed"; error: string | null;
   timelineRevision: number; subtitleRevision: number; language: "auto" | "zh" | "en" | "ja" | "ko"; cues: BatchCue[] };
 export type BatchSubtitles = { revision: number; cues: BatchCue[]; recognitions: BatchRecognition[] };
-export type BatchVariant = { id: string; revision: number; settings: { width: number; height: number; fps: number }; tracks: TimelineTrack[]; runs: BatchRun[];
-  subtitles?: BatchSubtitles; exports?: BatchExportRun[]; aspectMode?: AspectMode; resolvedAspect?: string; aspectReason?: string };
+export type BatchVariant = { id: string; revision: number; settings: { width: number; height: number; fps: number }; tracks: TimelineTrack[]; transitions?: TimelineTransition[]; runs: BatchRun[];
+  subtitles?: BatchSubtitles; exports?: BatchExportRun[]; aspectMode?: AspectMode; resolvedAspect?: string; aspectReason?: string; packaging?: Packaging | null; reframeAnalysis?: Record<string, ReframeAnalysis> };
 export type BatchProposal = { baseRevision: number; method: "asset-metadata-keywords"; assetIds: string[]; clips: TimelineClip[]; matches: Array<{
   clipId: string; scriptSegment: string; assetId: string; assetName: string; matchedTerms: string[]; matchedSellingPointTerms: string[];
 }> };
+export type MontageCandidate = { candidateId: string; assetId: string; inPointSeconds: number; outPointSeconds: number;
+  visualRelevance: number; quality: { score: number; evidence: Record<string, unknown> }; evidence?: { basis?: string } };
+export type MontageProposalSegment = { id: string; text: string; status: "planned" | "gap"; selectedCandidateId: string | null;
+  suggestion: (MontageCandidate & { quality: { score: number; evidence: Record<string, unknown> } }) | null;
+  suggestionClip?: TimelineClip | null; selectedClip: TimelineClip | null; alternatives: Array<{ candidate: MontageCandidate; clip: TimelineClip; unmet: string[] }>;
+  reasons: string[]; unmet: string[]; timing: { narrationDurationSeconds: number; wordBoundarySeconds: number; beatSnap: number | null } };
+export type MontageProposal = { id: string; revision: number; status: "draft" | "abandoned" | "applied"; plannerVersion: string;
+  baseRevision: number; appliedVariantRevision: number | null; appliedClipIds?: string[];
+  appliedSelections?: Array<{ segmentId: string; candidateId: string; clipId: string; assetId?: string; inPoint?: number; duration?: number }>; segments: MontageProposalSegment[]; clips: TimelineClip[]; transitions?: TimelineTransition[];
+  unmet: Array<{ segmentId: string; message: string }>; inputSnapshot: { contentRevision: number; variantRevision: number } };
 export type BatchTask = { voiceover?: {id:string;voiceId:string;status:"queued"|"running"|"completed"|"failed";error:string|null;
   contentRevision:number;variantRevision:number;model:string;modelRevision:string;assetIds:string[]}; id: string; sellingPoint: string; script: string; contentRevision?: number;
-  reviews?: BatchReview[]; reviewStatus?: "pending" | "approved" | "rejected" | "stale"; variant: BatchVariant; proposal?: BatchProposal;
+  reviews?: BatchReview[]; reviewStatus?: "pending" | "approved" | "rejected" | "stale"; variant: BatchVariant; proposal?: BatchProposal; montageProposals?: MontageProposal[];
   batchId?: string; generationId?: string; generation?: { status: "ready" | "failed"; error: string | null };
   aigcSource?: { candidateId: string; candidateRevision: number; briefRevision: number; generationId: string; screenCopySource: "script";
     facts: Array<{ id: string; text: string }>; brief?: AigcBrief; sellingPoint?: string; beats?: AigcBeat[];
@@ -49,9 +60,16 @@ export function createBatchTask(projectId: string, sellingPoint: string, script:
   return request(base(projectId), { method: "POST", headers, body: JSON.stringify({ sellingPoint, script }) }, "无法创建批量任务。");
 }
 
-export function saveBatchVariant(projectId: string, taskId: string, revision: number, tracks: TimelineTrack[], settings?: BatchVariant["settings"], aspectMode?: AspectMode): Promise<{ variant: BatchVariant }> {
+export function saveBatchVariant(projectId: string, taskId: string, revision: number, tracks: TimelineTrack[], transitions: TimelineTransition[] = [], settings?: BatchVariant["settings"], aspectMode?: AspectMode, packaging?: Packaging | null): Promise<{ variant: BatchVariant }> {
   return request(`${base(projectId)}/${encodeURIComponent(taskId)}/variant`,
-    { method: "PUT", headers, body: JSON.stringify({ revision, tracks, ...(settings ? { settings } : {}), ...(aspectMode ? { aspectMode } : {}) }) }, "无法保存短视频变体。");
+    { method: "PUT", headers, body: JSON.stringify({ revision, tracks, transitions, ...(settings ? { settings } : {}), ...(aspectMode ? { aspectMode } : {}), ...(packaging !== undefined ? { packaging } : {}) }) }, "无法保存短视频变体。");
+}
+
+export function analyzeBatchReframe(projectId: string, taskId: string, clipId: string, revision: number): Promise<{ variant: BatchVariant }> {
+  return request(`${base(projectId)}/${encodeURIComponent(taskId)}/variant/reframes/${encodeURIComponent(clipId)}/analyze`, { method: "POST", headers, body: JSON.stringify({ revision }) }, "无法提交主体分析，请重试。");
+}
+export function cancelBatchReframe(projectId: string, taskId: string, clipId: string, revision: number): Promise<{ variant: BatchVariant }> {
+  return request(`${base(projectId)}/${encodeURIComponent(taskId)}/variant/reframes/${encodeURIComponent(clipId)}/cancel`, { method: "POST", headers, body: JSON.stringify({ revision }) }, "无法取消主体分析，请重试。");
 }
 
 export function saveBatchContent(projectId: string, taskId: string, revision: number, sellingPoint: string, script: string): Promise<{ task: BatchTask }> {
@@ -72,6 +90,25 @@ export function startBatchPreview(projectId: string, taskId: string, revision: n
 export function recommendBatchVariant(projectId: string, taskId: string, revision: number, assetIds: string[]): Promise<{ proposal: BatchProposal }> {
   return request(`${base(projectId)}/${encodeURIComponent(taskId)}/recommendations`,
     { method: "POST", headers, body: JSON.stringify({ revision, assetIds }) }, "无法依据脚本推荐镜头。");
+}
+
+export function createMontageProposal(projectId: string, taskId: string, revision: number, searchIds: string[], narration: Array<{
+  durationSeconds: number; wordBoundariesSeconds: number[]; source: "measured_voiceover" | "subtitle_cue" | "estimated_text";
+}>, beatTimes: number[]): Promise<{ proposal: MontageProposal }> {
+  return request(`${base(projectId)}/${encodeURIComponent(taskId)}/montage-proposals`,
+    { method: "POST", headers, body: JSON.stringify({ revision, searchIds, narration, beatTimes }) }, "无法生成混剪提案。");
+}
+
+export function updateMontageProposal(projectId: string, taskId: string, proposalId: string, revision: number,
+  segments: Array<{ segmentId: string; candidateId: string; inPointSeconds: number; durationSeconds: number }>): Promise<{ proposal: MontageProposal }> {
+  return request(`${base(projectId)}/${encodeURIComponent(taskId)}/montage-proposals/${encodeURIComponent(proposalId)}`,
+    { method: "PUT", headers, body: JSON.stringify({ revision, segments }) }, "无法保存混剪提案调整。");
+}
+
+export function applyMontageProposal(projectId: string, taskId: string, proposalId: string, revision: number,
+  proposalRevision: number, strategy: "overwrite" | "merge" | "abandon"): Promise<{ proposal: MontageProposal; variant: BatchVariant }> {
+  return request(`${base(projectId)}/${encodeURIComponent(taskId)}/montage-proposals/${encodeURIComponent(proposalId)}/apply`,
+    { method: "POST", headers, body: JSON.stringify({ revision, proposalRevision, strategy }) }, "无法应用混剪提案。");
 }
 
 export function createBulkVariants(projectId: string, taskId: string, items: Array<{ sellingPoint: string; script: string }>, assetIds: string[]): Promise<{ generationId: string; tasks: BatchTask[] }> {

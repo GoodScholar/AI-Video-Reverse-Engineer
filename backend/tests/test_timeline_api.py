@@ -1,4 +1,6 @@
 import json
+import subprocess
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,7 +31,11 @@ def _asset_root(tmp_path):
     root = tmp_path / "project-files" / PROJECT_ID / "preproduction"
     (root / "assets").mkdir(parents=True, exist_ok=True)
     if not (root / "assets" / "video.mp4").exists():
-        (root / "assets" / "video.mp4").write_bytes(b"video")
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
+            "color=red:size=64x48:rate=24:duration=4", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            str(root / "assets" / "video.mp4"),
+        ], check=True, capture_output=True, text=True)
     if not (root / "assets" / "audio.wav").exists():
         (root / "assets" / "audio.wav").write_bytes(b"audio")
     (root / "state.json").write_text(json.dumps({
@@ -52,11 +58,30 @@ def _workspace(revision=0, tracks=None):
     }
 
 
-def setup(tmp_path, renderer=None):
+def _add_image_asset(tmp_path):
+    root = tmp_path / "project-files" / PROJECT_ID / "preproduction"
+    image = root / "assets" / "image.png"
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
+        "color=red:size=64x48", "-frames:v", "1", str(image),
+    ], check=True, capture_output=True, text=True)
+    state_path = root / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["assets"].append({"id": "image", "name": "静态图", "kind": "image", "file": "image.png", "width": 64, "height": 48})
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+
+def _image_workspace(revision=0):
+    workspace = _workspace(revision)
+    workspace["tracks"][0]["clips"][0]["assetId"] = "image"
+    return workspace
+
+
+def setup(tmp_path, renderer=None, reframe_analyzer=None):
     _asset_root(tmp_path)
     queue = Queue()
     app = FastAPI()
-    app.include_router(create_timeline_router(tmp_path, lambda project_id: SimpleNamespace(id=project_id) if project_id == PROJECT_ID else None, queue, renderer=renderer))
+    app.include_router(create_timeline_router(tmp_path, lambda project_id: SimpleNamespace(id=project_id) if project_id == PROJECT_ID else None, queue, renderer=renderer, reframe_analyzer=reframe_analyzer))
     return TestClient(app), queue
 
 
@@ -71,6 +96,445 @@ def test_workspace_reads_preproduction_assets_and_uses_revision_cas(tmp_path):
     assert saved.status_code == 200
     assert saved.json()["revision"] == 1
     assert client.put(BASE, json=_workspace()).status_code == 409
+
+
+def test_timeline_reframe_analyze_cancel_and_retry_are_durable(tmp_path):
+    """A cancelled queued reframe must not write back; retry owns a new job."""
+    from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint
+    def analyzer(source, identity):
+        return {"schemaVersion": 1, "sourceFingerprint": source_fingerprint(source), "sourceWidth": 64, "sourceHeight": 48,
+                "targetAspect": {"width": 1280, "height": 720}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+                "samples": [{"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+                            {"timeSeconds": 2, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9}],
+                "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []}}
+    client, queue = setup(tmp_path, reframe_analyzer=analyzer)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    started = client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1})
+    assert started.status_code == 202
+    assert started.json()["reframeAnalysis"]["clip1"]["status"] == "queued"
+    assert client.post(BASE + "/reframes/clip1/cancel", json={"revision": 1}).status_code == 200
+    queue.run()
+    assert client.get(BASE).json()["reframeAnalysis"]["clip1"]["status"] == "cancelled"
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    queue.run()
+    completed = client.get(BASE).json()
+    assert completed["reframeAnalysis"]["clip1"]["status"] == "completed"
+    assert completed["tracks"][0]["clips"][0]["reframe"]["status"] == "review_required"
+    forged = completed["tracks"]
+    forged[0]["clips"][0]["reframe"]["status"] = "ready"
+    assert client.put(BASE, json={"revision": completed["revision"], "settings": completed["settings"], "tracks": forged}).status_code == 422
+
+
+def test_timeline_image_manual_override_rejects_nonzero_or_multiple_keyframes_and_persists_center(tmp_path):
+    client, _ = setup(tmp_path)
+    _add_image_asset(tmp_path)
+    assert client.put(BASE, json=_image_workspace()).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    queued = client.get(BASE).json()
+
+    for keyframes in ([{"timeSeconds": .1, "x": .5, "y": .5}], [
+        {"timeSeconds": 0, "x": .5, "y": .5}, {"timeSeconds": .1, "x": .6, "y": .5},
+    ]):
+        attempted = json.loads(json.dumps(queued))
+        attempted["tracks"][0]["clips"][0]["reframe"]["override"] = {"mode": "manual", "keyframes": keyframes}
+        assert client.put(BASE, json={"revision": queued["revision"], "settings": queued["settings"], "tracks": attempted["tracks"]}).status_code == 422
+
+    queued["tracks"][0]["clips"][0]["reframe"]["override"] = {"mode": "center", "keyframes": []}
+    saved = client.put(BASE, json={"revision": queued["revision"], "settings": queued["settings"], "tracks": queued["tracks"]})
+    assert saved.status_code == 200
+    assert client.get(BASE).json()["tracks"][0]["clips"][0]["reframe"]["override"] == {"mode": "center", "keyframes": []}
+
+
+def test_timeline_empty_fingerprint_center_survives_explicit_analysis(tmp_path):
+    client, queue = setup(tmp_path)
+    _add_image_asset(tmp_path)
+    assert client.put(BASE, json=_image_workspace()).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    pending = client.get(BASE).json()
+    assert pending["tracks"][0]["clips"][0]["reframe"]["sourceFingerprint"] == ""
+    pending["tracks"][0]["clips"][0]["reframe"]["override"] = {"mode": "center", "keyframes": []}
+    assert client.put(BASE, json={"revision": pending["revision"], "settings": pending["settings"],
+                                  "tracks": pending["tracks"]}).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/cancel", json={"revision": 2}).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 2}).status_code == 202
+    queue.run(); queue.run()
+    assert client.get(BASE).json()["tracks"][0]["clips"][0]["reframe"]["override"] == {"mode": "center", "keyframes": []}
+
+
+def test_timeline_image_reframe_analysis_cas_rejects_an_old_output_aspect(tmp_path):
+    from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint
+    def analyzer(source, identity):
+        return {"schemaVersion": 1, "sourceFingerprint": source_fingerprint(source), "sourceWidth": 64, "sourceHeight": 48,
+                "targetAspect": identity["targetAspect"], "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+                "samples": [{"timeSeconds": 0, "boxes": [{"x": .2, "y": .1, "width": .3, "height": .7,
+                                                               "label": "person", "confidence": .9}],
+                             "center": {"x": .35, "y": .45}, "confidence": .9}],
+                "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []}}
+    client, queue = setup(tmp_path, reframe_analyzer=analyzer)
+    _add_image_asset(tmp_path)
+    assert client.put(BASE, json=_image_workspace()).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    queued = client.get(BASE).json()
+    assert queued["reframeAnalysis"]["clip1"]["identity"]["targetAspect"] == {"width": 1280, "height": 720}
+    queued["settings"] = {"width": 720, "height": 1280, "fps": 30}
+    assert client.put(BASE, json={"revision": queued["revision"], "settings": queued["settings"], "tracks": queued["tracks"]}).status_code == 200
+    queue.run()
+
+    record = client.get(BASE).json()["reframeAnalysis"]["clip1"]
+    assert record["status"] == "failed"
+    assert "输出比例" in record["error"]
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 2}).status_code == 202
+    queue.run()
+    retried = client.get(BASE).json()
+    assert retried["reframeAnalysis"]["clip1"]["status"] == "completed"
+    assert retried["tracks"][0]["clips"][0]["reframe"]["targetAspect"] == {"width": 720, "height": 1280}
+
+
+def test_static_image_packaging_preflight_render_and_completed_download_share_server_media_kind(tmp_path):
+    """A real image's single 0-second subject fact remains valid across every delivery gate."""
+    from app.montage_packaging import default_packaging
+    from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint
+
+    def analyzer(source, identity):
+        return {
+            "schemaVersion": 1,
+            "sourceFingerprint": source_fingerprint(source),
+            "sourceWidth": 64,
+            "sourceHeight": 48,
+            "targetAspect": identity["targetAspect"],
+            "detectorVersion": DETECTOR_VERSION,
+            "modelSha256": MODEL_SHA256,
+            "samples": [{
+                "timeSeconds": 0,
+                "boxes": [{"x": .2, "y": .1, "width": .3, "height": .7,
+                           "label": "person", "confidence": .9}],
+                "center": {"x": .35, "y": .45},
+                "confidence": .9,
+            }],
+            "uncertaintyReasons": [],
+            "status": "ready",
+            "override": {"mode": "auto", "keyframes": []},
+        }
+
+    observed_media_kinds = []
+
+    def renderer(_timeline, _sources, output, **kwargs):
+        observed_media_kinds.append(kwargs["asset_media_kinds"])
+        output.write_bytes(b"static-image-packaged")
+
+    client, queue = setup(tmp_path, renderer=renderer, reframe_analyzer=analyzer)
+    _add_image_asset(tmp_path)
+    assert client.put(BASE, json=_image_workspace()).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    queue.run()
+
+    analyzed = client.get(BASE).json()
+    assert analyzed["tracks"][0]["clips"][0]["reframe"]["status"] == "ready"
+    packaging = default_packaging()
+    packaging["elements"] = [{
+        "id": "image-title", "kind": "title", "enabled": True,
+        "start": .2, "end": .8, "text": "静态图包装",
+        "position": "top", "style": "emphasis",
+    }]
+    saved = client.put(BASE, json={
+        "revision": analyzed["revision"],
+        "settings": analyzed["settings"],
+        "tracks": analyzed["tracks"],
+        "packaging": packaging,
+    })
+    assert saved.status_code == 200, saved.text
+
+    revision = saved.json()["revision"]
+    preflight = client.post(BASE + "/preflight", json={"revision": revision, "format": "preview"})
+    assert preflight.status_code == 200, preflight.text
+    assert preflight.json()["ready"] is True
+
+    submitted = client.post(BASE + "/runs", json={"revision": revision, "format": "preview"})
+    assert submitted.status_code == 202, submitted.text
+    run_id = submitted.json()["runs"][-1]["id"]
+    queue.run()
+    assert client.get(BASE).json()["runs"][-1]["status"] == "completed"
+    downloaded = client.get(BASE + "/runs/" + run_id + "/output")
+    assert downloaded.status_code == 200
+    assert downloaded.content == b"static-image-packaged"
+    assert observed_media_kinds == [{"video": "video", "image": "image"}]
+
+
+def test_candidate_replacement_persists_pending_reframe_and_manual_render(tmp_path):
+    """Saving a replacement must never resurrect old facts on read or render."""
+    from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint
+    def analyzer(source, _identity):
+        return {"schemaVersion": 1, "sourceFingerprint": source_fingerprint(source), "sourceWidth": 64, "sourceHeight": 48,
+                "targetAspect": {"width": 1280, "height": 720}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+                "samples": [{"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+                            {"timeSeconds": 2, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9}],
+                "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []}}
+    client, queue = setup(tmp_path, reframe_analyzer=analyzer)
+    assets = tmp_path / "project-files" / PROJECT_ID / "preproduction" / "assets"
+    (assets / "replacement.mp4").write_bytes((assets / "video.mp4").read_bytes())
+    state_path = tmp_path / "project-files" / PROJECT_ID / "preproduction" / "state.json"
+    preproduction = json.loads(state_path.read_text())
+    preproduction["assets"].append({"id": "replacement", "name": "替换画面", "kind": "video", "file": "replacement.mp4", "duration": 10.0, "width": 64, "height": 48})
+    state_path.write_text(json.dumps(preproduction))
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    queue.run()
+    analyzed = client.get(BASE).json()
+    replacement = analyzed["tracks"]
+    replacement[0]["clips"][0]["assetId"] = "replacement"
+    replacement[0]["clips"][0].pop("reframe")
+    saved = client.put(BASE, json={"revision": analyzed["revision"], "settings": analyzed["settings"], "tracks": replacement}).json()
+    pending = saved["tracks"][0]["clips"][0]["reframe"]
+    assert pending["sourceFingerprint"] == "" and pending["samples"] == []
+    assert pending["override"] == {"mode": "auto", "keyframes": []}
+    assert client.get(BASE).json()["tracks"][0]["clips"][0]["reframe"] == pending
+    pending["override"] = {"mode": "center", "keyframes": []}
+    rendered = client.put(BASE, json={"revision": saved["revision"], "settings": saved["settings"], "tracks": saved["tracks"]}).json()
+    queued = client.post(BASE + "/runs", json={"revision": rendered["revision"], "format": "preview"})
+    assert queued.status_code == 202
+    queue.run()
+    assert client.get(BASE).json()["runs"][-1]["status"] == "completed"
+
+
+def test_timeline_reframe_invalidates_when_source_changes_while_queued(tmp_path):
+    from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint
+    initial = tmp_path / "project-files" / PROJECT_ID / "preproduction" / "assets" / "video.mp4"
+    _asset_root(tmp_path)
+    old_hash = source_fingerprint(initial)
+    def analyzer(_source, _identity):
+        return {"schemaVersion": 1, "sourceFingerprint": old_hash, "sourceWidth": 64, "sourceHeight": 48,
+                "targetAspect": {"width": 1280, "height": 720}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+                "samples": [{"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+                            {"timeSeconds": 2, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9}],
+                "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []}}
+    client, queue = setup(tmp_path, reframe_analyzer=analyzer)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    path = tmp_path / "project-files" / PROJECT_ID / "preproduction" / "assets" / "video.mp4"
+    path.write_bytes(b"changed")
+    queue.run()
+    record = client.get(BASE).json()["reframeAnalysis"]["clip1"]
+    assert record["status"] == "failed"
+
+
+def test_timeline_reframe_source_deleted_while_queued_becomes_retryable_failure(tmp_path):
+    from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint
+    _asset_root(tmp_path)
+    source = tmp_path / "project-files" / PROJECT_ID / "preproduction" / "assets" / "video.mp4"
+    initial_hash = source_fingerprint(source)
+    def analyzer(_source, _identity):
+        return {"schemaVersion": 1, "sourceFingerprint": initial_hash, "sourceWidth": 64, "sourceHeight": 48,
+                "targetAspect": {"width": 1280, "height": 720}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+                "samples": [{"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9},
+                            {"timeSeconds": 2, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9}],
+                "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []}}
+    client, queue = setup(tmp_path, reframe_analyzer=analyzer)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    source.unlink()
+    queue.run()
+    record = client.get(BASE).json()["reframeAnalysis"]["clip1"]
+    assert record["status"] == "failed"
+    assert "素材" in record["error"]
+
+
+def test_timeline_reframe_worker_rejects_asset_identity_change_with_same_file(tmp_path):
+    client, queue = setup(tmp_path)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    asset_path = tmp_path / "project-files" / PROJECT_ID / "preproduction" / "state.json"
+    assets = json.loads(asset_path.read_text(encoding="utf-8"))
+    assets["assets"][0]["sourceReferenceId"] = "replacement-reference"
+    asset_path.write_text(json.dumps(assets), encoding="utf-8")
+    queue.run()
+
+    assert client.get(BASE).json()["reframeAnalysis"]["clip1"]["status"] == "failed"
+
+
+def test_timeline_reframe_never_accepts_worker_dimensions_when_the_source_probe_has_none(tmp_path, monkeypatch):
+    """Only ffprobe dimensions may authorize detector facts for a timeline clip."""
+    from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256, source_fingerprint
+    from app import timeline_render
+    monkeypatch.setattr(timeline_render, "_probe_media", lambda *_: SimpleNamespace(width=None, height=None))
+
+    def analyzer(source, _identity):
+        return {"schemaVersion": 1, "sourceFingerprint": source_fingerprint(source), "sourceWidth": 64, "sourceHeight": 48,
+                "targetAspect": {"width": 1280, "height": 720}, "detectorVersion": DETECTOR_VERSION, "modelSha256": MODEL_SHA256,
+                "samples": [{"timeSeconds": 0, "boxes": [], "center": {"x": .5, "y": .5}, "confidence": .9}],
+                "uncertaintyReasons": [], "status": "ready", "override": {"mode": "auto", "keyframes": []}}
+
+    client, queue = setup(tmp_path, reframe_analyzer=analyzer)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    queue.run()
+
+    record = client.get(BASE).json()["reframeAnalysis"]["clip1"]
+    assert record["status"] == "failed"
+    assert "可信源尺寸" in record["error"]
+
+
+def test_timeline_reframe_restart_recovers_queued_analysis_as_retryable(tmp_path):
+    client, queue = setup(tmp_path)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    # The detector need not execute: recovery must not leave the durable
+    # queued record permanently active after a new router is constructed.
+    assert client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}).status_code == 202
+    restarted, _queue = setup(tmp_path)
+    record = restarted.get(BASE).json()["reframeAnalysis"]["clip1"]
+    assert record["status"] == "failed"
+    assert "重启" in record["error"]
+    assert queue.jobs
+
+
+def test_timeline_reframe_rejects_stale_revision_before_it_can_enqueue(tmp_path):
+    client, queue = setup(tmp_path)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    assert client.put(BASE, json=_workspace(revision=1)).status_code == 200
+
+    stale = client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1})
+
+    assert stale.status_code == 409
+    assert queue.jobs == []
+
+
+def test_timeline_reframe_proves_source_outside_lock_and_aborts_stale_submission(tmp_path, monkeypatch):
+    """A slow source proof must not block workspace edits or leave a stale queued record."""
+    from app import montage_reframe
+
+    client, queue = setup(tmp_path)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    entered, release, read_done = threading.Event(), threading.Event(), threading.Event()
+    original = montage_reframe.source_fingerprint
+
+    def blocked_fingerprint(path):
+        entered.set()
+        assert release.wait(5), "测试未释放主体分析来源证明"
+        return original(path)
+
+    monkeypatch.setattr(montage_reframe, "source_fingerprint", blocked_fingerprint)
+    result = {}
+    submitted = threading.Thread(target=lambda: result.setdefault(
+        "response", client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}),
+    ))
+    submitted.start()
+    assert entered.wait(5)
+    reader = threading.Thread(target=lambda: (result.setdefault("read", client.get(BASE)), read_done.set()))
+    reader.start()
+    try:
+        assert read_done.wait(1), "慢来源证明不应占用时间线锁"
+        current = result["read"].json()
+        # There is no record until the proof CAS succeeds, so cancel stays a
+        # quick, truthful conflict instead of waiting behind the hash.
+        assert client.post(BASE + "/reframes/clip1/cancel", json={"revision": 1}).status_code == 409
+        changed = client.put(BASE, json={
+            "revision": current["revision"],
+            "settings": {"width": 720, "height": 1280, "fps": 30},
+            "tracks": current["tracks"],
+        })
+        assert changed.status_code == 200, changed.text
+    finally:
+        release.set()
+        submitted.join(5)
+        reader.join(5)
+
+    assert result["response"].status_code == 409
+    assert result["response"].json()["detail"]["code"] == "timeline_conflict"
+    current = client.get(BASE).json()
+    assert current["reframeAnalysis"] == {}
+    assert queue.jobs == []
+
+
+def test_timeline_reframe_probe_media_proof_does_not_block_get(tmp_path, monkeypatch):
+    from app import timeline_render
+
+    client, queue = setup(tmp_path)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    entered, release, read_done = threading.Event(), threading.Event(), threading.Event()
+    original = timeline_render._probe_media
+    def blocked(path, probe):
+        entered.set(); assert release.wait(5); return original(path, probe)
+    monkeypatch.setattr(timeline_render, "_probe_media", blocked)
+    result = {}
+    thread = threading.Thread(target=lambda: result.setdefault("response", client.post(
+        BASE + "/reframes/clip1/analyze", json={"revision": 1})))
+    thread.start(); assert entered.wait(5)
+    reader = threading.Thread(target=lambda: (result.setdefault("read", client.get(BASE)), read_done.set()))
+    reader.start(); assert read_done.wait(1)
+    assert result["read"].status_code == 200
+    release.set(); thread.join(5); reader.join(5)
+    assert result["response"].status_code == 202
+    assert queue.jobs
+
+
+def test_timeline_reframe_source_replaced_during_proof_never_creates_a_job(tmp_path, monkeypatch):
+    from app import montage_reframe
+
+    client, queue = setup(tmp_path)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    source = tmp_path / "project-files" / PROJECT_ID / "preproduction" / "assets" / "video.mp4"
+    entered, release = threading.Event(), threading.Event()
+    original = montage_reframe.source_fingerprint
+
+    def blocked_fingerprint(path):
+        entered.set()
+        assert release.wait(5), "测试未释放替换来源证明"
+        return original(path)
+
+    monkeypatch.setattr(montage_reframe, "source_fingerprint", blocked_fingerprint)
+    result = {}
+    submitted = threading.Thread(target=lambda: result.setdefault(
+        "response", client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}),
+    ))
+    submitted.start()
+    assert entered.wait(5)
+    try:
+        source.write_bytes(b"replaced while proving")
+    finally:
+        release.set()
+        submitted.join(5)
+
+    assert result["response"].status_code == 409
+    assert result["response"].json()["detail"]["code"] == "reframe_source_unavailable"
+    assert client.get(BASE).json()["reframeAnalysis"] == {}
+    assert queue.jobs == []
+
+
+def test_timeline_reframe_proof_rejects_clip_identity_change_without_revision(tmp_path, monkeypatch):
+    """The second lock compares the clip, not only its public revision token."""
+    from app import montage_reframe
+
+    client, queue = setup(tmp_path)
+    assert client.put(BASE, json=_workspace()).status_code == 200
+    entered, release = threading.Event(), threading.Event()
+    original = montage_reframe.source_fingerprint
+
+    def blocked_fingerprint(path):
+        entered.set()
+        assert release.wait(5), "测试未释放片段身份证明"
+        return original(path)
+
+    monkeypatch.setattr(montage_reframe, "source_fingerprint", blocked_fingerprint)
+    result = {}
+    submitted = threading.Thread(target=lambda: result.setdefault(
+        "response", client.post(BASE + "/reframes/clip1/analyze", json={"revision": 1}),
+    ))
+    submitted.start()
+    assert entered.wait(5)
+    try:
+        state_path = tmp_path / "project-files" / PROJECT_ID / "timeline" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["tracks"][0]["clips"][0]["inPoint"] = 1
+        # This white-box race intentionally keeps revision=1: the proof CAS
+        # must still reject a changed clip identity before it creates state.
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+    finally:
+        release.set()
+        submitted.join(5)
+
+    assert result["response"].status_code == 409
+    assert result["response"].json()["detail"]["code"] == "timeline_conflict"
+    assert client.get(BASE).json()["reframeAnalysis"] == {}
+    assert queue.jobs == []
 
 
 def test_rejects_overlapping_video_clips_and_wrong_asset_track_kind(tmp_path):
@@ -95,7 +559,7 @@ def test_run_uses_saved_snapshot_and_publishes_only_completed_output(tmp_path):
 
     def renderer(timeline, sources, output, **kwargs):
         received.append((timeline, sources))
-        assert sources["video"].read_bytes() == b"video"
+        assert sources["video"].read_bytes() != b"changed"
         output.write_bytes(b"rendered")
 
     client, queue = setup(tmp_path, renderer)
@@ -112,6 +576,33 @@ def test_run_uses_saved_snapshot_and_publishes_only_completed_output(tmp_path):
     assert completed["revision"] == 1
     assert received[0][0]["tracks"][0]["clips"][0]["assetId"] == "video"
     assert client.get(BASE + "/runs/" + run_id + "/output").content == b"rendered"
+
+
+def test_transition_boundary_is_persisted_and_frozen_into_the_render_run(tmp_path):
+    received = []
+    def renderer(timeline, sources, output, **kwargs):
+        received.append(timeline)
+        output.write_bytes(b"rendered")
+    client, queue = setup(tmp_path, renderer)
+    value = _workspace(tracks=[{
+        "id": "v1", "name": "视频", "kind": "video", "muted": False, "hidden": False,
+        "clips": [
+            {"id": "one", "assetId": "video", "start": 0, "inPoint": 0, "duration": 2, "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0},
+            {"id": "two", "assetId": "video", "start": 1.6, "inPoint": 2, "duration": 2, "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0},
+        ],
+    }])
+    value["transitions"] = [{
+        "id": "boundary", "leftClipId": "one", "rightClipId": "two", "template": "dissolve",
+        "enabled": True, "duration": .4, "overlap": .4, "audioCrossfade": True, "reason": "场景变化",
+    }]
+
+    saved = client.put(BASE, json=value)
+    assert saved.status_code == 200
+    assert saved.json()["transitions"] == value["transitions"]
+    assert client.post(BASE + "/runs", json={"revision": 1, "format": "preview"}).status_code == 202
+    queue.run()
+
+    assert received[0]["transitions"] == value["transitions"]
 
 
 def test_cancelled_or_failed_run_never_publishes_partial_output(tmp_path):

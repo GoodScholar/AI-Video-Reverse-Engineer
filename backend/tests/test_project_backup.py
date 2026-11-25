@@ -1,8 +1,11 @@
 import io
 import json
+import threading
 import zipfile
+import subprocess
 
 from fastapi.testclient import TestClient
+from PIL import Image
 from app.main import create_app
 
 
@@ -61,6 +64,161 @@ def test_export_refuses_active_state_and_symlink(tmp_path):
         state.unlink()
         (root/'unsafe').symlink_to(tmp_path/'projects.json')
         assert client.post(f'/api/projects/{pid}/backup', json={}).status_code == 422
+
+
+def test_backup_rejects_invalid_current_timeline_packaging_without_a_render_history(tmp_path):
+    from app.montage_packaging import default_packaging
+    from app.timeline import TimelineStore
+
+    with TestClient(create_app(data_dir=tmp_path)) as client:
+        pid = create(client)
+        client.get(f'/api/projects/{pid}/timeline')
+        timeline = TimelineStore(tmp_path).load(pid)
+        package = default_packaging()
+        package['templateId'] = 'unknown-template'
+        timeline['packaging'] = package
+        TimelineStore(tmp_path).save(pid, timeline)
+
+        assert client.post(f'/api/projects/{pid}/backup', json={}).status_code == 422
+
+
+def test_backup_packaging_proof_releases_global_lock_and_rejects_changed_snapshot(tmp_path, monkeypatch):
+    """The expensive proof is lock-free; its captured timeline cannot be archived after an edit."""
+    from app import montage_packaging
+    from app.montage_packaging import default_packaging
+    from app.timeline import TimelineStore
+
+    with TestClient(create_app(data_dir=tmp_path)) as client:
+        pid = create(client)
+        client.get(f'/api/projects/{pid}/timeline')
+        timeline = TimelineStore(tmp_path).load(pid)
+        timeline['packaging'] = default_packaging()
+        TimelineStore(tmp_path).save(pid, timeline)
+        entered, release, read_done = threading.Event(), threading.Event(), threading.Event()
+        original = montage_packaging._hash_font
+        def blocked_hash(path):
+            entered.set()
+            assert release.wait(5), '测试未释放备份字体 proof'
+            return original(path)
+        monkeypatch.setattr(montage_packaging, '_hash_font', blocked_hash)
+        result = {}
+        worker = threading.Thread(target=lambda: result.setdefault(
+            'response', client.post(f'/api/projects/{pid}/backup', json={})
+        ))
+        worker.start()
+        assert entered.wait(2)
+        reader = threading.Thread(target=lambda: (client.get(f'/api/projects/{pid}/timeline'), read_done.set()))
+        reader.start()
+        try:
+            assert read_done.wait(.5), '字体 proof 期间读取不应等待全局写锁'
+            current = client.get(f'/api/projects/{pid}/timeline').json()
+            changed = client.put(f'/api/projects/{pid}/timeline', json={
+                'revision': current['revision'], 'settings': current['settings'], 'tracks': current['tracks'],
+                'transitions': current['transitions'],
+            })
+            assert changed.status_code == 200, changed.text
+        finally:
+            release.set()
+        worker.join(5)
+        reader.join(5)
+        assert result['response'].status_code == 409
+
+
+def test_backup_rejects_a_ready_static_image_reframe_whose_center_crops_out_the_person(tmp_path):
+    from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256
+    from app.timeline import TimelineStore
+
+    with TestClient(create_app(data_dir=tmp_path)) as client:
+        pid = create(client)
+        image = io.BytesIO()
+        Image.new('RGB', (64, 48), 'red').save(image, format='PNG')
+        prep = client.post(f'/api/projects/{pid}/preproduction/assets?role=character', files={
+            'file': ('still.png', image.getvalue(), 'image/png'),
+        }).json()
+        asset_id = prep['assets'][0]['id']
+        timeline = TimelineStore(tmp_path).load(pid)
+        timeline['tracks'] = [{"id": "video", "name": "画面", "kind": "video", "muted": False, "hidden": False,
+            "clips": [{"id": "still", "assetId": asset_id, "start": 0, "inPoint": 0, "duration": 1, "speed": 1,
+                       "volume": 1, "fadeIn": 0, "fadeOut": 0, "reframe": {
+                           "schemaVersion": 1, "sourceFingerprint": "a" * 64, "sourceWidth": 64, "sourceHeight": 48,
+                           "targetAspect": {"width": 9, "height": 16}, "detectorVersion": DETECTOR_VERSION,
+                           "modelSha256": MODEL_SHA256, "samples": [{"timeSeconds": 0, "boxes": [{"x": .02, "y": .1, "width": .15, "height": .7,
+                           "label": "person", "confidence": .9}], "center": {"x": .9, "y": .5}, "confidence": .9}], "uncertaintyReasons": [], "status": "ready",
+                           "override": {"mode": "auto", "keyframes": []},
+                       }}]}]
+        TimelineStore(tmp_path).save(pid, timeline)
+
+        assert client.post(f'/api/projects/{pid}/backup', json={}).status_code == 422
+
+
+def test_backup_rejects_a_ready_video_reframe_without_a_person_fact(tmp_path):
+    """A backup cannot preserve a forged video ready record that render would reject."""
+    from app.montage_reframe import DETECTOR_VERSION, MODEL_SHA256
+    from app.timeline import TimelineStore
+
+    video = tmp_path / "source.mp4"
+    subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    "color=red:size=64x48:rate=24:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video)],
+                   check=True, capture_output=True)
+    with TestClient(create_app(data_dir=tmp_path)) as client:
+        pid = create(client)
+        uploaded = client.post(f'/api/projects/{pid}/preproduction/assets?role=motion', files={
+            'file': ('source.mp4', video.read_bytes(), 'video/mp4'),
+        }).json()
+        asset_id = uploaded['assets'][0]['id']
+        timeline = TimelineStore(tmp_path).load(pid)
+        timeline['tracks'] = [{"id": "video", "name": "画面", "kind": "video", "muted": False, "hidden": False,
+            "clips": [{"id": "clip", "assetId": asset_id, "start": 0, "inPoint": 0, "duration": 1, "speed": 1,
+                       "volume": 1, "fadeIn": 0, "fadeOut": 0, "reframe": {
+                           "schemaVersion": 1, "sourceFingerprint": "a" * 64, "sourceWidth": 64, "sourceHeight": 48,
+                           "targetAspect": {"width": 9, "height": 16}, "detectorVersion": DETECTOR_VERSION,
+                           "modelSha256": MODEL_SHA256, "samples": [{"timeSeconds": 0, "boxes": [],
+                           "center": {"x": .5, "y": .5}, "confidence": .9}], "uncertaintyReasons": [], "status": "ready",
+                           "override": {"mode": "auto", "keyframes": []},
+                       }}]}]
+        TimelineStore(tmp_path).save(pid, timeline)
+
+        assert client.post(f'/api/projects/{pid}/backup', json={}).status_code == 422
+
+
+def test_backup_validates_legacy_cues_without_persisting_a_migration(tmp_path):
+    from app.batch_editing_api import BatchStore
+    from app.batch_production import create_batch
+
+    with TestClient(create_app(data_dir=tmp_path)) as client:
+        pid = create(client)
+        task = create_batch("卖点", "脚本", id_factory=iter(["task", "variant"]).__next__)
+        tracks = task["variant"]["tracks"]
+        tracks[0]["clips"] = [{"id": "clip", "assetId": "shot", "start": 0, "inPoint": 0, "duration": 2,
+                                "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0}]
+        recognition = {"id": "recognition-one", "status": "completed", "error": None, "language": "zh",
+                       "timelineRevision": 0, "subtitleRevision": 0,
+                       "cues": [{"id": "line-1", "start": 0, "end": 1, "text": "旧字幕"}],
+                       "snapshot": {"settings": task["variant"]["settings"], "tracks": tracks},
+                       "sources": {"shot": "shot.mp4"}}
+        task["variant"]["subtitles"].update(
+            cues=[{"id": "line-1", "start": 0, "end": 1, "text": "旧字幕"}],
+            recognitions=[recognition],
+        )
+        state = BatchStore(tmp_path).path(pid, "state.json")
+        state.parent.mkdir(parents=True)
+        state.write_text(json.dumps({"schemaVersion": 1, "tasks": [task]}), encoding="utf-8")
+        before, before_mtime = state.read_bytes(), state.stat().st_mtime_ns
+
+        first = client.post(f'/api/projects/{pid}/backup', json={})
+        second = client.post(f'/api/projects/{pid}/backup', json={})
+
+        assert first.status_code == second.status_code == 200
+        assert state.read_bytes() == before
+        assert state.stat().st_mtime_ns == before_mtime
+
+        ambiguous = {**recognition, "id": "recognition-two"}
+        task["variant"]["subtitles"]["recognitions"] = [recognition, ambiguous]
+        state.write_text(json.dumps({"schemaVersion": 1, "tasks": [task]}), encoding="utf-8")
+        ambiguous_before = state.read_bytes()
+
+        assert client.post(f'/api/projects/{pid}/backup', json={}).status_code == 200
+        assert state.read_bytes() == ambiguous_before
 
 
 def test_backup_routes_require_trusted_browser_intent(tmp_path):

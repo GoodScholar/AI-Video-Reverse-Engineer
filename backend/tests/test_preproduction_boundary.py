@@ -22,9 +22,13 @@ def test_final_generation_is_excluded_but_preparation_is_available(tmp_path):
     with TestClient(create_app(data_dir=tmp_path)) as client:
         pid = client.post('/api/projects', json={'name': '前置工作台'}).json()['id']
         for module in ('reproduction', 'character-motion'):
-            response = client.post(f'/api/projects/{pid}/{module}/runs', json={'revision': 0})
-            assert response.status_code == 410
-            assert response.json()['detail']['code'] == 'final_generation_disabled'
+            for suffix in ('/runs', '/runs/previous/refresh', '/runs/previous/resolve'):
+                response = client.post(f'/api/projects/{pid}/{module}{suffix}')
+                assert response.status_code == 410
+                assert response.json()['detail'] == {
+                    'code': 'final_generation_disabled',
+                    'message': '当前工作台只准备素材与方案，请导出后在外部工具执行视频生成。',
+                }
             assert client.get(f'/api/projects/{pid}/{module}').status_code == 200
 
 

@@ -565,11 +565,17 @@ class AnalysisProviderConfigurations:
         model: Optional[str],
         operation: Callable[[Any, str], _Result],
         require_verified: bool = False,
+        expected_configuration_revision: Optional[str] = None,
     ) -> _Result:
         with self._lock:
             snapshot = self._configured_snapshot_locked(
                 provider, model, require_verified=require_verified,
             )
+            if (
+                expected_configuration_revision is not None
+                and snapshot.setting.configurationRevision != expected_configuration_revision
+            ):
+                raise AnalysisProviderConfigurationChangedError()
         configured_provider = self._provider_factory(
             provider=provider,
             credential=snapshot.credential,

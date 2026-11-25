@@ -9,7 +9,12 @@ vi.mock("./contentWorkflowApi", () => ({ getContentWorkflow: vi.fn() }));
 vi.mock("./AigcCreator", () => ({ AigcCreator: () => <section aria-label="创作内容" /> }));
 vi.mock("./BatchEditor", () => ({ BatchEditor: ({ onPersistedChange }: { onPersistedChange?: () => void }) =>
   <section aria-label="批量制作"><button type="button" onClick={onPersistedChange}>保存批量更改</button></section> }));
-vi.mock("./PreproductionWorkspace", () => ({ PreproductionWorkspace: () => <section aria-label="项目素材" /> }));
+vi.mock("./PreproductionWorkspace", () => ({ PreproductionWorkspace: ({ onAssetsChanged }: { onAssetsChanged?: (assets: unknown[]) => void }) =>
+  <section aria-label="项目素材"><button type="button" onClick={() => onAssetsChanged?.([
+    { id: "video-a", name: "视频素材", kind: "video", role: "motion", url: "/video.mp4" },
+  ])}>载入素材</button></section> }));
+vi.mock("./SourceSegmentIndexPanel", () => ({ SourceSegmentIndexPanel: ({ projectId, assets }: { projectId: string; assets?: unknown[] }) =>
+  <section aria-label="片段索引接缝">{projectId} · {assets?.length ?? 0} 个素材</section> }));
 
 const project = { id: "p1", name: "商品项目", createdAt: "2026-09-27T00:00:00Z", updatedAt: "2026-09-27T00:00:00Z",
   referenceMedia: null, localPreprocessing: null };
@@ -80,4 +85,14 @@ it("持久化变化后刷新服务端投影并把过时审核视图退回选声�
   expect(await screen.findByRole("button", { name: "3 选声制作" })).toHaveAttribute("aria-current", "step");
   expect(getContentWorkflow).toHaveBeenCalledTimes(2);
   expect(screen.getByRole("button", { name: "4 审核导出" })).not.toHaveClass("is-done");
+});
+
+it("项目素材页在现有素材库后展示片段索引接缝", async () => {
+  vi.mocked(getContentWorkflow).mockResolvedValue(projection());
+  render(<ContentProductionWorkspace project={project} page="assets" tools={null}
+    onNavigate={vi.fn()} onDirtyChange={vi.fn()} />);
+
+  await userEvent.click(await screen.findByRole("button", { name: "载入素材" }));
+
+  expect(screen.getByRole("region", { name: "片段索引接缝" })).toHaveTextContent("p1 · 1 个素材");
 });

@@ -36,11 +36,75 @@ describe("TimelineEditor", () => {
   afterEach(() => vi.useRealTimers());
   beforeEach(() => { sessionStorage.clear(); localStorage.clear(); mockedGet.mockReset(); mockedSave.mockReset(); mockedCancel.mockReset(); });
 
+  it("转场随草稿保存和撤销，并在删除关联片段时清理", async () => {
+    const value = workspace();
+    value.tracks[0].clips.push({ ...value.tracks[0].clips[0], id: "clip-2", start: 3.6 });
+    value.transitions = [{ id: "t1", leftClipId: "clip-1", rightClipId: "clip-2", template: "dissolve", enabled: true, duration: .4, overlap: .4, audioCrossfade: true, reason: "场景切换" }];
+    mockedGet.mockResolvedValue(value);
+    mockedSave.mockImplementation(async (_id, draft) => ({ ...value, ...draft, revision: 3 }));
+    render(<TimelineEditor projectId="transition-draft" />);
+    const duration = await screen.findByLabelText("开场.jpg → 开场.jpg 持续时间（秒）");
+    fireEvent.change(duration, { target: { value: ".3" } });
+    await userEvent.click(screen.getByRole("button", { name: "撤销" }));
+    expect(duration).toHaveValue(.4);
+    await userEvent.click(screen.getByRole("button", { name: "重做" }));
+    await userEvent.click(screen.getByRole("button", { name: "保存时间线" }));
+    expect(mockedSave.mock.calls[0][1].transitions?.[0].overlap).toBe(.3);
+    expect(mockedSave.mock.calls[0][1].tracks[0].clips[1].start).toBe(3.6);
+    await userEvent.click(screen.getAllByRole("button", { name: "开场.jpg" })[0]);
+    await userEvent.keyboard("{Delete}");
+    await userEvent.click(screen.getByRole("button", { name: "保存时间线" }));
+    expect(mockedSave.mock.calls[1][1].transitions).toEqual([]);
+  });
+
+  it("同版本重试失败时不回显旧成功预览", async () => {
+    const value = workspace();
+    value.runs[0].revision = value.revision;
+    value.runs.push({ id: "failed", revision: value.revision, format: "preview", status: "failed", error: "转场失败" });
+    mockedGet.mockResolvedValue(value);
+    const view = render(<TimelineEditor projectId="failed-transition" />);
+    await screen.findByText("转场失败");
+    expect(view.container.querySelector("video")).toBeNull();
+    expect(screen.getByRole("button", { name: "重新提交" })).toBeEnabled();
+  });
+
   it("从候选引用定位已保存时间线片段", async () => {
     mockedGet.mockResolvedValue(workspace());
     render(<TimelineEditor projectId="focus-from-candidate" focusClip={{ trackId: "video-1", clipId: "clip-1" }} />);
     expect(await screen.findByLabelText("时间线起点")).toHaveValue(1);
     expect(screen.getByLabelText("播放头（秒）")).toHaveValue(1);
+  });
+
+  it("245px 检查器中包装字段保持单列且可用键盘聚焦编辑", async () => {
+    mockedGet.mockResolvedValue(workspace());
+    render(<TimelineEditor projectId="narrow-packaging" />);
+    await userEvent.click(await screen.findByRole("button", { name: "开场.jpg" }));
+    const inspector = document.querySelector(".timeline-inspector") as HTMLElement;
+    inspector.style.width = "245px";
+    expect(inspector).toHaveClass("timeline-inspector");
+    await userEvent.click(screen.getByRole("button", { name: "添加title" }));
+    const title = screen.getByLabelText(/title-\d+ 文字/);
+    title.focus();
+    await userEvent.keyboard("窄列标题");
+    expect(title).toHaveValue("窄列标题");
+  });
+
+  it("时间线可添加并保存不关联 cue 的手动字幕正文和时段", async () => {
+    const saved = workspace(3);
+    mockedGet.mockResolvedValue(workspace());
+    mockedSave.mockImplementation(async (_projectId, draft) => ({ ...saved, ...draft }));
+    render(<TimelineEditor projectId="inline-subtitle" />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "添加subtitle" }));
+    await userEvent.type(screen.getByLabelText("subtitle-1 文字"), "时间线手动字幕");
+    fireEvent.change(screen.getByLabelText("subtitle-1 开始"), { target: { value: "1.2" } });
+    fireEvent.change(screen.getByLabelText("subtitle-1 结束"), { target: { value: "2.8" } });
+    await userEvent.click(screen.getByRole("button", { name: "保存时间线" }));
+
+    expect(mockedSave).toHaveBeenCalledWith("inline-subtitle", expect.objectContaining({ packaging: expect.objectContaining({ elements: [
+      expect.objectContaining({ id: "subtitle-1", kind: "subtitle", text: "时间线手动字幕", start: 1.2, end: 2.8 }),
+    ] }) }));
+    expect(mockedSave.mock.calls[0][1].packaging?.elements[0]).not.toHaveProperty("cueId");
   });
 
   it("向项目备份报告内存草稿状态，保存后解除保护", async () => {
@@ -301,6 +365,66 @@ describe("TimelineEditor", () => {
     expect(screen.getByLabelText("时间线起点")).toHaveValue(9);
     await userEvent.click(screen.getByRole("button", { name: "保存时间线" }));
     expect(mockedSave.mock.calls[0][1]).toMatchObject({ revision: 5, tracks: [{ clips: [{ start: 9 }] }, {}] });
+  });
+
+  it("恢复图片人工构图冲突草稿时合并异步主体事实，只提交人工覆盖", async () => {
+    const server = workspace(5);
+    server.tracks[0].clips[0].reframe = {
+      schemaVersion: 1, sourceFingerprint: "a".repeat(64), sourceWidth: 64, sourceHeight: 48,
+      targetAspect: { width: 1280, height: 720 }, detectorVersion: "mediapipe-object-detector-0.10.21", modelSha256: "model",
+      samples: [{ timeSeconds: 0, boxes: [{ x: .2, y: .1, width: .3, height: .7, label: "person", confidence: .9 }], center: { x: .35, y: .45 }, confidence: .9 }],
+      uncertaintyReasons: [], status: "ready", override: { mode: "auto", keyframes: [] },
+    };
+    const draft = structuredClone(server);
+    draft.revision = 2;
+    draft.tracks[0].clips[0].reframe = { ...server.tracks[0].clips[0].reframe!, sourceFingerprint: "", sourceWidth: 0,
+      sourceHeight: 0, samples: [], uncertaintyReasons: ["已提交本地主体分析"], status: "review_required", override: {
+        mode: "manual", keyframes: [{ timeSeconds: 0, x: .54, y: .48 }],
+      }};
+    sessionStorage.setItem("aivre:timeline-draft:image-facts-conflict", JSON.stringify({
+      revision: 2, draft: { revision: 2, settings: draft.settings, tracks: draft.tracks },
+    }));
+    mockedGet.mockResolvedValue(server);
+    mockedSave.mockResolvedValue({ ...server, revision: 6 });
+
+    render(<TimelineEditor projectId="image-facts-conflict" />);
+    await userEvent.click(await screen.findByRole("button", { name: "恢复草稿并继续编辑" }));
+    await userEvent.click(screen.getByRole("button", { name: "开场.jpg" }));
+    await userEvent.click(screen.getByRole("button", { name: "保存时间线" }));
+
+    expect(mockedSave.mock.calls[0][1].tracks[0].clips[0].reframe).toMatchObject({
+      samples: server.tracks[0].clips[0].reframe!.samples,
+      override: { mode: "manual", keyframes: [{ timeSeconds: 0, x: .54, y: .48 }] },
+    });
+  });
+
+  it("同版本缓存也不会以旧 pending 图片事实覆盖服务端分析结果", async () => {
+    const server = workspace(5);
+    server.tracks[0].clips[0].reframe = {
+      schemaVersion: 1, sourceFingerprint: "a".repeat(64), sourceWidth: 64, sourceHeight: 48,
+      targetAspect: { width: 1280, height: 720 }, detectorVersion: "mediapipe-object-detector-0.10.21", modelSha256: "model",
+      samples: [{ timeSeconds: 0, boxes: [{ x: .2, y: .1, width: .3, height: .7, label: "person", confidence: .9 }], center: { x: .35, y: .45 }, confidence: .9 }],
+      uncertaintyReasons: [], status: "ready", override: { mode: "auto", keyframes: [] },
+    };
+    const draft = structuredClone(server);
+    draft.tracks[0].clips[0].reframe = { ...server.tracks[0].clips[0].reframe!, sourceFingerprint: "", sourceWidth: 0,
+      sourceHeight: 0, samples: [], uncertaintyReasons: ["已提交本地主体分析"], status: "review_required", override: {
+        mode: "manual", keyframes: [{ timeSeconds: 0, x: .54, y: .48 }],
+      }};
+    sessionStorage.setItem("aivre:timeline-draft:image-facts-current", JSON.stringify({
+      revision: 5, draft: { revision: 5, settings: draft.settings, tracks: draft.tracks },
+    }));
+    mockedGet.mockResolvedValue(server);
+    mockedSave.mockResolvedValue({ ...server, revision: 6 });
+
+    render(<TimelineEditor projectId="image-facts-current" />);
+    await userEvent.click(await screen.findByRole("button", { name: "开场.jpg" }));
+    await userEvent.click(screen.getByRole("button", { name: "保存时间线" }));
+
+    expect(mockedSave.mock.calls[0][1].tracks[0].clips[0].reframe).toMatchObject({
+      samples: server.tracks[0].clips[0].reframe!.samples,
+      override: { mode: "manual", keyframes: [{ timeSeconds: 0, x: .54, y: .48 }] },
+    });
   });
 
   it("放弃冲突草稿才清除缓存并使用服务端内容", async () => {

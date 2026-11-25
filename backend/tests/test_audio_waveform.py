@@ -25,6 +25,7 @@ def test_waveform_real_audio_silence_and_cache(tmp_path, monkeypatch):
 def test_no_audio_differs_from_broken_media(tmp_path):
     client, _ = setup(tmp_path)
     path = tmp_path / 'project-files/p1/preproduction/assets/video.mp4'
+    path.write_bytes(b'broken-media')
     assert client.post(BASE + '/assets/video/waveform', json={}).status_code == 422
     subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=size=64x48:duration=1', '-c:v', 'libx264', str(path)], check=True)
     assert client.post(BASE + '/assets/video/waveform', json={}).json()['status'] == 'no_audio'

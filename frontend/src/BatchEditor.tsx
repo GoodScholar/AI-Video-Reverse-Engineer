@@ -1,11 +1,15 @@
-import { useEffect, useRef, useState } from "react";
-import { cancelBatchExport, cancelBatchPreview, createBatchTask, createBulkVariants, getBatchWorkspace, recognizeBatchSubtitles, recommendBatchVariant, reviewBatchVariant, saveBatchContent, saveBatchSubtitles, saveBatchVariant, startBatchPreview, startGenerationPreviews, submitBatchExports, type BatchAsset, type BatchCue, type BatchReview, type BatchTask, type BatchVariant } from "./batchEditingApi";
-import type { TimelineAsset, TimelineClip, TimelineTrack } from "./timelineApi";
+import { Fragment, useEffect, useRef, useState } from "react";
+import { analyzeBatchReframe, applyMontageProposal, cancelBatchExport, cancelBatchPreview, cancelBatchReframe, createBatchTask, createBulkVariants, createMontageProposal, getBatchWorkspace, recognizeBatchSubtitles, recommendBatchVariant, reviewBatchVariant, saveBatchContent, saveBatchSubtitles, saveBatchVariant, startBatchPreview, startGenerationPreviews, submitBatchExports, updateMontageProposal, type BatchAsset, type BatchCue, type BatchReview, type BatchTask, type BatchVariant, type MontageProposal } from "./batchEditingApi";
+import type { TimelineAsset, TimelineClip, TimelineTrack, TimelineTransition } from "./timelineApi";
+import { TransitionControls } from "./TransitionControls";
+import { changeBoundary, reconcileBoundaries, transitionLabels } from "./timelineTransitions";
 import { AigcCreator } from "./AigcCreator";
 import { AspectRatioPicker } from "./AspectRatioPicker";
 import "./batch.css";
 import { VoiceSelector } from "./VoiceSelector";
 import { ratioLabel, resolveProductAspect, type AspectMode } from "./videoAspect";
+import { searchSegments } from "./segmentRetrievalApi";
+import { defaultPackaging, mergeServerReframeFacts, PackagingControls, ReframeControls, type Packaging, type Reframe } from "./ReframeControls";
 
 function clipName(clip: TimelineClip, assets: TimelineAsset[]) { return assets.find((asset) => asset.id === clip.assetId)?.name ?? "缺失素材"; }
 function isCurrentPreview(task: BatchTask, run: BatchVariant["runs"][number] | undefined): boolean {
@@ -22,6 +26,15 @@ function previewCategory(task: BatchTask): "completed" | "queued" | "failed" | "
   return "pending";
 }
 function nextId() { return `clip-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; }
+function scriptSegments(value: string) { return value.split(/[。！？；;!?\n]|\.(?!\d)/).map((item) => item.trim()).filter(Boolean); }
+function parseBeatTimes(value: string): number[] | null {
+  if (!value.trim()) return [];
+  const times = value.split(/[，,\s]+/).filter(Boolean).map(Number);
+  return times.every((item) => Number.isFinite(item) && item >= 0) ? [...new Set(times)].sort((a, b) => a - b) : null;
+}
+function estimatedNarrationDuration(text: string): number {
+  return Math.max(1.5, Math.min(6, [...text].length * .22));
+}
 const reviewLabel = { pending: "待审核", approved: "已通过", rejected: "已退回", stale: "旧审核已失效" };
 const exportLabel = { queued: "排队中", running: "导出中", completed: "已完成", failed: "失败", cancelled: "已取消" };
 function invalidatedReviewStatus(task: BatchTask): BatchTask["reviewStatus"] {
@@ -29,13 +42,23 @@ function invalidatedReviewStatus(task: BatchTask): BatchTask["reviewStatus"] {
 }
 type BulkItem = { sellingPoint: string; script: string };
 type VariantAspectDraft = { aspectMode: AspectMode; settings: BatchVariant["settings"]; resolvedAspect: string; aspectReason: string };
-function reorder(clips: TimelineClip[], index: number, direction: -1 | 1, kind: TimelineTrack["kind"]): TimelineClip[] {
+type MontageAdjustment = { candidateId: string; inPointSeconds: number; durationSeconds: number };
+function savedMontageAdjustments(proposal: MontageProposal | undefined): Record<string, MontageAdjustment> {
+  return Object.fromEntries((proposal?.segments ?? []).filter((item) => item.selectedClip && item.selectedCandidateId).map((item) => [item.id, {
+    candidateId: item.selectedCandidateId!, inPointSeconds: item.selectedClip!.inPoint, durationSeconds: item.selectedClip!.duration,
+  }]));
+}
+function reorder(clips: TimelineClip[], index: number, direction: -1 | 1, kind: TimelineTrack["kind"], transitions: TimelineTransition[]): TimelineClip[] {
   const gaps = clips.map((clip, position) => position === 0 ? clip.start : Math.max(0, clip.start - clips[position - 1].start - clips[position - 1].duration));
   const next = [...clips];
   [next[index], next[index + direction]] = [next[index + direction], next[index]];
   if (kind === "audio") return next.map((clip, position) => ({ ...clip, start: clips[position].start }));
   let position = 0;
-  return next.map((clip, index) => { position += gaps[index]; const moved = { ...clip, start: position }; position += clip.duration; return moved; });
+  return next.map((clip, index) => {
+    const boundary = transitions.find(item => item.leftClipId === next[index - 1]?.id && item.rightClipId === clip.id);
+    position += gaps[index] - (boundary?.enabled ? boundary.overlap : 0);
+    const moved = { ...clip, start: position }; position += clip.duration; return moved;
+  });
 }
 
 export function BatchEditor({ projectId, onDraftChange, onPersistedChange, presentation, focusTaskId, onProgress, onOpenEdit, projectAssets, visible = true }: { projectId: string; onDraftChange?: (dirty: boolean) => void; onPersistedChange?: () => void;
@@ -48,12 +71,18 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
   const assets = projectAssets ?? loadedAssets;
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, TimelineTrack[]>>({});
+  const [transitionDrafts, setTransitionDrafts] = useState<Record<string, TimelineTransition[]>>({});
   const [aspectDrafts, setAspectDrafts] = useState<Record<string, VariantAspectDraft>>({});
   const [contentDrafts, setContentDrafts] = useState<Record<string, BulkItem>>({});
   const [reviewReasons, setReviewReasons] = useState<Record<string, string>>({});
   const [selectedExportIds, setSelectedExportIds] = useState<string[]>([]);
   const [subtitleDrafts, setSubtitleDrafts] = useState<Record<string, BatchCue[]>>({});
+  const [packagingDrafts, setPackagingDrafts] = useState<Record<string, Packaging>>({});
   const [recommendationSelections, setRecommendationSelections] = useState<Record<string, string[]>>({});
+  const [montageAdjustments, setMontageAdjustments] = useState<Record<string, Record<string, MontageAdjustment>>>({});
+  const [montageStrategies, setMontageStrategies] = useState<Record<string, "overwrite" | "merge" | "abandon">>({});
+  const [montageBeatInputs, setMontageBeatInputs] = useState<Record<string, string>>({});
+  const [montageMessage, setMontageMessage] = useState("");
   const [bulkCount, setBulkCount] = useState(5);
   const [bulkInputs, setBulkInputs] = useState<Record<string, BulkItem[]>>({});
   const [sellingPoint, setSellingPoint] = useState("");
@@ -69,11 +98,20 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
   const [voiceSubmittingOwners, setVoiceSubmittingOwners] = useState<Record<string, string[]>>({});
   const voicePending = Object.values(voicePendingOwners).some(ids => ids.length > 0);
   const [reviewFilter, setReviewFilter] = useState<"all" | "pending" | "approved" | "changes">("all");
+  const [mobileTransitionView, setMobileTransitionView] = useState(() => window.matchMedia?.("(max-width: 600px)").matches ?? false);
+  useEffect(() => {
+    const query = window.matchMedia?.("(max-width: 600px)");
+    if (!query) return undefined;
+    const update = () => setMobileTransitionView(query.matches);
+    query.addEventListener?.("change", update);
+    update();
+    return () => query.removeEventListener?.("change", update);
+  }, []);
   useEffect(() => { setVoiceSelections({}); setVoicePendingOwners({}); setVoiceSubmittingOwners({}); }, [projectId]);
 
   useEffect(() => {
     let active = true;
-    setTasks([]); setAssets([]); setSelectedId(null); setDrafts({}); setAspectDrafts({}); setContentDrafts({}); setReviewReasons({}); setSelectedExportIds([]); setSubtitleDrafts({}); setRecommendationSelections({}); setBulkCount(5); setBulkInputs({}); setReviewFilter("all"); setLoading(true); setBusy(false); setError("");
+    setTasks([]); setAssets([]); setSelectedId(null); setDrafts({}); setTransitionDrafts({}); setAspectDrafts({}); setContentDrafts({}); setReviewReasons({}); setSelectedExportIds([]); setSubtitleDrafts({}); setPackagingDrafts({}); setRecommendationSelections({}); setMontageAdjustments({}); setMontageStrategies({}); setMontageBeatInputs({}); setMontageMessage(""); setBulkCount(5); setBulkInputs({}); setReviewFilter("all"); setLoading(true); setBusy(false); setError("");
     void getBatchWorkspace(projectId).then((result) => { if (active) { setTasks(result.tasks); setAssets(result.assets); if(presentation) setSelectedId(focusTaskId ?? [...result.tasks].reverse().find(task => !task.batchId)?.id ?? null); } })
       .catch((reason) => { if (active) setError(reason instanceof Error ? reason.message : "无法读取批量任务。"); })
       .finally(() => { if (active) setLoading(false); });
@@ -107,6 +145,7 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
     if (presentation === "voice" && selected?.batchId) setSelectedId(selected.batchId);
   }, [presentation, selected?.id, selected?.batchId]);
   const draftTracks = selected ? drafts[selected.id] ?? selected.variant.tracks : null;
+  const draftTransitions = selected ? transitionDrafts[selected.id] ?? selected.variant.transitions ?? [] : [];
   const savedAspect = selected ? {
     aspectMode: selected.variant.aspectMode ?? "9:16",
     settings: selected.variant.settings,
@@ -123,27 +162,33 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
   const contentDraft = selected ? contentDrafts[selected.id] ?? { sellingPoint: selected.sellingPoint, script: selected.script } : null;
   const contentDirty = Boolean(selected && contentDraft && (contentDraft.sellingPoint !== selected.sellingPoint || contentDraft.script !== selected.script));
   const tracksDirty = Boolean(selected && draftTracks && JSON.stringify(draftTracks) !== JSON.stringify(selected.variant.tracks));
+  const transitionsDirty = Boolean(selected && JSON.stringify(draftTransitions) !== JSON.stringify(selected.variant.transitions ?? []));
   const aspectDirty = Boolean(selected && selectedAspect && (selectedAspect.aspectMode !== (selected.variant.aspectMode ?? "9:16") ||
     JSON.stringify(selectedAspect.settings) !== JSON.stringify(selected.variant.settings)));
-  const dirty = tracksDirty || aspectDirty;
   const subtitles = selected?.variant.subtitles ?? { revision: 0, cues: [], recognitions: [] };
   const subtitleDraft = selected ? subtitleDrafts[selected.id] ?? subtitles.cues : [];
   const subtitleDirty = JSON.stringify(subtitleDraft) !== JSON.stringify(subtitles.cues);
+  const selectedPackaging = selected ? packagingDrafts[selected.id] ?? selected.variant.packaging ?? defaultPackaging() : null;
+  const packagingDirty = Boolean(selected && packagingDrafts[selected.id] && JSON.stringify(packagingDrafts[selected.id]) !== JSON.stringify(selected.variant.packaging ?? null));
+  const dirty = tracksDirty || transitionsDirty || aspectDirty || packagingDirty;
   const subtitleDuration = Math.max(0, ...(draftTracks ?? []).filter((track) => track.kind === "video" && !track.hidden)
     .flatMap((track) => track.clips.map((clip) => clip.start + clip.duration)));
   const subtitlesValid = subtitleDraft.every((cue) => cue.text.trim() && cue.text.length <= 120 && Number.isFinite(cue.start) && Number.isFinite(cue.end) &&
     cue.start >= 0 && cue.end > cue.start && Math.round(cue.end * 1000) > Math.round(cue.start * 1000) && cue.end <= subtitleDuration + 0.002);
   const anyDirty = tasks.some((task) => (contentDrafts[task.id] && (contentDrafts[task.id].sellingPoint !== task.sellingPoint || contentDrafts[task.id].script !== task.script)) ||
     (drafts[task.id] && JSON.stringify(drafts[task.id]) !== JSON.stringify(task.variant.tracks)) ||
+    (transitionDrafts[task.id] && JSON.stringify(transitionDrafts[task.id]) !== JSON.stringify(task.variant.transitions ?? [])) ||
     (aspectDrafts[task.id] && (aspectDrafts[task.id].aspectMode !== (task.variant.aspectMode ?? "9:16") ||
       JSON.stringify(aspectDrafts[task.id].settings) !== JSON.stringify(task.variant.settings))) ||
-    (subtitleDrafts[task.id] && JSON.stringify(subtitleDrafts[task.id]) !== JSON.stringify(task.variant.subtitles?.cues ?? [])));
+    (subtitleDrafts[task.id] && JSON.stringify(subtitleDrafts[task.id]) !== JSON.stringify(task.variant.subtitles?.cues ?? [])) ||
+    (packagingDrafts[task.id] && JSON.stringify(packagingDrafts[task.id]) !== JSON.stringify(task.variant.packaging ?? null)) ||
+    (montageAdjustments[task.id] && JSON.stringify(montageAdjustments[task.id]) !== JSON.stringify(savedMontageAdjustments(task.montageProposals?.[task.montageProposals.length - 1]))));
   useEffect(() => { onDraftChange?.(anyDirty || aigcDirty || voicePending); }, [anyDirty, aigcDirty, voicePending, onDraftChange]);
   const latestRun = selected?.variant.runs[selected.variant.runs.length - 1];
   const latestExport = selected?.variant.exports?.[selected.variant.exports.length - 1];
-  const latestCompleted = [...(selected?.variant.runs ?? [])].reverse().find((run) => run.status === "completed");
+  const latestCompleted = latestRun?.status === "completed" ? latestRun : undefined;
   const currentPreview = selected && isCurrentPreview(selected, latestRun) ? latestRun : null;
-  const reviewReady = Boolean(currentPreview && selected && !hasPendingVoice(selected) && !dirty && !contentDirty && !subtitleDirty && (reviewReasons[selected?.id ?? ""] ?? "").trim());
+  const reviewReady = Boolean(currentPreview && selected && !hasPendingVoice(selected) && !dirty && !contentDirty && !subtitleDirty && !packagingDirty && (reviewReasons[selected?.id ?? ""] ?? "").trim());
   const latestRecognition = subtitles.recognitions[subtitles.recognitions.length - 1];
   const selectedAssets = selected ? recommendationSelections[selected.id] ?? selected.proposal?.assetIds ?? [] : [];
   const selectedChildren = selected && !selected.batchId ? tasks.filter((task) => task.batchId === selected.id) : [];
@@ -155,6 +200,29 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
   const selectionChanged = Boolean(selected?.proposal && JSON.stringify(selectedAssets) !== JSON.stringify(selected.proposal.assetIds));
   const savedIncludesRecommendation = Boolean(selected?.proposal?.clips.every((clip) =>
     selected.variant.tracks.some((track) => track.kind === "video" && track.clips.some((item) => item.id === clip.id))));
+  const montageProposal = selected?.montageProposals?.[selected.montageProposals.length - 1];
+  const montageSaved = savedMontageAdjustments(montageProposal);
+  const montageDraft = selected && montageProposal ? montageAdjustments[selected.id] ?? montageSaved : {};
+  const montageAdjustmentDirty = JSON.stringify(montageDraft) !== JSON.stringify(montageSaved);
+  const montageBeatTimes = selected ? parseBeatTimes(montageBeatInputs[selected.id] ?? "") : [];
+  const montageNarration = selected ? (() => {
+    const segments = scriptSegments(selected.script);
+    const voiceCurrent = selected.voiceover?.status === "completed"
+      && selected.voiceover.contentRevision === (selected.contentRevision ?? 0)
+      && selected.voiceover.assetIds.length === segments.length;
+    const voiceDurations = voiceCurrent ? selected.voiceover!.assetIds.map((assetId) => {
+      const asset = assets.find((item) => item.id === assetId);
+      return asset?.kind === "audio" && typeof asset.duration === "number" && Number.isFinite(asset.duration)
+        && asset.duration > 0 ? asset.duration : null;
+    }) : [];
+    if (voiceCurrent && voiceDurations.every((duration) => duration !== null)) return segments.map((_text, index) => ({
+      durationSeconds: voiceDurations[index] as number, wordBoundariesSeconds: [], source: "measured_voiceover" as const,
+    }));
+    return segments.map((text) => ({
+      durationSeconds: estimatedNarrationDuration(text), wordBoundariesSeconds: [], source: "estimated_text" as const,
+    }));
+  })() : [];
+  const montageTimingEstimated = montageNarration.some((item) => item.source === "estimated_text");
 
   function hasPendingVoice(task: BatchTask): boolean {
     return Object.values(voicePendingOwners).some(ids => ids.includes(task.id));
@@ -166,7 +234,9 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
       task.variant.settings.fps === 30 && !aspectDrafts[task.id] &&
       (!contentDrafts[task.id] || (contentDrafts[task.id].sellingPoint === task.sellingPoint && contentDrafts[task.id].script === task.script)) &&
       (!drafts[task.id] || JSON.stringify(drafts[task.id]) === JSON.stringify(task.variant.tracks)) &&
-      (!subtitleDrafts[task.id] || JSON.stringify(subtitleDrafts[task.id]) === JSON.stringify(task.variant.subtitles?.cues ?? []));
+      (!transitionDrafts[task.id] || JSON.stringify(transitionDrafts[task.id]) === JSON.stringify(task.variant.transitions ?? [])) &&
+      (!subtitleDrafts[task.id] || JSON.stringify(subtitleDrafts[task.id]) === JSON.stringify(task.variant.subtitles?.cues ?? [])) &&
+      (!packagingDrafts[task.id] || JSON.stringify(packagingDrafts[task.id]) === JSON.stringify(task.variant.packaging ?? null));
   }
 
   const childTasks = tasks.filter(task => task.batchId);
@@ -174,9 +244,11 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
   function reviewState(task: BatchTask) {
     const changed = (contentDrafts[task.id] && (contentDrafts[task.id].sellingPoint !== task.sellingPoint || contentDrafts[task.id].script !== task.script)) ||
       (drafts[task.id] && JSON.stringify(drafts[task.id]) !== JSON.stringify(task.variant.tracks)) ||
+      (transitionDrafts[task.id] && JSON.stringify(transitionDrafts[task.id]) !== JSON.stringify(task.variant.transitions ?? [])) ||
       (aspectDrafts[task.id] && (aspectDrafts[task.id].aspectMode !== (task.variant.aspectMode ?? "9:16") ||
         JSON.stringify(aspectDrafts[task.id].settings) !== JSON.stringify(task.variant.settings))) ||
-      (subtitleDrafts[task.id] && JSON.stringify(subtitleDrafts[task.id]) !== JSON.stringify(task.variant.subtitles?.cues ?? []));
+      (subtitleDrafts[task.id] && JSON.stringify(subtitleDrafts[task.id]) !== JSON.stringify(task.variant.subtitles?.cues ?? [])) ||
+      (packagingDrafts[task.id] && JSON.stringify(packagingDrafts[task.id]) !== JSON.stringify(task.variant.packaging ?? null));
     const status = task.reviewStatus ?? "pending";
     return (status === "approved" || status === "rejected") && (changed || hasPendingVoice(task) || !isCurrentPreview(task, task.variant.runs[task.variant.runs.length - 1])) ? "stale" : status;
   }
@@ -187,7 +259,7 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
     if (presentation === "review" && !filteredReviewTasks.some(task => task.id === selectedId)) {
       setSelectedId(filteredReviewTasks[0]?.id ?? null);
     }
-  }, [presentation, reviewFilter, selectedId, tasks, contentDrafts, drafts, aspectDrafts, subtitleDrafts, voicePendingOwners]);
+  }, [presentation, reviewFilter, selectedId, tasks, contentDrafts, drafts, transitionDrafts, aspectDrafts, subtitleDrafts, voicePendingOwners]);
 
   function changeBulkItem(index: number, key: keyof BulkItem, value: string) {
     if (!selected) return;
@@ -287,11 +359,100 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
 
+  function rememberMontageProposal(taskId: string, proposal: MontageProposal) {
+    setTasks((current) => current.map((item) => item.id === taskId ? {
+      ...item, montageProposals: [...(item.montageProposals ?? []).filter((saved) => saved.id !== proposal.id), proposal],
+    } : item));
+    setMontageAdjustments((current) => ({ ...current, [taskId]: savedMontageAdjustments(proposal) }));
+  }
+
+  async function generateMontageProposal() {
+    if (!selected || contentDirty || dirty || montageAdjustmentDirty || !montageNarration.length) return;
+    const segments = scriptSegments(selected.script);
+    if (!segments.length) return;
+    setBusy(true); setError(""); setMontageMessage("");
+    try {
+      const searches = [];
+      for (const text of segments) searches.push(await searchSegments(projectId, text, 8));
+      if (projectRef.current !== projectId) return;
+      const result = await createMontageProposal(projectId, selected.id, selected.variant.revision,
+        searches.map((item) => item.id), montageNarration, montageBeatTimes ?? []);
+      if (projectRef.current !== projectId) return;
+      rememberMontageProposal(selected.id, result.proposal);
+      onPersistedChange?.();
+    } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法生成混剪提案。"); }
+    finally { if (projectRef.current === projectId) setBusy(false); }
+  }
+
+  function montageCandidate(proposal: MontageProposal, segmentId: string, candidateId: string) {
+    const segment = proposal.segments.find((item) => item.id === segmentId);
+    if (!segment) return null;
+    if (segment.suggestion?.candidateId === candidateId) return {
+      candidate: segment.suggestion, clip: segment.selectedCandidateId === candidateId && segment.selectedClip
+        ? segment.selectedClip : { ...(segment.suggestionClip ?? segment.selectedClip!), assetId: segment.suggestion.assetId,
+          inPoint: segment.suggestion.inPointSeconds,
+          duration: Math.min(segment.timing.narrationDurationSeconds, segment.suggestion.outPointSeconds - segment.suggestion.inPointSeconds) },
+    };
+    return segment.alternatives.find((item) => item.candidate.candidateId === candidateId) ?? null;
+  }
+
+  function changeMontageCandidate(segmentId: string, candidateId: string) {
+    if (!selected || !montageProposal) return;
+    const found = montageCandidate(montageProposal, segmentId, candidateId);
+    if (!found) return;
+    setMontageAdjustments((current) => ({ ...current, [selected.id]: { ...(current[selected.id] ?? montageDraft), [segmentId]: {
+      candidateId, inPointSeconds: found.clip.inPoint, durationSeconds: found.clip.duration,
+    } } }));
+  }
+
+  function changeMontageTiming(segmentId: string, field: "inPointSeconds" | "durationSeconds", value: number) {
+    if (!selected) return;
+    setMontageAdjustments((current) => ({ ...current, [selected.id]: { ...(current[selected.id] ?? montageDraft),
+      [segmentId]: { ...(current[selected.id] ?? montageDraft)[segmentId], [field]: value },
+    } }));
+  }
+
+  async function saveMontageAdjustments() {
+    if (!selected || !montageProposal) return;
+    const segments = montageProposal.segments.map((item) => ({ segmentId: item.id, ...(montageDraft[item.id] ?? {}) }))
+      .filter((item): item is { segmentId: string } & MontageAdjustment => Boolean(item.candidateId));
+    setBusy(true); setError(""); setMontageMessage("");
+    try {
+      const result = await updateMontageProposal(projectId, selected.id, montageProposal.id, montageProposal.revision, segments);
+      if (projectRef.current !== projectId) return;
+      rememberMontageProposal(selected.id, result.proposal);
+      onPersistedChange?.();
+    } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法保存混剪提案调整。"); }
+    finally { if (projectRef.current === projectId) setBusy(false); }
+  }
+
+  async function applyMontage() {
+    if (!selected || !montageProposal) return;
+    const strategy = montageStrategies[selected.id];
+    if (!strategy) return;
+    setBusy(true); setError(""); setMontageMessage("");
+    try {
+      const result = await applyMontageProposal(projectId, selected.id, montageProposal.id, selected.variant.revision,
+        montageProposal.revision, strategy);
+      if (projectRef.current !== projectId) return;
+      setTasks((current) => current.map((item) => item.id === selected.id ? {
+        ...item, variant: result.variant, reviewStatus: invalidatedReviewStatus(item),
+        montageProposals: [...(item.montageProposals ?? []).filter((saved) => saved.id !== result.proposal.id), result.proposal],
+      } : item));
+      if (strategy !== "abandon") {
+        setDrafts((current) => { const next = { ...current }; delete next[selected.id]; return next; });
+        setTransitionDrafts((current) => { const next = { ...current }; delete next[selected.id]; return next; });
+      }
+      setMontageMessage(strategy === "abandon" ? "已放弃本次混剪提案，当前编辑未改变。" : `提案已写入变体第 ${result.variant.revision} 版，可继续编辑。`);
+      onPersistedChange?.();
+    } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法应用混剪提案。"); }
+    finally { if (projectRef.current === projectId) setBusy(false); }
+  }
+
   function applyRecommendation() {
     if (!selected?.proposal || selected.proposal.baseRevision !== selected.variant.revision || dirty || selectionChanged) return;
     const firstVideo = selected.variant.tracks.find((track) => track.kind === "video")?.id;
-    setDrafts((current) => ({ ...current, [selected.id]: (current[selected.id] ?? selected.variant.tracks).map((track) =>
-      track.id === firstVideo ? { ...track, clips: selected.proposal!.clips } : track) }));
+    if (firstVideo) changeClips(firstVideo, () => selected.proposal!.clips);
   }
 
   async function refresh(notify = true) {
@@ -354,9 +515,18 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
   }, [projectId, selectedId, childrenActive, selected?.voiceover?.status, latestRun?.id, latestRun?.status, latestRecognition?.id, latestRecognition?.status, latestExport?.id, latestExport?.status]);
 
   function changeClips(trackId: string, update: (clips: TimelineClip[]) => TimelineClip[]) {
-    if (!selected) return;
-    setDrafts((current) => ({ ...current, [selected.id]: (current[selected.id] ?? selected.variant.tracks)
-      .map((track) => track.id === trackId ? { ...track, clips: update(track.clips) } : track) }));
+    if (!selected || !draftTracks) return;
+    const updated = reconcileBoundaries(draftTracks, draftTracks.map((track) => track.id === trackId ? { ...track, clips: update(track.clips) } : track), draftTransitions);
+    setDrafts((current) => ({ ...current, [selected.id]: updated.tracks }));
+    setTransitionDrafts((current) => ({ ...current, [selected.id]: updated.transitions }));
+    if (updated.transitions.length < draftTransitions.length) setError("片段时序已变化，失效边界已移除；请检查新的切点与转场。");
+  }
+
+  function changeTransition(transition: TimelineTransition, change: Partial<TimelineTransition>) {
+    if (!selected || !draftTracks || mobileTransitionView) return;
+    const next = changeBoundary(draftTracks, draftTransitions, transition, change);
+    setTransitionDrafts((saved) => ({ ...saved, [selected.id]: next.transitions }));
+    setDrafts((saved) => ({ ...saved, [selected.id]: next.tracks }));
   }
 
   function addAsset(asset: TimelineAsset) {
@@ -387,7 +557,8 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
     if (!selected || !draftTracks || !selectedAspect) return;
     setBusy(true); setError("");
     try {
-      const result = await saveBatchVariant(projectId, selected.id, selected.variant.revision, draftTracks, selectedAspect.settings, selectedAspect.aspectMode);
+      const result = await saveBatchVariant(projectId, selected.id, selected.variant.revision, draftTracks, draftTransitions, selectedAspect.settings, selectedAspect.aspectMode,
+        packagingDrafts[selected.id]);
       if (projectRef.current !== projectId) return;
       setTasks((current) => current.map((task) => task.id === selected.id ? { ...task, variant: result.variant,
         reviewStatus: invalidatedReviewStatus(task),
@@ -397,12 +568,34 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
         if (JSON.stringify(current[selected.id]) !== JSON.stringify(draftTracks)) return current;
         const next = { ...current }; delete next[selected.id]; return next;
       });
+      setPackagingDrafts((current) => {
+        if (!current[selected.id] || JSON.stringify(current[selected.id]) !== JSON.stringify(packagingDrafts[selected.id])) return current;
+        const next = { ...current }; delete next[selected.id]; return next;
+      });
+      setTransitionDrafts((current) => {
+        if (JSON.stringify(current[selected.id]) !== JSON.stringify(draftTransitions)) return current;
+        const next = { ...current }; delete next[selected.id]; return next;
+      });
       setAspectDrafts((current) => {
         if (JSON.stringify(current[selected.id]) !== JSON.stringify(selectedAspect)) return current;
         const next = { ...current }; delete next[selected.id]; return next;
       });
       onPersistedChange?.();
     } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法保存变体。"); }
+    finally { if (projectRef.current === projectId) setBusy(false); }
+  }
+
+  async function updateReframe(clipId: string, action: "analyze" | "cancel") {
+    if (!selected) return;
+    setBusy(true); setError("");
+    try {
+      const result = action === "analyze"
+        ? await analyzeBatchReframe(projectId, selected.id, clipId, selected.variant.revision)
+        : await cancelBatchReframe(projectId, selected.id, clipId, selected.variant.revision);
+      if (projectRef.current !== projectId) return;
+      setTasks((current) => current.map((task) => task.id === selected.id ? { ...task, variant: result.variant } : task));
+      setDrafts((current) => current[selected.id] ? { ...current, [selected.id]: mergeServerReframeFacts(current[selected.id], result.variant.tracks) } : current);
+    } catch (reason) { if (projectRef.current === projectId) setError(reason instanceof Error ? reason.message : "无法更新主体分析。"); }
     finally { if (projectRef.current === projectId) setBusy(false); }
   }
 
@@ -602,6 +795,64 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
         })}
       </div>}
       {(!presentation || presentation === "edit") && <>
+      <section className="batch-editor-montage" aria-labelledby="batch-montage-title">
+        <div className="batch-editor-montage-heading"><div><h5 id="batch-montage-title">可解释混剪提案</h5>
+          <p>按已保存脚本逐段执行本地视觉检索，旁白与词边界优先，节拍只作辅助。提案采用后写入当前变体编辑序列。</p></div>
+          <button type="button" className="primary-action" disabled={busy || dirty || contentDirty || montageAdjustmentDirty || montageBeatTimes === null || !montageNarration.length || !scriptSegments(selected.script).length}
+            onClick={() => void generateMontageProposal()}>{busy ? "正在处理…" : "生成可解释混剪提案"}</button></div>
+        <label className="batch-editor-montage-beats">音乐节拍（秒，选填）<input value={montageBeatInputs[selected.id] ?? ""}
+          onChange={(event) => setMontageBeatInputs((current) => ({ ...current, [selected.id]: event.target.value }))}
+          placeholder="例如 1.20, 2.40, 3.60" /></label>
+        {montageBeatTimes === null && <p role="status">节拍须填写非负秒数，并用逗号或空格分隔。</p>}
+        {montageTimingEstimated && <p>当前尚无逐段实测配音或已保存字幕时长，首轮提案使用明确标记的文本估时；生成配音后请重新生成，节拍吸附只会用于实测时长。</p>}
+        {(dirty || contentDirty) && <p>先保存或撤销当前脚本与变体草稿，再生成提案。</p>}
+        {montageAdjustmentDirty && <p>先保存或撤销当前提案调整，再重新生成。</p>}
+        {montageProposal && <div className="batch-editor-montage-proposal">
+          <p>提案版本 {montageProposal.revision} · {montageProposal.plannerVersion} · {montageProposal.status === "applied" ? `已写入变体第 ${montageProposal.appliedVariantRevision} 版` : montageProposal.status === "abandoned" ? "已放弃" : "待确认"}</p>
+          {montageProposal.segments.map((segment, index) => {
+            const candidates = [segment.suggestion, ...segment.alternatives.map((item) => item.candidate)].filter((item): item is NonNullable<typeof item> => Boolean(item));
+            const adjustment = montageDraft[segment.id];
+            const suggestionName = assets.find((asset) => asset.id === segment.suggestion?.assetId)?.name ?? segment.suggestion?.assetId;
+            const boundary = montageProposal.transitions?.find(item => item.leftClipId === segment.selectedClip?.id);
+            return <article key={segment.id} className={segment.status === "gap" ? "is-gap" : ""}>
+              <header><div><strong>第 {index + 1} 段</strong><p>{segment.text}</p></div><span>{segment.status === "gap"
+                ? segment.suggestion ? "时长缺口" : "缺少可用候选"
+                : `${segment.timing.narrationDurationSeconds.toFixed(3)} 秒`}</span></header>
+              {segment.suggestion && <p>系统原建议：{suggestionName} {segment.suggestion.inPointSeconds.toFixed(3)}–{segment.suggestion.outPointSeconds.toFixed(3)} 秒</p>}
+              {boundary && <p>下一镜头转场：{transitionLabels[boundary.template]} · {boundary.duration} 秒。{boundary.reason}；采用提案后可逐个调整。</p>}
+              {candidates.length > 0 && <div className="batch-editor-montage-controls">
+                <label>第 {index + 1} 段候选片段<select aria-label={`第 ${index + 1} 段候选片段`} value={adjustment?.candidateId ?? ""}
+                  onChange={(event) => changeMontageCandidate(segment.id, event.target.value)}>
+                  {candidates.map((candidate) => <option key={candidate.candidateId} value={candidate.candidateId}>
+                    {assets.find((asset) => asset.id === candidate.assetId)?.name ?? candidate.assetId} · {candidate.inPointSeconds.toFixed(3)}–{candidate.outPointSeconds.toFixed(3)} 秒
+                  </option>)}</select></label>
+                <label>第 {index + 1} 段源入点（秒）<input type="number" min="0" step="0.1" value={adjustment?.inPointSeconds ?? ""}
+                  onChange={(event) => changeMontageTiming(segment.id, "inPointSeconds", Number(event.target.value))} /></label>
+                <label>第 {index + 1} 段画面时长（秒）<input type="number" min="0.001" step="0.1" value={adjustment?.durationSeconds ?? ""}
+                  onChange={(event) => changeMontageTiming(segment.id, "durationSeconds", Number(event.target.value))} /></label>
+              </div>}
+              <details><summary>选择依据与未满足项</summary><ul>{segment.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>
+                {segment.unmet.length > 0 && <ul>{segment.unmet.map((message) => <li key={message}>{message}</li>)}</ul>}</details>
+            </article>;
+          })}
+          <button type="button" className="secondary-action" disabled={busy || !montageAdjustmentDirty || montageProposal.status !== "draft" || Object.keys(montageDraft).length !== montageProposal.segments.length}
+            onClick={() => void saveMontageAdjustments()}>保存提案调整</button>
+          {montageAdjustmentDirty && <p>先保存候选、入点和时长调整，再采用提案。</p>}
+          <fieldset><legend>当前变体已有编辑时如何处理</legend>
+            <label><input type="radio" name={`montage-strategy-${selected.id}`} checked={montageStrategies[selected.id] === "overwrite"}
+              onChange={() => setMontageStrategies((current) => ({ ...current, [selected.id]: "overwrite" }))} />覆盖当前人工编辑</label>
+            <label><input type="radio" name={`montage-strategy-${selected.id}`} checked={montageStrategies[selected.id] === "merge"}
+              onChange={() => setMontageStrategies((current) => ({ ...current, [selected.id]: "merge" }))} />合并到当前编辑末尾</label>
+            <label><input type="radio" name={`montage-strategy-${selected.id}`} checked={montageStrategies[selected.id] === "abandon"}
+              onChange={() => setMontageStrategies((current) => ({ ...current, [selected.id]: "abandon" }))} />放弃本次提案</label>
+          </fieldset>
+          <button type="button" className="primary-action" disabled={busy || montageAdjustmentDirty || !montageStrategies[selected.id] || montageProposal.status !== "draft" ||
+            (montageStrategies[selected.id] !== "abandon" && (dirty || contentDirty)) ||
+            (montageStrategies[selected.id] !== "abandon" && (montageProposal.unmet.length > 0 || montageProposal.segments.some((segment) => segment.unmet.length > 0)))}
+            onClick={() => void applyMontage()}>采用混剪提案</button>
+        </div>}
+        {montageMessage && <p role="status">{montageMessage}</p>}
+      </section>
       <div className="batch-editor-recommendation">
         <h5>按脚本推荐镜头</h5>
         <p>依据素材名称和备注的词语匹配脚本段落；当前不分析画面内容。请在素材页补充准确备注，脚本用句号或换行分段。</p>
@@ -618,14 +869,32 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
       </div>
       {draftTracks.map((track) => <div key={track.id} className="batch-editor-track">
         <h5>{track.name}</h5>
-        {track.clips.map((clip, index) => <div key={clip.id} className="batch-editor-clip">
-          <strong>{clipName(clip, assets)}</strong>
-          <button type="button" className="secondary-action" disabled={index === 0} onClick={() => changeClips(track.id, (clips) => reorder(clips, index, -1, track.kind))}>上移 {clipName(clip, assets)}</button>
-          <button type="button" className="secondary-action" disabled={index === track.clips.length - 1} onClick={() => changeClips(track.id, (clips) => reorder(clips, index, 1, track.kind))}>下移 {clipName(clip, assets)}</button>
-          <button type="button" className="secondary-action" onClick={() => changeClips(track.id, (clips) => clips.filter((item) => item.id !== clip.id))}>移除 {clipName(clip, assets)}</button>
-          {([ ["start", "起点（秒）"], ["inPoint", "入点（秒）"], ["duration", "时长（秒）"], ["speed", "速度"], ["volume", "音量"], ["fadeIn", "淡入（秒）"], ["fadeOut", "淡出（秒）"] ] as const).map(([key, label]) =>
-            <label key={key}>{clipName(clip, assets)} {label}<input type="number" min="0" step="0.1" value={clip[key]} onChange={(event) => changeClips(track.id, (clips) => clips.map((item) => item.id === clip.id ? { ...item, [key]: Number(event.target.value) } : item))} /></label>)}
-        </div>)}
+        {track.clips.map((clip, index) => {
+          const following = track.clips[index + 1];
+          const transition = following ? draftTransitions.find((item) => item.leftClipId === clip.id && item.rightClipId === following.id)
+            ?? (Math.abs(clip.start + clip.duration - following.start) < .000001 ? {
+              id: `transition-${nextId()}`, leftClipId: clip.id, rightClipId: following.id,
+              template: "cut" as const, enabled: true, duration: 0, overlap: 0, audioCrossfade: false,
+              reason: "普通叙事保持硬切；调整转场使用左片段尾部素材，保留后续配音和字幕时间。",
+            } : undefined) : undefined;
+          const boundaryName = following ? `${clipName(clip, assets)} → ${clipName(following, assets)}` : "";
+          return <Fragment key={clip.id}><div className="batch-editor-clip">
+            <strong>{clipName(clip, assets)}</strong>
+            <button type="button" className="secondary-action" disabled={index === 0} onClick={() => changeClips(track.id, (clips) => reorder(clips, index, -1, track.kind, draftTransitions))}>上移 {clipName(clip, assets)}</button>
+            <button type="button" className="secondary-action" disabled={index === track.clips.length - 1} onClick={() => changeClips(track.id, (clips) => reorder(clips, index, 1, track.kind, draftTransitions))}>下移 {clipName(clip, assets)}</button>
+            <button type="button" className="secondary-action" onClick={() => changeClips(track.id, (clips) => clips.filter((item) => item.id !== clip.id))}>移除 {clipName(clip, assets)}</button>
+            {([ ["start", "起点（秒）"], ["inPoint", "入点（秒）"], ["duration", "时长（秒）"], ["speed", "速度"], ["volume", "音量"], ["fadeIn", "淡入（秒）"], ["fadeOut", "淡出（秒）"] ] as const).map(([key, label]) =>
+              <label key={key}>{clipName(clip, assets)} {label}<input type="number" min="0" step="0.1" value={clip[key]} onChange={(event) => changeClips(track.id, (clips) => clips.map((item) => item.id === clip.id ? { ...item, [key]: Number(event.target.value) } : item))} /></label>)}
+          </div>
+          {track.kind === "video" && <ReframeControls clipId={clip.id} assetUrl={assets.find((asset) => asset.id === clip.assetId)?.url ?? ""} mediaKind={assets.find((asset) => asset.id === clip.assetId)?.kind === "image" ? "image" : "video"} sourceStart={clip.inPoint} sourceEnd={clip.inPoint + clip.duration * clip.speed}
+            reframe={clip.reframe as Reframe | undefined} analysis={selected.variant.reframeAnalysis?.[clip.id]} disabled={busy}
+            onChange={(reframe) => changeClips(track.id, (clips) => clips.map((item) => item.id === clip.id ? { ...item, reframe } : item))}
+            onAnalyze={() => void updateReframe(clip.id, "analyze")} onCancel={() => void updateReframe(clip.id, "cancel")}
+            candidates={assets.filter((asset) => (asset.kind === "video" || asset.kind === "image") && asset.id !== clip.assetId).map((asset) => ({ id: asset.id, name: asset.name }))}
+            onReplace={(assetId) => changeClips(track.id, (clips) => clips.map((item) => item.id === clip.id ? { ...item, assetId, reframe: undefined } : item))} />}
+          {track.kind === "video" && transition && <TransitionControls boundary={transition} name={boundaryName} onChange={change => changeTransition(transition, change)} />}
+          </Fragment>;
+        })}
       </div>)}
       <div className="batch-editor-subtitles">
         <h5>逐句字幕</h5>
@@ -650,8 +919,10 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
             [selected.id]: subtitleDraft.filter((_, position) => position !== index) }))}>删除第 {index + 1} 条字幕</button>
         </div>)}
         {subtitleDirty && !subtitlesValid && <p role="status">每条字幕需填写不超过 120 字；时间须在当前画面范围内且至少相隔 1 毫秒。</p>}
-        <button type="button" className="primary-action" disabled={busy || dirty || !subtitleDirty || !subtitlesValid} onClick={() => void saveSubtitles()}>保存字幕</button>
+        <button type="button" className="primary-action" disabled={busy || tracksDirty || transitionsDirty || aspectDirty || !subtitleDirty || !subtitlesValid} onClick={() => void saveSubtitles()}>保存字幕</button>
       </div>
+      {selectedPackaging && <PackagingControls value={selectedPackaging} cues={subtitleDraft} subtitleMode="cue" disabled={busy}
+        onChange={(packaging) => setPackagingDrafts((current) => ({ ...current, [selected.id]: packaging }))} />}
       <button type="button" className="primary-action" disabled={busy || !dirty} onClick={() => void saveVariant()}>保存变体</button>
       </>}
       <button type="button" className="secondary-action" disabled={busy || hasPendingVoice(selected) || dirty || contentDirty || subtitleDirty || !draftTracks.some((track) => track.kind === "video" && track.clips.length > 0) || latestRun?.status === "queued" || latestRun?.status === "running"} onClick={() => void preview()}>生成预览</button>
@@ -659,6 +930,7 @@ export function BatchEditor({ projectId, onDraftChange, onPersistedChange, prese
       {dirty && <p>先保存变体，才能预览当前编辑。</p>}
       {contentDirty && <p>先保存卖点与脚本，才能预览当前编辑。</p>}
       {subtitleDirty && <p>先保存字幕，才能预览当前编辑。</p>}
+      {packagingDirty && <p>先保存商业包装，旧预览和审核会在保存后失效。</p>}
       {latestRun && <p>{latestRun.status === "queued" ? "排队中" : latestRun.status === "running" ? "渲染中" : latestRun.status === "completed" ? "预览已完成" : latestRun.status === "cancelled" ? "预览已取消" : `预览失败：${latestRun.error ?? "请重试"}`}</p>}
       {!presentation && latestCompleted?.url && <div><p>预览对应保存版本 {latestCompleted.revision}{latestCompleted.subtitleRevision !== undefined || subtitles.revision > 0 ? `／字幕版本 ${latestCompleted.subtitleRevision ?? 0}` : ""}
         {latestCompleted.revision !== selected.variant.revision || (latestCompleted.contentRevision ?? 0) !== (selected.contentRevision ?? 0) || (latestCompleted.subtitleRevision ?? 0) !== subtitles.revision || dirty || contentDirty || subtitleDirty ? "（当前编辑已变化）" : ""}</p>

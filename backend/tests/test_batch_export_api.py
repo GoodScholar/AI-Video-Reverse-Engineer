@@ -1,5 +1,6 @@
 """Only approved current variants can enter durable batch delivery runs."""
 import json
+import os
 import shutil
 import subprocess
 
@@ -8,6 +9,56 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.batch_editing_api import create_batch_editing_router
+
+
+@pytest.mark.parametrize("replacement", [b"same", b"different bytes"])
+def test_batch_export_copy_race_is_a_409_and_leaves_no_delivery_run(tmp_path, monkeypatch, replacement):
+    """Identity/content replacement after preflight is not a durable 202 failure."""
+    root = tmp_path / "project-files" / "p1" / "preproduction"
+    (root / "assets").mkdir(parents=True)
+    source = root / "assets" / "shot0.mp4"
+    source.write_bytes(b"same")
+    for index in range(1, 5):
+        (root / "assets" / f"shot{index}.mp4").write_bytes(b"other")
+    (root / "state.json").write_text(json.dumps({"schemaVersion": 1, "revision": 0, "brief": {}, "shots": [],
+        "assets": [{"id": f"shot{i}", "name": f"镜头{i}", "kind": "video", "file": f"shot{i}.mp4", "duration": 2}
+                   for i in range(5)]}), encoding="utf-8")
+    jobs = []
+    class Queue:
+        def submit(self, kind, project_id, handler):
+            jobs.append((project_id, handler)); return True
+    app = FastAPI()
+    app.include_router(create_batch_editing_router(tmp_path, lambda _: object(), Queue(),
+                       renderer=lambda _t, _s, output, **_k: output.write_bytes(b"render")))
+    api, base = TestClient(app), "/api/projects/p1/batch-edits"
+    parent = api.post(base, json={"sellingPoint": "批量", "script": "文案"}).json()["task"]
+    child = api.post(f"{base}/{parent['id']}/variants/bulk", json={"items": [{"sellingPoint": f"镜头{i}", "script": f"文案{i}"} for i in range(5)],
+        "assetIds": [f"shot{i}" for i in range(5)]}).json()["tasks"][0]
+    tracks = child["variant"]["tracks"]
+    tracks[0]["clips"] = [{"id": "clip", "assetId": "shot0", "start": 0, "inPoint": 0, "duration": 1,
+                             "speed": 1, "volume": 1, "fadeIn": 0, "fadeOut": 0}]
+    assert api.put(f"{base}/{child['id']}/variant", json={"revision": 0, "tracks": tracks}).status_code == 200
+    assert api.post(f"{base}/{child['id']}/variant/previews", json={"revision": 1}).status_code == 202
+    for project_id, handler in jobs:
+        handler(project_id)
+    run_id = api.get(base).json()["tasks"][1]["variant"]["runs"][-1]["id"]
+    assert api.post(f"{base}/{child['id']}/reviews", json={"runId": run_id, "decision": "approved", "reason": "确认"}).status_code == 200
+    from app.render_inputs import RenderInputPreparation
+    original = RenderInputPreparation.freeze_approved
+    def replace_after_proof(self, *args, **kwargs):
+        temporary = source.with_suffix(".replacement")
+        temporary.write_bytes(replacement)
+        os.replace(temporary, source)
+        return original(self, *args, **kwargs)
+    monkeypatch.setattr(RenderInputPreparation, "freeze_approved", replace_after_proof)
+
+    response = api.post(f"{base}/{parent['id']}/exports", json={"taskIds": [child["id"]]})
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "batch_export_reframe_conflict"
+    assert api.get(base).json()["tasks"][1]["variant"]["exports"] == []
+    export_root = tmp_path / "project-files" / "p1" / "batch-edits" / "exports"
+    assert not export_root.exists() or not list(export_root.iterdir())
 
 
 def test_batch_export_gate_isolation_retry_and_history(tmp_path):
@@ -112,6 +163,17 @@ def test_batch_export_gate_isolation_retry_and_history(tmp_path):
         assert states[1]["variant"]["exports"][0]["url"]
         download = f"{base}/{first['id']}/exports/{first_export['id']}/output"
         assert api.get(download).content == b"delivery"
+        # A completed old export must revalidate its final default cue events,
+        # not merely explicit packaging elements; legacy snapshots stay valid.
+        from app.montage_packaging import default_packaging
+        completed_state = json.loads(state_path.read_text(encoding="utf-8"))
+        invalid_completed = json.loads(json.dumps(completed_state))
+        invalid_completed["tasks"][1]["variant"]["exports"][0]["snapshot"]["packaging"] = default_packaging()
+        invalid_completed["tasks"][1]["variant"]["exports"][0]["subtitles"] = [{"id": "old", "start": .1, "end": .5, "text": "\U00020000"}]
+        state_path.write_text(json.dumps(invalid_completed), encoding="utf-8")
+        blocked = api.get(download)
+        assert blocked.status_code == 409 and blocked.json()["detail"]["code"] == "batch_packaging_invalid"
+        state_path.write_text(json.dumps(completed_state), encoding="utf-8")
         assert api.get(f"{base}/{second['id']}/exports/{second_export['id']}/output").status_code == 409
 
         broken.clear()
@@ -128,7 +190,7 @@ def test_batch_export_gate_isolation_retry_and_history(tmp_path):
             "sellingPoint": "卖点0", "script": "新脚本"})
         assert changed.status_code == 200
         assert api.post(export_url, json={"taskIds": [first["id"]]}).status_code == 409
-        assert api.get(download).content == b"delivery"
+        assert api.get(download).status_code == 409
         assert api.get(base).json()["tasks"][1]["variant"]["exports"][0]["script"] == "卖点0"
         changed_second = api.put(f"{base}/{second['id']}/content", json={"revision": 0,
             "sellingPoint": "卖点1", "script": "新版卖点1"})
@@ -156,7 +218,7 @@ def test_batch_export_gate_isolation_retry_and_history(tmp_path):
         assert states[2]["variant"]["exports"][-1]["assets"][0]["name"] == "卖点1"
         assert states[3]["variant"]["exports"][-1]["status"] == "failed"
         assert "重启" in states[3]["variant"]["exports"][-1]["error"]
-        assert reopened.get(download).content == b"delivery"
+        assert reopened.get(download).status_code == 409
         changed_source = reopened.post(export_url, json={"taskIds": [second["id"]]})
         assert changed_source.status_code == 202
         assert changed_source.json()["results"][0]["status"] == "failed"

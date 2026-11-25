@@ -1,4 +1,5 @@
 import subprocess
+import pytest
 from test_timeline_api import setup, BASE, _workspace
 
 
@@ -10,6 +11,8 @@ def prepare(tmp_path):
 
 def test_missing_and_unreadable_sources_are_located_without_creating_run(tmp_path):
     client, queue = prepare(tmp_path)
+    path = tmp_path / 'project-files/p1/preproduction/assets/video.mp4'
+    path.write_bytes(b'broken-media')
     response = client.post(BASE + '/preflight', json={'revision': 1, 'format': 'mp4'})
     assert response.status_code == 200
     result = response.json()
@@ -17,7 +20,6 @@ def test_missing_and_unreadable_sources_are_located_without_creating_run(tmp_pat
     assert result['issues'][0]['clipId'] == 'clip1'
     assert result['issues'][0]['assetId'] == 'video'
     assert queue.jobs == []
-    path = tmp_path / 'project-files/p1/preproduction/assets/video.mp4'
     path.unlink()
     assert not client.post(BASE + '/preflight', json={'revision': 1, 'format': 'mp4'}).json()['ready']
     assert client.post(BASE + '/preflight', json={'revision': 0, 'format': 'mp4'}).status_code == 409
@@ -38,6 +40,93 @@ def test_actual_stream_duration_and_audio_are_checked(tmp_path):
     assert any(issue['level'] == 'warning' and '音频' in issue['message'] for issue in good['issues'])
     wav = client.post(BASE + '/preflight', json={'revision': 1, 'format': 'wav'}).json()
     assert not wav['ready']
+
+
+def test_enabled_packaging_blocks_an_unanalysed_visible_clip_but_not_a_nonoverlap(tmp_path):
+    from app.montage_packaging import default_packaging
+
+    client, _ = setup(tmp_path)
+    draft = _workspace()
+    draft['packaging'] = default_packaging()
+    draft['packaging']['elements'] = [{
+        'id': 'title', 'kind': 'title', 'enabled': True, 'start': .2, 'end': .8,
+        'text': '主体安全', 'position': 'top', 'style': 'plain',
+    }]
+    assert client.put(BASE, json=draft).status_code == 200
+    blocked = client.post(BASE + '/preflight', json={'revision': 1, 'format': 'mp4'}).json()
+    assert not blocked['ready']
+    assert any('主体信息缺失需人工构图' in issue['message'] for issue in blocked['issues'])
+
+    draft['revision'] = 1
+    draft['packaging']['elements'][0]['start'] = 2.1
+    draft['packaging']['elements'][0]['end'] = 2.5
+    assert client.put(BASE, json=draft).status_code == 200
+    assert client.post(BASE + '/preflight', json={'revision': 2, 'format': 'mp4'}).json()['ready']
+
+
+@pytest.mark.parametrize('mode', ['center', 'manual', 'replace'])
+def test_preflight_blocks_explicit_risk_with_only_partial_real_frame_coverage(tmp_path, mode):
+    from app.montage_packaging import default_packaging
+    from app.montage_reframe import pending_reframe
+
+    client, _ = setup(tmp_path)
+    draft = _workspace()
+    draft['packaging'] = default_packaging()
+    draft['packaging']['elements'] = [{
+        'id': 'title', 'kind': 'title', 'enabled': True, 'start': .2, 'end': .8,
+        'text': '人工构图', 'position': 'auto', 'style': 'plain',
+    }]
+    assert client.put(BASE, json=draft).status_code == 200
+    reframe = pending_reframe(target_width=1280, target_height=720, reason='历史分析中断')
+    reframe.update(sourceWidth=64, sourceHeight=48, frameDurationSeconds=.04, samples=[{
+        'timeSeconds': .5, 'boxes': [{'x': .35, 'y': .2, 'width': .3, 'height': .6,
+                                      'label': 'person', 'confidence': .9}],
+        'center': {'x': .5, 'y': .5}, 'confidence': .9,
+    }])
+    reframe['override'] = {'mode': mode, 'keyframes': [] if mode == 'center' else [
+        {'timeSeconds': 0, 'x': .5, 'y': .5},
+    ]}
+    # This is a persisted historical worker record: the public PUT correctly
+    # refuses clients trying to invent detector facts.
+    from app.timeline import TimelineStore
+    store = TimelineStore(tmp_path)
+    state = store.load('p1')
+    state['tracks'][0]['clips'][0]['reframe'] = reframe
+    store.save('p1', state)
+    result = client.post(BASE + '/preflight', json={'revision': 1, 'format': 'mp4'}).json()
+    assert not result['ready']
+    assert any('未完整覆盖实际帧区间' in issue['message'] for issue in result['issues'])
+
+
+@pytest.mark.parametrize('sample_time', [None, .1])
+def test_preflight_blocks_review_risk_without_an_observation_inside_packaging_event(tmp_path, sample_time):
+    from app.montage_packaging import default_packaging
+    from app.montage_reframe import pending_reframe
+    from app.timeline import TimelineStore
+
+    client, _ = setup(tmp_path)
+    draft = _workspace()
+    draft['packaging'] = default_packaging()
+    draft['packaging']['elements'] = [{
+        'id': 'title', 'kind': 'title', 'enabled': True, 'start': .2, 'end': .8,
+        'text': '人工构图', 'position': 'auto', 'style': 'plain',
+    }]
+    assert client.put(BASE, json=draft).status_code == 200
+    reframe = pending_reframe(target_width=1280, target_height=720, reason='历史分析中断')
+    reframe.update(sourceWidth=64, sourceHeight=48, override={'mode': 'center', 'keyframes': []})
+    if sample_time is not None:
+        reframe['samples'] = [{
+            'timeSeconds': sample_time, 'boxes': [{'x': .35, 'y': .2, 'width': .3, 'height': .6,
+                                                    'label': 'person', 'confidence': .9}],
+            'center': {'x': .5, 'y': .5}, 'confidence': .9,
+        }]
+    state = TimelineStore(tmp_path).load('p1')
+    state['tracks'][0]['clips'][0]['reframe'] = reframe
+    TimelineStore(tmp_path).save('p1', state)
+
+    result = client.post(BASE + '/preflight', json={'revision': 1, 'format': 'mp4'}).json()
+    assert not result['ready']
+    assert any('包装避让证据缺失' in issue['message'] for issue in result['issues'])
 
 
 def test_audio_probe_is_cached_and_muted_wav_is_blocked(tmp_path, monkeypatch):

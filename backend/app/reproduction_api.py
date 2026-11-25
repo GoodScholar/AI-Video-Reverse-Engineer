@@ -3,32 +3,25 @@ import io
 import json
 import subprocess
 import os
-import tempfile
 import zipfile
 from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock
-from typing import Literal, Optional
-from uuid import uuid4
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, Response
 from PIL import Image, ImageOps
 from pydantic import BaseModel, ConfigDict, Field
 
-from .durable_runs import EXTERNAL_RUN_POLICY
-from .reproduction import (GenerationRun, OutputSettings, ReproductionStore, SavedPrompts,
+from .final_generation_policy import reject_final_generation
+from .reproduction import (OutputSettings, ReproductionStore, SavedPrompts,
                            analysis_ready, current_depth, default_settings, source_hash, utc_now)
 
 
 class ConfirmAction(BaseModel):
     revision: int = Field(ge=0)
     disclosureAccepted: Literal[True]
-
-
-class ResolveRun(BaseModel):
-    promptId: Optional[str] = Field(default=None, min_length=1, max_length=200)
-    confirmedNotQueued: bool = False
 
 
 class SavePlan(BaseModel):
@@ -59,21 +52,12 @@ def create_reproduction_router(data_dir, get_project, generate, *, ffmpeg_path='
     store = ReproductionStore(data_dir)
     lock = RLock()
     busy = set()
-    submissions = set()
     make_client = client_factory or ComfyUIClient
 
     def load(project_id):
         project = get_project(project_id)
         with storage_errors():
             state = store.load(project)
-            interrupted = False
-            for run in state.runs:
-                if run.status == "submitting" and run.id not in submissions:
-                    run.status = EXTERNAL_RUN_POLICY.recover_after_restart(run.status).status
-                    run.error = "上次提交被中断，请在 ComfyUI 中核对是否已排队。"
-                    interrupted = True
-            if interrupted:
-                store.save(project_id, state)
             return project, state
 
     def view(project, state):
@@ -265,124 +249,16 @@ def create_reproduction_router(data_dir, get_project, generate, *, ffmpeg_path='
             return client.check(workflow)
 
     @router.post('/runs')
-    def start_run(project_id: str, body: ConfirmAction):
-        with lock, storage_errors():
-            project, state = load(project_id)
-            revision_matches(state, body.revision)
-            ready(project, state)
-            if any(EXTERNAL_RUN_POLICY.active(run.status) for run in state.runs):
-                fail('generation_in_progress', '已有生成运行未结束；请先刷新其状态，避免重复提交。')
-            assets = input_paths(project, state)
-            workflow = graph(state)
-            run = GenerationRun(id=str(uuid4()), status=EXTERNAL_RUN_POLICY.initial_status, createdAt=utc_now(), revision=state.revision,
-                                width=state.settings.width, height=state.settings.height,
-                                sourceHash=state.sourceHash, comfyUrl=state.comfyUrl, workflow=workflow)
-            state.runs.append(run)
-            submissions.add(run.id)
-            save(project_id, state)
-        submitted = False
-        try:
-            with client_for(run.comfyUrl) as client:
-                check = client.check(workflow)
-                if not check['ready']:
-                    fail('comfy_not_ready', 'ComfyUI 环境不完整，请先检查缺失模型和节点。', 422)
-                names = {name: client.upload_image(path, f'{run.id}-{path.name}') for name, path in assets.items()}
-                workflow = graph(state, names['input/reference.png'], names.get('input/depth-control.mp4'))
-                # Re-check the source just before dispatching a frozen workflow snapshot.
-                with lock:
-                    current, current_state = load(project_id)
-                    revision_matches(current_state, body.revision)
-                    if source_hash(current) != run.sourceHash:
-                        fail('reproduction_stale', '提交前素材或分析发生变化，请重新检查方案。')
-                submitted = True
-                prompt_id = client.submit(workflow)
-            with lock:
-                project, state = load(project_id)
-                saved = next(item for item in state.runs if item.id == run.id)
-                saved.promptId = prompt_id
-                saved.status = EXTERNAL_RUN_POLICY.validate('queued')
-                saved.workflow = workflow
-                save(project_id, state)
-                return view(project, state)
-        except HTTPException as error:
-            with lock:
-                project, state = load(project_id)
-                saved = next(item for item in state.runs if item.id == run.id)
-                uncertain = submitted and error.detail.get('outcomeUnknown', True)
-                saved.status = (EXTERNAL_RUN_POLICY.mark_outcome_unknown(saved.status) if uncertain
-                                else EXTERNAL_RUN_POLICY.fail(saved.status))
-                saved.error = ('提交响应不确定，请在 ComfyUI 中核对，避免重复生成。' if uncertain
-                               else error.detail.get('message', '生成提交失败。'))
-                save(project_id, state)
-            raise
-        finally:
-            with lock:
-                submissions.discard(run.id)
+    def start_run(project_id: str):
+        reject_final_generation()
 
     @router.post('/runs/{run_id}/resolve')
-    def resolve_run(project_id: str, run_id: str, body: ResolveRun):
-        with lock:
-            project, state = load(project_id)
-            run = next((item for item in state.runs if item.id == run_id), None)
-            if run is None:
-                fail('generation_not_found', '生成记录不存在。', 404)
-            if run.status != 'unknown':
-                fail('generation_not_unknown', '此运行不需要人工核对。')
-            if body.promptId and not body.confirmedNotQueued:
-                from .reference_video import validate_storage_id
-                try:
-                    validate_storage_id(body.promptId)
-                except ValueError:
-                    fail('prompt_id_invalid', 'ComfyUI 提示 ID 无效。', 422)
-                run.promptId, run.status, run.error = body.promptId, 'queued', None
-            elif body.confirmedNotQueued and not body.promptId:
-                run.status, run.error = 'failed', '用户已确认此运行未在 ComfyUI 排队，可重新提交。'
-            else:
-                fail('generation_resolution_required', '请提供 ComfyUI 提示 ID，或明确确认未排队。', 422)
-            save(project_id, state)
-            return view(project, state)
+    def resolve_run(project_id: str, run_id: str):
+        reject_final_generation()
 
     @router.post('/runs/{run_id}/refresh')
     def refresh_run(project_id: str, run_id: str):
-        with lock:
-            project, state = load(project_id)
-            run = next((run for run in state.runs if run.id == run_id), None)
-            if run is None:
-                fail('generation_not_found', '生成记录不存在。', 404)
-            if run.status in ('completed', 'failed') or not run.promptId:
-                return view(project, state)
-        with client_for(run.comfyUrl) as client:
-            result = client.poll(run.promptId)
-            outputs = []
-            if result['status'] == 'completed':
-                for index, item in enumerate(result.get('outputs', [])):
-                    suffix = Path(item['filename']).suffix.lower()
-                    if suffix not in ('.mp4', '.webm'):
-                        continue
-                    path = store.path(project_id, run.id, f'output-{index}{suffix}')
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    payload = client.fetch_output(item)
-                    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix='.video-')
-                    try:
-                        with os.fdopen(fd, 'wb') as target:
-                            target.write(payload)
-                        os.replace(temporary, path)
-                    finally:
-                        Path(temporary).unlink(missing_ok=True)
-                    outputs.append({'filename': path.name,
-                                    'url': f'/api/projects/{project_id}/reproduction/runs/{run.id}/output/{len(outputs)}'})
-                if not outputs:
-                    result = {'status': 'failed', 'error': 'ComfyUI 已结束，但未返回可预览的视频文件。'}
-        with lock:
-            project, state = load(project_id)
-            saved = next(item for item in state.runs if item.id == run_id)
-            if saved.status in ('completed', 'failed') or saved.promptId != run.promptId:
-                return view(project, state)
-            saved.status = EXTERNAL_RUN_POLICY.validate(result['status'])
-            saved.error = result.get('error') or ('ComfyUI 中已找不到此运行，请核对其状态。' if result['status'] == 'unknown' else None)
-            saved.outputs = outputs
-            save(project_id, state)
-            return view(project, state)
+        reject_final_generation()
 
     @router.get('/runs/{run_id}/output/{index}')
     def output_file(project_id: str, run_id: str, index: int):

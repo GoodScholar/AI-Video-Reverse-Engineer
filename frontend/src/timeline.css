@@ -10,7 +10,7 @@
 .timeline-layout { display: grid; grid-template-columns: 205px minmax(380px, 1fr) 245px; min-height: 450px; }
 .timeline-assets, .timeline-inspector { padding: 18px; background: #eeece4; }
 .timeline-assets { border-right: 1px solid #c7c6bc; }
-.timeline-inspector { border-left: 1px solid #c7c6bc; }
+.timeline-inspector { border-left: 1px solid #c7c6bc; min-width: 0; container-type: inline-size; container-name: timeline-inspector; }
 .timeline-assets > .secondary-action { width: 100%; justify-content: center; margin-top: 11px; }
 .timeline-assets ul { display: grid; gap: 8px; margin: 18px 0 0; padding: 0; list-style: none; }
 .timeline-assets li { display: grid; gap: 5px; padding: 10px 0; border-top: 1px solid #c7c6bc; }
@@ -51,6 +51,9 @@
 @media (prefers-reduced-motion: reduce) { .timeline-editor * { scroll-behavior: auto; } }
 @media (max-width: 1050px) { .timeline-layout { grid-template-columns: 180px minmax(340px, 1fr); }.timeline-inspector { grid-column: span 2; border-top: 1px solid #c7c6bc; border-left: 0; }.timeline-form-grid { grid-template-columns: repeat(4, minmax(100px, 1fr)); } }
 @media (max-width: 720px) { .timeline-header, .timeline-toolbar, .timeline-render { align-items: flex-start; flex-direction: column; padding-left: 16px; padding-right: 16px; }.timeline-layout { display: block; }.timeline-assets, .timeline-inspector { border: 0; border-bottom: 1px solid #c7c6bc; }.timeline-workarea { min-height: 240px; }.timeline-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }.timeline-header-actions, .timeline-render-actions { width: 100%; }.timeline-header-actions button, .timeline-render-actions button { flex: 1 1 130px; } }
+
+/* The inspector is a grid child: its own width, not the viewport, controls its fields. */
+@container (max-width: 300px) { .timeline-inspector .timeline-form-grid { grid-template-columns: minmax(0, 1fr); }.timeline-inspector .timeline-form-grid label { white-space: nowrap; } }
 
 .timeline-editor input:not([type="file"]), .timeline-editor select { box-sizing: border-box; min-height: 44px; padding: 9px 10px; border: 1px solid #797d76; border-radius: 2px; background: #fffdf7; color: #202427; font: inherit; }
 

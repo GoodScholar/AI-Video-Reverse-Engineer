@@ -6,11 +6,14 @@ import { ShotClipReplacement, type ShotResult } from "./ShotClipReplacement";
 import { type ChangeEvent, type KeyboardEvent, type PointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Copy, Download, Eye, EyeOff, LoaderCircle, Mic, MicOff, Pause, Plus, Save, Scissors, Trash2, Undo2, Redo2, Volume2, VolumeX } from "lucide-react";
 
-import { preflightTimeline, type TimelinePreflight, cancelTimelineRun, getTimeline, importShotResults, saveTimeline, validateTimelineDraft, startTimelineRun, timelineOutputUrl, uploadTimelineAudio, type TimelineAsset, type TimelineClip, type TimelineFormat, type TimelineTrack, type TimelineTrackKind, type TimelineWorkspace } from "./timelineApi";
+import { analyzeTimelineReframe, cancelTimelineReframe, preflightTimeline, type TimelinePreflight, cancelTimelineRun, getTimeline, importShotResults, saveTimeline, validateTimelineDraft, startTimelineRun, timelineOutputUrl, uploadTimelineAudio, type TimelineAsset, type TimelineClip, type TimelineFormat, type TimelineTrack, type TimelineTrackKind, type TimelineWorkspace } from "./timelineApi";
 import "./timeline.css";
+import { TransitionControls } from "./TransitionControls";
+import { changeBoundary, reconcileBoundaries } from "./timelineTransitions";
+import { defaultPackaging, mergeServerReframeFacts, PackagingControls, ReframeControls, type Packaging, type Reframe } from "./ReframeControls";
 
 type Props = { onDraftChange?: (dirty: boolean) => void; projectId: string; preproductionRevision?: number; preparationDirty?: boolean; shotResults?: ShotResult[]; focusClip?: { trackId: string; clipId: string } | null };
-type Draft = Pick<TimelineWorkspace, "revision" | "settings" | "tracks">;
+type Draft = Pick<TimelineWorkspace, "revision" | "settings" | "tracks" | "transitions" | "packaging">;
 type SelectedClip = { trackId: string; clipId: string } | null;
 type RecorderCtor = typeof MediaRecorder;
 
@@ -20,7 +23,7 @@ const formatLabels: Record<TimelineFormat, string> = { preview: "预览 MP4", mp
 const runStatusLabels = { queued: "排队中", running: "渲染中", completed: "已完成", failed: "失败", cancelled: "已取消" } as const;
 
 function errorMessage(error: unknown, fallback: string) { return error instanceof Error ? error.message : fallback; }
-function draftOf(workspace: TimelineWorkspace): Draft { return { revision: workspace.revision, settings: workspace.settings, tracks: workspace.tracks }; }
+function draftOf(workspace: TimelineWorkspace): Draft { return { revision: workspace.revision, settings: workspace.settings, tracks: workspace.tracks, ...(workspace.transitions ? { transitions: workspace.transitions } : {}), ...(workspace.packaging !== undefined ? { packaging: workspace.packaging } : {}) }; }
 function snapshot(workspace: Draft | null) { return workspace ? JSON.stringify(workspace) : ""; }
 function numberInput(value: string, fallback: number) { const next = Number(value); return Number.isFinite(next) ? next : fallback; }
 function clamp(value: number, min: number, max: number) { return Math.min(max, Math.max(min, value)); }
@@ -107,8 +110,8 @@ export function TimelineEditor({ projectId, onDraftChange, preproductionRevision
     return track && clip ? { track, clip, asset: workspace.assets.find((item) => item.id === clip.assetId) } : null;
   }, [workspace, selectedClip]);
   const selectedTrack = workspace?.tracks.find((track) => track.id === selectedTrackId) ?? workspace?.tracks[0] ?? null;
-  const previews = workspace?.runs.filter((run) => run.format === "preview" && run.status === "completed") ?? [];
-  const latestPreview = previews[previews.length - 1] ?? null;
+  const previews = workspace?.runs.filter((run) => run.format === "preview") ?? [];
+  const latestPreview = previews[previews.length - 1]?.status === "completed" ? previews[previews.length - 1] : null;
   const hasActiveRun = Boolean(workspace?.runs.some((run) => activeStatuses.has(run.status)));
 
   function accept(next: TimelineWorkspace, submitted?: string) {
@@ -117,7 +120,7 @@ export function TimelineEditor({ projectId, onDraftChange, preproductionRevision
     if (current && next.revision < current.revision) return;
     const preserveDraft = Boolean(current && snapshot(draftOf(current)) !== (submitted ?? savedSnapshotRef.current));
     const accepted = preserveDraft && current
-      ? { ...next, revision: submitted ? next.revision : current.revision, settings: current.settings, tracks: current.tracks }
+      ? { ...next, revision: submitted ? next.revision : current.revision, settings: current.settings, tracks: mergeServerReframeFacts(current.tracks, next.tracks), transitions: current.transitions, packaging: current.packaging }
       : next;
     workspaceRef.current = accepted;
     setWorkspace(accepted);
@@ -132,7 +135,7 @@ export function TimelineEditor({ projectId, onDraftChange, preproductionRevision
   function loadDraft(next: TimelineWorkspace, draft: Draft | null) {
     if (!mounted.current || projectRef.current !== projectId) return;
     const conflict = draft && draft.revision !== next.revision ? draft : null;
-    const current = draft && !conflict ? { ...next, settings: draft.settings, tracks: draft.tracks } : next;
+    const current = draft && !conflict ? { ...next, settings: draft.settings, tracks: mergeServerReframeFacts(draft.tracks, next.tracks), transitions: draft.transitions ?? [], packaging: draft.packaging } : next;
     workspaceRef.current = current;
     savedSnapshotRef.current = snapshot(draftOf(next));
     setConflictDraft(conflict); setWorkspace(current); setSavedSnapshot(savedSnapshotRef.current);
@@ -154,7 +157,7 @@ export function TimelineEditor({ projectId, onDraftChange, preproductionRevision
   function resolveDraft(restoreDraft: boolean) {
     if (!workspace || !conflictDraft) return;
     if (restoreDraft) {
-      const next = { ...workspace, settings: conflictDraft.settings, tracks: conflictDraft.tracks };
+      const next = { ...workspace, settings: conflictDraft.settings, tracks: mergeServerReframeFacts(conflictDraft.tracks, workspace.tracks), transitions: conflictDraft.transitions ?? [], packaging: conflictDraft.packaging };
       workspaceRef.current = next; setWorkspace(next); setSelectedTrackId(next.tracks[0]?.id ?? null);
     }
     setConflictDraft(null);
@@ -184,7 +187,7 @@ export function TimelineEditor({ projectId, onDraftChange, preproductionRevision
       });
       const value = JSON.parse(text);
       if (!value || value.projectId !== projectId) throw new Error("草稿不属于当前项目，无法恢复素材引用。");
-      const checked = await validateTimelineDraft(projectId, { revision: value.revision, settings: value.settings, tracks: value.tracks });
+      const checked = await validateTimelineDraft(projectId, { revision: value.revision, settings: value.settings, tracks: value.tracks, ...(value.transitions ? { transitions: value.transitions } : {}), ...(value.packaging !== undefined ? { packaging: value.packaging } : {}) });
       if (!mounted.current || projectRef.current !== projectId) return;
       if (snapshot(workspaceRef.current && draftOf(workspaceRef.current)) !== baseline) throw new Error("校验期间编辑已变化，请重新导入草稿。");
       setPendingImport({ draft: checked, baseline });
@@ -198,7 +201,7 @@ export function TimelineEditor({ projectId, onDraftChange, preproductionRevision
     if (snapshot(draftOf(workspace)) !== pendingImport.baseline) {
       setError("预览后编辑已变化，请重新导入草稿。"); setPendingImport(null); return;
     }
-    edit((current) => ({ ...current, settings: pendingImport.draft.settings, tracks: pendingImport.draft.tracks }));
+    edit((current) => ({ ...current, settings: pendingImport.draft.settings, tracks: pendingImport.draft.tracks, transitions: pendingImport.draft.transitions ?? [], ...(pendingImport.draft.packaging !== undefined ? { packaging: pendingImport.draft.packaging } : {}) }));
     setSelectedClip(null); setSelectedTrackId(pendingImport.draft.tracks[0]?.id ?? null);
     setPendingImport(null); setImportNotice("已恢复为可撤销的编辑草稿，请检查后保存时间线。");
   }
@@ -255,7 +258,9 @@ export function TimelineEditor({ projectId, onDraftChange, preproductionRevision
       if (!current) return current;
       setHistory((items) => [...items.slice(-39), draftOf(current)]);
       setFuture([]);
-      return change(current);
+      const next = change(current);
+      return current.transitions?.length && next.transitions === current.transitions
+        ? { ...next, ...reconcileBoundaries(current.tracks, next.tracks, current.transitions) } : next;
     });
   }
 
@@ -265,7 +270,7 @@ export function TimelineEditor({ projectId, onDraftChange, preproductionRevision
       const currentDraft = draftOf(current);
       if (direction === "undo") { setHistory((items) => items.slice(0, -1)); setFuture((items) => [...items, currentDraft]); }
       else { setFuture((items) => items.slice(0, -1)); setHistory((items) => [...items, currentDraft]); }
-      return { ...current, settings: next.settings, tracks: next.tracks };
+      return { ...current, settings: next.settings, tracks: next.tracks, transitions: next.transitions, packaging: next.packaging };
     });
   }
 
@@ -312,6 +317,17 @@ export function TimelineEditor({ projectId, onDraftChange, preproductionRevision
     setBusy("save"); setError(""); const submitted = snapshot(draftOf(workspace));
     try { accept(await saveTimeline(projectId, draftOf(workspace)), submitted); }
     catch (reason) { if (mounted.current && projectRef.current === projectId) setError(errorMessage(reason, "无法保存时间线。")); }
+    finally { if (mounted.current && projectRef.current === projectId) setBusy(null); }
+  }
+  async function updateReframe(clipId: string, action: "analyze" | "cancel") {
+    if (!workspace || busy) return;
+    setBusy(`reframe-${action}`); setError("");
+    try {
+      const next = action === "analyze"
+        ? await analyzeTimelineReframe(projectId, clipId, workspace.revision)
+        : await cancelTimelineReframe(projectId, clipId, workspace.revision);
+      accept(next);
+    } catch (reason) { if (mounted.current && projectRef.current === projectId) setError(errorMessage(reason, "无法更新主体分析。")); }
     finally { if (mounted.current && projectRef.current === projectId) setBusy(null); }
   }
   async function importResults() {
@@ -415,13 +431,17 @@ export function TimelineEditor({ projectId, onDraftChange, preproductionRevision
   function onClipPointerMove(event: PointerEvent<HTMLButtonElement>) {
     const drag = dragRef.current; if (!drag || busy) return;
     const proposed = clamp(drag.start + (event.clientX - drag.pointerX) / pixelsPerSecond, 0, 300);
-    setWorkspace((current) => current ? { ...current, tracks: current.tracks.map((track) => {
+    setWorkspace((current) => {
+      if (!current) return current;
+      const tracks = current.tracks.map((track) => {
       if (track.id !== drag.trackId) return track;
       const moving = track.clips.find((clip) => clip.id === drag.clipId);
       if (!moving) return track;
       const start = snappedStart(proposed, moving, track.id, current.tracks, playhead, pixelsPerSecond, snapping && !event.altKey);
       return { ...track, clips: track.clips.map((clip) => clip.id === drag.clipId ? { ...clip, start } : clip) };
-    }) } : current);
+      });
+      return { ...current, ...(current.transitions?.length ? reconcileBoundaries(current.tracks, tracks, current.transitions) : { tracks }) };
+    });
   }
   function onClipPointerUp() {
     if (!dragRef.current) return;
@@ -485,7 +505,25 @@ export function TimelineEditor({ projectId, onDraftChange, preproductionRevision
     <div className="timeline-toolbar"><button type="button" className="secondary-action" aria-pressed={snapping} disabled={Boolean(busy)} onClick={() => setSnapping((current) => !current)}>吸附{snapping ? "：开" : "：关"}</button><label>缩放<select aria-label="缩放" value={pixelsPerSecond} onChange={(event) => setPixelsPerSecond(Number(event.target.value))}>{scaleOptions.map((scale) => <option key={scale} value={scale}>{scale}%</option>)}</select></label><label>播放头（秒）<input aria-label="播放头（秒）" type="number" min="0" max="300" step="0.1" value={playhead} onChange={(event) => seek(clamp(numberInput(event.target.value, playhead), 0, 300))} /></label><button type="button" className="secondary-action" disabled={!selected || Boolean(busy)} onClick={splitClip}><Scissors size={16} />按播放头分割</button><button type="button" className="secondary-action" disabled={!selected || Boolean(busy)} onClick={copyClip}><Copy size={16} />复制片段</button><button type="button" className="secondary-action" disabled={!selected || Boolean(busy)} onClick={deleteClip}><Trash2 size={16} />删除片段</button></div>
     <div className="timeline-layout"><aside className="timeline-assets"><h3>可用素材</h3><p>导入原片片段、白模画面或本地音轨，添加到选中轨道。</p><button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => audioInputRef.current?.click()}><Plus size={16} />导入音频</button><input ref={audioInputRef} hidden aria-label="导入音频" type="file" accept="audio/*,video/*" disabled={Boolean(busy)} onChange={onAudioUpload} /><button type="button" className="secondary-action" disabled={recording || Boolean(busy)} onClick={() => void beginRecording()}><Mic size={16} />开始本地录音</button><button type="button" className="secondary-action" disabled={!recording} onClick={stopRecording}><MicOff size={16} />停止并上传</button><ul>{workspace.assets.map((asset) => <li key={asset.id}><strong>{asset.name}</strong><small>{asset.kind}{asset.duration ? ` · ${asset.duration} 秒` : ""}</small><button type="button" disabled={!selectedTrack || (selectedTrack.kind === "video" && asset.kind === "audio") || (selectedTrack.kind === "audio" && asset.kind === "image") || Boolean(busy)} onClick={() => addAsset(asset)}>添加到选中轨道</button></li>)}</ul></aside>
       <div className="timeline-workarea" ref={workareaRef}><div className="timeline-ruler" style={{ width: `${maxDuration * pixelsPerSecond + 150}px` }}>{Array.from({ length: Math.ceil(maxDuration / 5) + 1 }, (_, index) => <span key={index} style={{ left: `${118 + index * 5 * pixelsPerSecond}px` }}>{index * 5}s</span>)}<i style={{ left: `${118 + playhead * pixelsPerSecond}px` }} aria-hidden="true" /></div><div className="timeline-tracks">{workspace.tracks.map((track, index) => <div key={track.id} className={track.id === selectedTrack?.id ? "timeline-track is-selected" : "timeline-track"}><div className="timeline-track-label"><button type="button" onClick={() => setSelectedTrackId(track.id)}>{track.name}<small>{track.kind === "video" ? "画面" : "音频"}</small></button><div><button type="button" aria-label={`${track.muted ? "取消静音" : "静音"}${track.name}`} onClick={() => updateTrack(track.id, (item) => ({ ...item, muted: !item.muted }))}>{track.muted ? <VolumeX size={15} /> : <Volume2 size={15} />}</button>{track.kind === "video" && <button type="button" aria-label={`${track.hidden ? "显示" : "隐藏"}${track.name}`} onClick={() => updateTrack(track.id, (item) => ({ ...item, hidden: !item.hidden }))}>{track.hidden ? <EyeOff size={15} /> : <Eye size={15} />}</button>}<button type="button" aria-label={`上移${track.name}`} disabled={index === 0} onClick={() => reorderTrack(track.id, -1)}>↑</button><button type="button" aria-label={`下移${track.name}`} disabled={index === workspace.tracks.length - 1} onClick={() => reorderTrack(track.id, 1)}>↓</button></div></div><div className="timeline-track-canvas" style={{ width: `${maxDuration * pixelsPerSecond + 150}px` }} onPointerDown={(event) => { if (event.target === event.currentTarget) seek(clamp(event.nativeEvent.offsetX / pixelsPerSecond, 0, 300)); }}>{track.clips.map((clip) => <button key={clip.id} type="button" data-clip-id={clip.id} data-track-id={track.id} aria-label={clipLabel(workspace.assets.find((asset) => asset.id === clip.assetId))} className={selectedClip?.clipId === clip.id && selectedClip.trackId === track.id ? "timeline-clip is-selected" : "timeline-clip"} style={{ left: `${clip.start * pixelsPerSecond}px`, width: `${Math.max(32, clip.duration * pixelsPerSecond)}px` }} onPointerDown={(event) => onClipPointerDown(event, track.id, clip)} onClick={() => { setSelectedTrackId(track.id); setSelectedClip({ trackId: track.id, clipId: clip.id }); }} onPointerMove={onClipPointerMove} onPointerUp={onClipPointerUp} onPointerCancel={onClipPointerUp}><span className="timeline-clip-name">{clipLabel(workspace.assets.find((asset) => asset.id === clip.assetId))}</span>{workspace.assets.find((asset) => asset.id === clip.assetId)?.kind !== "image" && <ClipWaveform projectId={projectId} clip={clip} pixelsPerSecond={pixelsPerSecond} refresh={waveformRefresh} onError={onWaveformError} />}</button>)}</div></div>)}</div><div className="timeline-track-actions"><button type="button" className="secondary-action" disabled={workspace.tracks.length >= 8 || Boolean(busy)} onClick={() => addTrack("video")}><Plus size={16} />添加画面轨</button><button type="button" className="secondary-action" disabled={workspace.tracks.length >= 8 || Boolean(busy)} onClick={() => addTrack("audio")}><Plus size={16} />添加音频轨</button>{selectedTrack && <button type="button" className="secondary-action" disabled={workspace.tracks.length <= 1 || Boolean(busy)} onClick={() => { edit((current) => ({ ...current, tracks: current.tracks.filter((track) => track.id !== selectedTrack.id) })); setSelectedTrackId(workspace.tracks.find((track) => track.id !== selectedTrack.id)?.id ?? null); }}>删除选中轨道</button>}</div></div>
-      <aside className="timeline-inspector"><h3>片段参数</h3>{selected ? <><p>{clipLabel(selected.asset)}</p>{selected.track.kind === "video" && shotResults.length > 0 && <ShotClipReplacement key={`${selected.track.id}:${selected.clip.id}`} clip={selected.clip} assets={workspace.assets} shots={shotResults} disabled={Boolean(busy) || preparationDirty} onReplace={(assetId) => { updateClip(selected.track.id, selected.clip.id, (clip) => ({ ...clip, assetId })); setImportNotice("已替换选中片段，剪辑参数保持不变；请检查后保存。"); }} />}<div className="timeline-form-grid">{([ ["start", "时间线起点", 0, 300, 0.01], ["inPoint", "源入点", 0, selected.asset?.duration ?? 300, 0.01], ["duration", "输出时长", 0.01, 300, 0.01], ["speed", "速度", 0.25, 4, 0.01], ["volume", "音量", 0, 2, 0.01], ["fadeIn", "淡入（秒）", 0, selected.clip.duration, 0.01], ["fadeOut", "淡出（秒）", 0, selected.clip.duration, 0.01] ] as const).map(([field, label, min, max, step]) => <label key={field}>{label}<input aria-label={label} type="number" min={min} max={max} step={step} value={selected.clip[field]} onChange={(event) => updateClip(selected.track.id, selected.clip.id, (clip) => ({ ...clip, [field]: clamp(numberInput(event.target.value, clip[field]), min, max) }))} /></label>)}</div></> : <p className="timeline-empty">选择一个片段后精确调整切入、时长、速度和音量。</p>}<h3>输出设置</h3><div className="timeline-form-grid"><label>宽度<input aria-label="宽度" type="number" min="64" max="1920" step="2" value={workspace.settings.width} onChange={(event) => edit((current) => ({ ...current, settings: { ...current.settings, width: clamp(numberInput(event.target.value, current.settings.width), 64, 1920) } }))} /></label><label>高度<input aria-label="高度" type="number" min="64" max="1920" step="2" value={workspace.settings.height} onChange={(event) => edit((current) => ({ ...current, settings: { ...current.settings, height: clamp(numberInput(event.target.value, current.settings.height), 64, 1920) } }))} /></label><label>帧率<select aria-label="帧率" value={workspace.settings.fps} onChange={(event) => edit((current) => ({ ...current, settings: { ...current.settings, fps: Number(event.target.value) as 24 | 25 | 30 } }))}><option value="24">24 fps</option><option value="25">25 fps</option><option value="30">30 fps</option></select></label></div></aside></div>
+      <aside className="timeline-inspector"><h3>片段参数</h3>{selected ? <><p>{clipLabel(selected.asset)}</p>{selected.track.kind === "video" && shotResults.length > 0 && <ShotClipReplacement key={`${selected.track.id}:${selected.clip.id}`} clip={selected.clip} assets={workspace.assets} shots={shotResults} disabled={Boolean(busy) || preparationDirty} onReplace={(assetId) => { updateClip(selected.track.id, selected.clip.id, (clip) => ({ ...clip, assetId, reframe: undefined })); setImportNotice("已替换选中片段；服务端将把新素材置为待分析状态，请检查后保存。"); }} />}<div className="timeline-form-grid">{([ ["start", "时间线起点", 0, 300, 0.01], ["inPoint", "源入点", 0, selected.asset?.duration ?? 300, 0.01], ["duration", "输出时长", 0.01, 300, 0.01], ["speed", "速度", 0.25, 4, 0.01], ["volume", "音量", 0, 2, 0.01], ["fadeIn", "淡入（秒）", 0, selected.clip.duration, 0.01], ["fadeOut", "淡出（秒）", 0, selected.clip.duration, 0.01] ] as const).map(([field, label, min, max, step]) => <label key={field}>{label}<input aria-label={label} type="number" min={min} max={max} step={step} value={selected.clip[field]} onChange={(event) => updateClip(selected.track.id, selected.clip.id, (clip) => ({ ...clip, [field]: clamp(numberInput(event.target.value, clip[field]), min, max) }))} /></label>)}</div>{selected.track.kind === "video" && <ReframeControls clipId={selected.clip.id} assetUrl={selected.asset?.url ?? ""} mediaKind={selected.asset?.kind === "image" ? "image" : "video"} sourceStart={selected.clip.inPoint} sourceEnd={selected.clip.inPoint + selected.clip.duration * selected.clip.speed} reframe={selected.clip.reframe as Reframe | undefined} analysis={workspace.reframeAnalysis?.[selected.clip.id]} disabled={Boolean(busy)} onChange={(reframe) => updateClip(selected.track.id, selected.clip.id, (clip) => ({ ...clip, reframe }))} onAnalyze={() => void updateReframe(selected.clip.id, "analyze")} onCancel={() => void updateReframe(selected.clip.id, "cancel")} candidates={workspace.assets.filter((asset) => (asset.kind === "video" || asset.kind === "image") && asset.id !== selected.clip.assetId).map((asset) => ({ id: asset.id, name: asset.name }))} onReplace={(assetId) => { updateClip(selected.track.id, selected.clip.id, (clip) => ({ ...clip, assetId, reframe: undefined })); setImportNotice("已替换候选素材；服务端将把新素材置为待分析状态，请检查后保存。"); }}/>}</> : <p className="timeline-empty">选择一个片段后精确调整切入、时长、速度和音量。</p>}<h3>输出设置</h3><div className="timeline-form-grid"><label>宽度<input aria-label="宽度" type="number" min="64" max="1920" step="2" value={workspace.settings.width} onChange={(event) => edit((current) => ({ ...current, settings: { ...current.settings, width: clamp(numberInput(event.target.value, current.settings.width), 64, 1920) } }))} /></label><label>高度<input aria-label="高度" type="number" min="64" max="1920" step="2" value={workspace.settings.height} onChange={(event) => edit((current) => ({ ...current, settings: { ...current.settings, height: clamp(numberInput(event.target.value, current.settings.height), 64, 1920) } }))} /></label><label>帧率<select aria-label="帧率" value={workspace.settings.fps} onChange={(event) => edit((current) => ({ ...current, settings: { ...current.settings, fps: Number(event.target.value) as 24 | 25 | 30 } }))}><option value="24">24 fps</option><option value="25">25 fps</option><option value="30">30 fps</option></select></label></div><PackagingControls value={workspace.packaging ?? defaultPackaging()} cues={[]} subtitleMode="inline" disabled={Boolean(busy)} onChange={(packaging: Packaging) => edit((current) => ({ ...current, packaging }))} /></aside></div>
+    <section className="timeline-preflight" aria-label="镜头转场">
+      <h3>镜头转场</h3>
+      <p>转场使用左片段尾部素材，保持后续配音和字幕时间。片段时序改变时，失效边界会移除；可撤销恢复。</p>
+      {workspace.tracks.filter(track => track.kind === "video" && !track.hidden).flatMap(track => {
+        const clips = [...track.clips].sort((a, b) => a.start - b.start);
+        return clips.slice(0, -1).map((left, index) => {
+          const right = clips[index + 1];
+          const boundary = workspace.transitions?.find(item => item.leftClipId === left.id && item.rightClipId === right.id)
+            ?? (Math.abs(left.start + left.duration - right.start) < .000001 ? {
+              id: id("transition"), leftClipId: left.id, rightClipId: right.id,
+              template: "cut" as const, enabled: true, duration: 0, overlap: 0, audioCrossfade: false, reason: "普通叙事默认硬切。",
+            } : null);
+          return boundary && <TransitionControls key={`${left.id}-${right.id}`} boundary={boundary}
+            name={`${clipLabel(workspace.assets.find(asset => asset.id === left.assetId))} → ${clipLabel(workspace.assets.find(asset => asset.id === right.assetId))}`}
+            onChange={change => edit(current => ({ ...current, ...changeBoundary(current.tracks, current.transitions ?? [], boundary, change) }))} />;
+        });
+      })}
+    </section>
     <section className="timeline-preflight" aria-label="素材与导出预检">
       <h3>素材与导出预检</h3>
       <p>检查已保存版本的文件、音视频流与片段区间。每次导出都会重新检查；预检不代替最终渲染验证。</p>

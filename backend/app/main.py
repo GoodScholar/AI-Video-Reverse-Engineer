@@ -29,6 +29,7 @@ from app.shot_preparation_api import create_shot_preparation_router
 from app.shot_analysis import analyze_preparation_shot
 from app.reproduction_api import create_reproduction_router
 from app.character_motion_api import create_character_motion_router
+from app.final_generation_policy import FINAL_GENERATION_DISABLED
 from app.prompt_generation import generate_prompts
 
 from app.reference_video import (
@@ -347,6 +348,10 @@ def create_app(
     analysis_settings: Optional[AnalysisSettings] = None,
     semantic_analysis_queue_factory: Optional[Callable] = None,
     semantic_analysis_runner: Optional[Callable] = None,
+    source_segment_runner: Optional[Callable] = None,
+    segment_visual_vectorizer=None,
+    segment_reranker=None,
+    reframe_analyzer=None,
     analysis_provider_registry=None,
     provider_registry=None,
     clock: Optional[Callable[[], datetime]] = None,
@@ -1173,7 +1178,7 @@ def create_app(
             return True
         return (
             request.method in ("POST", "PUT")
-            and bool(re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|preparation|preproduction|timeline|batch-edits|upscale|character-motion|toolkit|backup)(?:/.*)?", path))
+            and bool(re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|preparation|preproduction|source-segments|segment-searches|timeline|batch-edits|upscale|character-motion|toolkit|backup)(?:/.*)?", path))
         ) or (
             request.method == "PUT" and bool(re.fullmatch(r"/api/analysis-providers/[^/]+/configuration", path))
         ) or (
@@ -1246,6 +1251,11 @@ def create_app(
 
     @app.middleware("http")
     async def reject_invalid_reference_video_request(request, call_next):
+        if request.method == "POST" and re.fullmatch(
+            r"/api/projects/[^/]+/(?:reproduction|character-motion)/runs(?:/[^/]+/(?:resolve|refresh))?",
+            request.url.path,
+        ):
+            return JSONResponse(status_code=410, content={"detail": FINAL_GENERATION_DISABLED})
         if is_character_motion_upload_request(request) or (request.method == "POST" and re.fullmatch(r"/api/projects/[^/]+/preproduction/assets", request.url.path)):
             origin = request.headers.get("origin")
             if origin is not None and origin not in _ALLOWED_ANALYSIS_MUTATION_ORIGINS:
@@ -1256,11 +1266,6 @@ def create_app(
             rejection = sensitive_mutation_rejection(request)
             if rejection is not None:
                 return rejection
-        if request.method == "POST" and re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|character-motion)/runs", request.url.path):
-            return JSONResponse(status_code=410, content={"detail": {
-                "code": "final_generation_disabled",
-                "message": "当前工作台只准备素材与方案，请导出后在外部工具执行视频生成。",
-            }})
         if not is_reference_media_request(request):
             return await call_next(request)
 
@@ -2495,12 +2500,30 @@ def create_app(
         data_dir, ensure_project_exists, compute_jobs,
         ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, source_lock=project_write_lock,
     ))
+    from .source_segment_index import create_source_segment_router
+    app.include_router(create_source_segment_router(
+        data_dir, ensure_project_exists, compute_jobs,
+        runner=source_segment_runner, ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
+        source_lock=project_write_lock,
+    ))
+    from .segment_retrieval import AnalysisProviderSegmentReranker, Siglip2VisualVectorizer, create_segment_retrieval_router
+    resolved_segment_vectorizer = segment_visual_vectorizer or Siglip2VisualVectorizer(
+        Path(data_dir) / "models" / "siglip2-base-p16-224",
+    )
+    resolved_segment_reranker = segment_reranker or AnalysisProviderSegmentReranker(analysis_provider_configurations)
+    app.include_router(create_segment_retrieval_router(
+        data_dir, ensure_project_exists,
+        vectorizer=resolved_segment_vectorizer,
+        reranker=resolved_segment_reranker,
+        source_lock=project_write_lock,
+    ))
     from .product_images_api import create_product_images_router
     app.include_router(create_product_images_router(data_dir, ensure_project_exists, source_lock=project_write_lock))
     from .timeline_api import create_timeline_router
     app.include_router(create_timeline_router(
         data_dir, ensure_project_exists, compute_jobs,
         ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, source_lock=project_write_lock,
+        reframe_analyzer=reframe_analyzer,
     ))
     from .batch_editing_api import create_batch_editing_router
     from .local_voice import LocalVoiceService, create_voice_router
@@ -2509,6 +2532,9 @@ def create_app(
     app.include_router(create_batch_editing_router(
         data_dir, ensure_project_exists, compute_jobs,
         ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, source_lock=project_write_lock, voice_service=voice_service,
+        segment_reranker=resolved_segment_reranker,
+        segment_vectorizer_version=resolved_segment_vectorizer.version,
+        reframe_analyzer=reframe_analyzer,
     ))
     from .aigc_content_api import create_aigc_content_router
 

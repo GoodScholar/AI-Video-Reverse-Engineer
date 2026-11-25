@@ -135,7 +135,7 @@ def test_each_provider_sends_only_analysis_proxy_contact_sheet_and_fixed_contrac
         ("bailian", "dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", lambda body: body["response_format"]["type"] == "json_schema" and body["messages"][1]["content"][0]["type"] == "image_url"),
         ("openai", "api.openai.com/v1/responses", lambda body: body["text"]["format"]["type"] == "json_schema" and body["input"][0]["content"][0]["type"] == "input_image"),
         ("gemini", "generativelanguage.googleapis.com/v1beta/models/gemini-test-model:generateContent", lambda body: body["generationConfig"]["responseMimeType"] == "application/json" and body["contents"][0]["parts"][0]["inlineData"]["mimeType"] == "image/jpeg"),
-        ("doubao", "ark.cn-beijing.volces.com/api/v3/responses", lambda body: body["text"]["format"]["type"] == "json_schema" and body["input"][0]["content"][0]["type"] == "input_image"),
+        ("doubao", "ark.cn-beijing.volces.com/api/coding/v3/responses", lambda body: body["text"]["format"]["type"] == "json_schema" and body["input"][0]["content"][0]["type"] == "input_image"),
         ("claude", "api.anthropic.com/v1/messages", lambda body: body["output_config"]["format"]["type"] == "json_schema" and body["messages"][0]["content"][0]["source"]["type"] == "base64"),
     ],
 )

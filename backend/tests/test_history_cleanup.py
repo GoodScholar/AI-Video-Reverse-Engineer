@@ -35,13 +35,15 @@ def test_completed_history_preview_and_delete_do_not_touch_assets_or_tracks(tmp_
     assert client.get(url + '/cleanup-preview').status_code == 409
     queue.run()
     preview = client.get(url + '/cleanup-preview').json()
-    assert preview['bytes'] == 11 and preview['fileCount'] == 2
+    source = tmp_path / 'project-files/p1/preproduction/assets/video.mp4'
+    source_bytes = source.read_bytes()
+    assert preview['bytes'] == source.stat().st_size + len(b'output') and preview['fileCount'] == 2
     assert client.post(url + '/delete', json={'revision': 0}).status_code == 409
     result = client.post(url + '/delete', json={'revision': 1})
     assert result.status_code == 200, result.text
     assert result.json()['runs'] == []
     assert result.json()['tracks'] == _workspace()['tracks']
-    assert (tmp_path / 'project-files/p1/preproduction/assets/video.mp4').read_bytes() == b'video'
+    assert source.read_bytes() == source_bytes
     assert not (tmp_path / 'project-files/p1/timeline/runs' / run['id']).exists()
     assert client.get(url + '/output').status_code == 404
 
@@ -92,7 +94,8 @@ def test_failed_state_write_rolls_back_history_files(tmp_path, monkeypatch):
     monkeypatch.setattr(TimelineStore, 'save', fail)
     assert client.post(url + '/delete', json={'revision': 1}).status_code == 503
     assert client.get(url + '/output').content == b'output'
-    assert (tmp_path / 'project-files/p1/timeline/runs' / run['id'] / 'sources/video.mp4').read_bytes() == b'video'
+    source = tmp_path / 'project-files/p1/preproduction/assets/video.mp4'
+    assert (tmp_path / 'project-files/p1/timeline/runs' / run['id'] / 'sources/video.mp4').read_bytes() == source.read_bytes()
 
 
 def test_symlink_in_history_cannot_delete_outside_project(tmp_path):

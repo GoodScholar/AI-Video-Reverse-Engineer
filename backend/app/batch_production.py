@@ -8,8 +8,11 @@ from typing import Any, Callable, Literal
 from uuid import uuid4
 
 from .durable_runs import LOCAL_RUN_POLICY, RunConflict, freeze_run_input
-from .timeline import validate_workspace
+from .timeline import validate_transitions, validate_workspace
 from .video_aspect import PRODUCT_PRESETS, ratio_label, resolve_product_aspect, valid_aspect_mode
+
+_PACKAGING_UNSET = object()
+_CTA_UNSET = object()
 
 
 class BatchProductionError(ValueError):
@@ -60,6 +63,53 @@ def current_version(task: dict[str, Any]) -> tuple[int, int, int]:
             variant.get("subtitles", {}).get("revision", 0))
 
 
+def initial_proposal_packaging(*, script: str, selling_point: str, duration: float, cta: str | None = None) -> dict[str, Any]:
+    """Build only copy traceable to confirmed input; absent CTA stays absent."""
+    from .montage_packaging import default_packaging
+
+    package = default_packaging()
+    end = min(max(float(duration), 0.01), 3.0)
+    title = next((part.strip() for part in script.replace("\n", "。 ").split("。")
+                  if part.strip() and len(part.strip()) <= 120), "")
+    elements = []
+    if title:
+        elements.append({"id": "proposal-title", "kind": "title", "enabled": True, "start": 0, "end": end,
+                         "text": title, "position": "top", "style": "emphasis"})
+    if selling_point.strip() and len(selling_point.strip()) <= 120:
+        elements.append({"id": "proposal-selling-point", "kind": "selling-point", "enabled": True,
+                         "start": 0, "end": end, "text": selling_point.strip(), "position": "middle", "style": "banner"})
+        if float(duration) > end + .01:
+            elements.append({"id": "proposal-keyword", "kind": "keyword", "enabled": True,
+                             "start": end, "end": min(float(duration), end + 3),
+                             "text": selling_point.strip(), "position": "top", "style": "emphasis"})
+    if isinstance(cta, str) and cta.strip() and len(cta.strip()) <= 120:
+        elements.append({"id": "proposal-cta", "kind": "cta", "enabled": True,
+                         "start": max(0, float(duration) - end), "end": max(float(duration), .01),
+                         "text": cta.strip(), "position": "bottom", "style": "banner"})
+    package["elements"] = elements
+    return package
+
+
+def _current_packaging_font_identity() -> tuple[int, int, int, int, int]:
+    from .montage_packaging import current_font_identity
+    return current_font_identity()
+
+
+def _valid_packaging_snapshot(snapshot: dict[str, Any], cues: list[dict[str, Any]],
+                              font_identity: Any = None) -> bool:
+    """Lock-safe lifecycle predicate; final glyph/font work uses request proofs."""
+    package = snapshot.get("packaging") if isinstance(snapshot, dict) else None
+    if package is None:
+        return True
+    try:
+        from .montage_packaging import validate_packaging
+        validate_packaging(package, cues, snapshot.get("tracks", []), batch=True)
+        return (isinstance(font_identity, (list, tuple)) and len(font_identity) == 5
+                and tuple(font_identity) == _current_packaging_font_identity())
+    except (OSError, ValueError):
+        return False
+
+
 def _voice_is_current(task: dict[str, Any]) -> bool:
     return _voice_fact(task).status in ("absent", "current")
 
@@ -67,11 +117,16 @@ def _voice_is_current(task: dict[str, Any]) -> bool:
 def frozen_edit_snapshot(task: dict[str, Any]) -> dict[str, Any]:
     variant = task["variant"]
     content_revision, variant_revision, subtitle_revision = current_version(task)
+    snapshot = {"settings": deepcopy(variant["settings"]), "tracks": deepcopy(variant["tracks"])}
+    if variant.get("transitions"):
+        snapshot["transitions"] = deepcopy(variant["transitions"])
+    if variant.get("packaging") is not None:
+        snapshot["packaging"] = deepcopy(variant["packaging"])
     return {
         "contentRevision": content_revision,
         "variantRevision": variant_revision,
         "subtitleRevision": subtitle_revision,
-        "snapshot": {"settings": deepcopy(variant["settings"]), "tracks": deepcopy(variant["tracks"])},
+        "snapshot": snapshot,
         "subtitleCues": deepcopy(variant.get("subtitles", {}).get("cues", [])),
     }
 
@@ -106,7 +161,9 @@ def _preview_fact(task: dict[str, Any], voice: LifecycleFact) -> LifecycleFact:
             or (run.get("contentRevision", 0), run.get("revision"), run.get("subtitleRevision", 0))
             != current_version(task)
             or run.get("snapshot") != frozen["snapshot"]
-            or run.get("subtitleCues", []) != frozen["subtitleCues"]):
+            or run.get("subtitleCues", []) != frozen["subtitleCues"]
+            or not _valid_packaging_snapshot(run.get("snapshot", {}), run.get("subtitleCues", []),
+                                             run.get("packagingFontIdentity"))):
         return LifecycleFact("stale", "preview_stale")
     return LifecycleFact("current", record=run)
 
@@ -156,6 +213,8 @@ def inspect_variant(task: dict[str, Any]) -> VariantLifecycle:
 
 def reusable_preview(task: dict[str, Any]) -> dict[str, Any] | None:
     """Return the latest preview that the bulk command may reuse."""
+    if has_ambiguous_packaging_dependency(task):
+        return None
     runs = task["variant"].get("runs", [])
     if not runs:
         return None
@@ -175,6 +234,53 @@ def review_status(task: dict[str, Any]) -> str:
     return inspect_variant(task).review.status
 
 
+def current_preview_output(task: dict[str, Any], run: dict[str, Any]) -> bool:
+    if has_ambiguous_packaging_dependency(task):
+        return False
+    fact = inspect_variant(task).preview
+    return fact.status == "current" and fact.record is run
+
+
+def current_delivery_output(task: dict[str, Any], run: dict[str, Any]) -> bool:
+    if has_ambiguous_packaging_dependency(task):
+        return False
+    lifecycle = inspect_variant(task)
+    preview, review = lifecycle.preview.record, lifecycle.review.record
+    version = current_version(task)
+    return bool(
+        run.get("status") == "completed" and lifecycle.preview.status == "current"
+        and lifecycle.review.status == "approved" and preview is not None and review is not None
+        and (run.get("contentRevision", 0), run.get("variantRevision", 0), run.get("subtitleRevision", 0)) == version
+        and run.get("previewRunId") == preview.get("id") and run.get("review", {}).get("id") == review.get("id")
+        and run.get("snapshot") == preview.get("snapshot") and run.get("subtitles", []) == preview.get("subtitleCues", [])
+    )
+
+
+def has_ambiguous_packaging_dependency(task: dict[str, Any]) -> bool:
+    subtitles = task.get("variant", {}).get("subtitles", {})
+    marker = subtitles.get("migrationRequired") if isinstance(subtitles, dict) else None
+    if not isinstance(marker, dict) or marker.get("code") != "legacy_cue_ambiguity":
+        return False
+    cue_ids = set(marker.get("cueIds", []))
+    packaging = task.get("variant", {}).get("packaging")
+    return isinstance(packaging, dict) and any(
+        isinstance(element, dict) and element.get("kind") == "subtitle" and element.get("cueId") in cue_ids
+        for element in packaging.get("elements", [])
+    )
+
+
+def clear_legacy_cue_migration(task: dict[str, Any]) -> bool:
+    subtitles = subtitles_for(task["variant"])
+    marker = subtitles.get("migrationRequired")
+    if not isinstance(marker, dict) or marker.get("code") != "legacy_cue_ambiguity":
+        return False
+    legacy_ids = set(marker.get("cueIds", []))
+    if any(cue.get("id") in legacy_ids for cue in subtitles.get("cues", []) if isinstance(cue, dict)):
+        return False
+    subtitles.pop("migrationRequired", None)
+    return True
+
+
 def create_batch(selling_point: str, script: str, aspect: dict[str, Any] | None = None,
                  *, id_factory: Callable[[], str] = _new_id) -> dict[str, Any]:
     aspect = aspect or {"mode": "9:16", "resolvedAspect": "9:16", "width": 720, "height": 1280,
@@ -191,20 +297,40 @@ def create_batch(selling_point: str, script: str, aspect: dict[str, Any] | None 
                 {"id": "video", "name": "画面", "kind": "video", "muted": False, "hidden": False, "clips": []},
                 {"id": "audio", "name": "声音", "kind": "audio", "muted": False, "hidden": False, "clips": []},
             ],
-            "subtitles": {"revision": 0, "cues": [], "recognitions": []},
+            "transitions": [],
+            "subtitles": {"revision": 0, "cues": [], "recognitions": []}, "packaging": None,
             "runs": [], "exports": [],
         },
     }
 
 
-def save_content(task: dict[str, Any], *, expected_revision: int, selling_point: str, script: str) -> bool:
+def save_content(task: dict[str, Any], *, expected_revision: int, selling_point: str, script: str,
+                 cta: Any = _CTA_UNSET) -> bool:
     if expected_revision != task.get("contentRevision", 0):
         raise BatchProductionError("batch_content_conflict", "脚本已更新，请刷新后重试。")
     content = (selling_point.strip(), script.strip())
-    if content == (task["sellingPoint"], task["script"]):
+    if cta is not _CTA_UNSET and cta is not None and (not isinstance(cta, str) or not cta.strip() or len(cta.strip()) > 120):
+        raise BatchProductionError("batch_content_invalid", "CTA 无效。", 422)
+    saved_cta = task.get("cta")
+    next_cta = saved_cta if cta is _CTA_UNSET else (cta.strip() if isinstance(cta, str) else None)
+    if content == (task["sellingPoint"], task["script"]) and next_cta == saved_cta:
         return False
+    script_changed = content[1] != task["script"]
+    packaging = task["variant"].get("packaging")
+    if script_changed and isinstance(packaging, dict) and any(
+        item.get("kind") == "subtitle" and item.get("cueId") for item in packaging.get("elements", [])
+    ):
+        raise BatchProductionError("batch_packaging_cues_stale", "脚本变更会使包装字幕引用失效，请先移除或更新包装字幕。", 422)
     task.update(sellingPoint=content[0], script=content[1],
                 contentRevision=task.get("contentRevision", 0) + 1)
+    if next_cta is None:
+        task.pop("cta", None)
+    else:
+        task["cta"] = next_cta
+    subtitles = task["variant"].get("subtitles")
+    if script_changed and subtitles is not None and subtitles.get("cues"):
+        subtitles["cues"] = []
+        subtitles["revision"] += 1
     task.pop("proposal", None)
     return True
 
@@ -378,10 +504,14 @@ def save_subtitles(task: dict[str, Any], *, expected_revision: int, timeline_rev
         raise BatchProductionError("batch_subtitles_conflict", "字幕已更新，请刷新后重试。")
     try:
         saved_cues = validate_cues(cues, variant["tracks"])
+        if variant.get("packaging") is not None:
+            from .montage_packaging import validate_packaging
+            validate_packaging(variant["packaging"], saved_cues, variant["tracks"], batch=True)
     except ValueError as error:
         raise BatchProductionError("batch_subtitles_invalid", str(error), 422) from None
     subtitles["cues"] = saved_cues
     subtitles["revision"] += 1
+    clear_legacy_cue_migration(task)
     return subtitles
 
 
@@ -456,13 +586,17 @@ def complete_voiceover(task: dict[str, Any], *, job_id: str, expected_version: t
 def save_variant(task: dict[str, Any], *, expected_revision: int, tracks: list[dict[str, Any]],
                  settings: dict[str, Any], aspect_mode: str | None, assets: dict[str, dict[str, Any]],
                  validate_subtitles: Callable[[list, list], Any] | None = None,
-                 aspect_was_explicit: bool = True) -> dict[str, Any]:
+                 aspect_was_explicit: bool = True,
+                 transitions: list[dict[str, Any]] | None = None, packaging: Any = _PACKAGING_UNSET) -> dict[str, Any]:
     variant = task["variant"]
     if type(expected_revision) is not int or expected_revision != variant["revision"]:
         raise BatchProductionError("batch_variant_conflict", "变体已更新，请刷新后重试。")
     try:
+        transition_input = variant.get("transitions", []) if transitions is None else transitions
         settings, tracks = validate_workspace(
-            {"revision": variant["revision"], "settings": settings, "tracks": tracks}, assets)
+            {"revision": variant["revision"], "settings": settings, "tracks": tracks,
+             "transitions": transition_input}, assets)
+        transitions = validate_transitions(transition_input, tracks)
         if settings["fps"] != 30:
             raise ValueError("批量成片使用 30 帧/秒")
         mode = aspect_mode
@@ -485,9 +619,15 @@ def save_variant(task: dict[str, Any], *, expected_revision: int, tracks: list[d
                 raise ValueError("输出尺寸与所选视频比例不一致")
         if validate_subtitles is not None:
             validate_subtitles(subtitles_for(variant)["cues"], tracks)
+        if packaging is not _PACKAGING_UNSET and packaging is not None:
+            from .montage_packaging import validate_packaging
+            packaging = validate_packaging(packaging, subtitles_for(variant)["cues"], tracks, batch=True)
     except (KeyError, TypeError, ValueError) as error:
         raise BatchProductionError("batch_variant_invalid", str(error), 422) from None
-    variant.update(tracks=tracks, settings=settings, aspectMode=mode, resolvedAspect=resolved)
+    variant.update(tracks=tracks, transitions=transitions, settings=settings, aspectMode=mode, resolvedAspect=resolved)
+    if packaging is not _PACKAGING_UNSET:
+        variant["packaging"] = packaging
+        variant["packagingSource"] = "manual" if packaging is not None else None
     variant["aspectReason"] = (resolution["reason"] if resolution else
                                ("单条作品覆盖批次视频比例。" if aspect_was_explicit else
                                 variant.get("aspectReason", "沿用作品已保存的输出尺寸。")))
@@ -503,6 +643,8 @@ def submit_preview(task: dict[str, Any], *, expected_revision: int, assets: dict
                    snapshot_sources: Callable[[str, list, dict], dict[str, str]],
                    id_factory: Callable[[], str] = _new_id) -> dict[str, Any]:
     variant = task["variant"]
+    if has_ambiguous_packaging_dependency(task):
+        raise BatchProductionError("batch_subtitles_migration_required", "包装引用的历史字幕身份歧义，请重新识别或更新字幕后再预览。")
     if not _voice_is_current(task):
         raise BatchProductionError("batch_voiceover_stale", "配音未完成或脚本已修改，请按当前脚本重新生成配音。")
     if expected_revision != variant["revision"]:
@@ -511,7 +653,8 @@ def submit_preview(task: dict[str, Any], *, expected_revision: int, assets: dict
         raise BatchProductionError("batch_preview_active", "此变体已有预览任务。")
     try:
         settings, tracks = validate_workspace(
-            {"revision": variant["revision"], "settings": variant["settings"], "tracks": variant["tracks"]}, assets)
+            {"revision": variant["revision"], "settings": variant["settings"], "tracks": variant["tracks"],
+             "transitions": variant.get("transitions", [])}, assets)
     except (KeyError, TypeError, ValueError) as error:
         raise BatchProductionError("batch_variant_invalid", str(error), 422) from None
     if not any(track["kind"] == "video" and not track["hidden"] and track["clips"] for track in tracks):
@@ -519,6 +662,10 @@ def submit_preview(task: dict[str, Any], *, expected_revision: int, assets: dict
     run_id = id_factory()
     frozen = frozen_edit_snapshot(task)
     frozen["snapshot"] = {"settings": settings, "tracks": tracks}
+    if variant.get("transitions"):
+        frozen["snapshot"]["transitions"] = validate_transitions(variant["transitions"], tracks)
+    if variant.get("packaging") is not None:
+        frozen["snapshot"]["packaging"] = deepcopy(variant["packaging"])
     run = {
         "id": run_id, "revision": frozen["variantRevision"],
         "contentRevision": frozen["contentRevision"], "subtitleRevision": frozen["subtitleRevision"],
@@ -533,6 +680,8 @@ def submit_preview(task: dict[str, Any], *, expected_revision: int, assets: dict
 def review_current_version(task: dict[str, Any], *, run_id: str, decision: str, reason: str,
                            preview_available: Callable[[dict[str, Any]], bool],
                            id_factory: Callable[[], str] = _new_id) -> dict[str, Any]:
+    if has_ambiguous_packaging_dependency(task):
+        raise BatchProductionError("batch_subtitles_migration_required", "包装引用的历史字幕身份歧义，请重新识别或更新字幕后再审核。")
     if not _voice_is_current(task):
         raise BatchProductionError("batch_voiceover_stale", "配音未完成或脚本已修改，请按当前脚本重新生成配音。")
     variant = task["variant"]
@@ -553,7 +702,10 @@ def review_current_version(task: dict[str, Any], *, run_id: str, decision: str, 
     return review
 
 
-def _approved_export_context(task: dict[str, Any], preview_available: Callable[[dict[str, Any]], bool]):
+def _approved_export_context(task: dict[str, Any], preview_available: Callable[[dict[str, Any]], bool],
+                             reframe_safe: Callable[[dict[str, Any]], None] = lambda _run: None):
+    if has_ambiguous_packaging_dependency(task):
+        raise BatchProductionError("batch_subtitles_migration_required", "包装引用的历史字幕身份歧义，请重新识别或更新字幕后再导出。")
     variant = task["variant"]
     version = current_version(task)
     lifecycle = inspect_variant(task)
@@ -568,12 +720,14 @@ def _approved_export_context(task: dict[str, Any], preview_available: Callable[[
         raise BatchProductionError("batch_export_not_approved", "仅能导出当前版本已预览并通过审核的变体。")
     if not preview_available(preview):
         raise BatchProductionError("batch_export_preview_unavailable", "当前预览文件不可用，请重新生成。")
+    reframe_safe(preview)
     previous = next((delivery for delivery in reversed(exports_for(variant))
                      if delivery.get("status") in ("queued", "running", "completed")
                      and (delivery.get("contentRevision", 0), delivery.get("variantRevision", 0),
                           delivery.get("subtitleRevision", 0)) == version
                      and delivery.get("previewRunId") == preview["id"]), None)
     if previous is not None:
+        reframe_safe(previous)
         return version, review, preview, frozen, previous
     return version, review, preview, frozen, None
 
@@ -581,9 +735,10 @@ def _approved_export_context(task: dict[str, Any], preview_available: Callable[[
 def export_approved_version(task: dict[str, Any], *, assets: dict[str, dict[str, Any]],
                             snapshot_sources: Callable[[str, dict, dict], dict[str, str]],
                             preview_available: Callable[[dict[str, Any]], bool] = lambda run: True,
+                            reframe_safe: Callable[[dict[str, Any]], None] = lambda _run: None,
                             id_factory: Callable[[], str] = _new_id) -> tuple[dict[str, Any], bool]:
     variant = task["variant"]
-    version, review, preview, frozen, previous = _approved_export_context(task, preview_available)
+    version, review, preview, frozen, previous = _approved_export_context(task, preview_available, reframe_safe)
     if previous is not None:
         return previous, False
     run_id = id_factory()
@@ -612,13 +767,15 @@ def export_approved_versions(parent: dict[str, Any], selected: list[dict[str, An
                              assets: dict[str, dict[str, Any]],
                              snapshot_sources: Callable[[str, dict, dict, dict], dict[str, str]],
                              preview_available: Callable[[dict[str, Any], dict[str, Any]], bool],
+                             reframe_safe: Callable[[dict[str, Any], dict[str, Any]], None] = lambda _task, _run: None,
                              id_factory: Callable[[], str] = _new_id) -> list[tuple[dict[str, Any], dict[str, Any], bool]]:
     if "batchId" in parent:
         raise BatchProductionError("batch_export_parent_invalid", "请从批量任务选择变体。", 422)
     for task in selected:
         if task.get("batchId") != parent["id"]:
             raise BatchProductionError("batch_export_selection_invalid", "所选变体不属于此批量任务。", 422)
-        _approved_export_context(task, lambda preview, item=task: preview_available(item, preview))
+        _approved_export_context(task, lambda preview, item=task: preview_available(item, preview),
+                                 lambda run, item=task: reframe_safe(item, run))
 
     results = []
     for task in selected:
@@ -627,6 +784,7 @@ def export_approved_versions(parent: dict[str, Any], selected: list[dict[str, An
             snapshot_sources=lambda run_id, preview, available, item=task:
                 snapshot_sources(run_id, item, preview, available),
             preview_available=lambda preview, item=task: preview_available(item, preview),
+            reframe_safe=lambda run, item=task: reframe_safe(item, run),
             id_factory=id_factory,
         )
         results.append((task, run, created))

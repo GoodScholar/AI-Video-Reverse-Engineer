@@ -1,0 +1,45 @@
+{
+  "command": "ffprobe -v error -show_entries format=filename,format_name,duration,size:stream=index,codec_name,codec_type,width,height,r_frame_rate,avg_frame_rate,duration -of json <file>; shasum -a 256 <file>; ffmpeg -v error -i <file> -f null -",
+  "results": [
+    {
+      "file": "d4fdb668d417479e9d7d18597999a238.mp4",
+      "container": "mov,mp4,m4a,3gp,3g2,mj2",
+      "bytes": 551308,
+      "durationSeconds": 12.48,
+      "video": {
+        "codec": "h264",
+        "width": 720,
+        "height": 1280,
+        "fps": "30/1",
+        "durationSeconds": 12.466667
+      },
+      "audio": {
+        "codec": "aac",
+        "durationSeconds": 12.48
+      },
+      "sha256": "1245a21b2d8a13069aaa3a0fe64ddb93ff7120b106083eaa80be9c2470f0ff46",
+      "decodeExitCode": 0,
+      "subtitleVisualCheck": "passed"
+    },
+    {
+      "file": "e498624a8d12463994b5774019be2741.mp4",
+      "container": "mov,mp4,m4a,3gp,3g2,mj2",
+      "bytes": 517393,
+      "durationSeconds": 10.8,
+      "video": {
+        "codec": "h264",
+        "width": 720,
+        "height": 1280,
+        "fps": "30/1",
+        "durationSeconds": 10.8
+      },
+      "audio": {
+        "codec": "aac",
+        "durationSeconds": 10.8
+      },
+      "sha256": "30c58212ad26f1ce1118cd4fa17606e9710cbafdc31e68c55f1deaf4b9691a4d",
+      "decodeExitCode": 0,
+      "subtitleVisualCheck": "passed"
+    }
+  ]
+}

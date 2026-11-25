@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import stat
+from copy import deepcopy
 from contextlib import nullcontext
 from pathlib import Path
 from threading import RLock
@@ -22,14 +23,14 @@ from .preproduction import PreproductionStore
 from .project_assets import ProjectAssets
 from .reference_video import validate_storage_id
 from .render_inputs import RenderInputError, RenderInputPreparation
-from .timeline import TimelineStore, has_audible_audio, has_visible_video, validate_workspace
+from .timeline import TimelineStore, has_audible_audio, has_visible_video, validate_transitions, validate_workspace
 
 
 ACTIVE_STATUSES = LOCAL_RUN_POLICY.active_statuses
 TERMINAL_STATUSES = LOCAL_RUN_POLICY.allowed_statuses - ACTIVE_STATUSES
 
 
-def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", source_lock=None, renderer=None):
+def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", source_lock=None, renderer=None, reframe_analyzer=None):
     root = Path(data_dir)
     store = TimelineStore(root)
     preproduction = PreproductionStore(root)
@@ -73,6 +74,10 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
         except (OSError, ValueError):
             fail("preproduction_storage_invalid", "前置工作台状态无法读取。", 503)
 
+    def packaging_media_kinds(assets):
+        return {asset_id: asset["kind"] for asset_id, asset in assets.items()
+                if isinstance(asset, dict) and asset.get("kind") in {"image", "video"}}
+
     def public_run(project_id, run):
         public = {key: value for key, value in run.items() if key not in ("snapshot", "sources", "output") and not key.startswith("_")}
         if run["status"] == "completed":
@@ -80,7 +85,207 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
         return public
 
     def response(project_id, state):
-        return {"revision": state["revision"], "settings": state["settings"], "tracks": state["tracks"], "assets": public_assets(project_id), "runs": [public_run(project_id, run) for run in state["runs"]]}
+        return {"revision": state["revision"], "settings": state["settings"], "tracks": state["tracks"],
+                "transitions": state.get("transitions", []), "assets": public_assets(project_id),
+                "runs": [public_run(project_id, run) for run in state["runs"]],
+                "reframeAnalysis": state.get("reframeAnalysis", {}), "packaging": state.get("packaging")}
+
+    class ReframeSourceProofConflict(OSError):
+        """A lock-free reframe source proof is no longer current."""
+
+    def reframe_source_identity(source: Path) -> dict[str, Any]:
+        source = Path(source)
+        _regular_file(source)
+        item = os.stat(source)
+        if not stat.S_ISREG(item.st_mode):
+            raise OSError("不是普通文件")
+        return {"path": str(source), "dev": item.st_dev, "ino": item.st_ino, "size": item.st_size,
+                "mtimeNs": item.st_mtime_ns, "ctimeNs": item.st_ctime_ns}
+
+    def prove_reframe_source(source: Path, *, still_image: bool) -> dict[str, Any]:
+        """Read costly source facts outside timeline/source locks, bound to one stat identity."""
+        from .montage_reframe import probe_source_timing, source_fingerprint
+
+        try:
+            before = reframe_source_identity(source)
+            fingerprint = source_fingerprint(source)
+            try:
+                from .timeline_render import _probe_media
+                media = _probe_media(source, ffprobe_path)
+                size = (media.width, media.height)
+            except Exception:
+                # Keep the established worker failure for an unprobeable
+                # source rather than trusting dimensions supplied by a worker.
+                size = (None, None)
+            timing = None if still_image else probe_source_timing(source, ffprobe_path)
+            after = reframe_source_identity(source)
+        except (OSError, ValueError) as error:
+            raise ReframeSourceProofConflict("素材在校验期间不可读取") from error
+        if before != after:
+            raise ReframeSourceProofConflict("素材在校验期间变化")
+        return {"identity": before, "fingerprint": fingerprint, "timing": timing, "size": size}
+
+    def reframe_fingerprint_fact(source: Path) -> dict[str, Any]:
+        """Recheck content outside locks before a worker publishes its result."""
+        from .montage_reframe import source_fingerprint
+
+        try:
+            before = reframe_source_identity(source)
+            fingerprint = source_fingerprint(source)
+            after = reframe_source_identity(source)
+        except (OSError, ValueError) as error:
+            raise ReframeSourceProofConflict("素材在校验期间不可读取") from error
+        if before != after:
+            raise ReframeSourceProofConflict("素材在校验期间变化")
+        return {"identity": before, "fingerprint": fingerprint}
+
+    def reframe_asset_identity(asset: dict[str, Any]) -> dict[str, Any]:
+        return {key: asset.get(key) for key in ("id", "kind", "file", "sourceReferenceId")}
+
+    def schedule_reframe(project_id, clip_id, *, expected_revision=None):
+        run_id = uuid4().hex
+        with source_lock or nullcontext(), lock:
+            state = state_for(project_id)
+            if expected_revision is not None and state["revision"] != expected_revision:
+                fail("timeline_conflict", "时间线已更新，请刷新后重试。")
+            clip = next((item for track in state["tracks"] for item in track["clips"] if item["id"] == clip_id), None)
+            if clip is None:
+                fail("reframe_clip_missing", "时间线片段不存在。", 404)
+            asset = asset_index(project_id).get(clip["assetId"])
+            if asset is None or asset.get("kind") not in ("video", "image"):
+                fail("reframe_source_unavailable", "主体分析仅支持可用图片或视频素材。")
+            try:
+                source = source_path(project_id, asset)
+            except HTTPException:
+                fail("reframe_source_unavailable", "主体分析素材不可用。")
+            still_image = asset.get("kind") == "image"
+            try:
+                source_identity = reframe_source_identity(source)
+            except OSError:
+                fail("reframe_source_unavailable", "主体分析素材不可用。")
+            request = {"revision": state["revision"], "clip": {
+                key: clip[key] for key in ("assetId", "inPoint", "duration", "speed")
+            }, "asset": reframe_asset_identity(asset), "source": source_identity,
+                       "targetAspect": {"width": state["settings"]["width"], "height": state["settings"]["height"]},
+                       "stillImage": still_image}
+
+        try:
+            proof = prove_reframe_source(source, still_image=request["stillImage"])
+        except ReframeSourceProofConflict:
+            fail("reframe_source_unavailable", "主体分析素材在校验期间变化或不可用，请刷新后重试。")
+
+        with source_lock or nullcontext(), lock:
+            state = state_for(project_id)
+            if state["revision"] != request["revision"]:
+                fail("timeline_conflict", "时间线已更新，请刷新后重试。")
+            clip = next((item for track in state["tracks"] for item in track["clips"] if item["id"] == clip_id), None)
+            if clip is None:
+                fail("reframe_clip_missing", "时间线片段不存在。", 404)
+            asset = asset_index(project_id).get(request["clip"]["assetId"])
+            if asset is None or reframe_asset_identity(asset) != request["asset"]:
+                fail("reframe_source_unavailable", "主体分析素材已变化，请刷新后重试。")
+            try:
+                current_source = source_path(project_id, asset)
+            except HTTPException:
+                fail("reframe_source_unavailable", "主体分析素材不可用。")
+            try:
+                current_source_identity = reframe_source_identity(current_source)
+            except OSError:
+                fail("reframe_source_unavailable", "主体分析素材不可用。")
+            if (current_source_identity != request["source"]
+                    or current_source_identity != proof["identity"]):
+                fail("reframe_source_unavailable", "主体分析素材已变化，请刷新后重试。")
+            current_clip = {key: clip.get(key) for key in request["clip"]}
+            if current_clip != request["clip"]:
+                fail("timeline_conflict", "时间线片段已更新，请刷新后重试。")
+            current_aspect = {"width": state["settings"]["width"], "height": state["settings"]["height"]}
+            if current_aspect != request["targetAspect"]:
+                fail("timeline_conflict", "时间线输出比例已更新，请刷新后重试。")
+            from .montage_reframe import pending_reframe
+            previous_reframe = clip.get("reframe", {})
+            previous_fingerprint = previous_reframe.get("sourceFingerprint")
+            pending = pending_reframe(target_width=current_aspect["width"], target_height=current_aspect["height"], reason="已提交本地主体分析")
+            override = previous_reframe.get("override")
+            if ((not previous_fingerprint or previous_fingerprint == proof["fingerprint"])
+                    and isinstance(override, dict) and override.get("mode") != "auto"):
+                pending["override"] = deepcopy(override)
+            clip["reframe"] = pending
+            identity = {**request["clip"], "sourceFingerprint": proof["fingerprint"], "targetAspect": current_aspect}
+            source = current_source
+            source_timing, trusted_size = proof["timing"], proof["size"]
+            state.setdefault("reframeAnalysis", {})[clip_id] = {"id": run_id, "status": "queued", "error": None, "identity": identity}
+            save(project_id, state)
+        def process(_pid):
+            with lock:
+                state = state_for(project_id)
+                record = state.get("reframeAnalysis", {}).get(clip_id)
+                if record is None or record.get("id") != run_id or record.get("status") != "queued":
+                    return
+                record["status"] = "running"
+                save(project_id, state)
+            try:
+                from .montage_reframe import normalize_reframe, run_local_detector
+                if not source.is_file():
+                    raise ValueError("分析期间素材已变化，请重新主体分析。")
+                if not all(type(value) is int and value > 0 for value in trusted_size):
+                    raise ValueError("无法获取可信源尺寸，不能完成主体分析。")
+                raw = reframe_analyzer(source, identity) if reframe_analyzer else run_local_detector(
+                    source, start=0 if still_image else identity["inPoint"], end=0 if still_image else identity["inPoint"] + identity["duration"] * identity["speed"],
+                    target_width=identity["targetAspect"]["width"], target_height=identity["targetAspect"]["height"],
+                    source_timing=source_timing, media_kind="image" if still_image else "video",
+                    cancelled=lambda: (state_for(project_id).get("reframeAnalysis", {}).get(clip_id, {}).get("id") != run_id
+                                       or state_for(project_id).get("reframeAnalysis", {}).get(clip_id, {}).get("status") == "cancelled"))
+                result = normalize_reframe(raw, source_fingerprint=identity["sourceFingerprint"],
+                                           source_width=trusted_size[0], source_height=trusted_size[1], source_timing=source_timing,
+                                           required_start=None if still_image else identity["inPoint"],
+                                           required_end=None if still_image else identity["inPoint"] + identity["duration"] * identity["speed"],
+                                           still_image=still_image)
+                error = None
+            except Exception as failure:
+                result, error = None, str(failure)[:300] or "本地主体分析失败。"
+            try:
+                current_source_fact = reframe_fingerprint_fact(source) if result is not None else None
+            except ReframeSourceProofConflict:
+                current_source_fact = None
+            with source_lock or nullcontext(), lock:
+                state = state_for(project_id)
+                record = state.get("reframeAnalysis", {}).get(clip_id)
+                clip = next((item for track in state["tracks"] for item in track["clips"] if item["id"] == clip_id), None)
+                if record is None or record.get("id") != run_id or record.get("status") == "cancelled" or clip is None:
+                    return
+                if result is None:
+                    record.update(status="failed", error=error)
+                else:
+                    try:
+                        current_asset = asset_index(project_id).get(identity["assetId"])
+                        current_source = source_path(project_id, current_asset) if current_asset else None
+                        current_source_identity = reframe_source_identity(current_source) if current_source else None
+                    except (HTTPException, OSError, ValueError):
+                        current_source_identity = None
+                    if ({key: clip.get(key) for key in ("assetId", "inPoint", "duration", "speed")} !=
+                            {key: identity[key] for key in ("assetId", "inPoint", "duration", "speed")}
+                            or current_source_fact is None
+                            or current_asset is None or reframe_asset_identity(current_asset) != request["asset"]
+                            or current_source_identity != proof["identity"]
+                            or current_source_identity != current_source_fact["identity"]
+                            or current_source_fact["identity"] != proof["identity"]
+                            or current_source_fact["fingerprint"] != identity["sourceFingerprint"]):
+                        record.update(status="failed", error="分析期间素材或片段已变化，请重新主体分析。")
+                    elif {"width": state["settings"]["width"], "height": state["settings"]["height"]} != identity["targetAspect"]:
+                        record.update(status="failed", error="分析期间输出比例已变化，请重新主体分析。")
+                    else:
+                        override = clip.get("reframe", {}).get("override")
+                        clip["reframe"] = {**result, **({"override": override} if isinstance(override, dict) and override.get("mode") != "auto" else {})}
+                        record.update(status="completed", error=None)
+                        state["revision"] += 1
+                save(project_id, state)
+        if not compute_queue.submit("timeline-reframe:" + run_id, project_id, process):
+            with lock:
+                state = state_for(project_id)
+                record = state.get("reframeAnalysis", {}).get(clip_id)
+                if record and record.get("id") == run_id:
+                    record.update(status="failed", error="本地处理队列不可用。")
+                    save(project_id, state)
 
     def find_run(state, run_id):
         try:
@@ -134,6 +339,7 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 active_workers.add((project_id, run_id))
                 snapshot = run["snapshot"]
                 source_names = dict(run["sources"])
+                media_kinds = packaging_media_kinds(asset_index(project_id))
             sources = render_inputs.resolve(store.path(project_id, "runs", run_id), source_names)
             suffix = ".wav" if run["format"] == "wav" else ".mp4"
             staging = store.path(project_id, "runs", run_id, "output" + suffix)
@@ -141,7 +347,9 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             if actual_renderer is None:
                 from .timeline_render import render_timeline
                 actual_renderer = render_timeline
-            actual_renderer(snapshot, sources, staging, format=run["format"], ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, cancelled=lambda: cancelled(project_id, run_id))
+            actual_renderer(snapshot, sources, staging, format=run["format"], ffmpeg_path=ffmpeg_path,
+                            ffprobe_path=ffprobe_path, cancelled=lambda: cancelled(project_id, run_id),
+                            asset_media_kinds=media_kinds)
             _regular_file(staging)
             with lock:
                 state = state_for(project_id)
@@ -191,6 +399,10 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                     if recovery.reason == "interrupted":
                         run.update(status=recovery.status, error="服务重启中断了渲染，可重新提交。")
                         changed = True
+                for record in state.get("reframeAnalysis", {}).values():
+                    if record.get("status") in ("queued", "running"):
+                        record.update(status="failed", error="服务重启中断了主体分析，可重新提交。")
+                        changed = True
                 if changed:
                     store.save(project_dir.name, state)
             except (OSError, ValueError):
@@ -204,6 +416,31 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
         with lock:
             return response(project_id, state_for(project_id))
 
+    @router.post("/reframes/{clip_id}/analyze", status_code=202)
+    def analyze_reframe(project_id: str, clip_id: str, body: Dict[str, Any]):
+        project_for(project_id)
+        if not isinstance(body, dict) or set(body) != {"revision"} or type(body["revision"]) is not int:
+            fail("reframe_request_invalid", "主体分析请求无效。", 422)
+        schedule_reframe(project_id, clip_id, expected_revision=body["revision"])
+        with lock:
+            return response(project_id, state_for(project_id))
+
+    @router.post("/reframes/{clip_id}/cancel")
+    def cancel_reframe(project_id: str, clip_id: str, body: Dict[str, Any]):
+        project_for(project_id)
+        if not isinstance(body, dict) or set(body) != {"revision"} or type(body["revision"]) is not int:
+            fail("reframe_request_invalid", "主体分析取消请求无效。", 422)
+        with lock:
+            state = state_for(project_id)
+            if state["revision"] != body["revision"]:
+                fail("timeline_conflict", "时间线已更新，请刷新后重试。")
+            record = state.get("reframeAnalysis", {}).get(clip_id)
+            if record is None or record.get("status") not in ("queued", "running"):
+                fail("reframe_not_active", "主体分析未在运行。")
+            record.update(status="cancelled", error=None)
+            save(project_id, state)
+            return response(project_id, state)
+
     @router.post("/validate-draft")
     def validate_draft(project_id: str, body: Dict[str, Any]):
         project_for(project_id)
@@ -215,21 +452,52 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 fail("timeline_invalid", str(error), 422)
             for asset_id in {clip["assetId"] for track in tracks for clip in track["clips"]}:
                 source_path(project_id, assets[asset_id])
-            return {"revision": body["revision"], "settings": settings, "tracks": tracks}
+            checked = {"revision": body["revision"], "settings": settings, "tracks": tracks}
+            if "transitions" in body:
+                checked["transitions"] = validate_transitions(body["transitions"], tracks)
+            if "packaging" in body:
+                if body["packaging"] is None:
+                    checked["packaging"] = None
+                else:
+                    from .montage_packaging import PackagingError, validate_packaging
+                    try:
+                        checked["packaging"] = validate_packaging(body["packaging"], [], tracks,
+                                                                   asset_media_kinds=packaging_media_kinds(assets))
+                    except PackagingError as error:
+                        fail("timeline_packaging_invalid", str(error), 422)
+            return checked
 
     @router.put("")
     def save_workspace(project_id: str, body: Dict[str, Any]):
         project_for(project_id)
         with source_lock or nullcontext(), lock:
             state = state_for(project_id)
+            transition_input = body.get("transitions", state.get("transitions", [])) if isinstance(body, dict) else []
             try:
-                settings, tracks = validate_workspace(body, asset_index(project_id))
+                value = {**body, "transitions": transition_input}
+                settings, tracks = validate_workspace(value, asset_index(project_id))
             except ValueError as error:
                 fail("timeline_invalid", str(error), 422)
             if body["revision"] != state["revision"]:
                 fail("timeline_conflict", "时间线已更新，请刷新后重试。")
+            try:
+                from .montage_reframe import ReframeError, retain_server_reframe_facts
+                tracks = retain_server_reframe_facts(state["tracks"], tracks)
+            except ReframeError as error:
+                fail("timeline_invalid", str(error), 422)
             state["settings"] = settings
             state["tracks"] = tracks
+            state["transitions"] = validate_transitions(transition_input, tracks)
+            if "packaging" in body:
+                if body["packaging"] is None:
+                    state.pop("packaging", None)
+                else:
+                    from .montage_packaging import PackagingError, validate_packaging
+                    try:
+                        state["packaging"] = validate_packaging(body["packaging"], [], tracks,
+                                                                   asset_media_kinds=packaging_media_kinds(asset_index(project_id)))
+                    except PackagingError as error:
+                        fail("timeline_packaging_invalid", str(error), 422)
             state["revision"] += 1
             save(project_id, state)
             return response(project_id, state)
@@ -271,7 +539,9 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 start = round(start + duration, 6)
             track = {"id": track_id, "name": "镜头结果 · 方案 {}".format(preparation["revision"]), "kind": "video", "muted": False, "hidden": False, "clips": clips}
             try:
-                _, tracks = validate_workspace({"revision": state["revision"], "settings": state["settings"], "tracks": state["tracks"] + [track]}, assets)
+                _, tracks = validate_workspace({"revision": state["revision"], "settings": state["settings"],
+                                                "tracks": state["tracks"] + [track],
+                                                "transitions": state.get("transitions", [])}, assets)
             except ValueError as error:
                 fail("shot_result_invalid", str(error))
             state["tracks"] = tracks
@@ -330,7 +600,9 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 fail("timeline_run_active", "当前项目已有渲染任务正在执行。")
             assets = asset_index(project_id)
             try:
-                settings, tracks = validate_workspace({"revision": state["revision"], "settings": state["settings"], "tracks": state["tracks"]}, assets)
+                settings, tracks = validate_workspace({"revision": state["revision"], "settings": state["settings"],
+                                                       "tracks": state["tracks"],
+                                                       "transitions": state.get("transitions", [])}, assets)
             except ValueError as error:
                 fail("timeline_invalid", str(error), 422)
             if body["format"] == "wav":
@@ -341,7 +613,11 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             run_id = uuid4().hex
             sources = snapshot_sources(project_id, run_id, tracks, assets)
             run = {"id": run_id, "revision": state["revision"], "format": body["format"], "status": LOCAL_RUN_POLICY.initial_status, "error": None,
-                   "snapshot": {"settings": settings, "tracks": tracks}, "sources": sources}
+                   "snapshot": {"settings": settings, "tracks": tracks,
+                                "transitions": validate_transitions(state.get("transitions", []), tracks)},
+                   "sources": sources}
+            if state.get("packaging") is not None:
+                run["snapshot"]["packaging"] = state["packaging"]
             state["runs"].append(run)
             save(project_id, state)
             queue_run(project_id, run_id)
@@ -415,6 +691,33 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             if run["status"] != "completed":
                 fail("timeline_output_unavailable", "渲染结果尚不可用。")
             try:
+                output = run["output"]
+                validate_storage_id(output)
+                path = store.path(project_id, "outputs", output)
+                _regular_file(path)
+                snapshot = run.get("snapshot", {})
+                media_kinds = packaging_media_kinds(asset_index(project_id))
+                if snapshot.get("packaging") is not None:
+                    from .montage_packaging import validate_packaging
+                    validate_packaging(snapshot["packaging"], [], snapshot.get("tracks", []),
+                                       asset_media_kinds=media_kinds)
+            except (KeyError, OSError, ValueError):
+                fail("timeline_output_unavailable", "渲染结果不可用。")
+            snapshot = json.loads(json.dumps(snapshot))
+        try:
+            from .montage_packaging import PackagingError, prepare_packaging_proof
+            packaging_proof = prepare_packaging_proof(snapshot, [], batch=False, asset_media_kinds=media_kinds)
+        except PackagingError:
+            fail("timeline_output_unavailable", "渲染结果不可用。")
+        with lock:
+            state = state_for(project_id)
+            run = find_run(state, run_id)
+            if run["status"] != "completed" or run.get("snapshot") != snapshot:
+                fail("timeline_output_unavailable", "渲染结果不可用。")
+            try:
+                from .montage_packaging import consume_packaging_proof
+                consume_packaging_proof(packaging_proof, run.get("snapshot", {}), [], batch=False,
+                                        asset_media_kinds=packaging_media_kinds(asset_index(project_id)))
                 output = run["output"]
                 validate_storage_id(output)
                 path = store.path(project_id, "outputs", output)
