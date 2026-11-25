@@ -1,0 +1,20 @@
+{
+  "created": 1790928000.0,
+  "duration": 0.012,
+  "exitcode": 0,
+  "root": "/isolated/checkout",
+  "environment": {},
+  "summary": {"passed": 1, "failed": 0, "skipped": 0, "total": 1, "collected": 1},
+  "collectors": [],
+  "tests": [
+    {
+      "nodeid": "tests/test_contract.py::test_policy",
+      "lineno": 7,
+      "outcome": "passed",
+      "keywords": ["test_policy", "test_contract.py", "tests"],
+      "setup": {"duration": 0.001, "outcome": "passed"},
+      "call": {"duration": 0.009, "outcome": "passed"},
+      "teardown": {"duration": 0.002, "outcome": "passed"}
+    }
+  ]
+}

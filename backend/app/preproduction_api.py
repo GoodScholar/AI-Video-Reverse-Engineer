@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import inspect
 import math
 import os
 import shutil
@@ -13,14 +14,14 @@ import zipfile
 from copy import deepcopy
 from contextlib import nullcontext
 from pathlib import Path
-from threading import RLock
+from threading import Event, RLock
 from types import SimpleNamespace
 from typing import Any, Callable, Literal, Optional
 from urllib.parse import quote
 from uuid import uuid4
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.background import BackgroundTask
 
@@ -33,19 +34,84 @@ from .asset_references import (
 )
 from .batch_editing_api import BatchStore
 from .canvas_layout import CanvasLayoutConflict, CanvasLayoutStore, validate_layout
-from .durable_runs import LOCAL_RUN_POLICY
+from .durable_runs import LOCAL_RUN_POLICY, freeze_run_input
 from .timeline import TimelineStore
 from .preproduction import PreproductionStore
 from .project_assets import (
     AssetFileUnavailableError,
     AssetInUseError,
     AssetReferencesUnavailableError,
+    AssetStateConflict,
+    LocalVideoInstallationConflict,
     ProjectAssets,
 )
 from .preproduction_handoff import render_handoff
 from .preproduction_nodes import FFMPEG_TIMEOUT_SECONDS, MAX_MEDIA_DURATION_SECONDS, MAX_OUTPUT_DIMENSION, MAX_OUTPUT_PIXELS
 from .reference_media_storage import managed_reference_media_is_safe, resolve_reference_media_path
 from .reference_video import validate_storage_id
+from .video_sources import utc_timestamp
+from .youtube_import import (
+    MAX_YOUTUBE_SOURCE_DURATION_SECONDS,
+    SystemYoutubeCookieStore,
+    YOUTUBE_ADAPTER,
+    YtDlpYoutubeAdapter,
+    YoutubeImportError,
+    YoutubeImportCancelled,
+    YoutubeImportRuns,
+    public_youtube_import_run,
+    normalize_youtube_url,
+    probe_downloaded_youtube_video,
+)
+from .bilibili_import import (
+    BILIBILI_ADAPTER,
+    MAX_BILIBILI_SOURCE_DURATION_SECONDS,
+    BilibiliImportError,
+    BilibiliImportRuns,
+    SystemBilibiliCookieStore,
+    YtDlpBilibiliAdapter,
+    bilibili_url_part,
+    bilibili_video_source,
+    normalize_bilibili_url,
+    probe_downloaded_bilibili_video,
+    public_bilibili_import_run,
+    resolve_bilibili_short_url,
+)
+from .douyin_import import (
+    DOUYIN_ADAPTER,
+    MAX_DOUYIN_SOURCE_DURATION_SECONDS,
+    DouyinImportError,
+    DouyinImportRuns,
+    SystemDouyinCookieStore,
+    YtDlpDouyinAdapter,
+    douyin_video_source,
+    extract_douyin_share_url,
+    normalize_douyin_url,
+    probe_downloaded_douyin_video,
+    public_douyin_import_run,
+    resolve_douyin_short_url,
+)
+from .xiaohongshu_import import (
+    XIAOHONGSHU_ADAPTER,
+    MAX_XIAOHONGSHU_SOURCE_DURATION_SECONDS,
+    XiaohongshuImportError,
+    XiaohongshuImportRuns,
+    SystemXiaohongshuCookieStore,
+    SystemXiaohongshuRequestStore,
+    YtDlpXiaohongshuAdapter,
+    extract_xiaohongshu_share_url,
+    normalize_xiaohongshu_url,
+    probe_downloaded_xiaohongshu_video,
+    public_xiaohongshu_import_run,
+    resolve_xiaohongshu_short_url,
+    xiaohongshu_source_facts,
+    xiaohongshu_video_source,
+)
+from .kuaishou_import import (
+    KUAISHOU_ADAPTER, MAX_KUAISHOU_SOURCE_DURATION_SECONDS, KuaishouImportError,
+    KuaishouImportRuns, KuaishouSourceAdapter, SystemKuaishouCookieStore,
+    extract_kuaishou_share_url, normalize_kuaishou_url, public_kuaishou_import_run,
+    resolve_kuaishou_short_url, kuaishou_source_facts, kuaishou_video_source,
+)
 from .shot_production import MAX_RESULT_VERSIONS, NODE_KINDS, ShotProduction, ShotProductionError, StepSource, public_result_versions
 from .shot_organization import ShotOrganization, ShotOrganizationError
 from .preproduction_transaction import WorkspaceTransaction, WorkspaceTransactionError
@@ -56,6 +122,52 @@ MAX_SHOTS = 500
 MAX_NODES_PER_SHOT = 80
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 _MEDIA_SUFFIXES = _IMAGE_SUFFIXES | {".mp4", ".mov", ".m4a", ".mp3", ".wav", ".aac", ".webm"}
+
+
+def youtube_external_request() -> dict[str, Any]:
+    """Pre-network disclosure used by both the UI and metadata response."""
+    return {
+        "probeHosts": ["www.youtube.com", "YouTube player metadata API"],
+        "downloadHosts": ["*.googlevideo.com"],
+        "purpose": "读取公开视频元数据；确认权利后下载到本项目受管暂存区。",
+        "sessionPolicy": "默认不读取或发送会话；仅在你明确勾选后，才读取系统安全存储中的合法会话并仅发送给 YouTube。",
+    }
+
+
+def bilibili_external_request() -> dict[str, Any]:
+    return {
+        "probeHosts": ["www.bilibili.com", "api.bilibili.com"],
+        "downloadHosts": ["B站授权媒体 CDN"],
+        "purpose": "读取公开视频与分P元数据；确认权利并明确选择分P后下载到本项目受管暂存区。",
+        "sessionPolicy": "默认不读取或发送会话；仅在你明确勾选后，才读取系统安全存储中的合法会话并仅发送给 B站。",
+        "shortLinkPolicy": "b23.tv 短链只会经无代理、最多三次的 HTTPS 跳转解析，最终必须是标准 BV 视频页。",
+    }
+
+
+def douyin_external_request() -> dict[str, Any]:
+    return {
+        "probeHosts": ["www.douyin.com"],
+        "downloadHosts": ["抖音授权媒体 CDN"],
+        "purpose": "读取公开视频元数据；确认权利后下载到本项目受管暂存区。",
+        "sessionPolicy": "默认不读取或发送会话；仅在你明确勾选后，才读取系统安全存储中的合法会话并仅发送给抖音。",
+        "shortLinkPolicy": "v.douyin.com 短链只会经无代理、最多三次、DNS 固定的 HTTPS 跳转解析，最终必须是标准抖音视频页。",
+    }
+
+
+def xiaohongshu_external_request() -> dict[str, Any]:
+    return {
+        "probeHosts": ["www.xiaohongshu.com", "sns-video-bd.xhscdn.com（原始视频可用性探测）"],
+        "downloadHosts": ["小红书授权媒体 CDN（*.xhscdn.com）"],
+        "purpose": "读取公开小红书笔记的视频元数据；确认权利后下载到本项目受管暂存区。",
+        "sessionPolicy": "默认不读取或发送会话；仅在你明确勾选后，才读取系统安全存储中的合法会话并仅发送给小红书。",
+        "shortLinkPolicy": "xhslink.com 短链只会经无代理、最多三次、DNS 固定的 HTTPS 跳转解析，最终必须是标准小红书笔记页。",
+    }
+
+def kuaishou_external_request() -> dict[str, Any]:
+    return {"probeHosts": ["www.kuaishou.com"], "downloadHosts": ["快手授权媒体 CDN（*.yximgs.com / *.kwaicdn.com）"],
+            "purpose": "读取公开快手页面的元数据；确认权利后下载到本项目受管暂存区。",
+            "sessionPolicy": "默认不读取或发送会话；仅在你明确勾选后，才读取系统安全存储中的合法会话并仅发送给快手。",
+            "shortLinkPolicy": "v.kuaishou.com 短链只会经无代理、最多三次、DNS 固定的 HTTPS 跳转解析，最终必须是标准快手视频页。"}
 
 
 class Brief(BaseModel):
@@ -158,6 +270,31 @@ class AssetMetadata(RevisionRequest):
         return value
 
 
+class YoutubeImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    url: str = Field(min_length=1, max_length=4096)
+    role: Literal["character", "scene", "motion", "audio", "reference"] = "reference"
+    rightsConfirmed: bool = False
+    externalRequestAccepted: bool = False
+    useSession: bool = False
+    idempotencyKey: str = Field(default="", max_length=128)
+
+
+class BilibiliImportRequest(YoutubeImportRequest):
+    part: int | None = Field(default=None, ge=1, le=9999)
+
+
+class DouyinImportRequest(YoutubeImportRequest):
+    pass
+
+
+class XiaohongshuImportRequest(YoutubeImportRequest):
+    pass
+
+class KuaishouImportRequest(YoutubeImportRequest):
+    pass
+
+
 class CanvasLayoutUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     layoutRevision: int = Field(ge=0)
@@ -174,6 +311,21 @@ def create_preproduction_router(
     ffprobe_path: str = "ffprobe",
     source_lock: Any = None,
     runner: Optional[Callable[..., list[str]]] = None,
+    youtube_adapter: Any = None,
+    youtube_session_store: Any = None,
+    bilibili_adapter: Any = None,
+    bilibili_session_store: Any = None,
+    bilibili_short_link_resolver: Any = None,
+    douyin_adapter: Any = None,
+    douyin_session_store: Any = None,
+    douyin_short_link_resolver: Any = None,
+    xiaohongshu_adapter: Any = None,
+    xiaohongshu_session_store: Any = None,
+    xiaohongshu_request_store: Any = None,
+    xiaohongshu_short_link_resolver: Any = None,
+    kuaishou_adapter: Any = None,
+    kuaishou_session_store: Any = None,
+    kuaishou_short_link_resolver: Any = None,
 ) -> APIRouter:
     """Create the router; ``runner`` is a test seam and defaults to execute_node."""
     root = Path(data_dir)
@@ -190,7 +342,116 @@ def create_preproduction_router(
         lambda project_id, asset_id: batch_asset_references(batch_store.load(project_id), asset_id),
     ))
     lock = source_lock or RLock()
+    youtube_adapter = youtube_adapter or YtDlpYoutubeAdapter()
+    youtube_runs = YoutubeImportRuns(root)
+    youtube_cancel_events: dict[str, Event] = {}
+    bilibili_adapter = bilibili_adapter or YtDlpBilibiliAdapter(ffmpeg_path=ffmpeg_path)
+    bilibili_short_link_resolver = bilibili_short_link_resolver or resolve_bilibili_short_url
+    bilibili_runs = BilibiliImportRuns(root)
+    bilibili_cancel_events: dict[str, Event] = {}
+    douyin_adapter = douyin_adapter or YtDlpDouyinAdapter(ffmpeg_path=ffmpeg_path)
+    douyin_short_link_resolver = douyin_short_link_resolver or resolve_douyin_short_url
+    douyin_runs = DouyinImportRuns(root)
+    douyin_cancel_events: dict[str, Event] = {}
+    xiaohongshu_adapter = xiaohongshu_adapter or YtDlpXiaohongshuAdapter(ffmpeg_path=ffmpeg_path)
+    xiaohongshu_short_link_resolver = xiaohongshu_short_link_resolver or resolve_xiaohongshu_short_url
+    xiaohongshu_runs = XiaohongshuImportRuns(root)
+    xiaohongshu_cancel_events: dict[str, Event] = {}
+    kuaishou_adapter = kuaishou_adapter or KuaishouSourceAdapter()
+    kuaishou_short_link_resolver = kuaishou_short_link_resolver or resolve_kuaishou_short_url
+    kuaishou_runs = KuaishouImportRuns(root)
+    kuaishou_cancel_events: dict[str, Event] = {}
+
+    def xiaohongshu_request_url(run_id: str, fallback: str) -> str:
+        try:
+            value = (xiaohongshu_request_store or SystemXiaohongshuRequestStore()).get(run_id)
+        except Exception:
+            value = None
+        return value or fallback
     router = APIRouter(prefix="/api/projects/{project_id}/preproduction")
+
+    def reconcile_youtube_imports(project_id: str) -> None:
+        """Close the post-install/pre-run-record crash window without redownloading."""
+        assets = project_assets.index(project_id)
+        for run in youtube_runs.list(project_id):
+            if run["status"] not in {"failed", "cancelled"} or run.get("uploadedAssetId"):
+                continue
+            canonical = normalize_youtube_url(str(run.get("input", {}).get("url", "")))
+            video_id = (canonical or "").removeprefix("https://www.youtube.com/watch?v=")
+            asset = next((item for item in assets.values() if isinstance(item.get("videoSource"), dict)
+                          and item["videoSource"].get("sourceId") == "source-youtube-" + video_id), None)
+            if asset is None:
+                continue
+            try:
+                project_assets.file(project_id, asset)
+            except (OSError, ValueError, KeyError):
+                continue
+            youtube_runs.transition(project_id, run["id"], status="completed", error=None, uploadedAssetId=asset["id"])
+
+    def reconcile_bilibili_imports(project_id: str) -> None:
+        assets = project_assets.index(project_id)
+        for run in bilibili_runs.list(project_id):
+            if run["status"] not in {"failed", "cancelled"} or run.get("uploadedAssetId"):
+                continue
+            input_data = run.get("input", {})
+            canonical = normalize_bilibili_url(str(input_data.get("url", "")))
+            part = input_data.get("part")
+            if canonical is None or not isinstance(part, int):
+                continue
+            bvid = canonical.split("/video/", 1)[-1].split("?", 1)[0]
+            asset = next((item for item in assets.values() if isinstance(item.get("videoSource"), dict)
+                          and item["videoSource"].get("sourceId") == f"source-bilibili-{bvid}-p{part}"), None)
+            if asset is None:
+                continue
+            try:
+                project_assets.file(project_id, asset)
+            except (OSError, ValueError, KeyError):
+                continue
+            bilibili_runs.transition(project_id, run["id"], status="completed", error=None, uploadedAssetId=asset["id"])
+
+    def reconcile_douyin_imports(project_id: str) -> None:
+        assets = project_assets.index(project_id)
+        for run in douyin_runs.list(project_id):
+            if run["status"] not in {"failed", "cancelled"} or run.get("uploadedAssetId"):
+                continue
+            canonical = normalize_douyin_url(str(run.get("input", {}).get("url", "")))
+            video_id = (canonical or "").rsplit("/", 1)[-1]
+            asset = next((item for item in assets.values() if isinstance(item.get("videoSource"), dict)
+                          and item["videoSource"].get("sourceId") == "source-douyin-" + video_id), None)
+            if asset is None:
+                continue
+            try:
+                project_assets.file(project_id, asset)
+            except (OSError, ValueError, KeyError):
+                continue
+            douyin_runs.transition(project_id, run["id"], status="completed", error=None, uploadedAssetId=asset["id"])
+
+    def reconcile_xiaohongshu_imports(project_id: str) -> None:
+        assets = project_assets.index(project_id)
+        for run in xiaohongshu_runs.list(project_id):
+            if run["status"] not in {"failed", "cancelled"} or run.get("uploadedAssetId"):
+                continue
+            canonical = normalize_xiaohongshu_url(str(run.get("input", {}).get("url", "")))
+            video_id = (canonical or "").split("?", 1)[0].rsplit("/", 1)[-1]
+            asset = next((item for item in assets.values() if isinstance(item.get("videoSource"), dict)
+                          and item["videoSource"].get("sourceId") == "source-xiaohongshu-" + video_id), None)
+            if asset is None:
+                continue
+            try:
+                project_assets.file(project_id, asset)
+            except (OSError, ValueError, KeyError):
+                continue
+            xiaohongshu_runs.transition(project_id, run["id"], status="completed", error=None, uploadedAssetId=asset["id"])
+
+    def reconcile_kuaishou_imports(project_id: str) -> None:
+        assets = project_assets.index(project_id)
+        for run in kuaishou_runs.list(project_id):
+            if run["status"] not in {"failed", "cancelled"} or run.get("uploadedAssetId"): continue
+            video_id = str(run.get("input", {}).get("url", "")).rsplit("/", 1)[-1]
+            asset = next((item for item in assets.values() if isinstance(item.get("videoSource"), dict) and item["videoSource"].get("sourceId") == "source-kuaishou-" + video_id), None)
+            if asset:
+                try: project_assets.file(project_id, asset); kuaishou_runs.transition(project_id, run["id"], status="completed", error=None, uploadedAssetId=asset["id"])
+                except (OSError, ValueError, KeyError): continue
 
     if runner is None:
         from .preproduction_nodes import execute_node
@@ -208,6 +469,17 @@ def create_preproduction_router(
     def state_for(project_id: str) -> dict[str, Any]:
         try:
             workspace_transaction.recover(project_id)
+            project_assets.recover_local_video_installations(project_id)
+            project_assets.recover_youtube_video_installations(project_id)
+            project_assets.recover_bilibili_video_installations(project_id)
+            project_assets.recover_douyin_video_installations(project_id)
+            project_assets.recover_xiaohongshu_video_installations(project_id)
+            project_assets.recover_kuaishou_video_installations(project_id)
+            reconcile_youtube_imports(project_id)
+            reconcile_bilibili_imports(project_id)
+            reconcile_douyin_imports(project_id)
+            reconcile_xiaohongshu_imports(project_id)
+            reconcile_kuaishou_imports(project_id)
             return store.load(project_id)
         except (OSError, ValueError):
             fail("preproduction_storage_invalid", "前置工作台状态无法读取。", 503)
@@ -318,6 +590,10 @@ def create_preproduction_router(
                     continue
                 project_id = path.parents[1].name
                 workspace_transaction.recover(project_id)
+                project_assets.recover_local_video_installations(project_id)
+                project_assets.recover_youtube_video_installations(project_id)
+                project_assets.recover_bilibili_video_installations(project_id)
+                project_assets.recover_douyin_video_installations(project_id)
                 state = store.load(project_id)
                 changed = False
                 for shot in state["shots"]:
@@ -330,6 +606,44 @@ def create_preproduction_router(
                     store.save(project_id, state)
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
+        for path in base.glob("*/preproduction/youtube-import/runs.json"):
+            try:
+                if not path.is_symlink():
+                    project_id = path.parents[2].name
+                    youtube_runs.recover(project_id)
+                    reconcile_youtube_imports(project_id)
+            except (OSError, ValueError):
+                continue
+        for path in base.glob("*/preproduction/bilibili-import/runs.json"):
+            try:
+                if not path.is_symlink():
+                    project_id = path.parents[2].name
+                    bilibili_runs.recover(project_id)
+                    reconcile_bilibili_imports(project_id)
+            except (OSError, ValueError):
+                continue
+        for path in base.glob("*/preproduction/douyin-import/runs.json"):
+            try:
+                if not path.is_symlink():
+                    project_id = path.parents[2].name
+                    douyin_runs.recover(project_id)
+                    reconcile_douyin_imports(project_id)
+            except (OSError, ValueError):
+                continue
+
+        for path in base.glob("*/preproduction/xiaohongshu-import/runs.json"):
+            try:
+                if not path.is_symlink():
+                    project_id = path.parents[2].name
+                    xiaohongshu_runs.recover(project_id)
+                    reconcile_xiaohongshu_imports(project_id)
+            except (OSError, ValueError):
+                continue
+        for path in base.glob("*/preproduction/kuaishou-import/runs.json"):
+            try:
+                if not path.is_symlink():
+                    project_id = path.parents[2].name; kuaishou_runs.recover(project_id); reconcile_kuaishou_imports(project_id)
+            except (OSError, ValueError): continue
 
     recover()
 
@@ -491,10 +805,13 @@ def create_preproduction_router(
         with source_lock or nullcontext(), lock:
             state = editable_assets(project_id, body.revision)
             managed_asset(state, asset_id)
-            project_assets.update_metadata(
-                state, asset_id, name=body.name, notes=body.notes,
-                save=lambda value: save(project_id, value),
-            )
+            try:
+                project_assets.update_metadata(
+                    project_id, state, asset_id, name=body.name, notes=body.notes,
+                    save=lambda value: save(project_id, value),
+                )
+            except AssetStateConflict:
+                fail("preproduction_conflict", "前置工作台已被更新，请刷新后重试。")
             return response(project_id, state)
 
     @router.post("/assets/{asset_id}/delete")
@@ -505,6 +822,8 @@ def create_preproduction_router(
             managed_asset(state, asset_id)
             try:
                 project_assets.delete(project_id, state, asset_id, save=lambda value: save(project_id, value))
+            except AssetStateConflict:
+                fail("preproduction_conflict", "前置工作台已被更新，请刷新后重试。")
             except AssetInUseError as error:
                 raise HTTPException(status_code=409, detail={
                     "code": "asset_in_use",
@@ -519,8 +838,865 @@ def create_preproduction_router(
                 fail("asset_delete_failed", "素材删除未能完成，请刷新检查后重试。", 503)
             return response(project_id, state)
 
+    def youtube_error(error: YoutubeImportError) -> None:
+        messages = {
+            "requires_login": "该 YouTube 内容需要已授权会话；系统不会自动登录、读取浏览器 Cookie 或绕过访问限制。",
+            "temporarily_unavailable": "YouTube 暂时不可用或站点适配已变化，请稍后重试。",
+            "unsupported_link": "该链接或内容受 DRM、私密或其他不支持的访问限制，不能导入。",
+        }
+        statuses = {"requires_login": 409, "temporarily_unavailable": 503, "unsupported_link": 422}
+        fail(f"youtube_{error.status}", messages[error.status], statuses[error.status])
+
+    def youtube_cookie() -> str | None:
+        try:
+            store = youtube_session_store or SystemYoutubeCookieStore()
+            return store.get()
+        except Exception:
+            # Public videos continue without a session.  A protected video will
+            # deterministically report requires_login; no credential detail leaks.
+            return None
+
+    def youtube_probe(body: YoutubeImportRequest, *, cancelled=None):
+        canonical = normalize_youtube_url(body.url)
+        if canonical is None:
+            raise YoutubeImportError("unsupported_link")
+        try:
+            probe = youtube_adapter.probe
+            kwargs = {"cookie": youtube_cookie() if body.useSession else None}
+            if cancelled is not None and "cancelled" in inspect.signature(probe).parameters:
+                kwargs["cancelled"] = cancelled
+            result = probe(canonical, **kwargs)
+        except YoutubeImportError:
+            raise
+        except Exception:
+            raise YoutubeImportError("temporarily_unavailable") from None
+        if result.status != "available":
+            raise YoutubeImportError(result.status)
+        if result.canonical_url != canonical:
+            # An adapter may enrich metadata but may not turn a recognized URL
+            # into another source identity after the user reviewed disclosure.
+            raise YoutubeImportError("temporarily_unavailable")
+        if result.duration is not None and result.duration > MAX_YOUTUBE_SOURCE_DURATION_SECONDS:
+            raise YoutubeImportError("unsupported_link")
+        return result
+
+    @router.post("/youtube/probe")
+    def probe_youtube(project_id: str, body: YoutubeImportRequest):
+        project_for(project_id)
+        if not body.externalRequestAccepted:
+            fail("youtube_external_request_confirmation_required", "请先确认将向 YouTube 发起元数据请求。", 422)
+        try:
+            probe = youtube_probe(body)
+        except YoutubeImportError as error:
+            youtube_error(error)
+        return {
+            "canonicalUrl": probe.canonical_url, "videoId": probe.video_id, "title": probe.title,
+            "durationSeconds": probe.duration, "uploader": probe.uploader, "status": "available",
+            "adapter": {"id": "yt-dlp", "version": str(getattr(youtube_adapter, "version", YOUTUBE_ADAPTER["version"]))},
+            "externalRequest": youtube_external_request(),
+            # E2 controlled verification and ordinary metadata probing are not
+            # E3 evidence.  Only an authorised gold-link record may set this.
+            "lastRealVerificationAt": None,
+        }
+
+    @router.get("/youtube/disclosure")
+    def youtube_disclosure(project_id: str):
+        project_for(project_id)
+        return youtube_external_request()
+
+    @router.post("/youtube/import")
+    def import_youtube(project_id: str, body: YoutubeImportRequest):
+        project_for(project_id)
+        if not body.rightsConfirmed:
+            fail("youtube_video_rights_required", "请先确认你拥有该 YouTube 视频的使用权，再导入项目。", 422)
+        if not body.externalRequestAccepted:
+            fail("youtube_external_request_confirmation_required", "请先确认将向 YouTube 发起下载请求。", 422)
+        canonical = normalize_youtube_url(body.url)
+        if canonical is None:
+            youtube_error(YoutubeImportError("unsupported_link"))
+        snapshot = {"url": canonical, "role": body.role, "useSession": body.useSession, "adapter": dict(YOUTUBE_ADAPTER)}
+        key = body.idempotencyKey.strip() or freeze_run_input(snapshot).fingerprint
+        try:
+            run, created = youtube_runs.create_or_reuse(project_id, snapshot, key)
+        except OSError:
+            fail("youtube_run_storage_failed", "YouTube 导入运行无法保存。", 503)
+        if created:
+            youtube_cancel_events[run["id"]] = Event()
+            if not compute_queue.submit("youtube-import", run["id"], lambda run_id: execute_youtube_import(project_id, run_id), project_id=project_id):
+                youtube_runs.transition(project_id, run["id"], status="failed", error="queue_unavailable")
+                fail("youtube_queue_unavailable", "YouTube 导入队列不可用，请稍后重试。", 503)
+        return JSONResponse(status_code=202, content={"run": public_youtube_import_run(run)})
+
+    @router.get("/youtube/imports/{run_id}")
+    def get_youtube_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try:
+            return {"run": public_youtube_import_run(youtube_runs.get(project_id, run_id))}
+        except (KeyError, ValueError):
+            fail("youtube_import_not_found", "YouTube 导入运行不存在。", 404)
+        except OSError:
+            fail("youtube_run_storage_failed", "YouTube 导入运行无法读取。", 503)
+
+    @router.get("/youtube/imports")
+    def list_youtube_imports(project_id: str):
+        project_for(project_id)
+        try:
+            return {"runs": [public_youtube_import_run(run) for run in youtube_runs.list(project_id)]}
+        except OSError:
+            fail("youtube_run_storage_failed", "YouTube 导入运行无法读取。", 503)
+
+    @router.post("/youtube/imports/{run_id}/cancel")
+    def cancel_youtube_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try:
+            with source_lock or nullcontext(), lock:
+                run = youtube_runs.request_cancel(project_id, run_id)
+        except KeyError:
+            fail("youtube_import_not_found", "YouTube 导入运行不存在。", 404)
+        except ValueError:
+            fail("youtube_import_not_cancellable", "该 YouTube 导入运行当前不能取消。", 409)
+        event = youtube_cancel_events.get(run_id)
+        if event is not None: event.set()
+        if run["status"] == "cancelled": shutil.rmtree(youtube_runs.staging_dir(project_id, run_id), ignore_errors=True)
+        return JSONResponse(status_code=202, content={"run": public_youtube_import_run(run)})
+
+    @router.post("/youtube/imports/{run_id}/retry")
+    def retry_youtube_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try:
+            run, created = youtube_runs.retry(project_id, run_id)
+        except KeyError:
+            fail("youtube_import_not_found", "YouTube 导入运行不存在。", 404)
+        except ValueError:
+            fail("youtube_import_not_retryable", "该 YouTube 导入运行当前不能重试。", 409)
+        except OSError:
+            fail("youtube_run_storage_failed", "YouTube 导入运行无法保存。", 503)
+        if not created:
+            return JSONResponse(status_code=202, content={"run": public_youtube_import_run(run)})
+        youtube_cancel_events[run["id"]] = Event()
+        if not compute_queue.submit("youtube-import", run["id"], lambda candidate_id: execute_youtube_import(project_id, candidate_id), project_id=project_id):
+            youtube_runs.transition(project_id, run["id"], status="failed", error="queue_unavailable")
+            fail("youtube_queue_unavailable", "YouTube 导入队列不可用，请稍后重试。", 503)
+        return JSONResponse(status_code=202, content={"run": public_youtube_import_run(run)})
+
+    def execute_youtube_import(project_id: str, run_id: str) -> None:
+        temporary: Path | None = None
+        staging = youtube_runs.staging_dir(project_id, run_id)
+        event = youtube_cancel_events.setdefault(run_id, Event())
+        try:
+            run = youtube_runs.get(project_id, run_id)
+            if run["status"] == "cancelled" or event.is_set():
+                youtube_runs.transition(project_id, run_id, status="cancelled", error="cancelled"); return
+            if run["status"] != "queued": return
+            youtube_runs.transition(project_id, run_id, status="running", error=None)
+            body = YoutubeImportRequest(url=run["input"]["url"], role=run["input"]["role"], rightsConfirmed=True, externalRequestAccepted=True, useSession=bool(run["input"].get("useSession", False)))
+            probe = youtube_probe(body, cancelled=event.is_set)
+            if event.is_set(): raise YoutubeImportCancelled()
+            staging.mkdir(parents=True, exist_ok=True)
+            descriptor, name = tempfile.mkstemp(dir=staging, prefix=".youtube-", suffix=".mp4"); os.close(descriptor); temporary = Path(name)
+            download = youtube_adapter.download
+            accepts_cancelled = "cancelled" in inspect.signature(download).parameters
+            downloaded = Path(download(probe, temporary, cookie=youtube_cookie() if body.useSession else None, **({"cancelled": event.is_set} if accepts_cancelled else {})))
+            if event.is_set(): raise YoutubeImportCancelled()
+            if downloaded.parent.resolve(strict=True) != staging.resolve(strict=True) or not downloaded.name.startswith(".youtube-"):
+                raise OSError("unmanaged YouTube staging output")
+            if downloaded != temporary: temporary.unlink(missing_ok=True); temporary = downloaded
+            metadata = probe_downloaded_youtube_video(temporary, ffprobe_path=ffprobe_path, ffmpeg_path=ffmpeg_path)
+            if event.is_set(): raise YoutubeImportCancelled()
+            with source_lock or nullcontext(), lock:
+                if event.is_set(): raise YoutubeImportCancelled()
+                installed = project_assets.install_youtube_video(project_id, source=temporary, staging_root=staging, probe=probe,
+                                                                  role=run["input"]["role"], metadata=metadata, confirmed_at=utc_timestamp())
+                youtube_runs.transition(project_id, run_id, status="completed", error=None, uploadedAssetId=installed["id"])
+                temporary = None
+        except YoutubeImportCancelled:
+            youtube_runs.transition(project_id, run_id, status="cancelled", error="cancelled")
+        except YoutubeImportError as error:
+            youtube_runs.transition(project_id, run_id, status="failed", error="youtube_" + error.status)
+        except ValueError:
+            youtube_runs.transition(project_id, run_id, status="failed", error="youtube_download_invalid")
+        except Exception:
+            youtube_runs.transition(project_id, run_id, status="failed", error="youtube_temporarily_unavailable")
+        finally:
+            if temporary is not None: temporary.unlink(missing_ok=True)
+            shutil.rmtree(staging, ignore_errors=True)
+            youtube_cancel_events.pop(run_id, None)
+
+    def bilibili_error(error: BilibiliImportError) -> None:
+        messages = {
+            "requires_login": "该 B站内容需要已授权会话；系统不会自动登录、读取浏览器 Cookie 或绕过访问限制。",
+            "temporarily_unavailable": "B站暂时不可用或站点适配已变化，请稍后重试。",
+            "unsupported_link": "该链接或内容受会员、私密、合集、互动、直播、DRM 或其他不支持的访问限制，不能导入。",
+        }
+        statuses = {"requires_login": 409, "temporarily_unavailable": 503, "unsupported_link": 422}
+        fail(f"bilibili_{error.status}", messages[error.status], statuses[error.status])
+
+    def bilibili_cookie(required: bool) -> str | None:
+        if not required: return None
+        try:
+            cookie = (bilibili_session_store or SystemBilibiliCookieStore()).get()
+        except Exception:
+            cookie = None
+        if not cookie: raise BilibiliImportError("requires_login")
+        return cookie
+
+    def bilibili_probe(body: BilibiliImportRequest, *, cancelled=None):
+        canonical = normalize_bilibili_url(body.url) or bilibili_short_link_resolver(body.url)
+        if canonical is None: raise BilibiliImportError("unsupported_link")
+        try:
+            probe = bilibili_adapter.probe
+            kwargs = {"cookie": bilibili_cookie(body.useSession)}
+            if cancelled is not None and "cancelled" in inspect.signature(probe).parameters: kwargs["cancelled"] = cancelled
+            result = probe(canonical, **kwargs)
+        except (BilibiliImportError, YoutubeImportCancelled):
+            raise
+        except Exception:
+            raise BilibiliImportError("temporarily_unavailable") from None
+        if result.status != "available" or result.canonical_url != canonical.split("?", 1)[0]:
+            raise BilibiliImportError("temporarily_unavailable")
+        if not result.parts or any(part.duration is not None and part.duration > MAX_BILIBILI_SOURCE_DURATION_SECONDS for part in result.parts):
+            raise BilibiliImportError("unsupported_link")
+        return result
+
+    def selected_bilibili_part(body: BilibiliImportRequest, probe) -> Any:
+        url_part = bilibili_url_part(body.url)
+        if body.part is not None and url_part is not None and body.part != url_part:
+            raise BilibiliImportError("unsupported_link")
+        selected = body.part if body.part is not None else url_part
+        if selected is None and len(probe.parts) != 1:
+            fail("bilibili_part_selection_required", "该视频有多个分P；请明确选择一个分P，系统不会自动下载合集或默认第一集。", 422)
+        selected = selected or 1
+        part = next((candidate for candidate in probe.parts if candidate.number == selected), None)
+        if part is None: raise BilibiliImportError("unsupported_link")
+        return part
+
+    @router.get("/bilibili/disclosure")
+    def bilibili_disclosure(project_id: str):
+        project_for(project_id)
+        return bilibili_external_request()
+
+    @router.post("/bilibili/probe")
+    def probe_bilibili(project_id: str, body: BilibiliImportRequest):
+        project_for(project_id)
+        if not body.externalRequestAccepted:
+            fail("bilibili_external_request_confirmation_required", "请先确认将向 B站 发起元数据请求。", 422)
+        try:
+            probe = bilibili_probe(body)
+        except BilibiliImportError as error:
+            bilibili_error(error)
+        return {
+            "canonicalUrl": probe.canonical_url, "videoId": probe.video_id, "title": probe.title, "uploader": probe.uploader,
+            "parts": [{"number": part.number, "cid": part.cid, "title": part.title, "durationSeconds": part.duration} for part in probe.parts],
+            "status": "available", "adapter": {"id": "yt-dlp", "version": str(getattr(bilibili_adapter, "version", BILIBILI_ADAPTER["version"]))},
+            "externalRequest": bilibili_external_request(), "lastRealVerificationAt": None,
+        }
+
+    @router.post("/bilibili/import")
+    def import_bilibili(project_id: str, body: BilibiliImportRequest):
+        project_for(project_id)
+        if not body.rightsConfirmed:
+            fail("bilibili_video_rights_required", "请先确认你拥有该 B站视频的使用权，再导入项目。", 422)
+        if not body.externalRequestAccepted:
+            fail("bilibili_external_request_confirmation_required", "请先确认将向 B站 发起下载请求。", 422)
+        try:
+            probe = bilibili_probe(body)
+            part = selected_bilibili_part(body, probe)
+        except BilibiliImportError as error:
+            bilibili_error(error)
+        snapshot = {"url": probe.canonical_url, "part": part.number, "role": body.role, "useSession": body.useSession, "adapter": dict(BILIBILI_ADAPTER)}
+        key = body.idempotencyKey.strip() or freeze_run_input(snapshot).fingerprint
+        try:
+            run, created = bilibili_runs.create_or_reuse(project_id, snapshot, key)
+        except OSError:
+            fail("bilibili_run_storage_failed", "B站导入运行无法保存。", 503)
+        if created:
+            bilibili_cancel_events[run["id"]] = Event()
+            if not compute_queue.submit("bilibili-import", run["id"], lambda run_id: execute_bilibili_import(project_id, run_id), project_id=project_id):
+                bilibili_runs.transition(project_id, run["id"], status="failed", error="queue_unavailable")
+                fail("bilibili_queue_unavailable", "B站导入队列不可用，请稍后重试。", 503)
+        return JSONResponse(status_code=202, content={"run": public_bilibili_import_run(run)})
+
+    @router.get("/bilibili/imports/{run_id}")
+    def get_bilibili_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try: return {"run": public_bilibili_import_run(bilibili_runs.get(project_id, run_id))}
+        except (KeyError, ValueError): fail("bilibili_import_not_found", "B站导入运行不存在。", 404)
+        except OSError: fail("bilibili_run_storage_failed", "B站导入运行无法读取。", 503)
+
+    @router.post("/bilibili/imports/{run_id}/cancel")
+    def cancel_bilibili_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try:
+            with source_lock or nullcontext(), lock: run = bilibili_runs.request_cancel(project_id, run_id)
+        except KeyError: fail("bilibili_import_not_found", "B站导入运行不存在。", 404)
+        except ValueError: fail("bilibili_import_not_cancellable", "该 B站导入运行当前不能取消。", 409)
+        if (event := bilibili_cancel_events.get(run_id)) is not None: event.set()
+        if run["status"] == "cancelled": shutil.rmtree(bilibili_runs.staging_dir(project_id, run_id), ignore_errors=True)
+        return JSONResponse(status_code=202, content={"run": public_bilibili_import_run(run)})
+
+    @router.post("/bilibili/imports/{run_id}/retry")
+    def retry_bilibili_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try: run, created = bilibili_runs.retry(project_id, run_id)
+        except KeyError: fail("bilibili_import_not_found", "B站导入运行不存在。", 404)
+        except ValueError: fail("bilibili_import_not_retryable", "该 B站导入运行当前不能重试。", 409)
+        except OSError: fail("bilibili_run_storage_failed", "B站导入运行无法保存。", 503)
+        if created:
+            bilibili_cancel_events[run["id"]] = Event()
+            if not compute_queue.submit("bilibili-import", run["id"], lambda candidate: execute_bilibili_import(project_id, candidate), project_id=project_id):
+                bilibili_runs.transition(project_id, run["id"], status="failed", error="queue_unavailable")
+                fail("bilibili_queue_unavailable", "B站导入队列不可用，请稍后重试。", 503)
+        return JSONResponse(status_code=202, content={"run": public_bilibili_import_run(run)})
+
+    def execute_bilibili_import(project_id: str, run_id: str) -> None:
+        temporary: Path | None = None
+        staging = bilibili_runs.staging_dir(project_id, run_id)
+        event = bilibili_cancel_events.setdefault(run_id, Event())
+        try:
+            run = bilibili_runs.get(project_id, run_id)
+            if run["status"] == "cancelled" or event.is_set():
+                bilibili_runs.transition(project_id, run_id, status="cancelled", error="cancelled"); return
+            if run["status"] != "queued": return
+            bilibili_runs.transition(project_id, run_id, status="running", error=None)
+            body = BilibiliImportRequest(url=run["input"]["url"], part=run["input"]["part"], role=run["input"]["role"], rightsConfirmed=True, externalRequestAccepted=True, useSession=bool(run["input"].get("useSession", False)))
+            probe = bilibili_probe(body, cancelled=event.is_set)
+            part = selected_bilibili_part(body, probe)
+            if event.is_set(): raise YoutubeImportCancelled()
+            staging.mkdir(parents=True, exist_ok=True)
+            descriptor, name = tempfile.mkstemp(dir=staging, prefix=".bilibili-", suffix=".mp4"); os.close(descriptor); temporary = Path(name)
+            download = bilibili_adapter.download
+            accepts_cancelled = "cancelled" in inspect.signature(download).parameters
+            downloaded = Path(download(probe, part, temporary, cookie=bilibili_cookie(body.useSession), **({"cancelled": event.is_set} if accepts_cancelled else {})))
+            if event.is_set(): raise YoutubeImportCancelled()
+            if downloaded.parent.resolve(strict=True) != staging.resolve(strict=True) or not downloaded.name.startswith(".bilibili-"):
+                raise OSError("unmanaged Bilibili staging output")
+            if downloaded != temporary: temporary.unlink(missing_ok=True); temporary = downloaded
+            metadata = probe_downloaded_bilibili_video(temporary, ffprobe_path=ffprobe_path, ffmpeg_path=ffmpeg_path)
+            if event.is_set(): raise YoutubeImportCancelled()
+            provenance = bilibili_video_source(probe=probe, part=part, metadata=metadata, content_hash=hashlib.sha256(temporary.read_bytes()).hexdigest(), confirmed_at=utc_timestamp())
+            with source_lock or nullcontext(), lock:
+                if event.is_set(): raise YoutubeImportCancelled()
+                installed = project_assets.install_platform_video(project_id, source=temporary, staging_root=staging, platform="bilibili", probe=probe,
+                                                                    role=run["input"]["role"], metadata=metadata, confirmed_at=utc_timestamp(), provenance=provenance)
+                bilibili_runs.transition(project_id, run_id, status="completed", error=None, uploadedAssetId=installed["id"])
+                temporary = None
+        except YoutubeImportCancelled:
+            bilibili_runs.transition(project_id, run_id, status="cancelled", error="cancelled")
+        except BilibiliImportError as error:
+            bilibili_runs.transition(project_id, run_id, status="failed", error="bilibili_" + error.status)
+        except ValueError:
+            bilibili_runs.transition(project_id, run_id, status="failed", error="bilibili_download_invalid")
+        except Exception:
+            bilibili_runs.transition(project_id, run_id, status="failed", error="bilibili_temporarily_unavailable")
+        finally:
+            if temporary is not None: temporary.unlink(missing_ok=True)
+            shutil.rmtree(staging, ignore_errors=True)
+            bilibili_cancel_events.pop(run_id, None)
+
+    def douyin_error(error: DouyinImportError) -> None:
+        messages = {
+            "requires_login": "该抖音内容需要已授权会话；系统不会自动登录、读取浏览器 Cookie 或绕过访问限制。",
+            "temporarily_unavailable": "抖音暂时不可用或站点适配已变化，请稍后重试。",
+            "unsupported_link": "该链接或内容受私密、地区、DRM 或其他不支持的访问限制，不能导入。",
+        }
+        statuses = {"requires_login": 409, "temporarily_unavailable": 503, "unsupported_link": 422}
+        fail(f"douyin_{error.status}", messages[error.status], statuses[error.status])
+
+    def douyin_cookie(required: bool) -> str | None:
+        if not required:
+            return None
+        try:
+            cookie = (douyin_session_store or SystemDouyinCookieStore()).get()
+        except Exception:
+            cookie = None
+        if not cookie:
+            raise DouyinImportError("requires_login")
+        return cookie
+
+    def douyin_probe(body: DouyinImportRequest, *, cancelled=None, redirect_facts: list[dict[str, Any]] | None = None):
+        raw_url = extract_douyin_share_url(body.url)
+        if raw_url is None:
+            raise DouyinImportError("unsupported_link")
+        canonical = normalize_douyin_url(raw_url)
+        if canonical is None:
+            canonical = douyin_short_link_resolver(raw_url, facts=redirect_facts) if redirect_facts is not None else douyin_short_link_resolver(raw_url)
+        if canonical is None:
+            raise DouyinImportError("unsupported_link")
+        try:
+            probe = douyin_adapter.probe
+            kwargs = {"cookie": douyin_cookie(body.useSession)}
+            if cancelled is not None and "cancelled" in inspect.signature(probe).parameters:
+                kwargs["cancelled"] = cancelled
+            result = probe(canonical, **kwargs)
+        except (DouyinImportError, YoutubeImportCancelled):
+            raise
+        except Exception:
+            raise DouyinImportError("temporarily_unavailable") from None
+        if result.status != "available" or result.canonical_url != canonical:
+            raise DouyinImportError("temporarily_unavailable")
+        if result.duration is not None and result.duration > MAX_DOUYIN_SOURCE_DURATION_SECONDS:
+            raise DouyinImportError("unsupported_link")
+        return result
+
+    @router.get("/douyin/disclosure")
+    def douyin_disclosure(project_id: str):
+        project_for(project_id)
+        return douyin_external_request()
+
+    @router.post("/douyin/probe")
+    def probe_douyin(project_id: str, body: DouyinImportRequest):
+        project_for(project_id)
+        if not body.externalRequestAccepted:
+            fail("douyin_external_request_confirmation_required", "请先确认将向抖音发起元数据请求。", 422)
+        try:
+            probe = douyin_probe(body, redirect_facts=[])
+        except DouyinImportError as error:
+            douyin_error(error)
+        return {
+            "canonicalUrl": probe.canonical_url, "videoId": probe.video_id, "title": probe.title,
+            "durationSeconds": probe.duration, "uploader": probe.uploader, "status": "available",
+            "adapter": {"id": "yt-dlp", "version": str(getattr(douyin_adapter, "version", DOUYIN_ADAPTER["version"]))},
+            "externalRequest": douyin_external_request(), "lastRealVerificationAt": None,
+        }
+
+    @router.post("/douyin/import")
+    def import_douyin(project_id: str, body: DouyinImportRequest):
+        project_for(project_id)
+        if not body.rightsConfirmed:
+            fail("douyin_video_rights_required", "请先确认你拥有该抖音视频的使用权，再导入项目。", 422)
+        if not body.externalRequestAccepted:
+            fail("douyin_external_request_confirmation_required", "请先确认将向抖音发起下载请求。", 422)
+        redirect_facts: list[dict[str, Any]] = []
+        try:
+            probe = douyin_probe(body, redirect_facts=redirect_facts)
+        except DouyinImportError as error:
+            douyin_error(error)
+        snapshot = {"url": probe.canonical_url, "role": body.role, "useSession": body.useSession,
+                    "adapter": dict(DOUYIN_ADAPTER), "redirectFacts": redirect_facts}
+        key = body.idempotencyKey.strip() or freeze_run_input(snapshot).fingerprint
+        try:
+            run, created = douyin_runs.create_or_reuse(project_id, snapshot, key)
+        except OSError:
+            fail("douyin_run_storage_failed", "抖音导入运行无法保存。", 503)
+        if created:
+            douyin_cancel_events[run["id"]] = Event()
+            if not compute_queue.submit("douyin-import", run["id"], lambda run_id: execute_douyin_import(project_id, run_id), project_id=project_id):
+                douyin_runs.transition(project_id, run["id"], status="failed", error="queue_unavailable")
+                fail("douyin_queue_unavailable", "抖音导入队列不可用，请稍后重试。", 503)
+        return JSONResponse(status_code=202, content={"run": public_douyin_import_run(run)})
+
+    @router.get("/douyin/imports/{run_id}")
+    def get_douyin_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try:
+            return {"run": public_douyin_import_run(douyin_runs.get(project_id, run_id))}
+        except (KeyError, ValueError):
+            fail("douyin_import_not_found", "抖音导入运行不存在。", 404)
+        except OSError:
+            fail("douyin_run_storage_failed", "抖音导入运行无法读取。", 503)
+
+    @router.post("/douyin/imports/{run_id}/cancel")
+    def cancel_douyin_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try:
+            with source_lock or nullcontext(), lock:
+                run = douyin_runs.request_cancel(project_id, run_id)
+        except KeyError:
+            fail("douyin_import_not_found", "抖音导入运行不存在。", 404)
+        except ValueError:
+            fail("douyin_import_not_cancellable", "该抖音导入运行当前不能取消。", 409)
+        if (event := douyin_cancel_events.get(run_id)) is not None:
+            event.set()
+        if run["status"] == "cancelled":
+            shutil.rmtree(douyin_runs.staging_dir(project_id, run_id), ignore_errors=True)
+        return JSONResponse(status_code=202, content={"run": public_douyin_import_run(run)})
+
+    @router.post("/douyin/imports/{run_id}/retry")
+    def retry_douyin_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try:
+            run, created = douyin_runs.retry(project_id, run_id)
+        except KeyError:
+            fail("douyin_import_not_found", "抖音导入运行不存在。", 404)
+        except ValueError:
+            fail("douyin_import_not_retryable", "该抖音导入运行当前不能重试。", 409)
+        except OSError:
+            fail("douyin_run_storage_failed", "抖音导入运行无法保存。", 503)
+        if created:
+            douyin_cancel_events[run["id"]] = Event()
+            if not compute_queue.submit("douyin-import", run["id"], lambda candidate: execute_douyin_import(project_id, candidate), project_id=project_id):
+                douyin_runs.transition(project_id, run["id"], status="failed", error="queue_unavailable")
+                fail("douyin_queue_unavailable", "抖音导入队列不可用，请稍后重试。", 503)
+        return JSONResponse(status_code=202, content={"run": public_douyin_import_run(run)})
+
+    def execute_douyin_import(project_id: str, run_id: str) -> None:
+        temporary: Path | None = None
+        staging = douyin_runs.staging_dir(project_id, run_id)
+        event = douyin_cancel_events.setdefault(run_id, Event())
+        try:
+            run = douyin_runs.get(project_id, run_id)
+            if run["status"] == "cancelled" or event.is_set():
+                douyin_runs.transition(project_id, run_id, status="cancelled", error="cancelled"); return
+            if run["status"] != "queued": return
+            douyin_runs.transition(project_id, run_id, status="running", error=None)
+            body = DouyinImportRequest(url=run["input"]["url"], role=run["input"]["role"], rightsConfirmed=True,
+                                       externalRequestAccepted=True, useSession=bool(run["input"].get("useSession", False)))
+            probe = douyin_probe(body, cancelled=event.is_set)
+            if event.is_set(): raise YoutubeImportCancelled()
+            staging.mkdir(parents=True, exist_ok=True)
+            descriptor, name = tempfile.mkstemp(dir=staging, prefix=".douyin-", suffix=".mp4"); os.close(descriptor); temporary = Path(name)
+            download = douyin_adapter.download
+            kwargs = {"cookie": douyin_cookie(body.useSession)}
+            if "cancelled" in inspect.signature(download).parameters: kwargs["cancelled"] = event.is_set
+            downloaded = Path(download(probe, temporary, **kwargs))
+            if event.is_set(): raise YoutubeImportCancelled()
+            if downloaded.parent.resolve(strict=True) != staging.resolve(strict=True) or not downloaded.name.startswith(".douyin-"):
+                raise OSError("unmanaged Douyin staging output")
+            if downloaded != temporary: temporary.unlink(missing_ok=True); temporary = downloaded
+            metadata = probe_downloaded_douyin_video(temporary, ffprobe_path=ffprobe_path, ffmpeg_path=ffmpeg_path)
+            if event.is_set(): raise YoutubeImportCancelled()
+            provenance = douyin_video_source(probe=probe, metadata=metadata, content_hash=hashlib.sha256(temporary.read_bytes()).hexdigest(),
+                                              confirmed_at=utc_timestamp(), redirect_facts=run["input"].get("redirectFacts"))
+            with source_lock or nullcontext(), lock:
+                if event.is_set(): raise YoutubeImportCancelled()
+                installed = project_assets.install_platform_video(project_id, source=temporary, staging_root=staging, platform="douyin", probe=probe,
+                                                                    role=run["input"]["role"], metadata=metadata, confirmed_at=utc_timestamp(), provenance=provenance)
+                douyin_runs.transition(project_id, run_id, status="completed", error=None, uploadedAssetId=installed["id"])
+                temporary = None
+        except YoutubeImportCancelled:
+            douyin_runs.transition(project_id, run_id, status="cancelled", error="cancelled")
+        except DouyinImportError as error:
+            douyin_runs.transition(project_id, run_id, status="failed", error="douyin_" + error.status)
+        except ValueError:
+            douyin_runs.transition(project_id, run_id, status="failed", error="douyin_download_invalid")
+        except Exception:
+            douyin_runs.transition(project_id, run_id, status="failed", error="douyin_temporarily_unavailable")
+        finally:
+            if temporary is not None: temporary.unlink(missing_ok=True)
+            shutil.rmtree(staging, ignore_errors=True)
+            douyin_cancel_events.pop(run_id, None)
+    def xiaohongshu_error(error: XiaohongshuImportError) -> None:
+        messages = {
+            "requires_login": "该小红书内容需要已授权会话；系统不会自动登录、读取浏览器 Cookie 或绕过访问限制。",
+            "temporarily_unavailable": "小红书暂时不可用或站点适配已变化，请稍后重试。",
+            "unsupported_link": "该链接或内容受私密、地区、DRM 或其他不支持的访问限制，不能导入。",
+        }
+        statuses = {"requires_login": 409, "temporarily_unavailable": 503, "unsupported_link": 422}
+        fail(f"xiaohongshu_{error.status}", messages[error.status], statuses[error.status])
+
+    def xiaohongshu_cookie(required: bool) -> str | None:
+        if not required:
+            return None
+        try:
+            cookie = (xiaohongshu_session_store or SystemXiaohongshuCookieStore()).get()
+        except Exception:
+            cookie = None
+        if not cookie:
+            raise XiaohongshuImportError("requires_login")
+        return cookie
+
+    def xiaohongshu_probe(body: XiaohongshuImportRequest, *, cancelled=None, redirect_facts: list[dict[str, Any]] | None = None):
+        raw_url = extract_xiaohongshu_share_url(body.url)
+        if raw_url is None:
+            raise XiaohongshuImportError("unsupported_link")
+        canonical = normalize_xiaohongshu_url(raw_url)
+        if canonical is None:
+            canonical = xiaohongshu_short_link_resolver(raw_url, facts=redirect_facts) if redirect_facts is not None else xiaohongshu_short_link_resolver(raw_url)
+        if canonical is None:
+            raise XiaohongshuImportError("unsupported_link")
+        try:
+            probe = xiaohongshu_adapter.probe
+            kwargs = {"cookie": xiaohongshu_cookie(body.useSession)}
+            if cancelled is not None and "cancelled" in inspect.signature(probe).parameters:
+                kwargs["cancelled"] = cancelled
+            result = probe(canonical, **kwargs)
+        except (XiaohongshuImportError, YoutubeImportCancelled):
+            raise
+        except Exception:
+            raise XiaohongshuImportError("temporarily_unavailable") from None
+        if result.status != "available" or result.canonical_url != canonical:
+            raise XiaohongshuImportError("temporarily_unavailable")
+        if result.duration is not None and result.duration > MAX_XIAOHONGSHU_SOURCE_DURATION_SECONDS:
+            raise XiaohongshuImportError("unsupported_link")
+        return result
+
+    @router.get("/xiaohongshu/disclosure")
+    def xiaohongshu_disclosure(project_id: str):
+        project_for(project_id)
+        return xiaohongshu_external_request()
+
+    @router.post("/xiaohongshu/probe")
+    def probe_xiaohongshu(project_id: str, body: XiaohongshuImportRequest):
+        project_for(project_id)
+        if not body.rightsConfirmed:
+            fail("xiaohongshu_video_rights_required", "请先确认你拥有该小红书视频的使用权，再读取链接。", 422)
+        if not body.externalRequestAccepted:
+            fail("xiaohongshu_external_request_confirmation_required", "请先确认将向小红书发起元数据请求。", 422)
+        try:
+            probe = xiaohongshu_probe(body, redirect_facts=[])
+        except XiaohongshuImportError as error:
+            xiaohongshu_error(error)
+        return {
+            "canonicalUrl": probe.canonical_url, "videoId": probe.video_id, "title": probe.title,
+            "durationSeconds": probe.duration, "uploader": probe.uploader, "status": "available",
+            "adapter": {"id": "yt-dlp", "version": str(getattr(xiaohongshu_adapter, "version", XIAOHONGSHU_ADAPTER["version"]))},
+            "externalRequest": xiaohongshu_external_request(), "lastRealVerificationAt": None,
+        }
+
+    @router.post("/xiaohongshu/import")
+    def import_xiaohongshu(project_id: str, body: XiaohongshuImportRequest):
+        project_for(project_id)
+        if not body.rightsConfirmed:
+            fail("xiaohongshu_video_rights_required", "请先确认你拥有该小红书视频的使用权，再导入项目。", 422)
+        if not body.externalRequestAccepted:
+            fail("xiaohongshu_external_request_confirmation_required", "请先确认将向小红书发起下载请求。", 422)
+        redirect_facts: list[dict[str, Any]] = []
+        rights_confirmed_at = utc_timestamp()
+        try:
+            probe = xiaohongshu_probe(body, redirect_facts=redirect_facts)
+        except XiaohongshuImportError as error:
+            xiaohongshu_error(error)
+        request_url = probe.canonical_url
+        snapshot = {"url": request_url.split("?", 1)[0], "role": body.role, "useSession": body.useSession, "rightsConfirmedAt": rights_confirmed_at,
+                    "adapter": dict(XIAOHONGSHU_ADAPTER), "sourceFacts": xiaohongshu_source_facts(body.url, probe.canonical_url, redirect_facts)}
+        key = body.idempotencyKey.strip() or freeze_run_input(snapshot).fingerprint
+        try:
+            run, created = xiaohongshu_runs.create_or_reuse(project_id, snapshot, key)
+        except OSError:
+            fail("xiaohongshu_run_storage_failed", "小红书导入运行无法保存。", 503)
+        if created:
+            if request_url != snapshot["url"]:
+                try:
+                    (xiaohongshu_request_store or SystemXiaohongshuRequestStore()).set(run["id"], request_url)
+                except Exception:
+                    xiaohongshu_runs.transition(project_id, run["id"], status="failed", error="request_url_storage_unavailable")
+                    fail("xiaohongshu_request_url_storage_unavailable", "小红书请求链接安全存储不可用。", 503)
+            xiaohongshu_cancel_events[run["id"]] = Event()
+            if not compute_queue.submit("xiaohongshu-import", run["id"], lambda run_id: execute_xiaohongshu_import(project_id, run_id), project_id=project_id):
+                xiaohongshu_runs.transition(project_id, run["id"], status="failed", error="queue_unavailable")
+                fail("xiaohongshu_queue_unavailable", "小红书导入队列不可用，请稍后重试。", 503)
+        return JSONResponse(status_code=202, content={"run": public_xiaohongshu_import_run(run)})
+
+    @router.get("/xiaohongshu/imports/{run_id}")
+    def get_xiaohongshu_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try:
+            return {"run": public_xiaohongshu_import_run(xiaohongshu_runs.get(project_id, run_id))}
+        except (KeyError, ValueError):
+            fail("xiaohongshu_import_not_found", "小红书导入运行不存在。", 404)
+        except OSError:
+            fail("xiaohongshu_run_storage_failed", "小红书导入运行无法读取。", 503)
+
+    @router.post("/xiaohongshu/imports/{run_id}/cancel")
+    def cancel_xiaohongshu_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try:
+            with source_lock or nullcontext(), lock:
+                run = xiaohongshu_runs.request_cancel(project_id, run_id)
+        except KeyError:
+            fail("xiaohongshu_import_not_found", "小红书导入运行不存在。", 404)
+        except ValueError:
+            fail("xiaohongshu_import_not_cancellable", "该小红书导入运行当前不能取消。", 409)
+        if (event := xiaohongshu_cancel_events.get(run_id)) is not None:
+            event.set()
+        if run["status"] == "cancelled":
+            shutil.rmtree(xiaohongshu_runs.staging_dir(project_id, run_id), ignore_errors=True)
+        return JSONResponse(status_code=202, content={"run": public_xiaohongshu_import_run(run)})
+
+    @router.post("/xiaohongshu/imports/{run_id}/retry")
+    def retry_xiaohongshu_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try:
+            previous = xiaohongshu_runs.get(project_id, run_id)
+            run, created = xiaohongshu_runs.retry(project_id, run_id)
+        except KeyError:
+            fail("xiaohongshu_import_not_found", "小红书导入运行不存在。", 404)
+        except ValueError:
+            fail("xiaohongshu_import_not_retryable", "该小红书导入运行当前不能重试。", 409)
+        except OSError:
+            fail("xiaohongshu_run_storage_failed", "小红书导入运行无法保存。", 503)
+        if created:
+            previous_url = xiaohongshu_request_url(run_id, previous["input"]["url"])
+            if previous_url != run["input"]["url"]:
+                try:
+                    (xiaohongshu_request_store or SystemXiaohongshuRequestStore()).set(run["id"], previous_url)
+                except Exception:
+                    xiaohongshu_runs.transition(project_id, run["id"], status="failed", error="request_url_storage_unavailable")
+                    fail("xiaohongshu_request_url_storage_unavailable", "小红书请求链接安全存储不可用。", 503)
+            xiaohongshu_cancel_events[run["id"]] = Event()
+            if not compute_queue.submit("xiaohongshu-import", run["id"], lambda candidate: execute_xiaohongshu_import(project_id, candidate), project_id=project_id):
+                xiaohongshu_runs.transition(project_id, run["id"], status="failed", error="queue_unavailable")
+                fail("xiaohongshu_queue_unavailable", "小红书导入队列不可用，请稍后重试。", 503)
+        return JSONResponse(status_code=202, content={"run": public_xiaohongshu_import_run(run)})
+
+    def execute_xiaohongshu_import(project_id: str, run_id: str) -> None:
+        temporary: Path | None = None
+        staging = xiaohongshu_runs.staging_dir(project_id, run_id)
+        event = xiaohongshu_cancel_events.setdefault(run_id, Event())
+        try:
+            run = xiaohongshu_runs.get(project_id, run_id)
+            if run["status"] == "cancelled" or event.is_set():
+                xiaohongshu_runs.transition(project_id, run_id, status="cancelled", error="cancelled"); return
+            if run["status"] != "queued": return
+            xiaohongshu_runs.transition(project_id, run_id, status="running", error=None)
+            body = XiaohongshuImportRequest(url=xiaohongshu_request_url(run_id, run["input"]["url"]), role=run["input"]["role"], rightsConfirmed=True,
+                                       externalRequestAccepted=True, useSession=bool(run["input"].get("useSession", False)))
+            probe = xiaohongshu_probe(body, cancelled=event.is_set)
+            if event.is_set(): raise YoutubeImportCancelled()
+            staging.mkdir(parents=True, exist_ok=True)
+            descriptor, name = tempfile.mkstemp(dir=staging, prefix=".xiaohongshu-", suffix=".mp4"); os.close(descriptor); temporary = Path(name)
+            download = xiaohongshu_adapter.download
+            kwargs = {"cookie": xiaohongshu_cookie(body.useSession)}
+            if "cancelled" in inspect.signature(download).parameters: kwargs["cancelled"] = event.is_set
+            downloaded = Path(download(probe, temporary, **kwargs))
+            if event.is_set(): raise YoutubeImportCancelled()
+            if downloaded.parent.resolve(strict=True) != staging.resolve(strict=True) or not downloaded.name.startswith(".xiaohongshu-"):
+                raise OSError("unmanaged Xiaohongshu staging output")
+            if downloaded != temporary: temporary.unlink(missing_ok=True); temporary = downloaded
+            metadata = probe_downloaded_xiaohongshu_video(temporary, ffprobe_path=ffprobe_path, ffmpeg_path=ffmpeg_path)
+            if event.is_set(): raise YoutubeImportCancelled()
+            provenance = xiaohongshu_video_source(
+                probe=probe, metadata=metadata, content_hash=hashlib.sha256(temporary.read_bytes()).hexdigest(),
+                confirmed_at=run["input"]["rightsConfirmedAt"], source_facts=run["input"].get("sourceFacts"),
+            )
+            with source_lock or nullcontext(), lock:
+                if event.is_set(): raise YoutubeImportCancelled()
+                installed = project_assets.install_platform_video(
+                    project_id, source=temporary, staging_root=staging, platform="xiaohongshu", probe=probe,
+                    role=run["input"]["role"], metadata=metadata, confirmed_at=run["input"]["rightsConfirmedAt"], provenance=provenance,
+                )
+                xiaohongshu_runs.transition(project_id, run_id, status="completed", error=None, uploadedAssetId=installed["id"])
+                temporary = None
+        except YoutubeImportCancelled:
+            xiaohongshu_runs.transition(project_id, run_id, status="cancelled", error="cancelled")
+        except XiaohongshuImportError as error:
+            xiaohongshu_runs.transition(project_id, run_id, status="failed", error="xiaohongshu_" + error.status)
+        except ValueError:
+            xiaohongshu_runs.transition(project_id, run_id, status="failed", error="xiaohongshu_download_invalid")
+        except Exception:
+            xiaohongshu_runs.transition(project_id, run_id, status="failed", error="xiaohongshu_temporarily_unavailable")
+        finally:
+            if temporary is not None: temporary.unlink(missing_ok=True)
+            shutil.rmtree(staging, ignore_errors=True)
+            xiaohongshu_cancel_events.pop(run_id, None)
+            try:
+                (xiaohongshu_request_store or SystemXiaohongshuRequestStore()).delete(run_id)
+            except Exception:
+                pass
+
+    def kuaishou_cookie(required: bool):
+        if not required: return None
+        try: cookie = (kuaishou_session_store or SystemKuaishouCookieStore()).get()
+        except Exception: cookie = None
+        if not cookie: raise KuaishouImportError("requires_login")
+        return cookie
+    def kuaishou_probe(body, *, cancelled=None, facts=None):
+        raw = extract_kuaishou_share_url(body.url)
+        canonical = normalize_kuaishou_url(raw) if raw else None
+        canonical = canonical or (kuaishou_short_link_resolver(raw, facts=facts) if raw else None)
+        if not canonical: raise KuaishouImportError("unsupported_link")
+        try: result = kuaishou_adapter.probe(canonical, cookie=kuaishou_cookie(body.useSession), cancelled=cancelled)
+        except (KuaishouImportError, YoutubeImportCancelled): raise
+        except Exception: raise KuaishouImportError("temporarily_unavailable") from None
+        if result.status != "available":
+            if result.status in {"requires_login", "temporarily_unavailable", "unsupported_link"}:
+                raise KuaishouImportError(result.status)
+            raise KuaishouImportError("temporarily_unavailable")
+        if result.canonical_url != canonical or result.video_id != canonical.rsplit("/", 1)[-1] or not result.media_url:
+            raise KuaishouImportError("temporarily_unavailable")
+        if result.duration is not None and (not math.isfinite(result.duration) or result.duration <= 0 or result.duration > MAX_KUAISHOU_SOURCE_DURATION_SECONDS):
+            raise KuaishouImportError("unsupported_link")
+        return result
+    def kuaishou_fail(error):
+        messages = {"requires_login": "该快手内容需要已授权会话；系统不会自动登录或绕过访问限制。", "temporarily_unavailable": "快手暂时不可用或站点适配已变化，请稍后重试。", "unsupported_link": "该链接或内容受私密、地区、DRM 或其他不支持的访问限制，不能导入。"}
+        fail("kuaishou_" + error.status, messages[error.status], {"requires_login":409,"temporarily_unavailable":503,"unsupported_link":422}[error.status])
+    @router.get("/kuaishou/disclosure")
+    def kuaishou_disclosure(project_id: str): project_for(project_id); return kuaishou_external_request()
+    @router.post("/kuaishou/probe")
+    def probe_kuaishou(project_id: str, body: KuaishouImportRequest):
+        project_for(project_id)
+        if not body.rightsConfirmed: fail("kuaishou_video_rights_required", "请先确认你拥有该快手视频的使用权，再读取链接。", 422)
+        if not body.externalRequestAccepted: fail("kuaishou_external_request_confirmation_required", "请先确认将向快手发起元数据请求。", 422)
+        try: probe = kuaishou_probe(body, facts=[])
+        except KuaishouImportError as error: kuaishou_fail(error)
+        return {"canonicalUrl": probe.canonical_url, "videoId": probe.video_id, "title": probe.title, "durationSeconds": probe.duration, "uploader": probe.uploader, "status":"available", "adapter":dict(KUAISHOU_ADAPTER), "externalRequest":kuaishou_external_request(), "lastRealVerificationAt":None}
+
+    def execute_kuaishou_import(project_id: str, run_id: str):
+        temporary = None; staging = kuaishou_runs.staging_dir(project_id, run_id); event = kuaishou_cancel_events.setdefault(run_id, Event())
+        try:
+            run = kuaishou_runs.get(project_id, run_id)
+            if run["status"] == "cancelled" or event.is_set(): kuaishou_runs.transition(project_id, run_id, status="cancelled", error="cancelled"); return
+            if run["status"] != "queued": return
+            kuaishou_runs.transition(project_id, run_id, status="running", error=None)
+            body = KuaishouImportRequest(url=run["input"]["url"], role=run["input"]["role"], rightsConfirmed=True, externalRequestAccepted=True, useSession=bool(run["input"].get("useSession")))
+            probe = kuaishou_probe(body, cancelled=event.is_set)
+            staging.mkdir(parents=True, exist_ok=True); descriptor, name = tempfile.mkstemp(dir=staging, prefix=".kuaishou-", suffix=".mp4"); os.close(descriptor); temporary = Path(name)
+            downloaded = Path(kuaishou_adapter.download(probe, temporary, cookie=kuaishou_cookie(body.useSession), cancelled=event.is_set))
+            if event.is_set(): raise YoutubeImportCancelled()
+            if downloaded.parent.resolve(strict=True) != staging.resolve(strict=True) or not downloaded.name.startswith(".kuaishou-"): raise OSError("unmanaged Kuaishou staging output")
+            if downloaded != temporary: temporary.unlink(missing_ok=True); temporary = downloaded
+            metadata = probe_downloaded_xiaohongshu_video(temporary, ffprobe_path=ffprobe_path, ffmpeg_path=ffmpeg_path)
+            if event.is_set(): raise YoutubeImportCancelled()
+            digest = hashlib.sha256()
+            with temporary.open("rb") as source:
+                for chunk in iter(lambda: source.read(65536), b""):
+                    if event.is_set(): raise YoutubeImportCancelled()
+                    digest.update(chunk)
+            provenance = kuaishou_video_source(probe=probe, metadata=metadata, content_hash=digest.hexdigest(), confirmed_at=run["input"]["rightsConfirmedAt"], source_facts=run["input"].get("sourceFacts"))
+            with source_lock or nullcontext(), lock:
+                if event.is_set(): raise YoutubeImportCancelled()
+                installed = project_assets.install_platform_video(project_id, source=temporary, staging_root=staging, platform="kuaishou", probe=probe, role=run["input"]["role"], metadata=metadata, confirmed_at=run["input"]["rightsConfirmedAt"], provenance=provenance)
+                kuaishou_runs.transition(project_id, run_id, status="completed", error=None, uploadedAssetId=installed["id"]); temporary = None
+        except YoutubeImportCancelled: kuaishou_runs.transition(project_id, run_id, status="cancelled", error="cancelled")
+        except KuaishouImportError as error: kuaishou_runs.transition(project_id, run_id, status="failed", error="kuaishou_" + error.status)
+        except ValueError: kuaishou_runs.transition(project_id, run_id, status="failed", error="kuaishou_download_invalid")
+        except Exception: kuaishou_runs.transition(project_id, run_id, status="failed", error="kuaishou_temporarily_unavailable")
+        finally:
+            if temporary is not None: temporary.unlink(missing_ok=True)
+            shutil.rmtree(staging, ignore_errors=True); kuaishou_cancel_events.pop(run_id, None)
+
+    @router.post("/kuaishou/import")
+    def import_kuaishou(project_id: str, body: KuaishouImportRequest):
+        project_for(project_id)
+        if not body.rightsConfirmed: fail("kuaishou_video_rights_required", "请先确认你拥有该快手视频的使用权，再导入项目。", 422)
+        if not body.externalRequestAccepted: fail("kuaishou_external_request_confirmation_required", "请先确认将向快手发起下载请求。", 422)
+        facts=[]
+        try: probe = kuaishou_probe(body, facts=facts)
+        except KuaishouImportError as error: kuaishou_fail(error)
+        snapshot={"url":probe.canonical_url,"role":body.role,"useSession":body.useSession,"rightsConfirmedAt":utc_timestamp(),"adapter":dict(KUAISHOU_ADAPTER),"sourceFacts":kuaishou_source_facts(body.url,probe.canonical_url,facts)}
+        run, created = kuaishou_runs.create_or_reuse(project_id, snapshot, body.idempotencyKey.strip() or freeze_run_input(snapshot).fingerprint)
+        if created:
+            kuaishou_cancel_events[run["id"]]=Event()
+            if not compute_queue.submit("kuaishou-import", run["id"], lambda candidate: execute_kuaishou_import(project_id,candidate), project_id=project_id):
+                kuaishou_runs.transition(project_id, run["id"], status="failed", error="queue_unavailable"); fail("kuaishou_queue_unavailable","快手导入队列不可用，请稍后重试。",503)
+        return JSONResponse(status_code=202, content={"run":public_kuaishou_import_run(run)})
+    @router.get("/kuaishou/imports/{run_id}")
+    def get_kuaishou_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try: return {"run":public_kuaishou_import_run(kuaishou_runs.get(project_id,run_id))}
+        except (KeyError,ValueError): fail("kuaishou_import_not_found","快手导入运行不存在。",404)
+    @router.post("/kuaishou/imports/{run_id}/cancel")
+    def cancel_kuaishou_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try: run=kuaishou_runs.request_cancel(project_id,run_id)
+        except KeyError: fail("kuaishou_import_not_found","快手导入运行不存在。",404)
+        except ValueError: fail("kuaishou_import_not_cancellable","该快手导入运行当前不能取消。",409)
+        if run_id in kuaishou_cancel_events: kuaishou_cancel_events[run_id].set()
+        return JSONResponse(status_code=202,content={"run":public_kuaishou_import_run(run)})
+    @router.post("/kuaishou/imports/{run_id}/retry")
+    def retry_kuaishou_import(project_id: str, run_id: str):
+        project_for(project_id)
+        try: run, created = kuaishou_runs.retry(project_id, run_id)
+        except KeyError: fail("kuaishou_import_not_found", "快手导入运行不存在。", 404)
+        except ValueError: fail("kuaishou_import_not_retryable", "该快手导入运行当前不能重试。", 409)
+        if created:
+            kuaishou_cancel_events[run["id"]] = Event()
+            if not compute_queue.submit("kuaishou-import", run["id"], lambda candidate: execute_kuaishou_import(project_id, candidate), project_id=project_id):
+                kuaishou_runs.transition(project_id, run["id"], status="failed", error="queue_unavailable")
+        return JSONResponse(status_code=202, content={"run": public_kuaishou_import_run(run)})
+
     @router.post("/assets")
-    async def upload_asset(project_id: str, role: Literal["character", "scene", "motion", "audio", "reference"] = Query(...), file: UploadFile = File(...), resultForShot: Optional[str] = Query(None), revision: Optional[int] = Query(None)):
+    async def upload_asset(project_id: str, role: Literal["character", "scene", "motion", "audio", "reference"] = Query(...), file: UploadFile = File(...), resultForShot: Optional[str] = Query(None), revision: Optional[int] = Query(None), derivation: Optional[str] = Form(None), rightsConfirmed: bool = Form(False)):
         project_for(project_id)
         suffix = Path(file.filename or "").suffix.lower()
         if suffix not in _MEDIA_SUFFIXES:
@@ -536,6 +1712,33 @@ def create_preproduction_router(
                 metadata = _probe_media(temporary, suffix, ffprobe_path, ffmpeg_path)
                 if resultForShot is not None and metadata["kind"] != "video":
                     fail("preproduction_result_invalid", "镜头结果必须上传视频。", 422)
+                if metadata["kind"] == "video" and not rightsConfirmed:
+                    fail("local_video_rights_required", "请先确认你拥有该本地视频的使用权，再导入项目。", 422)
+                if metadata["kind"] == "video":
+                    try:
+                        installed = project_assets.install_local_video(
+                            project_id,
+                            source=temporary,
+                            staging_root=root,
+                            original_name=file.filename or "素材.mp4",
+                            role=role,
+                            metadata=metadata,
+                            confirmed_at=utc_timestamp(),
+                            apply=(
+                                lambda latest, asset: decide(
+                                    production_for(project_id, latest).attach_result,
+                                    resultForShot,
+                                    asset["id"],
+                                )
+                            ) if resultForShot is not None else None,
+                            deduplicate=resultForShot is None,
+                        )
+                    except LocalVideoInstallationConflict as error:
+                        fail("local_video_source_conflict", str(error), 409)
+                    except OSError:
+                        fail("preproduction_storage_failed", "本地视频未能安全入库，请检查存储后重试。", 503)
+                    latest = state_for(project_id)
+                    return {**response(project_id, latest), "uploadedAssetId": installed["id"]}
                 asset_id = project_assets.new_id()
                 name = asset_id + suffix
                 record = {"id": asset_id, "name": _display_name(file.filename), "kind": metadata["kind"], "role": role,
@@ -547,7 +1750,7 @@ def create_preproduction_router(
                         state["revision"] += 1
                     save(project_id, state)
                 temporary = None
-                return response(project_id, state)
+                return {**response(project_id, state), "uploadedAssetId": asset_id}
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)

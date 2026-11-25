@@ -7,6 +7,28 @@ type Props = {
   onBusy: (busy: boolean) => void;
 };
 
+type ResultProvenance = {
+  sourceRunId: string; sourceResultId: string; provider?: string; processingMethod?: string;
+  versionId?: string; sha256?: string; inputFingerprint?: string; inputSnapshot?: unknown;
+};
+
+function resultProvenance(asset: PreproductionAsset): ResultProvenance | null {
+  const value = asset as unknown as Record<string, unknown>;
+  const sourceRunId = typeof value.sourceRunId === "string" ? value.sourceRunId : null;
+  const sourceResultId = typeof value.sourceResultId === "string" ? value.sourceResultId : null;
+  if (!sourceRunId || !sourceResultId) return null;
+  const text = (key: string) => typeof value[key] === "string" ? value[key] : undefined;
+  return {
+    sourceRunId, sourceResultId, provider: text("provider"), processingMethod: text("processingMethod"),
+    versionId: text("assetVersionId") ?? text("versionId"), sha256: text("sha256"), inputFingerprint: text("inputFingerprint"),
+    inputSnapshot: value.inputSnapshot,
+  };
+}
+
+function videoSource(asset: PreproductionAsset) {
+  return asset.videoSource?.sourceType === "local" ? asset.videoSource : null;
+}
+
 export function AssetManager({ projectId, asset, revision, blocked, onChanged, onBusy }: Props) {
   const [name, setName] = useState(asset.name);
   const [notes, setNotes] = useState(asset.notes ?? "");
@@ -17,6 +39,8 @@ export function AssetManager({ projectId, asset, revision, blocked, onChanged, o
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const live = useRef(true);
+  const provenance = resultProvenance(asset);
+  const source = videoSource(asset);
   useEffect(() => { live.current = true; return () => { live.current = false; }; }, []);
   useEffect(() => {
     let active = true;
@@ -62,6 +86,22 @@ export function AssetManager({ projectId, asset, revision, blocked, onChanged, o
     <h4>素材信息 · {asset.name}</h4>
     <p>名称和备注在素材库、候选列表中共用，不改变媒体内容。</p>
     {asset.source && <p>网络图片 · {asset.source.productName} · <a href={asset.source.pageUrl} target="_blank" rel="noreferrer">查看原始来源</a></p>}
+    {provenance && <section aria-label="结果溯源">
+      <h4>结果溯源</h4>
+      <p>运行 {provenance.sourceRunId} · 结果 {provenance.sourceResultId}</p>
+      {(provenance.provider || provenance.processingMethod) && <p>Provider/处理方式 · {provenance.provider ?? "未记录"} / {provenance.processingMethod ?? "未记录"}</p>}
+      {provenance.versionId && <p>版本 · {provenance.versionId}</p>}
+      {provenance.sha256 && <p>内容哈希 · {provenance.sha256}</p>}
+      {provenance.inputFingerprint && <p>输入指纹 · {provenance.inputFingerprint}</p>}
+      {provenance.inputSnapshot !== undefined && <details><summary>冻结输入快照</summary><pre>{JSON.stringify(provenance.inputSnapshot, null, 2)}</pre></details>}
+    </section>}
+    {source && <section aria-label="视频来源">
+      <h4>视频来源</h4>
+      <p>本地文件 · {source.originalReference} · {source.status === "available" ? "可用" : source.status}</p>
+      <p>适配器 · {source.adapter.id} {source.adapter.version} · 验证于 {source.verifiedAt}</p>
+      <p>内容哈希 · {source.contentHash}</p>
+      {source.rightsConfirmation && <p>使用权确认于 {source.rightsConfirmation.confirmedAt}</p>}
+    </section>}
     <label>素材名称<input value={name} maxLength={255} disabled={busy} onChange={(event) => setName(event.target.value)} /></label>
     <label>素材备注<textarea value={notes} maxLength={4000} disabled={busy} onChange={(event) => setNotes(event.target.value)} /></label>
     <button type="button" className="secondary-action" disabled={blocked || busy || !name.trim() || (name.trim() === asset.name && notes === (asset.notes ?? ""))} onClick={() => void mutate(false)}>保存素材信息</button>

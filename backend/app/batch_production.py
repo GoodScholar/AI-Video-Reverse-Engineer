@@ -29,6 +29,11 @@ LifecycleStatus = Literal[
     "absent", "active", "failed", "current", "stale", "pending", "approved", "rejected"
 ]
 
+_PRODUCTION_DEPENDENCY_KEYS = frozenset({
+    "source", "generated_result", "current_output", "remix_plan", "edit_sequence", "crop", "packaging",
+    "subtitles", "audio", "model", "configuration",
+})
+
 
 @dataclass(frozen=True)
 class LifecycleFact:
@@ -122,13 +127,69 @@ def frozen_edit_snapshot(task: dict[str, Any]) -> dict[str, Any]:
         snapshot["transitions"] = deepcopy(variant["transitions"])
     if variant.get("packaging") is not None:
         snapshot["packaging"] = deepcopy(variant["packaging"])
-    return {
+    frozen = {
         "contentRevision": content_revision,
         "variantRevision": variant_revision,
         "subtitleRevision": subtitle_revision,
+        "productionDependencyRevision": task.get("productionDependencyRevision", 0),
         "snapshot": snapshot,
         "subtitleCues": deepcopy(variant.get("subtitles", {}).get("cues", [])),
     }
+    dependencies = _production_dependencies(task)
+    if dependencies is not None:
+        dependency_input = freeze_run_input(dependencies)
+        frozen["dependencySnapshot"] = dependency_input.snapshot
+        frozen["dependencyFingerprint"] = dependency_input.fingerprint
+    return frozen
+
+
+def _run_dependencies_match(run: dict[str, Any], frozen: dict[str, Any]) -> bool:
+    """Old saved previews predate cross-engine provenance and remain readable."""
+    if "dependencyFingerprint" not in run:
+        return frozen.get("dependencyFingerprint") is None and frozen.get("productionDependencyRevision", 0) == 0
+    return (run.get("dependencyFingerprint") == frozen.get("dependencyFingerprint")
+            and run.get("productionDependencyRevision") == frozen.get("productionDependencyRevision"))
+
+
+def _run_matches_current(run: dict[str, Any], task: dict[str, Any], frozen: dict[str, Any]) -> bool:
+    return (
+        (run.get("contentRevision", 0), run.get("revision"), run.get("subtitleRevision", 0)) == current_version(task)
+        and run.get("snapshot") == frozen["snapshot"]
+        and run.get("subtitleCues", []) == frozen["subtitleCues"]
+        and _run_dependencies_match(run, frozen)
+    )
+
+
+def _production_dependencies(task: dict[str, Any]) -> dict[str, Any] | None:
+    dependencies = task.get("productionDependencies")
+    if dependencies is None:
+        return None
+    if not isinstance(dependencies, dict) or set(dependencies) - _PRODUCTION_DEPENDENCY_KEYS:
+        raise BatchProductionError("batch_dependency_invalid", "成片依赖快照包含不支持的类别。", 422)
+    # Script is a first-class dependency even when a caller only supplies
+    # cross-engine provenance. Its normal revision remains in the same run.
+    return {"script": task["script"], **deepcopy(dependencies)}
+
+
+def save_production_dependencies(task: dict[str, Any], *, expected_revision: int,
+                                 dependencies: dict[str, Any]) -> bool:
+    """CAS-save the explicit cross-engine inputs which make a preview reproducible."""
+    current_revision = task.get("productionDependencyRevision", 0)
+    if type(current_revision) is not int or current_revision < 0:
+        raise BatchProductionError("batch_dependency_invalid", "成片依赖版本无效。", 422)
+    if expected_revision != current_revision:
+        raise BatchProductionError("batch_dependency_conflict", "成片依赖已更新，请刷新后重试。")
+    candidate = {"productionDependencies": dependencies, "script": task["script"]}
+    normalized = _production_dependencies(candidate)
+    if normalized is None:
+        raise BatchProductionError("batch_dependency_invalid", "成片依赖无效。", 422)
+    # Script is derived from the task, not stored in this user-controlled map.
+    normalized.pop("script", None)
+    if task.get("productionDependencies") == normalized:
+        return False
+    task["productionDependencies"] = normalized
+    task["productionDependencyRevision"] = current_revision + 1
+    return True
 
 
 def _voice_fact(task: dict[str, Any]) -> LifecycleFact:
@@ -151,17 +212,17 @@ def _preview_fact(task: dict[str, Any], voice: LifecycleFact) -> LifecycleFact:
     if not runs:
         return LifecycleFact("absent")
     run = runs[-1]
+    frozen = frozen_edit_snapshot(task)
+    matches_current = _run_matches_current(run, task, frozen)
     if run.get("status") in ("queued", "running"):
+        if not matches_current:
+            return LifecycleFact("stale", "preview_stale")
         return LifecycleFact("active", "preview_active", run)
     if run.get("status") == "failed":
         return LifecycleFact("failed", "preview_failed", run)
-    frozen = frozen_edit_snapshot(task)
     if (run.get("status") != "completed"
             or voice.status not in ("absent", "current")
-            or (run.get("contentRevision", 0), run.get("revision"), run.get("subtitleRevision", 0))
-            != current_version(task)
-            or run.get("snapshot") != frozen["snapshot"]
-            or run.get("subtitleCues", []) != frozen["subtitleCues"]
+            or not matches_current
             or not _valid_packaging_snapshot(run.get("snapshot", {}), run.get("subtitleCues", []),
                                              run.get("packagingFontIdentity"))):
         return LifecycleFact("stale", "preview_stale")
@@ -219,14 +280,11 @@ def reusable_preview(task: dict[str, Any]) -> dict[str, Any] | None:
     if not runs:
         return None
     latest = runs[-1]
-    if (latest.get("status") in ("queued", "running")
-            and (latest.get("contentRevision", 0), latest.get("revision"),
-                 latest.get("subtitleRevision", 0)) == current_version(task)):
+    preview = inspect_variant(task).preview
+    if latest.get("status") in ("queued", "running") and preview.status == "active" and preview.record is latest:
         return latest
-    if latest.get("status") == "completed":
-        preview = inspect_variant(task).preview
-        if preview.status == "current" and preview.record is latest:
-            return latest
+    if latest.get("status") == "completed" and preview.status == "current" and preview.record is latest:
+        return latest
     return None
 
 
@@ -649,7 +707,9 @@ def submit_preview(task: dict[str, Any], *, expected_revision: int, assets: dict
         raise BatchProductionError("batch_voiceover_stale", "配音未完成或脚本已修改，请按当前脚本重新生成配音。")
     if expected_revision != variant["revision"]:
         raise BatchProductionError("batch_variant_conflict", "请先保存当前变体。")
-    if any(LOCAL_RUN_POLICY.active(run["status"]) for run in variant["runs"]):
+    frozen_current = frozen_edit_snapshot(task)
+    if any(LOCAL_RUN_POLICY.active(run["status"]) and _run_matches_current(run, task, frozen_current)
+           for run in variant["runs"]):
         raise BatchProductionError("batch_preview_active", "此变体已有预览任务。")
     try:
         settings, tracks = validate_workspace(
@@ -673,6 +733,10 @@ def submit_preview(task: dict[str, Any], *, expected_revision: int, assets: dict
         "status": LOCAL_RUN_POLICY.initial_status, "error": None,
         "sources": snapshot_sources(run_id, tracks, assets),
     }
+    if "dependencyFingerprint" in frozen:
+        run["dependencySnapshot"] = frozen["dependencySnapshot"]
+        run["dependencyFingerprint"] = frozen["dependencyFingerprint"]
+        run["productionDependencyRevision"] = frozen["productionDependencyRevision"]
     variant["runs"].append(run)
     return run
 
@@ -716,6 +780,7 @@ def _approved_export_context(task: dict[str, Any], preview_available: Callable[[
             or preview["status"] != "completed" or variant["settings"].get("fps") != 30
             or preview["snapshot"] != frozen["snapshot"]
             or preview.get("subtitleCues", []) != frozen["subtitleCues"]
+            or not _run_dependencies_match(preview, frozen)
             or (preview.get("contentRevision", 0), preview["revision"], preview.get("subtitleRevision", 0)) != version):
         raise BatchProductionError("batch_export_not_approved", "仅能导出当前版本已预览并通过审核的变体。")
     if not preview_available(preview):

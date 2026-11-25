@@ -35,6 +35,7 @@ from .batch_production import (
     reusable_preview,
     queue_voiceover,
     save_content as save_batch_content,
+    save_production_dependencies,
     save_subtitles as save_batch_subtitles,
     save_variant as save_batch_variant,
     submit_preview as submit_batch_preview,
@@ -61,6 +62,25 @@ def _valid_id(value: Any) -> bool:
         return True
     except (TypeError, ValueError):
         return False
+
+
+def _remix_plans(task: dict[str, Any]) -> list[dict[str, Any]]:
+    """Keep one persisted plan collection while accepting pre-RemixPlan task records."""
+    plans = task.get("remixPlans")
+    if isinstance(plans, list):
+        return plans
+    legacy = task.pop("montageProposals", [])
+    task["remixPlans"] = legacy if isinstance(legacy, list) else []
+    return task["remixPlans"]
+
+
+def _peek_remix_plans(task: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read RemixPlan/legacy montageProposals without mutating the task dict."""
+    plans = task.get("remixPlans")
+    if isinstance(plans, list):
+        return plans
+    legacy = task.get("montageProposals")
+    return legacy if isinstance(legacy, list) else []
 
 
 def _run_input(run: dict[str, Any]) -> dict[str, Any]:
@@ -126,7 +146,7 @@ def _validate_media_properties(media: Any, message: str) -> None:
 def _shared_montage_usage(batch_members: list[dict[str, Any]], current_task_id: str) -> dict[str, int]:
     usage: dict[str, int] = {}
     for sibling in (item for item in batch_members if item["id"] != current_task_id):
-        sibling_proposals = sibling.get("montageProposals", [])
+        sibling_proposals = _remix_plans(sibling)
         current_clips = {
             clip["id"]: clip for track in sibling["variant"]["tracks"] for clip in track.get("clips", [])
         }
@@ -247,7 +267,7 @@ def _migrate_legacy_recognition_cues(value: Any) -> bool:
         rewrite_cues(subtitles.get("cues"))
         rewrite_packaging(variant)
         rewrite_packaging(task.get("proposal"))
-        for proposal in task.get("montageProposals", []):
+        for proposal in _peek_remix_plans(task):
             if isinstance(proposal, dict):
                 rewrite_packaging(proposal)
         for run in variant.get("runs", []):
@@ -362,7 +382,7 @@ def _validate_state(value: Any) -> None:
                         or not isinstance(match.get("matchedSellingPointTerms"), list)
                         or any(not isinstance(term, str) or not term for term in match["matchedSellingPointTerms"])):
                     raise ValueError("短视频推荐依据无效")
-        for montage_proposal in task.get("montageProposals", []):
+        for montage_proposal in _peek_remix_plans(task):
             if not isinstance(montage_proposal, dict):
                 raise ValueError("混剪提案无效")
             package = montage_proposal.get("packaging")
@@ -556,9 +576,53 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
         return {asset_id: asset["kind"] for asset_id, asset in assets.items()
                 if isinstance(asset, dict) and asset.get("kind") in {"image", "video"}}
 
+    def validate_dependencies(dependencies: Any, assets: dict[str, dict[str, Any]]) -> None:
+        allowed = {"source", "generated_result", "current_output", "remix_plan", "edit_sequence", "crop", "packaging",
+                   "subtitles", "audio", "model", "configuration"}
+        if not isinstance(dependencies, dict) or set(dependencies) - allowed:
+            raise HTTPException(422, detail={"code": "batch_dependency_invalid", "message": "成片依赖无效。"})
+        source = dependencies.get("source")
+        if source is not None:
+            if not isinstance(source, dict) or not _valid_id(source.get("assetId")) or source["assetId"] not in assets:
+                raise HTTPException(422, detail={"code": "batch_dependency_source_invalid", "message": "来源素材不存在。"})
+            asset = assets[source["assetId"]]
+            for key in ("assetVersionId", "sha256"):
+                if asset.get(key) is not None and source.get(key) != asset[key]:
+                    raise HTTPException(422, detail={"code": "batch_dependency_source_invalid", "message": "来源素材版本已变化。"})
+                if key in source and source[key] != asset.get(key):
+                    raise HTTPException(422, detail={"code": "batch_dependency_source_invalid", "message": "来源素材版本已变化。"})
+        for key in ("generated_result", "current_output"):
+            value = dependencies.get(key)
+            if value is None:
+                continue
+            if (not isinstance(value, dict) or not _valid_id(value.get("runId"))
+                    or not _valid_id(value.get("resultId"))):
+                raise HTTPException(422, detail={"code": "batch_dependency_result_invalid", "message": "生成结果身份无效。"})
+        generated = dependencies.get("generated_result")
+        current = dependencies.get("current_output")
+        has_generated = "generated_result" in dependencies
+        has_current = "current_output" in dependencies
+        if has_generated != has_current or (has_generated and (not isinstance(generated, dict) or not isinstance(current, dict))):
+            raise HTTPException(422, detail={"code": "batch_dependency_result_invalid", "message": "生成结果和当前输出必须同时指定。"})
+        if has_generated:
+            if not _valid_id(generated.get("assetId")) or generated["assetId"] not in assets:
+                raise HTTPException(422, detail={"code": "batch_dependency_result_invalid", "message": "生成结果素材不存在。"})
+            asset = assets[generated["assetId"]]
+            if (asset.get("sourceResultId") != generated["resultId"]
+                    or generated["runId"] not in {asset.get("sourceRunId"), asset.get("sourceCommonRunId")}):
+                raise HTTPException(422, detail={"code": "batch_dependency_result_invalid", "message": "生成结果与素材来源不一致。"})
+            if generated["runId"] != current["runId"] or generated["resultId"] != current["resultId"]:
+                raise HTTPException(422, detail={"code": "batch_dependency_result_invalid", "message": "当前输出与生成结果不一致。"})
+            if isinstance(source, dict) and source["assetId"] != generated["assetId"]:
+                raise HTTPException(422, detail={"code": "batch_dependency_source_invalid", "message": "来源素材与生成结果素材不一致。"})
+
     def public_task(project_id: str, task: dict[str, Any]):
+        remix_plans = _remix_plans(task)
         result = {**task, "contentRevision": task.get("contentRevision", 0), "reviews": task.get("reviews", []),
                   "reviewStatus": review_status(task), "variant": {**task["variant"]}}
+        result["remixPlans"] = deepcopy(remix_plans)
+        # Read-only compatibility projection for clients still using the pre-unification name.
+        result["montageProposals"] = result["remixPlans"]
         saved_ratio = ratio_label(task["variant"]["settings"]["width"], task["variant"]["settings"]["height"])
         result["variant"].setdefault("aspectMode", saved_ratio if saved_ratio in PRODUCT_PRESETS else "smart")
         result["variant"].setdefault("resolvedAspect", saved_ratio)
@@ -965,14 +1029,14 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 current_clip = next((clip for track in current_task["variant"]["tracks"]
                                      for clip in track.get("clips", []) if clip.get("id") == clip_id), None)
                 if current_clip is None:
-                    current_clip = next((segment.get("selectedClip") for proposal in current_task.get("montageProposals", [])
+                    current_clip = next((segment.get("selectedClip") for proposal in _peek_remix_plans(current_task)
                                          for segment in proposal.get("segments", [])
                                          if (segment.get("selectedClip") or {}).get("id") == clip_id), None)
                 if current_clip is not None:
                     staged_clip = next((clip for track in task["variant"]["tracks"]
                                         for clip in track.get("clips", []) if clip.get("id") == clip_id), None)
                     if staged_clip is None:
-                        staged_clip = next((segment.get("selectedClip") for proposal in task.get("montageProposals", [])
+                        staged_clip = next((segment.get("selectedClip") for proposal in _peek_remix_plans(task)
                                             for segment in proposal.get("segments", [])
                                             if (segment.get("selectedClip") or {}).get("id") == clip_id), None)
                     if staged_clip is None:
@@ -1733,6 +1797,21 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             save(project_id, state)
             return {"variant": public_task(project_id, task)["variant"]}
 
+    @router.put("/{task_id}/dependencies")
+    def save_dependencies(project_id: str, task_id: str, body: dict[str, Any]):
+        project_for(project_id)
+        if (not isinstance(body, dict) or set(body) != {"revision", "dependencies"}
+                or type(body["revision"]) is not int):
+            raise HTTPException(422, detail={"code": "batch_dependency_invalid", "message": "成片依赖请求无效。"})
+        with source_lock or nullcontext(), lock:
+            state = state_for(project_id)
+            task = task_for(state, task_id)
+            dependencies = body["dependencies"]
+            validate_dependencies(dependencies, assets_for(project_id))
+            production_call(save_production_dependencies, task, expected_revision=body["revision"], dependencies=dependencies)
+            save(project_id, state)
+            return {"task": public_task(project_id, task)}
+
     @router.post("/{task_id}/recommendations")
     def create_recommendation(project_id: str, task_id: str, body: dict[str, Any]):
         project_for(project_id)
@@ -1763,7 +1842,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
     def montage_proposal_for(task: dict[str, Any], proposal_id: str) -> dict[str, Any]:
         try:
             validate_storage_id(proposal_id)
-            return next(item for item in task.get("montageProposals", []) if item.get("id") == proposal_id)
+            return next(item for item in _remix_plans(task) if item.get("id") == proposal_id)
         except (ValueError, StopIteration):
             raise HTTPException(404, detail={"code": "montage_proposal_missing", "message": "混剪提案不存在。"}) from None
 
@@ -1782,7 +1861,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             status = 404 if error.code == "segment_search_not_found" else 409
             raise HTTPException(status, detail={"code": error.code, "message": error.message}) from None
 
-    @router.post("/{task_id}/montage-proposals", status_code=201)
+    @router.post("/{task_id}/remix-plans", status_code=201)
+    @router.post("/{task_id}/montage-proposals", status_code=201, deprecated=True)
     def create_montage_proposal(project_id: str, task_id: str, body: dict[str, Any]):
         project_for(project_id)
         if (not isinstance(body, dict) or set(body) != {"revision", "searchIds", "narration", "beatTimes"}
@@ -1833,7 +1913,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                     content_revision=task.get("contentRevision", 0), variant_revision=task["variant"]["revision"],
                     segments=segment_inputs, beat_times=body["beatTimes"], shared_usage=shared_usage,
                     variant_ordinal=variant_ordinal,
-                    proposal_generation=len(task.get("montageProposals", [])),
+                    proposal_generation=len(_remix_plans(task)),
                     selling_point=task["sellingPoint"],
                     target_width=task["variant"]["settings"]["width"],
                     target_height=task["variant"]["settings"]["height"],
@@ -1855,10 +1935,11 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             )
             from .montage_packaging import validate_packaging
             proposal["packaging"] = validate_packaging(proposal["packaging"], [], proposal_tracks)
-            proposals = task.setdefault("montageProposals", [])
+            proposals = _remix_plans(task)
             proposals.append(proposal)
             staged_state = state
-            response = {"proposal": deepcopy(proposal)}
+            result = deepcopy(proposal)
+            response = {"remixPlan": result, "proposal": deepcopy(result)}
         # Queue all chosen first-pass clips together; users never need to click each one.
         if proposal["clips"]:
             schedule_reframes(project_id, task_id, [clip["id"] for clip in proposal["clips"]], proposal_id=proposal["id"],
@@ -1896,7 +1977,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             save(project_id, state)
             return {"variant": public_task(project_id, task)["variant"]}
 
-    @router.put("/{task_id}/montage-proposals/{proposal_id}")
+    @router.put("/{task_id}/remix-plans/{proposal_id}")
+    @router.put("/{task_id}/montage-proposals/{proposal_id}", deprecated=True)
     def update_montage_proposal(project_id: str, task_id: str, proposal_id: str, body: dict[str, Any]):
         project_for(project_id)
         if (not isinstance(body, dict) or set(body) != {"revision", "segments"} or type(body.get("revision")) is not int
@@ -1928,12 +2010,26 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                         adjustment["durationSeconds"] = round(clip["duration"] - old_handles[clip["id"]], 6)
             seen = set()
             for adjustment in body["segments"]:
-                if (not isinstance(adjustment, dict) or set(adjustment) != {"segmentId", "candidateId", "inPointSeconds", "durationSeconds"}
-                        or adjustment["segmentId"] in seen or adjustment["segmentId"] not in by_segment
-                        or type(adjustment["inPointSeconds"]) not in (int, float)
-                        or type(adjustment["durationSeconds"]) not in (int, float)):
+                disabled = isinstance(adjustment, dict) and set(adjustment) == {"segmentId", "disabled"} and adjustment.get("disabled") is True
+                selection = (isinstance(adjustment, dict)
+                             and set(adjustment) == {"segmentId", "candidateId", "inPointSeconds", "durationSeconds"}
+                             and type(adjustment.get("inPointSeconds")) in (int, float)
+                             and type(adjustment.get("durationSeconds")) in (int, float))
+                if (not isinstance(adjustment, dict) or not (disabled or selection)
+                        or adjustment["segmentId"] in seen or adjustment["segmentId"] not in by_segment):
                     raise HTTPException(422, detail={"code": "montage_adjustment_invalid", "message": "提案段落调整无效。"})
                 seen.add(adjustment["segmentId"])
+                target = by_segment[adjustment["segmentId"]]
+                if disabled:
+                    target.update(
+                        disabled=True, selectedCandidateId=None, selectedClip=None, status="gap",
+                        unmet=["该段候选已由人工禁用，请重新选择候选后再采用。"],
+                    )
+                    target["reasons"] = [
+                        *[reason for reason in target.get("reasons", []) if reason.startswith(("按旁白", "镜头结束", "节拍"))],
+                        "人工禁用了该段候选；系统原建议和候选来源保留供恢复选择。",
+                    ]
+                    continue
                 source = input_by_segment[adjustment["segmentId"]]
                 candidate = next((item for item in source["candidates"] if item.get("candidateId") == adjustment["candidateId"]), None)
                 start = float(adjustment["inPointSeconds"])
@@ -1941,7 +2037,6 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 if (candidate is None or not math.isfinite(start) or not math.isfinite(duration) or duration <= 0
                         or start < candidate["inPointSeconds"] or start + duration > candidate["outPointSeconds"] + 1e-8):
                     raise HTTPException(422, detail={"code": "montage_adjustment_out_of_range", "message": "调整后的入点或时长超出候选源区间。"})
-                target = by_segment[adjustment["segmentId"]]
                 previous_clip = target.get("selectedClip")
                 selection_changed = (
                     target.get("selectedCandidateId") != candidate["candidateId"]
@@ -1957,6 +2052,7 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                                if item["candidate"]["candidateId"] == candidate["candidateId"]),
                               (target.get("selectedClip") or {}).get("id"))
                 )
+                target["disabled"] = False
                 target["selectedCandidateId"] = candidate["candidateId"]
                 target["selectedClip"] = {
                     "id": clip_id, "assetId": candidate["assetId"], "start": (target.get("selectedClip") or {}).get("start", 0),
@@ -2033,16 +2129,17 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             changed_reframes = [item["selectedClip"]["id"] for item in proposal["segments"]
                                 if item.get("selectedClip")]
             staged_state = state
-            response = {"proposal": deepcopy(proposal)}
         if changed_reframes:
             schedule_reframes(project_id, task_id, changed_reframes, proposal_id=proposal_id,
                               staged_state=staged_state, expected_state=expected_state, reuse_existing=True)
         else:
             commit_staged_batch_state(project_id, expected_state, staged_state)
         with lock:
-            return {"proposal": deepcopy(montage_proposal_for(task_for(state_for(project_id), task_id), proposal_id))}
+            result = deepcopy(montage_proposal_for(task_for(state_for(project_id), task_id), proposal_id))
+            return {"remixPlan": result, "proposal": deepcopy(result)}
 
-    @router.post("/{task_id}/montage-proposals/{proposal_id}/apply")
+    @router.post("/{task_id}/remix-plans/{proposal_id}/apply")
+    @router.post("/{task_id}/montage-proposals/{proposal_id}/apply", deprecated=True)
     def apply_montage_proposal(project_id: str, task_id: str, proposal_id: str, body: dict[str, Any]):
         project_for(project_id)
         if (not isinstance(body, dict) or set(body) != {"revision", "proposalRevision", "strategy"}
@@ -2064,7 +2161,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
                 raise HTTPException(409, detail={"code": "montage_proposal_stale", "message": "脚本已变化，请重新生成混剪提案。"})
             if body["strategy"] == "abandon":
                 proposal.update(status="abandoned", revision=proposal["revision"] + 1)
-                response = {"proposal": deepcopy(proposal), "variant": public_task(project_id, task)["variant"]}
+                result = deepcopy(proposal)
+                response = {"remixPlan": result, "proposal": deepcopy(result), "variant": public_task(project_id, task)["variant"]}
                 staged_state = state
             else:
                 response = None
@@ -2214,7 +2312,6 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             # a duplicate job, but schedules a new one when its source changed.
             missing = [clip["id"] for clip in proposed_clips]
             staged_state = state
-            response = {"proposal": deepcopy(proposal), "variant": public_task(project_id, task)["variant"]}
         if missing:
             schedule_reframes(project_id, task_id, missing, staged_state=staged_state, expected_state=expected_state,
                               reuse_existing=True)
@@ -2222,7 +2319,8 @@ def create_batch_editing_router(data_dir, get_project, compute_queue, *, ffmpeg_
             commit_staged_batch_state(project_id, expected_state, staged_state)
         with lock:
             task = task_for(state_for(project_id), task_id)
-            return {"proposal": deepcopy(montage_proposal_for(task, proposal_id)), "variant": public_task(project_id, task)["variant"]}
+            result = deepcopy(montage_proposal_for(task, proposal_id))
+            return {"remixPlan": result, "proposal": deepcopy(result), "variant": public_task(project_id, task)["variant"]}
 
     def process_voiceover(project_id, task_id, job_id):
         directory = store.path(project_id, "voiceovers", job_id, task_id)

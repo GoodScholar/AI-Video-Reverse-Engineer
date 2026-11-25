@@ -8,6 +8,7 @@ import re
 import stat
 from copy import deepcopy
 from contextlib import nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any, Callable, Dict, Optional
@@ -80,6 +81,14 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
 
     def public_run(project_id, run):
         public = {key: value for key, value in run.items() if key not in ("snapshot", "sources", "output") and not key.startswith("_")}
+        public.setdefault("commonRunId", "timeline:" + run["id"])
+        public.setdefault("domainKind", "timeline.render")
+        public.setdefault("inputSnapshot", run.get("snapshot"))
+        public.setdefault("inputFingerprint", None)
+        public.setdefault("idempotencyKey", None)
+        public.setdefault("retryOf", None)
+        public.setdefault("attempt", 1)
+        public.setdefault("logs", [])
         if run["status"] == "completed":
             public["url"] = "/api/projects/{}/timeline/runs/{}/output".format(project_id, run["id"])
         return public
@@ -288,11 +297,12 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                     save(project_id, state)
 
     def find_run(state, run_id):
+        domain_run_id = run_id.removeprefix("timeline:") if run_id.startswith("timeline:") else run_id
         try:
-            validate_storage_id(run_id)
+            validate_storage_id(domain_run_id)
         except ValueError:
             fail("timeline_run_missing", "渲染任务不存在。", 404)
-        run = next((item for item in state["runs"] if item.get("id") == run_id), None)
+        run = next((item for item in state["runs"] if item.get("id") == domain_run_id and (run_id == domain_run_id or item.get("commonRunId", "timeline:" + domain_run_id) == run_id)), None)
         if run is None:
             fail("timeline_run_missing", "渲染任务不存在。", 404)
         return run
@@ -310,6 +320,16 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
         except RenderInputError:
             fail("timeline_asset_unavailable", "素材文件不可用。", 409)
 
+    def retry_sources(project_id, original_run, retry_run_id):
+        try:
+            return render_inputs.clone_frozen(
+                store.path(project_id, "runs", retry_run_id),
+                store.path(project_id, "runs", original_run["id"]),
+                dict(original_run["sources"]),
+            )
+        except (KeyError, RenderInputError):
+            fail("timeline_retry_inputs_unavailable", "原渲染任务的冻结输入不可用，无法重试。")
+
     def queue_run(project_id, run_id):
         accepted = compute_queue.submit("timeline:" + run_id, project_id, lambda pid: process(pid, run_id))
         if accepted:
@@ -318,16 +338,18 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
         run = find_run(state, run_id)
         if run["status"] == "queued":
             run.update(status=LOCAL_RUN_POLICY.fail(run["status"]), error="本地处理队列不可用。")
+            run.setdefault("logs", []).append({"event": "failed", "attempt": run.get("attempt", 1), "reason": "queue_unavailable"})
             save(project_id, state)
 
     def cancelled(project_id, run_id):
         with lock:
             state = state_for(project_id)
             run = find_run(state, run_id)
-            return run["status"] == "cancelled"
+            return run["status"] in {"cancel_requested", "cancelled"}
 
     def process(project_id, run_id):
         staging = None
+        retained_staging = False
         try:
             with lock:
                 state = state_for(project_id)
@@ -335,14 +357,16 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                 if run is None or run["status"] != "queued":
                     return
                 run["status"] = LOCAL_RUN_POLICY.start(run["status"])
+                run.setdefault("logs", []).append({"event": "running", "attempt": run.get("attempt", 1)})
                 save(project_id, state)
                 active_workers.add((project_id, run_id))
                 snapshot = run["snapshot"]
                 source_names = dict(run["sources"])
                 media_kinds = packaging_media_kinds(asset_index(project_id))
+                attempt = run.get("attempt", 1)
             sources = render_inputs.resolve(store.path(project_id, "runs", run_id), source_names)
             suffix = ".wav" if run["format"] == "wav" else ".mp4"
-            staging = store.path(project_id, "runs", run_id, "output" + suffix)
+            staging = store.path(project_id, "runs", run_id, "attempt-{}.staging{}".format(attempt, suffix))
             actual_renderer = renderer
             if actual_renderer is None:
                 from .timeline_render import render_timeline
@@ -354,6 +378,19 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             with lock:
                 state = state_for(project_id)
                 run = find_run(state, run_id)
+                if run.get("attempt", 1) != attempt:
+                    _retain_late_output(staging, store.path(project_id, "runs", run_id, "attempt-{}".format(attempt) + suffix))
+                    run.setdefault("logs", []).append({"event": "retained_not_adopted", "attempt": attempt, "reason": "superseded_attempt"})
+                    save(project_id, state)
+                    retained_staging = True
+                    return
+                if run["status"] == "cancel_requested":
+                    _retain_late_output(staging, store.path(project_id, "runs", run_id, "attempt-{}".format(attempt) + suffix))
+                    run.update(status=LOCAL_RUN_POLICY.acknowledge_cancel(run["status"]), error=None)
+                    run.setdefault("logs", []).append({"event": "retained_not_adopted", "attempt": attempt, "reason": "cancelled"})
+                    save(project_id, state)
+                    retained_staging = True
+                    return
                 if run["status"] != "running":
                     return
                 output = store.path(project_id, "outputs", run_id + suffix)
@@ -366,6 +403,7 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                     result={"output": output.name},
                 )
                 run.update(status=completion.status, error=None, **completion.result)
+                run.setdefault("logs", []).append({"event": "completed", "attempt": attempt})
                 save(project_id, state)
         except HTTPException:
             raise
@@ -373,12 +411,28 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             with lock:
                 state = state_for(project_id)
                 run = find_run(state, run_id)
+                if run.get("attempt", 1) != locals().get("attempt"):
+                    if staging is not None and staging.exists():
+                        _retain_late_output(staging, store.path(project_id, "runs", run_id, "attempt-{}{}".format(attempt, staging.suffix)))
+                        run.setdefault("logs", []).append({"event": "retained_not_adopted", "attempt": attempt, "reason": "superseded_attempt"})
+                        retained_staging = True
+                        save(project_id, state)
+                    return
+                if run.get("attempt", 1) == locals().get("attempt") and run["status"] == "cancel_requested":
+                    if staging is not None and staging.exists():
+                        _retain_late_output(staging, store.path(project_id, "runs", run_id, "attempt-{}{}".format(attempt, staging.suffix)))
+                        run.setdefault("logs", []).append({"event": "retained_not_adopted", "attempt": attempt, "reason": "cancelled"})
+                        retained_staging = True
+                    run.update(status=LOCAL_RUN_POLICY.acknowledge_cancel(run["status"]), error=None)
+                    save(project_id, state)
+                    return
                 if run["status"] == "running":
                     run.update(status=LOCAL_RUN_POLICY.fail(run["status"]), error=_safe_error(error))
+                    run.setdefault("logs", []).append({"event": "failed", "attempt": locals().get("attempt", 1)})
                     save(project_id, state)
         finally:
             try:
-                if staging is not None:
+                if staging is not None and not retained_staging:
                     staging.unlink(missing_ok=True)
             finally:
                 with lock:
@@ -394,10 +448,19 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             try:
                 state = store.load(project_dir.name)
                 changed = False
+                resumable = []
                 for run in state["runs"]:
-                    recovery = LOCAL_RUN_POLICY.recover_after_restart(run.get("status"))
-                    if recovery.reason == "interrupted":
-                        run.update(status=recovery.status, error="服务重启中断了渲染，可重新提交。")
+                    if run.get("status") in {"queued", "running"}:
+                        next_attempt = run.get("attempt", 1) + 1
+                        run.update(status="queued", error=None, attempt=next_attempt,
+                                   recovery={"reason": "restart_resumed", "attempt": next_attempt})
+                        run.setdefault("logs", []).append({"event": "recovered", "attempt": next_attempt, "reason": "restart_resumed"})
+                        resumable.append(run["id"])
+                        changed = True
+                    elif run.get("status") == "cancel_requested":
+                        run.update(status=LOCAL_RUN_POLICY.acknowledge_cancel(run["status"]), error=None,
+                                   recovery={"reason": "restart_cancelled", "attempt": run.get("attempt", 1)})
+                        run.setdefault("logs", []).append({"event": "recovered", "attempt": run.get("attempt", 1), "reason": "restart_cancelled"})
                         changed = True
                 for record in state.get("reframeAnalysis", {}).values():
                     if record.get("status") in ("queued", "running"):
@@ -405,6 +468,8 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                         changed = True
                 if changed:
                     store.save(project_dir.name, state)
+                for run_id in resumable:
+                    queue_run(project_dir.name, run_id)
             except (OSError, ValueError):
                 continue
 
@@ -590,14 +655,12 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
     @router.post("/runs", status_code=202)
     def submit_run(project_id: str, body: Dict[str, Any]):
         project_for(project_id)
-        if not isinstance(body, dict) or set(body) != {"revision", "format"} or not isinstance(body.get("revision"), int) or isinstance(body.get("revision"), bool) or body.get("format") not in ("preview", "mp4", "wav"):
+        if not isinstance(body, dict) or set(body) - {"revision", "format", "idempotencyKey"} or not {"revision", "format"}.issubset(body) or not isinstance(body.get("revision"), int) or isinstance(body.get("revision"), bool) or body.get("format") not in ("preview", "mp4", "wav") or ("idempotencyKey" in body and (not isinstance(body["idempotencyKey"], str) or not body["idempotencyKey"] or len(body["idempotencyKey"]) > 200)):
             fail("timeline_invalid", "渲染请求无效。", 422)
         with source_lock or nullcontext(), lock:
             state = state_for(project_id)
             if body["revision"] != state["revision"]:
                 fail("timeline_conflict", "时间线已更新，请先保存当前版本。")
-            if any(run.get("status") in ACTIVE_STATUSES for run in state["runs"]):
-                fail("timeline_run_active", "当前项目已有渲染任务正在执行。")
             assets = asset_index(project_id)
             try:
                 settings, tracks = validate_workspace({"revision": state["revision"], "settings": state["settings"],
@@ -610,17 +673,70 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
                     fail("timeline_audible_audio_required", "WAV 导出至少需要一个未静音的音频片段。", 422)
             elif not has_visible_video(tracks):
                 fail("timeline_visible_video_required", "至少需要一个可见的视频片段。", 422)
+            input_snapshot = {"revision": state["revision"], "format": body["format"], "settings": settings, "tracks": tracks}
+            frozen_input = freeze_run_input(input_snapshot)
+            idempotency_key = body.get("idempotencyKey")
+            if idempotency_key is not None:
+                existing = next((run for run in state["runs"] if run.get("idempotencyKey") == idempotency_key), None)
+                if existing is not None:
+                    if existing.get("inputFingerprint") != frozen_input.fingerprint:
+                        fail("timeline_idempotency_conflict", "幂等键已用于不同的渲染输入。")
+                    return response(project_id, state)
+            if any(run.get("status") in ACTIVE_STATUSES for run in state["runs"]):
+                fail("timeline_run_active", "当前项目已有渲染任务正在执行。")
             run_id = uuid4().hex
             sources = snapshot_sources(project_id, run_id, tracks, assets)
-            run = {"id": run_id, "revision": state["revision"], "format": body["format"], "status": LOCAL_RUN_POLICY.initial_status, "error": None,
-                   "snapshot": {"settings": settings, "tracks": tracks,
-                                "transitions": validate_transitions(state.get("transitions", []), tracks)},
-                   "sources": sources}
+            snapshot = {"settings": settings, "tracks": tracks,
+                        "transitions": validate_transitions(state.get("transitions", []), tracks)}
             if state.get("packaging") is not None:
-                run["snapshot"]["packaging"] = state["packaging"]
+                snapshot["packaging"] = state["packaging"]
+            run = {"id": run_id, "revision": state["revision"], "format": body["format"], "status": LOCAL_RUN_POLICY.initial_status, "error": None,
+                   "snapshot": snapshot, "sources": sources,
+                   "commonRunId": "timeline:" + run_id, "domainKind": "timeline.render", "inputSnapshot": input_snapshot,
+                   "inputFingerprint": frozen_input.fingerprint, "idempotencyKey": idempotency_key, "retryOf": None,
+                   "attempt": 1, "logs": [{"event": "created", "attempt": 1}, {"event": "queued", "attempt": 1}]}
             state["runs"].append(run)
             save(project_id, state)
             queue_run(project_id, run_id)
+            return response(project_id, state_for(project_id))
+
+    @router.get("/runs/{run_id}")
+    def get_run(project_id: str, run_id: str):
+        project_for(project_id)
+        with lock:
+            return public_run(project_id, find_run(state_for(project_id), run_id))
+
+    @router.post("/runs/{run_id}/retry", status_code=202)
+    def retry_run(project_id: str, run_id: str, body: Dict[str, Any]):
+        project_for(project_id)
+        if not isinstance(body, dict) or set(body) != {"idempotencyKey"} or not isinstance(body.get("idempotencyKey"), str) or not body["idempotencyKey"] or len(body["idempotencyKey"]) > 200:
+            fail("timeline_invalid", "重试请求无效。", 422)
+        with source_lock or nullcontext(), lock:
+            state = state_for(project_id)
+            original = find_run(state, run_id)
+            if original["status"] not in TERMINAL_STATUSES:
+                fail("timeline_run_active", "任务尚未结束，不能重试。")
+            key = body["idempotencyKey"]
+            existing = next((item for item in state["runs"] if item.get("idempotencyKey") == key), None)
+            if existing is not None:
+                if existing.get("retryOf") != original["id"] or existing.get("inputFingerprint") != original.get("inputFingerprint"):
+                    fail("timeline_idempotency_conflict", "幂等键已用于不同的重试请求。")
+                return response(project_id, state)
+            if any(item.get("status") in ACTIVE_STATUSES for item in state["runs"]):
+                fail("timeline_run_active", "当前项目已有渲染任务正在执行。")
+            retry_id = uuid4().hex
+            sources = retry_sources(project_id, original, retry_id)
+            retry = {
+                "id": retry_id, "revision": original["revision"], "format": original["format"], "status": LOCAL_RUN_POLICY.initial_status, "error": None,
+                "snapshot": original["snapshot"], "sources": sources,
+                "commonRunId": "timeline:" + retry_id, "domainKind": "timeline.render",
+                "inputSnapshot": original.get("inputSnapshot", original["snapshot"]), "inputFingerprint": original.get("inputFingerprint"),
+                "idempotencyKey": key, "retryOf": original["id"], "attempt": 1,
+                "logs": [{"event": "created", "attempt": 1}, {"event": "queued", "attempt": 1}, {"event": "retry_created", "retryOf": original["id"]}],
+            }
+            state["runs"].append(retry)
+            save(project_id, state)
+            queue_run(project_id, retry_id)
             return response(project_id, state_for(project_id))
 
     @router.post("/runs/{run_id}/cancel")
@@ -633,18 +749,25 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             run = find_run(state, run_id)
             if run["status"] not in ACTIVE_STATUSES:
                 fail("timeline_run_finished", "渲染任务已经结束。")
-            run.update(status=LOCAL_RUN_POLICY.cancel(run["status"]), error=None)
+            cancellation = LOCAL_RUN_POLICY.request_cancel(run["status"])
+            run.update(status=cancellation, error=None)
+            if cancellation == "cancel_requested":
+                run["cancelRequestedAt"] = datetime.now(timezone.utc).isoformat()
+                run.setdefault("logs", []).append({"event": "cancel_requested", "attempt": run.get("attempt", 1)})
+            else:
+                run.setdefault("logs", []).append({"event": "cancelled", "attempt": run.get("attempt", 1)})
             save(project_id, state)
             return response(project_id, state)
 
     def cleanup_paths(project_id, state, run_id):
         run = find_run(state, run_id)
-        if run["status"] not in TERMINAL_STATUSES or (project_id, run_id) in active_workers:
+        domain_run_id = run["id"]
+        if run["status"] not in TERMINAL_STATUSES or (project_id, domain_run_id) in active_workers:
             fail("timeline_run_active", "任务尚未完全停止，暂不能清理。")
-        paths = [store.path(project_id, "runs", run_id)]
+        paths = [store.path(project_id, "runs", domain_run_id)]
         if run.get("output"):
-            expected = run_id + (".wav" if run["format"] == "wav" else ".mp4")
-            if run["output"] != expected or any(item["id"] != run_id and item.get("output") == expected for item in state["runs"]):
+            expected = domain_run_id + (".wav" if run["format"] == "wav" else ".mp4")
+            if run["output"] != expected or any(item["id"] != domain_run_id and item.get("output") == expected for item in state["runs"]):
                 fail("timeline_cleanup_unsafe", "输出文件关联异常，不能自动清理。")
             paths.append(store.path(project_id, "outputs", expected))
         return paths
@@ -671,8 +794,9 @@ def create_timeline_router(data_dir, get_project, compute_queue, *, ffmpeg_path=
             if body["revision"] != state["revision"]:
                 fail("timeline_conflict", "时间线已更新，请重新预览清理范围。")
             try:
-                paths = cleanup_paths(project_id, state, run_id)
-                state["runs"] = [item for item in state["runs"] if item["id"] != run_id]
+                domain_run_id = find_run(state, run_id)["id"]
+                paths = cleanup_paths(project_id, state, domain_run_id)
+                state["runs"] = [item for item in state["runs"] if item["id"] != domain_run_id]
                 state["revision"] += 1
                 warning = remove_history_files(paths, store.path(project_id), lambda: save(project_id, state))
             except (OSError, ValueError):
@@ -738,6 +862,13 @@ def _regular_file(path):
             raise OSError("不是普通文件")
     finally:
         os.close(descriptor)
+
+
+def _retain_late_output(staging, retained):
+    if not staging.exists():
+        return
+    _regular_file(staging)
+    os.replace(str(staging), str(retained))
 
 
 def _safe_error(error):

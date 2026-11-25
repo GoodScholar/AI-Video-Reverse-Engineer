@@ -15,6 +15,8 @@ vi.mock("./PreproductionWorkspace", () => ({ PreproductionWorkspace: ({ onAssets
   ])}>载入素材</button></section> }));
 vi.mock("./SourceSegmentIndexPanel", () => ({ SourceSegmentIndexPanel: ({ projectId, assets }: { projectId: string; assets?: unknown[] }) =>
   <section aria-label="片段索引接缝">{projectId} · {assets?.length ?? 0} 个素材</section> }));
+vi.mock("./TranscriptionPanel", () => ({ TranscriptionPanel: ({ projectId, assets }: { projectId: string; assets?: unknown[] }) =>
+  <section aria-label="转录接缝">{projectId} · {assets?.length ?? 0} 个素材</section> }));
 
 const project = { id: "p1", name: "商品项目", createdAt: "2026-09-27T00:00:00Z", updatedAt: "2026-09-27T00:00:00Z",
   referenceMedia: null, localPreprocessing: null };
@@ -95,4 +97,5 @@ it("项目素材页在现有素材库后展示片段索引接缝", async () => {
   await userEvent.click(await screen.findByRole("button", { name: "载入素材" }));
 
   expect(screen.getByRole("region", { name: "片段索引接缝" })).toHaveTextContent("p1 · 1 个素材");
+  expect(screen.getByRole("region", { name: "转录接缝" })).toHaveTextContent("p1 · 1 个素材");
 });

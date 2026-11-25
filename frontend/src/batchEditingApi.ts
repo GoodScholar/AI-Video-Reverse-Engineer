@@ -22,18 +22,22 @@ export type BatchProposal = { baseRevision: number; method: "asset-metadata-keyw
   clipId: string; scriptSegment: string; assetId: string; assetName: string; matchedTerms: string[]; matchedSellingPointTerms: string[];
 }> };
 export type MontageCandidate = { candidateId: string; assetId: string; inPointSeconds: number; outPointSeconds: number;
-  visualRelevance: number; quality: { score: number; evidence: Record<string, unknown> }; evidence?: { basis?: string } };
+  visualRelevance: number; quality: { score: number; evidence: Record<string, unknown> }; evidence?: { basis?: string };
+  rerank?: { id: string; model: string; confidence: number; reason: string } };
 export type MontageProposalSegment = { id: string; text: string; status: "planned" | "gap"; selectedCandidateId: string | null;
+  disabled?: boolean; input?: { searchId: string; indexVersion: string; rerankId?: string | null };
   suggestion: (MontageCandidate & { quality: { score: number; evidence: Record<string, unknown> } }) | null;
   suggestionClip?: TimelineClip | null; selectedClip: TimelineClip | null; alternatives: Array<{ candidate: MontageCandidate; clip: TimelineClip; unmet: string[] }>;
   reasons: string[]; unmet: string[]; timing: { narrationDurationSeconds: number; wordBoundarySeconds: number; beatSnap: number | null } };
-export type MontageProposal = { id: string; revision: number; status: "draft" | "abandoned" | "applied"; plannerVersion: string;
+export type RemixPlan = { id: string; revision: number; status: "draft" | "abandoned" | "applied"; plannerVersion: string;
+  schemaVersion?: number; engine?: "RemixEngine"; entrypoint?: "script" | "highlight";
   baseRevision: number; appliedVariantRevision: number | null; appliedClipIds?: string[];
   appliedSelections?: Array<{ segmentId: string; candidateId: string; clipId: string; assetId?: string; inPoint?: number; duration?: number }>; segments: MontageProposalSegment[]; clips: TimelineClip[]; transitions?: TimelineTransition[];
   unmet: Array<{ segmentId: string; message: string }>; inputSnapshot: { contentRevision: number; variantRevision: number } };
+export type MontageProposal = RemixPlan;
 export type BatchTask = { voiceover?: {id:string;voiceId:string;status:"queued"|"running"|"completed"|"failed";error:string|null;
   contentRevision:number;variantRevision:number;model:string;modelRevision:string;assetIds:string[]}; id: string; sellingPoint: string; script: string; contentRevision?: number;
-  reviews?: BatchReview[]; reviewStatus?: "pending" | "approved" | "rejected" | "stale"; variant: BatchVariant; proposal?: BatchProposal; montageProposals?: MontageProposal[];
+  reviews?: BatchReview[]; reviewStatus?: "pending" | "approved" | "rejected" | "stale"; variant: BatchVariant; proposal?: BatchProposal; remixPlans?: RemixPlan[]; montageProposals?: MontageProposal[];
   batchId?: string; generationId?: string; generation?: { status: "ready" | "failed"; error: string | null };
   aigcSource?: { candidateId: string; candidateRevision: number; briefRevision: number; generationId: string; screenCopySource: "script";
     facts: Array<{ id: string; text: string }>; brief?: AigcBrief; sellingPoint?: string; beats?: AigcBeat[];
@@ -92,23 +96,23 @@ export function recommendBatchVariant(projectId: string, taskId: string, revisio
     { method: "POST", headers, body: JSON.stringify({ revision, assetIds }) }, "无法依据脚本推荐镜头。");
 }
 
-export function createMontageProposal(projectId: string, taskId: string, revision: number, searchIds: string[], narration: Array<{
+export function createScriptRemixPlan(projectId: string, taskId: string, revision: number, searchIds: string[], narration: Array<{
   durationSeconds: number; wordBoundariesSeconds: number[]; source: "measured_voiceover" | "subtitle_cue" | "estimated_text";
-}>, beatTimes: number[]): Promise<{ proposal: MontageProposal }> {
-  return request(`${base(projectId)}/${encodeURIComponent(taskId)}/montage-proposals`,
-    { method: "POST", headers, body: JSON.stringify({ revision, searchIds, narration, beatTimes }) }, "无法生成混剪提案。");
+}>, beatTimes: number[]): Promise<{ remixPlan: RemixPlan; proposal?: RemixPlan }> {
+  return request(`${base(projectId)}/${encodeURIComponent(taskId)}/remix-plans`,
+    { method: "POST", headers, body: JSON.stringify({ revision, searchIds, narration, beatTimes }) }, "无法生成 RemixPlan。");
 }
 
-export function updateMontageProposal(projectId: string, taskId: string, proposalId: string, revision: number,
-  segments: Array<{ segmentId: string; candidateId: string; inPointSeconds: number; durationSeconds: number }>): Promise<{ proposal: MontageProposal }> {
-  return request(`${base(projectId)}/${encodeURIComponent(taskId)}/montage-proposals/${encodeURIComponent(proposalId)}`,
-    { method: "PUT", headers, body: JSON.stringify({ revision, segments }) }, "无法保存混剪提案调整。");
+export function updateRemixPlan(projectId: string, taskId: string, planId: string, revision: number,
+  segments: Array<{ segmentId: string; disabled: true } | { segmentId: string; candidateId: string; inPointSeconds: number; durationSeconds: number }>): Promise<{ remixPlan: RemixPlan; proposal?: RemixPlan }> {
+  return request(`${base(projectId)}/${encodeURIComponent(taskId)}/remix-plans/${encodeURIComponent(planId)}`,
+    { method: "PUT", headers, body: JSON.stringify({ revision, segments }) }, "无法保存 RemixPlan 调整。");
 }
 
-export function applyMontageProposal(projectId: string, taskId: string, proposalId: string, revision: number,
-  proposalRevision: number, strategy: "overwrite" | "merge" | "abandon"): Promise<{ proposal: MontageProposal; variant: BatchVariant }> {
-  return request(`${base(projectId)}/${encodeURIComponent(taskId)}/montage-proposals/${encodeURIComponent(proposalId)}/apply`,
-    { method: "POST", headers, body: JSON.stringify({ revision, proposalRevision, strategy }) }, "无法应用混剪提案。");
+export function applyRemixPlan(projectId: string, taskId: string, planId: string, revision: number,
+  planRevision: number, strategy: "overwrite" | "merge" | "abandon"): Promise<{ remixPlan: RemixPlan; proposal?: RemixPlan; variant: BatchVariant }> {
+  return request(`${base(projectId)}/${encodeURIComponent(taskId)}/remix-plans/${encodeURIComponent(planId)}/apply`,
+    { method: "POST", headers, body: JSON.stringify({ revision, proposalRevision: planRevision, strategy }) }, "无法采用 RemixPlan。");
 }
 
 export function createBulkVariants(projectId: string, taskId: string, items: Array<{ sellingPoint: string; script: string }>, assetIds: string[]): Promise<{ generationId: string; tasks: BatchTask[] }> {

@@ -128,7 +128,7 @@ def _packaging_inputs(data_root, project_id):
             inputs.append(({'settings': variant['settings'], 'tracks': variant['tracks'],
                            **({'transitions': variant['transitions']} if variant.get('transitions') else {}),
                            'packaging': variant['packaging']}, cues, True))
-        for proposal in task.get('montageProposals', []):
+        for proposal in (task.get('remixPlans') if isinstance(task.get('remixPlans'), list) else task.get('montageProposals', [])):
             package = proposal.get('packaging') if isinstance(proposal, dict) else None
             if package is not None:
                 tracks = [{**track, 'clips': proposal.get('clips', [])} if track.get('kind') == 'video' else track
@@ -283,6 +283,7 @@ def create_backup_router(data_dir, get_project, parse_project, register_project,
                 payload = project.model_dump(mode='json')
                 check_idle(payload)
                 source = safe_child(root, 'project-files', project.id)
+                TimelineStore(root).load(project.id)
                 before = inventory(source)
                 # The global write lock protects the immutable state capture,
                 # not the 16 MB font hash/TTFont/event proof.

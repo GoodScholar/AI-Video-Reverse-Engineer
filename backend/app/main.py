@@ -112,7 +112,7 @@ from app.analysis_settings import (
     AnalysisSettingsConflictError,
 )
 from app.credential_store import CredentialStore
-from app.provider_models import PROVIDER_IDS, model_is_allowed
+from app.provider_models import CATALOG_VERSION, PROVIDER_IDS, model_is_allowed, provider_for
 from app.analysis_providers.bailian import BailianAnalysisProvider
 from app.analysis_providers.base import ProviderAnalysisError, ProviderFailure, ProviderRequest
 from app.analysis_providers.claude import ClaudeAnalysisProvider
@@ -350,6 +350,7 @@ def create_app(
     semantic_analysis_runner: Optional[Callable] = None,
     source_segment_runner: Optional[Callable] = None,
     segment_visual_vectorizer=None,
+    transcription_runner: Optional[Callable] = None,
     segment_reranker=None,
     reframe_analyzer=None,
     analysis_provider_registry=None,
@@ -1178,9 +1179,13 @@ def create_app(
             return True
         return (
             request.method in ("POST", "PUT")
-            and bool(re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|preparation|preproduction|source-segments|segment-searches|timeline|batch-edits|upscale|character-motion|toolkit|backup)(?:/.*)?", path))
+            and bool(re.fullmatch(r"/api/projects/[^/]+/(?:reproduction|preparation|preproduction|image-generation|video-generation|source-segments|transcriptions|segment-searches|timeline|batch-edits|upscale|character-motion|toolkit|backup)(?:/.*)?", path))
         ) or (
             request.method == "PUT" and bool(re.fullmatch(r"/api/analysis-providers/[^/]+/configuration", path))
+        ) or (
+            request.method == "PUT" and path == "/api/image-generation/configuration"
+        ) or (
+            request.method == "PUT" and bool(re.fullmatch(r"/api/generation-routing-policies/[^/]+", path))
         ) or (
             request.method == "POST" and (
                 bool(re.fullmatch(r"/api/analysis-providers/[^/]+/(?:test-connection|connection-test)", path))
@@ -2500,11 +2505,31 @@ def create_app(
         data_dir, ensure_project_exists, compute_jobs,
         ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, source_lock=project_write_lock,
     ))
+    from .bilibili_session_api import create_bilibili_session_router
+    app.include_router(create_bilibili_session_router())
+    from .douyin_session_api import create_douyin_session_router
+    app.include_router(create_douyin_session_router())
+    from .xiaohongshu_session_api import create_xiaohongshu_session_router
+    app.include_router(create_xiaohongshu_session_router())
+    from .kuaishou_session_api import create_kuaishou_session_router
+    app.include_router(create_kuaishou_session_router())
+    from .image_generation import ImageGenerationConfigurations, ImageGenerationService, ImageGenerationSettings
+    from .image_generation_api import create_image_generation_router
+    image_generation_configurations = ImageGenerationConfigurations(
+        ImageGenerationSettings(data_dir / "image-generation.json"),
+    )
+    image_generation_service = ImageGenerationService(image_generation_configurations)
+    app.include_router(create_image_generation_router(image_generation_configurations))
     from .source_segment_index import create_source_segment_router
     app.include_router(create_source_segment_router(
         data_dir, ensure_project_exists, compute_jobs,
         runner=source_segment_runner, ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
         source_lock=project_write_lock,
+    ))
+    from .transcription import create_transcription_router
+    app.include_router(create_transcription_router(
+        data_dir, ensure_project_exists, compute_jobs, runner=transcription_runner,
+        ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, source_lock=project_write_lock,
     ))
     from .segment_retrieval import AnalysisProviderSegmentReranker, Siglip2VisualVectorizer, create_segment_retrieval_router
     resolved_segment_vectorizer = segment_visual_vectorizer or Siglip2VisualVectorizer(
@@ -2536,9 +2561,10 @@ def create_app(
         segment_vectorizer_version=resolved_segment_vectorizer.version,
         reframe_analyzer=reframe_analyzer,
     ))
-    from .aigc_content_api import create_aigc_content_router
+    from .aigc_content_api import _CandidateResponse, create_aigc_content_router
+    from .generation_service import GenerationAdapter, GenerationAdapterRegistry, GenerationService, TEXT_CAPABILITIES
 
-    def generate_marketing_candidates(provider_id, model, prompt, schema):
+    def generate_marketing_candidates(provider_id, model, prompt, schema, *, configuration_version=None):
         if not analysis_model_is_supported(provider_id, model):
             raise HTTPException(422, detail={"code": "provider_unconfigured", "message": "请先配置并验证所选 AI 服务。"})
         try:
@@ -2546,6 +2572,7 @@ def create_app(
                 provider=provider_id,
                 model=model,
                 require_verified=True,
+                expected_configuration_revision=configuration_version,
                 operation=lambda provider, configured_model: provider.analyze(ProviderRequest(
                     task="prompt_generation", prompt=prompt, model=configured_model,
                     responseSchema=schema,
@@ -2553,12 +2580,82 @@ def create_app(
             )
         except AnalysisProviderUnconfiguredError:
             raise HTTPException(422, detail={"code": "provider_unconfigured", "message": "请先配置并验证所选 AI 服务。"}) from None
+        except AnalysisProviderConfigurationChangedError:
+            raise HTTPException(409, detail={"code": "provider_configuration_changed", "message": "Provider 配置已变化，请重新确认本次生成。"}) from None
         except ProviderAnalysisError as error:
             raise HTTPException(422, detail={"code": error.failure.code, "message": error.failure.message}) from None
 
+    def aigc_capabilities(provider_id, model):
+        # A successful credential probe only proves connectivity.  Production
+        # text generation also requires this separately maintained, versioned
+        # compatibility catalog entry for the exact provider/model.
+        try:
+            compatibility = provider_for(provider_id)
+        except ValueError:
+            raise GenerationError("generation_capability_unavailable") from None
+        if (
+            compatibility.compatibilityAvailability != "verified"
+            or not any(candidate.id == model for candidate in compatibility.models)
+        ):
+            raise GenerationError("generation_capability_unavailable")
+        try:
+            configuration = analysis_provider_configurations.require_configured(
+                provider_id, model, require_verified=True,
+            )
+        except AnalysisProviderUnconfiguredError:
+            raise GenerationError("provider_unconfigured") from None
+        return {
+            "provider": provider_id,
+            "model": configuration.model,
+            "configurationVersion": configuration.configurationRevision,
+            "capabilities": dict(TEXT_CAPABILITIES) | {"version": f"text-compatibility-{CATALOG_VERSION}"},
+        }
+
+    def run_aigc_generation(run):
+        try:
+            return generate_marketing_candidates(
+                run["provider"], run["model"], run["input"]["prompt"], run["input"]["textParams"].get("structuredSchema"),
+                configuration_version=run["configurationVersion"],
+            )
+        except HTTPException as error:
+            # These failures happen while resolving the frozen local
+            # configuration, before an operation is handed to a provider.
+            if isinstance(error.detail, dict) and error.detail.get("code") in {"provider_unconfigured", "provider_configuration_changed"}:
+                raise GenerationError("generation_configuration_unavailable", safe_to_fallback=True) from None
+            raise GenerationError("generation_provider_outcome_unknown", outcome="unknown", billing_unknown=True) from None
+
+    aigc_generation_registry = GenerationAdapterRegistry()
+    aigc_generation_registry.register(GenerationAdapter(
+        "analysis-structured-text", "analysis-v1", "text", run_aigc_generation, aigc_capabilities,
+        result_validator=lambda text: _CandidateResponse.model_validate_json(text),
+    ))
+    from .image_generation_adapter import ConfiguredImageGenerationAdapter
+    configured_image_adapter = ConfiguredImageGenerationAdapter(
+        data_dir, image_generation_configurations, image_generation_service,
+    )
+    aigc_generation_registry.register(configured_image_adapter.as_generation_adapter())
+    from .comfyui_adapter import ComfyUIAdapter, ComfyUIConfigurationStore, create_comfyui_adapter_router
+    comfyui_adapter_settings = ComfyUIConfigurationStore(data_dir)
+    # Registration is harmless while unconfigured: its catalog is empty until a
+    # separately evidenced workflow verification exists.
+    aigc_generation_registry.register(ComfyUIAdapter(data_dir, comfyui_adapter_settings).as_generation_adapter())
+    aigc_generation_service = GenerationService(
+        data_dir, registry=aigc_generation_registry, queue=compute_jobs,
+        ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
+    )
+
+    from .image_generation_run_api import create_image_generation_run_router
+    app.include_router(create_image_generation_run_router(aigc_generation_service, ensure_project_exists))
+    from .video_generation_run_api import create_video_generation_run_router
+    app.include_router(create_video_generation_run_router(aigc_generation_service, ensure_project_exists))
+    from .generation_routing_api import create_generation_routing_router
+    app.include_router(create_generation_routing_router(aigc_generation_service))
+    app.include_router(create_comfyui_adapter_router(comfyui_adapter_settings))
+
     app.include_router(create_aigc_content_router(data_dir, ensure_project_exists,
                                                    script_generator=generate_marketing_candidates,
-                                                   source_lock=project_write_lock))
+                                                   source_lock=project_write_lock,
+                                                   generation_service=aigc_generation_service))
     from .content_workflow_api import create_content_workflow_router
     app.include_router(create_content_workflow_router(
         data_dir, ensure_project_exists, source_lock=project_write_lock,

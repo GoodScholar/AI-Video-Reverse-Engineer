@@ -461,6 +461,9 @@ describe("BatchEditor", () => {
     await userEvent.click(screen.getByRole("button", { name: "生成可解释混剪提案" }));
 
     expect(await screen.findByText("系统原建议：杯盖画面 1.000–5.000 秒")).toBeVisible();
+    expect(screen.getByText(/本次计划默认仅使用本地索引与视觉检索/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "禁用第 1 段候选" })).toBeVisible();
+    expect(String(vi.mocked(fetch).mock.calls[3][0])).toContain("/remix-plans");
     expect(JSON.parse(String(vi.mocked(fetch).mock.calls[3][1]?.body))).toEqual(expect.objectContaining({
       revision: 0, searchIds: ["search-1", "search-2"],
     }));

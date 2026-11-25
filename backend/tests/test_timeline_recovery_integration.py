@@ -16,22 +16,22 @@ def test_real_cancel_corrupt_source_and_retry(tmp_path):
             return response
         pid = call('post', '/api/projects', json={'name': '取消与损坏恢复'}).json()['id']
         base = f'/api/projects/{pid}'
-        prep = call('post', base + '/preproduction/assets?role=motion', files={'file': ('source.mp4', source.read_bytes(), 'video/mp4')}).json()
+        prep = call('post', base + '/preproduction/assets?role=motion', data={'rightsConfirmed':'true'}, files={'file': ('source.mp4', source.read_bytes(), 'video/mp4')}).json()
         aid = prep['assets'][0]['id']
         tl = base + '/timeline'
         clips = [{'id': f'c{i}', 'assetId': aid, 'start': i * 5, 'inPoint': 0, 'duration': 5, 'speed': 1, 'volume': 1, 'fadeIn': 0, 'fadeOut': 0} for i in range(60)]
         state = call('put', tl, json={'revision': 0, 'settings': {'width': 1920, 'height': 1080, 'fps': 30}, 'tracks': [{'id': 'v', 'name': '长画面', 'kind': 'video', 'muted': False, 'hidden': False, 'clips': clips}]}).json()
         run = call('post', tl + '/runs', json={'revision': state['revision'], 'format': 'mp4'}).json()['runs'][-1]
         project_root = tmp_path / 'data' / 'project-files' / pid
-        partial = project_root / 'timeline' / 'runs' / run['id'] / 'output.mp4'
+        run_root = project_root / 'timeline' / 'runs' / run['id']
         try:
             deadline = time.monotonic() + 20
-            while not list(partial.parent.glob(".output.*.mp4")):
+            while not list(run_root.glob(".*.mp4")):
                 assert time.monotonic() < deadline, 'FFmpeg did not start writing'
                 time.sleep(.05)
         finally:
             cancelled = call('post', tl + '/runs/' + run['id'] + '/cancel', json={}).json()
-        assert cancelled['runs'][-1]['status'] == 'cancelled'
+        assert cancelled['runs'][-1]['status'] == 'cancel_requested'
         assert client.get(tl + '/runs/' + run['id'] + '/output').status_code == 409
         deadline = time.monotonic() + 20
         while True:
@@ -41,8 +41,9 @@ def test_real_cancel_corrupt_source_and_retry(tmp_path):
             assert time.monotonic() < deadline, 'cancelled worker did not exit'
             time.sleep(.05)
         assert backup.status_code == 200, backup.text
-        assert not partial.exists()
-        assert not list(partial.parent.glob(".output.*.mp4"))
+        assert call('get', tl + '/runs/' + run['id']).json()['status'] == 'cancelled'
+        assert not list(run_root.glob("*.staging.mp4"))
+        assert not list(run_root.glob(".*.mp4"))
         restored = call('post', '/api/project-backups/restore', content=backup.content, headers={'Content-Type': 'application/zip'}).json()
         assert call('get', f'/api/projects/{restored["id"]}/timeline').json()['runs'][-1]['status'] == 'cancelled'
         # Corrupt only isolated source; preflight must reject and recover when repaired.

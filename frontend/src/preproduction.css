@@ -22,6 +22,20 @@
 .preproduction-native-form input:not([type="file"]), .preproduction-native-form select, .preproduction-native-form textarea { box-sizing: border-box; width: 100%; min-height: 42px; padding: 9px 10px; border: 1px solid #797d76; border-radius: 2px; background: #fffdf7; color: #202427; font: inherit; font-weight: 400; }
 .preproduction-native-form textarea { min-height: 78px; resize: vertical; }
 .preproduction-upload { justify-content: flex-start; margin: 22px 0; padding: 16px 0; border-top: 1px solid #c7c6bc; border-bottom: 1px solid #c7c6bc; }
+.image-generation-panel { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 22px 0; padding: 20px; border: 1px solid #dce1e9; border-radius: 10px; background: #fff; color: #17202d; }
+.image-generation-panel > h4, .image-generation-panel > p, .image-generation-panel > fieldset, .image-generation-panel > section, .image-generation-panel > button { grid-column: 1 / -1; }
+.image-generation-panel h4, .image-generation-panel h5, .image-generation-panel p { margin: 0; }
+.image-generation-panel h4 { font-size: 18px; }
+.image-generation-panel > p, .image-generation-panel article span { color: #596579; font-size: 13px; line-height: 1.6; }
+.image-generation-panel fieldset { display: flex; flex-wrap: wrap; gap: 8px 16px; margin: 0; padding: 12px; border: 1px solid #dce1e9; border-radius: 7px; }
+.image-generation-panel fieldset label, .image-generation-panel > label:last-of-type { display: flex; grid-auto-flow: column; align-items: center; justify-content: start; gap: 8px; }
+.image-generation-panel input[type="checkbox"] { width: 18px; min-height: 18px; }
+.image-generation-panel > section { display: grid; gap: 10px; padding-top: 4px; }
+.image-generation-panel > section > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.image-generation-panel article { padding: 14px; border: 1px solid #dce1e9; border-radius: 7px; background: #f6f7fb; }
+.image-generation-panel article > div { display: flex; gap: 10px; margin-top: 8px; }
+.image-generation-panel article > button { margin: 10px 8px 0 0; }
+@media (max-width: 760px) { .image-generation-panel { grid-template-columns: minmax(0, 1fr); padding: 16px; } .image-generation-panel > * { grid-column: 1; } }
 .preproduction-upload label.secondary-action { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
 .preproduction-filters { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 16px; }
 .preproduction-filters button, .preproduction-bindings button { min-height: 34px; padding: 0 10px; border: 1px solid #aeb0aa; border-radius: 2px; background: transparent; color: #33423f; font: inherit; font-size: 13px; }

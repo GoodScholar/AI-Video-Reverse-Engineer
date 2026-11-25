@@ -29,6 +29,21 @@ it('展示引用且禁止删除', async () => {
   expect(screen.getByText('短视频变体「卖点」· 交付 delivery-1')).toBeInTheDocument();
   expect(screen.getByRole('button', { name: '删除素材' })).toBeDisabled();
 });
+it('展示运行结果素材的可追溯版本信息和既有下游引用', async () => {
+  const resultAsset = {
+    ...asset, name: '生成片段', sourceRunId: 'run-1', sourceResultId: 'result-1',
+    provider: 'local-renderer', processingMethod: 'ffmpeg', assetVersionId: 'asset-generated-v1',
+    sha256: 'a'.repeat(64), inputFingerprint: 'b'.repeat(64), inputSnapshot: { script: '第一版' },
+  } as typeof asset;
+  vi.mocked(fetch).mockResolvedValue(response({ references: [{ kind: 'timeline', label: '编辑序列 · 片段' }] }));
+  render(<AssetManager {...props} asset={resultAsset} />);
+  expect(await screen.findByText('运行 run-1 · 结果 result-1')).toBeInTheDocument();
+  expect(screen.getByText('Provider/处理方式 · local-renderer / ffmpeg')).toBeInTheDocument();
+  expect(screen.getByText(`输入指纹 · ${'b'.repeat(64)}`)).toBeInTheDocument();
+  expect(screen.getByText(`内容哈希 · ${'a'.repeat(64)}`)).toBeInTheDocument();
+  expect(screen.getByText('版本 · asset-generated-v1')).toBeInTheDocument();
+  expect(screen.getByText('编辑序列 · 片段')).toBeInTheDocument();
+});
 it('删除前再次阻止未保存的时间线草稿', async () => {
   vi.mocked(fetch).mockResolvedValue(response({ references: [] }));
   render(<AssetManager {...props} />);

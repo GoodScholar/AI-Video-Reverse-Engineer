@@ -198,6 +198,8 @@ export type AnalysisProviderConfiguration = {
   verifiedAt?: string | null;
   failedAt?: string | null;
   errorCode?: string | null;
+  textGenerationCapabilityState?: "verified" | "unverified";
+  textGenerationCapabilityVersion?: string | null;
 };
 
 export type DepthCaptureStageName =

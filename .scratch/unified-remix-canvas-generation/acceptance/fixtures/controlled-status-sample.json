@@ -1,0 +1,59 @@
+{
+  "allowedStatuses": ["通过", "失败", "阻塞", "明确不适用"],
+  "frozenAt": "2026-09-30",
+  "frozenNotApplicableIds": ["sample-na"],
+  "requiredEvidence": ["E2"],
+  "records": [
+    {
+      "id": "sample-pass",
+      "status": "通过",
+      "evidenceRefs": ["sample-e2"],
+      "gap": "",
+      "zeroToleranceViolations": []
+    },
+    {
+      "id": "sample-fail",
+      "status": "失败",
+      "evidenceRefs": [],
+      "gap": "受控失败用于证明失败状态保留未闭合差异。",
+      "zeroToleranceViolations": ["黑边"]
+    },
+    {
+      "id": "sample-blocked",
+      "status": "阻塞",
+      "evidenceRefs": [],
+      "blockedReason": "受控样例缺少真实 Provider 凭据。",
+      "gap": "凭据到位后仍须补 E2 及真实运行证据。",
+      "zeroToleranceViolations": []
+    },
+    {
+      "id": "sample-na",
+      "status": "明确不适用",
+      "evidenceRefs": [],
+      "gap": "",
+      "zeroToleranceViolations": [],
+      "frozenDecision": {
+        "decidedAt": "2026-09-30",
+        "reason": "受控样例在冻结分母时被明确排除。",
+        "approvedBy": "票据 01 受控测试夹具",
+        "alternativeCoverage": ["sample-pass"]
+      }
+    }
+  ],
+  "evidence": [
+    {
+      "id": "sample-e2",
+      "level": "E2",
+      "kind": "automated-behavior-test",
+      "verifierId": "controlled-e2-fixture",
+      "artifactPath": "fixtures/controlled-e2-proof.json",
+      "supports": ["sample-pass"],
+      "automatedTest": {
+        "command": "pytest -q test_acceptance_contract.py::test_controlled_sample_proves_all_four_legal_statuses",
+        "observedAt": "2026-09-30",
+        "exitCode": 0,
+        "testIds": ["test_controlled_sample_proves_all_four_legal_statuses"]
+      }
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "numTotalTestSuites": 1,
+  "numPassedTestSuites": 1,
+  "numFailedTestSuites": 0,
+  "numPendingTestSuites": 0,
+  "numTotalTests": 1,
+  "numPassedTests": 1,
+  "numFailedTests": 0,
+  "numPendingTests": 0,
+  "numTodoTests": 0,
+  "startTime": 1790928000000,
+  "success": true,
+  "testResults": [
+    {
+      "assertionResults": [
+        {
+          "ancestorTitles": ["Creative canvas"],
+          "fullName": "Creative canvas saves independently",
+          "status": "passed",
+          "title": "saves independently",
+          "duration": 4,
+          "failureMessages": []
+        }
+      ],
+      "startTime": 1790928000000,
+      "endTime": 1790928000010,
+      "status": "passed",
+      "message": "",
+      "name": "frontend/src/CreativeCanvas.test.tsx"
+    }
+  ]
+}

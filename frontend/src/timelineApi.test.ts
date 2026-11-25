@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { cancelTimelineRun, getTimeline, saveTimeline, startTimelineRun, timelineOutputUrl, uploadTimelineAudio, type TimelineWorkspace } from "./timelineApi";
+import { cancelTimelineRun, getTimeline, retryTimelineRun, saveTimeline, startTimelineRun, timelineOutputUrl, uploadTimelineAudio, type TimelineWorkspace } from "./timelineApi";
 
 const workspace: TimelineWorkspace = {
   revision: 3,
@@ -37,16 +37,21 @@ describe("timelineApi", () => {
   it("取消任务、音频上传和完成输出地址不会混用素材或任务路径", async () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce(new Response(JSON.stringify(workspace), { status: 200 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify(workspace), { status: 200 }));
+      .mockResolvedValueOnce(new Response(JSON.stringify(workspace), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(workspace), { status: 202 }));
     const file = new File(["voice"], "voice.webm", { type: "audio/webm" });
 
     await cancelTimelineRun("project/001", "run/001");
     await uploadTimelineAudio("project/001", file);
+    await retryTimelineRun("project/001", "run/001", "retry-key");
 
     expect(fetch).toHaveBeenNthCalledWith(1, "/api/projects/project%2F001/timeline/runs/run%2F001/cancel", {
       method: "POST", headers: { "Content-Type": "application/json", "x-aivre-intent": "semantic-analysis" }, body: "{}",
     });
     expect(fetch).toHaveBeenNthCalledWith(2, "/api/projects/project%2F001/preproduction/assets?role=audio", { method: "POST", body: expect.any(FormData) });
+    expect(fetch).toHaveBeenNthCalledWith(3, "/api/projects/project%2F001/timeline/runs/run%2F001/retry", {
+      method: "POST", headers: { "Content-Type": "application/json", "x-aivre-intent": "semantic-analysis" }, body: JSON.stringify({ idempotencyKey: "retry-key" }),
+    });
     expect(timelineOutputUrl("project/001", "run/001")).toBe("/api/projects/project%2F001/timeline/runs/run%2F001/output");
   });
 });

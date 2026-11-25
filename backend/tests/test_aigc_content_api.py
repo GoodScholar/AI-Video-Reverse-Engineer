@@ -92,23 +92,23 @@ def test_disclosure_shows_exact_text_without_media_or_storage_paths(tmp_path):
         assert "private-front.png" not in payload["prompt"] and "private-use.mp4" not in payload["prompt"]
         assert str(tmp_path) not in payload["prompt"]
 
-        denied = client.post(base + "/candidates", json={"briefRevision": 1, "provider": "local_openai_compatible",
+        denied = client.post(base + "/generation-runs", json={"briefRevision": 1, "provider": "local_openai_compatible",
                                                        "model": "local-model", "digest": payload["digest"],
-                                                       "disclosureAccepted": False}, headers=INTENT)
+                                                       "disclosureAccepted": False, "idempotencyKey": "denied"}, headers=INTENT)
         assert denied.status_code == 422
         assert client.get(base).json()["candidates"] == []
-        unconfigured = client.post(base + "/candidates", json={"briefRevision": 1, "provider": "local_openai_compatible",
+        unconfigured = client.post(base + "/generation-runs", json={"briefRevision": 1, "provider": "local_openai_compatible",
                                                             "model": "local-model", "digest": payload["digest"],
-                                                            "disclosureAccepted": True}, headers=INTENT)
+                                                            "disclosureAccepted": True, "idempotencyKey": "unconfigured"}, headers=INTENT)
         assert unconfigured.status_code == 422
         assert unconfigured.json()["detail"]["code"] == "provider_unconfigured"
         configured = client.put("/api/analysis-providers/local_openai_compatible/configuration",
                                 json={"model": "local-model", "baseUrl": "http://127.0.0.1:8188/v1"}, headers=INTENT)
         assert configured.status_code == 200, configured.text
         assert configured.json()["verificationState"] == "unverified"
-        unverified = client.post(base + "/candidates", json={"briefRevision": 1, "provider": "local_openai_compatible",
+        unverified = client.post(base + "/generation-runs", json={"briefRevision": 1, "provider": "local_openai_compatible",
                                                        "model": "local-model", "digest": payload["digest"],
-                                                       "disclosureAccepted": True}, headers=INTENT)
+                                                       "disclosureAccepted": True, "idempotencyKey": "unverified"}, headers=INTENT)
         assert unverified.status_code == 422
         assert unverified.json()["detail"]["code"] == "provider_unconfigured"
 
@@ -144,23 +144,27 @@ def test_confirmed_disclosure_generates_five_saved_candidates(tmp_path):
         assert client.put(base + "/brief", json={"revision": 0, "brief": brief}).status_code == 200
         disclosure = client.post(base + "/disclosure", json={"provider": "local_openai_compatible", "model": "local-model"}).json()
 
-        response = client.post(base + "/candidates", json={"briefRevision": disclosure["briefRevision"],
+        response = client.post(base + "/generation-runs", json={"briefRevision": disclosure["briefRevision"],
             "provider": disclosure["provider"], "model": disclosure["model"], "digest": disclosure["digest"],
-            "disclosureAccepted": True})
+            "disclosureAccepted": True, "idempotencyKey": "marketing-run"})
 
-        assert response.status_code == 201, response.text
-        candidates = response.json()["candidates"]
+        assert response.status_code == 202, response.text
+        run = response.json()["run"]
+        assert run["status"] == "completed"
+        assert client.get(base).json()["candidates"] == []
+        adopted = client.post(base + f"/generation-runs/{run['id']}/outputs/{run['outputItems'][0]['resultId']}/adopt")
+        assert adopted.status_code == 200, adopted.text
+        candidates = adopted.json()["candidates"]
         assert len(candidates) == 5
+        assert all(candidate["sourceRunId"] == run["id"] and candidate["sourceResultId"] == run["outputItems"][0]["resultId"] for candidate in candidates)
         assert candidates[0]["beats"][0]["assetId"] == "front"
         assert candidates[0]["briefRevision"] == 1
         assert client.get(base).json()["candidates"] == candidates
         assert len(calls) == 1 and calls[0][2] == disclosure["prompt"]
 
-        stale = client.post(base + "/candidates", json={"briefRevision": disclosure["briefRevision"],
-            "provider": disclosure["provider"], "model": disclosure["model"], "digest": disclosure["digest"],
-            "disclosureAccepted": True})
-        assert stale.status_code == 409
-        assert client.get(base).json()["candidates"] == candidates
+        duplicate = client.post(base + f"/generation-runs/{run['id']}/outputs/{run['outputItems'][0]['resultId']}/adopt")
+        assert duplicate.status_code == 200
+        assert duplicate.json()["candidates"] == candidates
 
         first_url = f"{base}/candidates/{candidates[0]['id']}"
         confirmed = client.post(first_url + "/confirm", json={"revision": 0})
@@ -175,6 +179,63 @@ def test_confirmed_disclosure_generates_five_saved_candidates(tmp_path):
         reopened = client.get(base).json()["candidates"]
         assert reopened[0]["sellingPoint"] == "新卖点"
         assert reopened[1]["sellingPoint"] == "卖点 1"
+
+
+def test_generation_run_persists_structured_result_without_automatically_creating_candidates(tmp_path):
+    project_id = "generation-run-1"
+    asset_root = tmp_path / "project-files" / project_id / "preproduction"
+    asset_root.mkdir(parents=True)
+    (asset_root / "state.json").write_text(json.dumps({"schemaVersion": 1, "revision": 1, "brief": {}, "shots": [], "assets": [
+        {"id": "front", "name": "杯盖展示", "notes": "防泼溅", "kind": "image", "file": "front.png"},
+        {"id": "use", "name": "通勤展示", "notes": "背包收纳", "kind": "video", "file": "use.mp4", "duration": 4},
+    ]}), encoding="utf-8")
+
+    def generate(*_args):
+        return json.dumps({"candidates": [{"sellingPoint": f"卖点 {index}", "beats": [
+            {"text": f"杯盖防泼溅 {index}", "factIds": ["f1"], "assetId": "front"},
+            {"text": "通勤随手带", "factIds": ["f1"], "assetId": "use"},
+        ]} for index in range(5)]})
+
+    app = FastAPI()
+    app.include_router(create_aigc_content_router(tmp_path, lambda _: True, script_generator=generate))
+    base = f"/api/projects/{project_id}/aigc-content"
+    brief = {"productName": "晴雨杯", "facts": [{"id": "f1", "text": "杯盖防泼溅"}], "audience": "通勤者",
+             "sellingPoints": ["携带方便"], "callToAction": "查看详情", "forbiddenPhrases": [], "assetIds": ["front", "use"]}
+    with TestClient(app) as client:
+        assert client.put(base + "/brief", json={"revision": 0, "brief": brief}).status_code == 200
+        disclosure = client.post(base + "/disclosure", json={"provider": "local_openai_compatible", "model": "local-model"}).json()
+
+        submitted = client.post(base + "/generation-runs", json={
+            "briefRevision": disclosure["briefRevision"], "provider": disclosure["provider"], "model": disclosure["model"],
+            "digest": disclosure["digest"], "disclosureAccepted": True, "idempotencyKey": "same-input",
+        })
+
+        assert submitted.status_code == 202, submitted.text
+        run = submitted.json()["run"]
+        assert run["status"] == "completed"
+        assert run["modality"] == "text"
+        assert "disclosure" not in run
+        assert "apiKey" not in json.dumps(run)
+        assert client.get(base).json()["candidates"] == []
+        reread = client.get(base + f"/generation-runs/{run['id']}")
+        assert reread.status_code == 200
+        assert reread.json()["outputItems"][0]["text"]
+        assert client.put(base + "/brief", json={"revision": 1, "brief": {**brief, "audience": "新受众"}}).status_code == 200
+        stale_adoption = client.post(base + f"/generation-runs/{run['id']}/outputs/{run['outputItems'][0]['resultId']}/adopt")
+        assert stale_adoption.status_code == 409
+        assert stale_adoption.json()["detail"]["code"] == "aigc_disclosure_stale"
+
+
+def test_legacy_candidate_endpoint_cannot_bypass_explicit_run_and_adoption(tmp_path):
+    app = FastAPI()
+    app.include_router(create_aigc_content_router(tmp_path, lambda _: True, script_generator=lambda *_: "{}"))
+    base = "/api/projects/no-direct-candidates/aigc-content"
+
+    with TestClient(app) as client:
+        response = client.post(base + "/candidates", json={"disclosureAccepted": True})
+
+    assert response.status_code == 410
+    assert response.json()["detail"]["code"] == "aigc_generation_run_required"
 
 
 def test_only_five_current_confirmed_candidates_enter_batch_editing(tmp_path):

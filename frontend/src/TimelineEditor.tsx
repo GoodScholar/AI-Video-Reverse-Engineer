@@ -6,7 +6,7 @@ import { ShotClipReplacement, type ShotResult } from "./ShotClipReplacement";
 import { type ChangeEvent, type KeyboardEvent, type PointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Copy, Download, Eye, EyeOff, LoaderCircle, Mic, MicOff, Pause, Plus, Save, Scissors, Trash2, Undo2, Redo2, Volume2, VolumeX } from "lucide-react";
 
-import { analyzeTimelineReframe, cancelTimelineReframe, preflightTimeline, type TimelinePreflight, cancelTimelineRun, getTimeline, importShotResults, saveTimeline, validateTimelineDraft, startTimelineRun, timelineOutputUrl, uploadTimelineAudio, type TimelineAsset, type TimelineClip, type TimelineFormat, type TimelineTrack, type TimelineTrackKind, type TimelineWorkspace } from "./timelineApi";
+import { analyzeTimelineReframe, cancelTimelineReframe, preflightTimeline, type TimelinePreflight, cancelTimelineRun, getTimeline, importShotResults, saveTimeline, validateTimelineDraft, startTimelineRun, retryTimelineRun, timelineOutputUrl, uploadTimelineAudio, type TimelineAsset, type TimelineClip, type TimelineFormat, type TimelineTrack, type TimelineTrackKind, type TimelineWorkspace } from "./timelineApi";
 import "./timeline.css";
 import { TransitionControls } from "./TransitionControls";
 import { changeBoundary, reconcileBoundaries } from "./timelineTransitions";
@@ -18,13 +18,33 @@ type SelectedClip = { trackId: string; clipId: string } | null;
 type RecorderCtor = typeof MediaRecorder;
 
 const scaleOptions = [40, 70, 100, 140, 180];
-const activeStatuses = new Set(["queued", "running"]);
+const activeStatuses = new Set(["queued", "running", "cancel_requested"]);
 const formatLabels: Record<TimelineFormat, string> = { preview: "预览 MP4", mp4: "成片 MP4", wav: "音轨 WAV" };
-const runStatusLabels = { queued: "排队中", running: "渲染中", completed: "已完成", failed: "失败", cancelled: "已取消" } as const;
+const runStatusLabels = { queued: "排队中", running: "渲染中", cancel_requested: "取消中", cancelled: "已取消", failed: "失败", unknown: "状态未知", partial_success: "部分成功", completed: "已完成" } as const;
 
 function errorMessage(error: unknown, fallback: string) { return error instanceof Error ? error.message : fallback; }
 function draftOf(workspace: TimelineWorkspace): Draft { return { revision: workspace.revision, settings: workspace.settings, tracks: workspace.tracks, ...(workspace.transitions ? { transitions: workspace.transitions } : {}), ...(workspace.packaging !== undefined ? { packaging: workspace.packaging } : {}) }; }
 function snapshot(workspace: Draft | null) { return workspace ? JSON.stringify(workspace) : ""; }
+function newIdempotencyKey(prefix: string) {
+  const token = typeof globalThis.crypto?.randomUUID === "function" ? globalThis.crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return `${prefix}:${token}`;
+}
+function pendingIdempotencyKey(memory: Map<string, string>, scope: string, prefix: string) {
+  const cached = memory.get(scope);
+  if (cached) return cached;
+  try {
+    const stored = sessionStorage.getItem(scope);
+    if (stored) { memory.set(scope, stored); return stored; }
+  } catch { /* The in-memory key still protects retries in this mounted editor. */ }
+  const created = newIdempotencyKey(prefix);
+  memory.set(scope, created);
+  try { sessionStorage.setItem(scope, created); } catch { /* See fallback above. */ }
+  return created;
+}
+function clearIdempotencyKey(memory: Map<string, string>, scope: string, value: string) {
+  if (memory.get(scope) === value) memory.delete(scope);
+  try { if (sessionStorage.getItem(scope) === value) sessionStorage.removeItem(scope); } catch { /* Storage is optional. */ }
+}
 function numberInput(value: string, fallback: number) { const next = Number(value); return Number.isFinite(next) ? next : fallback; }
 function clamp(value: number, min: number, max: number) { return Math.min(max, Math.max(min, value)); }
 function id(prefix: string) { return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`; }
@@ -82,6 +102,7 @@ export function TimelineEditor({ projectId, onDraftChange, preproductionRevision
   const savedSnapshotRef = useRef(savedSnapshot);
   const busyRef = useRef<string | null>(busy);
   const recordingPendingRef = useRef(false);
+  const pendingIdempotencyKeys = useRef(new Map<string, string>());
   const audioInputRef = useRef<HTMLInputElement>(null);
   const previewRef = useRef<HTMLVideoElement | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -110,8 +131,10 @@ export function TimelineEditor({ projectId, onDraftChange, preproductionRevision
     return track && clip ? { track, clip, asset: workspace.assets.find((item) => item.id === clip.assetId) } : null;
   }, [workspace, selectedClip]);
   const selectedTrack = workspace?.tracks.find((track) => track.id === selectedTrackId) ?? workspace?.tracks[0] ?? null;
-  const previews = workspace?.runs.filter((run) => run.format === "preview") ?? [];
-  const latestPreview = previews[previews.length - 1]?.status === "completed" ? previews[previews.length - 1] : null;
+  const currentPreviews = workspace?.runs.filter((run) => run.format === "preview" && run.revision === workspace.revision) ?? [];
+  const latestPreview = currentPreviews[currentPreviews.length - 1]?.status === "completed" ? currentPreviews[currentPreviews.length - 1] : null;
+  const historicalPreviews = workspace?.runs.filter((run) => run.format === "preview" && run.status === "completed" && run.revision !== workspace.revision) ?? [];
+  const historicalPreview = historicalPreviews[historicalPreviews.length - 1] ?? null;
   const hasActiveRun = Boolean(workspace?.runs.some((run) => activeStatuses.has(run.status)));
 
   function accept(next: TimelineWorkspace, submitted?: string) {
@@ -373,7 +396,11 @@ export function TimelineEditor({ projectId, onDraftChange, preproductionRevision
       }
       setPreflight(result);
       if (checkOnly || !result.ready) return;
-      accept(await startTimelineRun(projectId, workspace.revision, format));
+      const keyScope = `aivre:timeline-submit:${projectId}:${workspace.revision}:${format}`;
+      const idempotencyKey = pendingIdempotencyKey(pendingIdempotencyKeys.current, keyScope, `timeline:${projectId}:${workspace.revision}:${format}`);
+      const next = await startTimelineRun(projectId, workspace.revision, format, idempotencyKey);
+      clearIdempotencyKey(pendingIdempotencyKeys.current, keyScope, idempotencyKey);
+      accept(next);
     }
     catch (reason) { if (mounted.current && projectRef.current === projectId) setError(errorMessage(reason, "无法提交渲染任务。")); }
     finally { if (mounted.current && projectRef.current === projectId) setBusy(null); }
@@ -383,6 +410,19 @@ export function TimelineEditor({ projectId, onDraftChange, preproductionRevision
     setBusy(`cancel-${runId}`); setError("");
     try { accept(await cancelTimelineRun(projectId, runId)); }
     catch (reason) { if (mounted.current && projectRef.current === projectId) setError(errorMessage(reason, "无法取消渲染任务。")); }
+    finally { if (mounted.current && projectRef.current === projectId) setBusy(null); }
+  }
+  async function retry(runId: string) {
+    if (busy) return;
+    setBusy(`retry-${runId}`); setError("");
+    const keyScope = `aivre:timeline-retry:${projectId}:${runId}`;
+    const idempotencyKey = pendingIdempotencyKey(pendingIdempotencyKeys.current, keyScope, `timeline-retry:${runId}`);
+    try {
+      const next = await retryTimelineRun(projectId, runId, idempotencyKey);
+      clearIdempotencyKey(pendingIdempotencyKeys.current, keyScope, idempotencyKey);
+      accept(next);
+    }
+    catch (reason) { if (mounted.current && projectRef.current === projectId) setError(errorMessage(reason, "无法重试渲染任务。")); }
     finally { if (mounted.current && projectRef.current === projectId) setBusy(null); }
   }
   async function uploadAudio(file: File) {
@@ -538,7 +578,7 @@ export function TimelineEditor({ projectId, onDraftChange, preproductionRevision
           if (track && clip) { setSelectedTrackId(track.id); setSelectedClip({ trackId: track.id, clipId: clip.id }); setPlayhead(clip.start); setImportFocus({ trackId: track.id, clipId: clip.id, start: clip.start }); }
         }}>定位片段</button>}</li>)}</ul></div>}
     </section>
-    <section className="timeline-render"><div><h3>已保存版本渲染</h3><p>{dirty ? "当前草稿尚未保存；下方结果仍对应较早版本。" : `当前已保存版本：${workspace.revision}`}</p></div><div className="timeline-render-actions"><button type="button" className="primary-action" disabled={dirty || hasActiveRun || Boolean(busy)} onClick={() => void submitRun("preview")}>{busy === "run-preview" ? <LoaderCircle className="loading-spinner" size={16} /> : <Pause size={16} />}渲染预览 MP4</button><button type="button" className="secondary-action" disabled={dirty || hasActiveRun || Boolean(busy)} onClick={() => void submitRun("mp4")}><Download size={16} />导出 MP4</button><button type="button" className="secondary-action" disabled={dirty || hasActiveRun || Boolean(busy)} onClick={() => void submitRun("wav")}><Download size={16} />导出 WAV</button></div>{latestPreview && <figure className="timeline-preview"><video ref={previewRef} onTimeUpdate={(event) => setPlayhead(event.currentTarget.currentTime)} controls preload="metadata" src={latestPreview.url ?? timelineOutputUrl(projectId, latestPreview.id)} /><figcaption>{latestPreview.revision === workspace.revision && !dirty ? "已保存版本预览" : `旧预览：版本 ${latestPreview.revision}，当前版本 ${workspace.revision}`}</figcaption></figure>}<ul className="timeline-runs">{workspace.runs.map((run) => <li key={run.id}><span>{formatLabels[run.format]} · 版本 {run.revision}</span><strong className={`timeline-run--${run.status}`}>{runStatusLabels[run.status]}</strong>{run.error && <span>{run.error}</span>}{activeStatuses.has(run.status) && <button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void cancel(run.id)}>取消</button>}{(run.status === "failed" || run.status === "cancelled") && <button type="button" className="secondary-action" disabled={dirty || hasActiveRun || Boolean(busy)} onClick={() => void submitRun(run.format)}>重新提交</button>}{!activeStatuses.has(run.status) && <HistoryCleanup<TimelineWorkspace & { cleanupWarning?: string }> label="清理记录" revision={workspace.revision} disabled={dirty || Boolean(busy)}
+    <section className="timeline-render"><div><h3>已保存版本渲染</h3><p>{dirty ? "当前草稿尚未保存；下方结果仍对应较早版本。" : `当前已保存版本：${workspace.revision}`}</p></div><div className="timeline-render-actions"><button type="button" className="primary-action" disabled={dirty || hasActiveRun || Boolean(busy)} onClick={() => void submitRun("preview")}>{busy === "run-preview" ? <LoaderCircle className="loading-spinner" size={16} /> : <Pause size={16} />}渲染预览 MP4</button><button type="button" className="secondary-action" disabled={dirty || hasActiveRun || Boolean(busy)} onClick={() => void submitRun("mp4")}><Download size={16} />导出 MP4</button><button type="button" className="secondary-action" disabled={dirty || hasActiveRun || Boolean(busy)} onClick={() => void submitRun("wav")}><Download size={16} />导出 WAV</button></div>{latestPreview && <figure className="timeline-preview"><video ref={previewRef} onTimeUpdate={(event) => setPlayhead(event.currentTarget.currentTime)} controls preload="metadata" src={latestPreview.url ?? timelineOutputUrl(projectId, latestPreview.id)} /><figcaption>当前已保存版本预览</figcaption></figure>}{historicalPreview && <figure className="timeline-preview timeline-preview--historical"><video controls preload="metadata" src={historicalPreview.url ?? timelineOutputUrl(projectId, historicalPreview.id)} /><figcaption>历史预览：版本 {historicalPreview.revision}，未作为当前预览采用。</figcaption></figure>}<ul className="timeline-runs">{workspace.runs.map((run) => <li key={run.id}><span>{formatLabels[run.format]} · 版本 {run.revision}</span><strong className={`timeline-run--${run.status}`}>{runStatusLabels[run.status]}</strong><span>公共运行 ID：{run.commonRunId ?? `timeline:${run.id}`}</span><span>领域：{run.domainKind === "timeline.render" ? "时间线渲染" : run.domainKind ?? "旧记录"} · 尝试 {run.attempt ?? 1}</span>{run.retryOf && <span>重试自：{run.retryOf}</span>}{run.logs?.some((entry) => entry.event === "retained_not_adopted") && <span>迟到结果已保留，未采用。</span>}{run.error && <span>{run.error}</span>}{activeStatuses.has(run.status) && <button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void cancel(run.id)}>取消</button>}{(run.status === "failed" || run.status === "cancelled") && <button type="button" className="secondary-action" disabled={dirty || hasActiveRun || Boolean(busy)} onClick={() => void retry(run.id)}>重试</button>}{!activeStatuses.has(run.status) && <HistoryCleanup<TimelineWorkspace & { cleanupWarning?: string }> label="清理记录" revision={workspace.revision} disabled={dirty || Boolean(busy)}
       previewUrl={`/api/projects/${encodeURIComponent(projectId)}/timeline/runs/${encodeURIComponent(run.id)}/cleanup-preview`}
       deleteUrl={`/api/projects/${encodeURIComponent(projectId)}/timeline/runs/${encodeURIComponent(run.id)}/delete`}
       onBusy={(active) => setBusy(active ? "history-cleanup" : null)} onComplete={(next) => { accept(next); setImportNotice(next.cleanupWarning ?? "渲染历史已清理，原素材和当前时间线保留。"); }} />}

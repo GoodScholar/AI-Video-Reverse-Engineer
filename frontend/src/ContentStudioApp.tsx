@@ -5,6 +5,10 @@ import type { BatchAsset } from "./batchEditingApi";
 import { getBatchWorkspace } from "./batchEditingApi";
 import { listAnalysisProviders } from "./analysisProviderApi";
 import { AnalysisProviderSettings } from "./AnalysisProviderSettings";
+import { BilibiliSessionSettings } from "./BilibiliSessionSettings";
+import { DouyinSessionSettings } from "./DouyinSessionSettings";
+import { ImageGenerationSettings } from "./ImageGenerationSettings";
+import { KuaishouSessionSettings } from "./KuaishouSessionSettings";
 import { ContentProductionWorkspace, type StudioProjectPage } from "./ContentProductionWorkspace";
 import { ProjectBackup } from "./ProjectBackup";
 import { ReferenceMediaPanel } from "./ReferenceMediaPanel";
@@ -105,11 +109,11 @@ export function ContentStudioApp(){
           {error&&<div className="studio-error" role="alert"><p>{error}</p><button type="button" className="sp-button" onClick={()=>void loadProjects()}>重新读取项目</button></div>}
           {!loading&&!error&&<div className="sp-project-grid">{projects.map(item=><button type="button" className="sp-project studio-project-card" key={item.id} aria-label={`打开项目 ${item.name}`} disabled={dirty&&project?.id!==item.id} onClick={()=>openProject(item)}><div className="studio-project-visual"><Clapperboard size={32}/><span>本地项目</span></div><div><span className="sp-tag">内容项目</span><h3>{item.name}</h3><p>最近更新 {new Date(item.updatedAt).toLocaleDateString("zh-CN")}</p><span>继续制作<ArrowRight size={15}/></span></div></button>)}{!projects.length&&<div className="sp-empty"><FolderOpen size={28}/><h3>还没有项目</h3><p>填写项目名称，再添加获准使用的商品素材。</p></div>}</div>}
         </>}
-        {providerError&&<div className="studio-error" role="alert"><p>{providerError}</p><button type="button" className="sp-button" onClick={()=>void loadProviders()}>重新读取 AI 服务设置</button></div>}
-        {project&&<div hidden={page==="projects"||page==="settings"}><ContentProductionWorkspace key={project.id} project={project} tools={tools} active={page!=="projects"&&page!=="settings"} page={page==="projects"||page==="settings"?"create":page} onNavigate={navigate} onDirtyChange={onDirty}/></div>}
+        {providerError&&page!=="canvas"&&<div className="studio-error" role="alert"><p>{providerError}</p><button type="button" className="sp-button" onClick={()=>void loadProviders()}>重新读取 AI 服务设置</button></div>}
+        {project&&<div hidden={page==="projects"||page==="settings"}><ContentProductionWorkspace key={project.id} project={project} tools={tools} active={page!=="projects"&&page!=="settings"} page={page==="projects"||page==="settings"?"create":page} onNavigate={navigate} onOpenSettings={()=>{setSettingsTab("services");navigate("settings");}} onDirtyChange={onDirty}/></div>}
         {page==="tools"&&!project&&<div className="sp-empty"><Clapperboard size={32}/><h2>先选择需要处理的项目</h2><p>工具使用项目里的素材，并把结果保存回该项目。</p><button type="button" className="sp-button sp-primary" onClick={()=>navigate("projects")}>选择项目<ArrowRight size={16}/></button></div>}
         {page==="settings"&&<><div className="sp-work-heading"><div><h2>为制作准备好环境</h2><p>服务连接、声音与备份集中在这里。</p></div></div><div className="sp-settings-layout"><nav aria-label="设置分类">{[["services","AI 服务连接"],["local","声音与渲染说明"],["files","文件与备份"]].map(([id,label])=><button type="button" key={id} aria-pressed={settingsTab===id} onClick={()=>setSettingsTab(id)}>{label}<ArrowRight size={15}/></button>)}</nav><section className="sp-settings-panel">
-          {settingsTab==="services"&&<AnalysisProviderSettings providers={providers} onProvidersChanged={setProviders}/>}
+          {settingsTab==="services"&&<><AnalysisProviderSettings providers={providers} onProvidersChanged={setProviders}/><ImageGenerationSettings /><TextGenerationSettings /><BilibiliSessionSettings /><DouyinSessionSettings /><KuaishouSessionSettings /></>}
           {settingsTab==="local"&&<><h3>本地声音与视频制作</h3><p>选声制作步骤会读取真实音色目录与运行环境，支持描述、适用场景及试听。</p><p>配音使用已准备的本机 Qwen3-TTS；视频使用现有 FFmpeg。缺失环境会显示原因，不自动下载。</p><button type="button" className="sp-button sp-primary" onClick={()=>navigate(project?"create":"projects")}>前往制作<ArrowRight size={16}/></button></>}
           {settingsTab==="files"&&<ProjectBackup projectId={project?.id} hasUnsavedDraft={dirty} onRestored={restored=>{setProjects(current=>[restored,...current]);setProject(restored);setPage("create");}}/>}
         </section></div></>}

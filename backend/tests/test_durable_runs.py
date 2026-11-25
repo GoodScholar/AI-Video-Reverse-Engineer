@@ -1,6 +1,7 @@
 from threading import Event
 
 import pytest
+import app.durable_runs as durable_runs
 
 from app.durable_runs import (
     EXTERNAL_RUN_POLICY,
@@ -88,6 +89,20 @@ def test_cancelled_run_rejects_late_completion_and_completion_has_no_business_de
     assert not hasattr(completion, "approved")
     assert not hasattr(completion, "adopted")
     assert not hasattr(completion, "delivered")
+
+
+def test_public_contract_distinguishes_cancel_request_from_worker_acknowledgement():
+    assert durable_runs.PUBLIC_RUN_STATUSES == frozenset({
+        "queued", "running", "cancel_requested", "cancelled", "failed", "unknown", "partial_success", "completed",
+    })
+    assert LOCAL_RUN_POLICY.cancel("queued") == "cancelled"
+    assert LOCAL_RUN_POLICY.cancel("running") == "cancelled"
+    assert LOCAL_RUN_POLICY.request_cancel("running") == "cancel_requested"
+    assert LOCAL_RUN_POLICY.acknowledge_cancel("cancel_requested") == "cancelled"
+    with pytest.raises(RunConflict, match="取消请求"):
+        LOCAL_RUN_POLICY.complete(
+            "cancel_requested", frozen_input=freeze_run_input({"revision": 1}), current_input={"revision": 1}, result={"output": "ignored.mp4"},
+        )
 
 
 @pytest.mark.parametrize("decision", ["approved", "adopted", "delivered", "reviewDecision"])

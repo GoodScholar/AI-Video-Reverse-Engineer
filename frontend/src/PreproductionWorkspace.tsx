@@ -10,6 +10,21 @@ import {
   importPreparationShots,
   importToolkitAssets,
   importReferenceAssets,
+  importYoutubeVideo,
+  getYoutubeImportRun,
+  cancelYoutubeImportRun,
+  retryYoutubeImportRun,
+  probeYoutubeVideo,
+  importBilibiliVideo,
+  getBilibiliImportRun,
+  cancelBilibiliImportRun,
+  retryBilibiliImportRun,
+  probeBilibiliVideo,
+  importDouyinVideo,
+  getDouyinImportRun,
+  cancelDouyinImportRun,
+  retryDouyinImportRun,
+  probeDouyinVideo,
   runPreproductionNode,
   savePreproductionWorkspace,
   uploadPreproductionAsset,
@@ -21,6 +36,12 @@ import {
   type PreproductionNode,
   type PreproductionShot,
   type PreproductionWorkspace as Workspace,
+  type YoutubeProbe,
+  type YoutubeImportRun,
+  type BilibiliProbe,
+  type BilibiliImportRun,
+  type DouyinProbe,
+  type DouyinImportRun,
 } from "./preproductionApi";
 import "./preproduction.css";
 import { ReproductionFlow } from "./ReproductionFlow";
@@ -31,6 +52,10 @@ import { TimelineEditor } from "./TimelineEditor";
 import { BatchEditor } from "./BatchEditor";
 import { ShotWorkspaceLayout } from "./ShotWorkspaceLayout";
 import { createPreproductionWorkspaceStore, selectWorkspaceDirty, selectWorkspaceSnapshot } from "./preproductionWorkspaceStore";
+import { ImageGenerationPanel } from "./ImageGenerationPanel";
+import { VideoGenerationPanel } from "./VideoGenerationPanel";
+import { XiaohongshuImportPanel } from "./XiaohongshuImportPanel";
+import { KuaishouImportPanel } from "./KuaishouImportPanel";
 
 type Props = { project: Project; tools: ReactNode; onDraftChange?: (projectId: string, dirty: boolean) => void;
   importedWorkspace?: {projectId:string;workspace:Workspace}; sectionOverride?: Section; studioMode?: boolean; onAssetsChanged?: (assets: Workspace["assets"]) => void };
@@ -42,6 +67,26 @@ const kindLabels: Record<NodeKind, string> = {
 };
 const statusLabels = { pending: "待运行", queued: "已排队", running: "运行中", completed: "已完成", failed: "错误", stale: "已过期" } as const;
 const activeStatuses = new Set(["queued", "running"]);
+
+function TextAssetPreview({ url, name }: { url: string; name: string }) {
+  const [text, setText] = useState<string>();
+  const [error, setError] = useState("");
+  useEffect(() => {
+    const controller = new AbortController();
+    setText(undefined); setError("");
+    void fetch(url, { signal: controller.signal }).then(async response => {
+      if (!response.ok) throw new Error("文本素材暂不可读取，请重试下载。");
+      return response.text();
+    }).then(value => { if (!controller.signal.aborted) setText(value); })
+      .catch(reason => { if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : "文本素材暂不可读取。"); });
+    return () => controller.abort();
+  }, [url]);
+  return error ? <p role="alert">{error}</p> : <pre aria-label={`${name} 预览`} style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", maxHeight: 240, overflow: "auto" }}>{text ?? "正在读取文本…"}</pre>;
+}
+
+function isVideoFile(file: File) {
+  return file.type.startsWith("video/") || /\.(mp4|mov|webm)$/i.test(file.name);
+}
 
 function errorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
@@ -136,8 +181,27 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
   const selectedShotIds = useStore(workspaceStore, (state) => state.selection.selectedShotIds);
   const primaryEntity = useStore(workspaceStore, (state) => state.selection.primaryEntity);
   const [managedAssetId, setManagedAssetId] = useState<string | null>(null);
+  const [imageGenerationOpen, setImageGenerationOpen] = useState(false);
+  const [videoGenerationOpen, setVideoGenerationOpen] = useState(false);
+  useEffect(() => { setImageGenerationOpen(false); }, [project.id]);
   const [roleFilter, setRoleFilter] = useState<AssetRole | "all">("all");
   const [uploadRole, setUploadRole] = useState<AssetRole>("reference");
+  const [youtubeUrl, setYoutubeUrl] = useState("");
+  const [youtubeProbe, setYoutubeProbe] = useState<YoutubeProbe | null>(null);
+  const [youtubeRun, setYoutubeRun] = useState<YoutubeImportRun | null>(null);
+  const [youtubeDisclosureAccepted, setYoutubeDisclosureAccepted] = useState(false);
+  const [youtubeUseSession, setYoutubeUseSession] = useState(false);
+  const [bilibiliUrl, setBilibiliUrl] = useState("");
+  const [bilibiliProbe, setBilibiliProbe] = useState<BilibiliProbe | null>(null);
+  const [bilibiliPart, setBilibiliPart] = useState<number | null>(null);
+  const [bilibiliRun, setBilibiliRun] = useState<BilibiliImportRun | null>(null);
+  const [bilibiliDisclosureAccepted, setBilibiliDisclosureAccepted] = useState(false);
+  const [bilibiliUseSession, setBilibiliUseSession] = useState(false);
+  const [douyinUrl, setDouyinUrl] = useState("");
+  const [douyinProbe, setDouyinProbe] = useState<DouyinProbe | null>(null);
+  const [douyinRun, setDouyinRun] = useState<DouyinImportRun | null>(null);
+  const [douyinDisclosureAccepted, setDouyinDisclosureAccepted] = useState(false);
+  const [douyinUseSession, setDouyinUseSession] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState("");
@@ -220,6 +284,32 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
     });
     return () => { mounted.current = false; };
   }, [project.id, workspaceStore]);
+
+  useEffect(() => {
+    const runId = window.sessionStorage.getItem(`aivre:youtube-import:${project.id}`);
+    if (!runId) { setYoutubeRun(null); return; }
+    void getYoutubeImportRun(project.id, runId).then(result => setYoutubeRun(result.run)).catch(() => {
+      window.sessionStorage.removeItem(`aivre:youtube-import:${project.id}`);
+      setYoutubeRun(null);
+    });
+  }, [project.id]);
+
+  useEffect(() => {
+    const runId = window.sessionStorage.getItem(`aivre:douyin-import:${project.id}`);
+    if (!runId) { setDouyinRun(null); return; }
+    void getDouyinImportRun(project.id, runId).then(result => setDouyinRun(result.run)).catch(() => {
+      window.sessionStorage.removeItem(`aivre:douyin-import:${project.id}`); setDouyinRun(null);
+    });
+  }, [project.id]);
+
+  useEffect(() => {
+    const runId = window.sessionStorage.getItem(`aivre:bilibili-import:${project.id}`);
+    if (!runId) { setBilibiliRun(null); return; }
+    void getBilibiliImportRun(project.id, runId).then(result => setBilibiliRun(result.run)).catch(() => {
+      window.sessionStorage.removeItem(`aivre:bilibili-import:${project.id}`);
+      setBilibiliRun(null);
+    });
+  }, [project.id]);
 
   useEffect(() => {
     if (loading || !importedWorkspace || importedWorkspace.projectId !== project.id) return;
@@ -323,18 +413,142 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
   async function upload(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     if (!file || busy || dirty) return;
+    const rightsConfirmed = !isVideoFile(file) || window.confirm("请确认：你拥有该本地视频的使用权，并同意将其导入当前项目。取消不会上传或登记素材。");
+    if (!rightsConfirmed) { event.target.value = ""; return; }
     setBusy("upload"); setError("");
-    try { accept(await uploadPreproductionAsset(project.id, uploadRole, file)); }
+    try { accept(await uploadPreproductionAsset(project.id, uploadRole, file, undefined, isVideoFile(file))); }
     catch (reason) { setError(errorMessage(reason, "无法上传素材。")); }
     finally { event.target.value = ""; if (mounted.current) setBusy(null); }
+  }
+
+  async function probeYoutube() {
+    if (!youtubeUrl.trim() || busy || dirty) return;
+    setBusy("youtube-probe"); setError("");
+    try { setYoutubeProbe(await probeYoutubeVideo(project.id, youtubeUrl.trim(), youtubeUseSession)); }
+    catch (reason) { setYoutubeProbe(null); setError(errorMessage(reason, "无法读取 YouTube 视频信息。")); }
+    finally { if (mounted.current) setBusy(null); }
+  }
+
+  async function importYoutube() {
+    if (!youtubeProbe || busy || dirty) return;
+    if (!window.confirm("请确认：你拥有该 YouTube 视频的使用权。系统不会自动登录或绕过会员、私密、地区和 DRM 限制。")) return;
+    if (!window.confirm(`即将向 ${youtubeProbe.externalRequest.downloadHosts.join("、")} 发起下载请求：${youtubeProbe.externalRequest.purpose}`)) return;
+    setBusy("youtube-import"); setError("");
+    try {
+      const started = await importYoutubeVideo(project.id, {
+        url: youtubeUrl.trim(), role: uploadRole, rightsConfirmed: true, externalRequestAccepted: true, useSession: youtubeUseSession,
+      });
+      setYoutubeRun(started.run);
+      window.sessionStorage.setItem(`aivre:youtube-import:${project.id}`, started.run.id);
+    } catch (reason) { setError(errorMessage(reason, "无法导入 YouTube 视频。")); }
+    finally { if (mounted.current) setBusy(null); }
+  }
+
+  async function refreshYoutubeRun() {
+    if (!youtubeRun || busy) return;
+    setBusy("youtube-status"); setError("");
+    try {
+      const next = await getYoutubeImportRun(project.id, youtubeRun.id);
+      setYoutubeRun(next.run);
+      if (["completed", "failed", "cancelled"].includes(next.run.status)) window.sessionStorage.removeItem(`aivre:youtube-import:${project.id}`);
+      if (next.run.status === "completed") await reloadSavedWorkspace();
+    } catch (reason) { setError(errorMessage(reason, "无法读取 YouTube 导入状态。")); }
+    finally { if (mounted.current) setBusy(null); }
+  }
+
+  async function changeYoutubeRun(action: "cancel" | "retry") {
+    if (!youtubeRun || busy) return;
+    setBusy(`youtube-${action}`); setError("");
+    try { setYoutubeRun((await (action === "cancel" ? cancelYoutubeImportRun(project.id, youtubeRun.id) : retryYoutubeImportRun(project.id, youtubeRun.id))).run); }
+    catch (reason) { setError(errorMessage(reason, "无法更新 YouTube 导入状态。")); }
+    finally { if (mounted.current) setBusy(null); }
+  }
+
+  async function probeBilibili() {
+    if (!bilibiliUrl.trim() || busy || dirty) return;
+    setBusy("bilibili-probe"); setError("");
+    try {
+      const next = await probeBilibiliVideo(project.id, bilibiliUrl.trim(), bilibiliUseSession);
+      setBilibiliProbe(next); setBilibiliPart(next.parts.length === 1 ? next.parts[0].number : null);
+    } catch (reason) { setBilibiliProbe(null); setBilibiliPart(null); setError(errorMessage(reason, "无法读取 B站视频信息。")); }
+    finally { if (mounted.current) setBusy(null); }
+  }
+
+  async function importBilibili() {
+    if (!bilibiliProbe || bilibiliPart === null || busy || dirty) return;
+    if (!window.confirm("请确认：你拥有所选 B站分P视频的使用权。系统不会自动登录、读取浏览器 Cookie 或绕过会员、私密、地区和 DRM 限制。")) return;
+    if (!window.confirm(`即将向 ${bilibiliProbe.externalRequest.downloadHosts.join("、")} 发起下载请求：${bilibiliProbe.externalRequest.purpose}`)) return;
+    setBusy("bilibili-import"); setError("");
+    try {
+      const started = await importBilibiliVideo(project.id, { url: bilibiliUrl.trim(), part: bilibiliPart, role: uploadRole, rightsConfirmed: true, externalRequestAccepted: true, useSession: bilibiliUseSession });
+      setBilibiliRun(started.run); window.sessionStorage.setItem(`aivre:bilibili-import:${project.id}`, started.run.id);
+    } catch (reason) { setError(errorMessage(reason, "无法导入 B站视频。")); }
+    finally { if (mounted.current) setBusy(null); }
+  }
+
+  async function probeDouyin() {
+    if (!douyinUrl.trim() || busy || dirty) return;
+    setBusy("douyin-probe"); setError("");
+    try { setDouyinProbe(await probeDouyinVideo(project.id, douyinUrl.trim(), douyinUseSession)); }
+    catch (reason) { setDouyinProbe(null); setError(errorMessage(reason, "无法读取抖音视频信息。")); }
+    finally { setBusy(null); }
+  }
+
+  async function importDouyin() {
+    if (!douyinProbe || busy || dirty) return;
+    if (!window.confirm(`即将向 ${douyinProbe.externalRequest.downloadHosts.join("、")} 发起下载请求：${douyinProbe.externalRequest.purpose}`)) return;
+    setBusy("douyin-import"); setError("");
+    try {
+      const started = await importDouyinVideo(project.id, { url: douyinUrl.trim(), role: uploadRole, rightsConfirmed: true, externalRequestAccepted: true, useSession: douyinUseSession });
+      setDouyinRun(started.run); window.sessionStorage.setItem(`aivre:douyin-import:${project.id}`, started.run.id);
+    } catch (reason) { setError(errorMessage(reason, "无法导入抖音视频。")); }
+    finally { setBusy(null); }
+  }
+
+  async function refreshDouyinRun() {
+    if (!douyinRun || busy) return;
+    setBusy("douyin-status"); setError("");
+    try {
+      const next = await getDouyinImportRun(project.id, douyinRun.id); setDouyinRun(next.run);
+      if (["completed", "failed", "cancelled"].includes(next.run.status)) window.sessionStorage.removeItem(`aivre:douyin-import:${project.id}`);
+    } catch (reason) { setError(errorMessage(reason, "无法读取抖音导入状态。")); }
+    finally { setBusy(null); }
+  }
+
+  async function changeDouyinRun(action: "cancel" | "retry") {
+    if (!douyinRun || busy) return;
+    setBusy(`douyin-${action}`); setError("");
+    try { setDouyinRun((await (action === "cancel" ? cancelDouyinImportRun(project.id, douyinRun.id) : retryDouyinImportRun(project.id, douyinRun.id))).run); }
+    catch (reason) { setError(errorMessage(reason, "无法更新抖音导入运行。")); }
+    finally { setBusy(null); }
+  }
+
+  async function refreshBilibiliRun() {
+    if (!bilibiliRun || busy) return;
+    setBusy("bilibili-status"); setError("");
+    try {
+      const next = await getBilibiliImportRun(project.id, bilibiliRun.id); setBilibiliRun(next.run);
+      if (["completed", "failed", "cancelled"].includes(next.run.status)) window.sessionStorage.removeItem(`aivre:bilibili-import:${project.id}`);
+      if (next.run.status === "completed") await reloadSavedWorkspace();
+    } catch (reason) { setError(errorMessage(reason, "无法读取 B站导入状态。")); }
+    finally { if (mounted.current) setBusy(null); }
+  }
+
+  async function changeBilibiliRun(action: "cancel" | "retry") {
+    if (!bilibiliRun || busy) return;
+    setBusy(`bilibili-${action}`); setError("");
+    try { setBilibiliRun((await (action === "cancel" ? cancelBilibiliImportRun(project.id, bilibiliRun.id) : retryBilibiliImportRun(project.id, bilibiliRun.id))).run); }
+    catch (reason) { setError(errorMessage(reason, "无法更新 B站导入状态。")); }
+    finally { if (mounted.current) setBusy(null); }
   }
 
   async function uploadResult(event: ChangeEvent<HTMLInputElement>) {
     const input = event.currentTarget;
     const file = input.files?.[0];
     if (!file || !workspace || !selectedShot || busy || dirty) return;
+    if (!window.confirm("请确认：你拥有该本地视频的使用权，并同意将其导入当前项目。取消不会上传或登记素材。")) { input.value = ""; return; }
     setBusy("result"); setError("");
-    try { accept(await uploadShotResult(project.id, selectedShot.id, workspace.revision, file)); }
+    try { accept(await uploadShotResult(project.id, selectedShot.id, workspace.revision, file, true)); }
     catch (reason) { if (mounted.current) setError(errorMessage(reason, "无法上传镜头结果。")); }
     finally { input.value = ""; if (mounted.current) setBusy(null); }
   }
@@ -416,10 +630,61 @@ export function PreproductionWorkspace({ project, tools, onDraftChange, sectionO
         </section>}
 
         {section === "assets" && <section className="preproduction-panel preproduction-native-form" aria-labelledby="preproduction-assets-title">
-          <div className="preproduction-panel-heading"><div><h3 id="preproduction-assets-title">素材库</h3><p>上传后按用途标记，镜头可以绑定多份素材。</p></div><div className="preproduction-import-actions"><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("reference")}>导入参考素材</button><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("shots")}>导入已有分镜</button><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("toolkit")}>导入工具产物</button></div></div>
+          <div className="preproduction-panel-heading"><div><h3 id="preproduction-assets-title">素材库</h3><p>上传后按用途标记，镜头可以绑定多份素材。</p></div><div className="preproduction-import-actions"><button type="button" className="secondary-action" onClick={() => setImageGenerationOpen((open) => !open)}>{imageGenerationOpen ? "收起图片生成" : "图片生成"}</button><button type="button" className="secondary-action" onClick={() => setVideoGenerationOpen((open) => !open)}>{videoGenerationOpen ? "收起视频生成" : "视频生成"}</button><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("reference")}>导入参考素材</button><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("shots")}>导入已有分镜</button><button type="button" className="secondary-action" disabled={dirty || Boolean(busy)} onClick={() => void importAction("toolkit")}>导入工具产物</button></div></div>
+          {imageGenerationOpen && <ImageGenerationPanel
+            projectId={project.id}
+            imageAssets={workspace.assets.filter((asset) => asset.kind === "image").map((asset) => ({
+              id: asset.id,
+              assetVersionId: (asset as typeof asset & { assetVersionId?: string }).assetVersionId ?? `${asset.id}-v1`,
+              name: asset.name,
+              kind: "image",
+              url: asset.url,
+            }))}
+            onInstalled={() => void reloadSavedWorkspace()}
+          />}
+          {videoGenerationOpen && <VideoGenerationPanel
+            projectId={project.id}
+            imageAssets={workspace.assets.filter((asset) => asset.kind === "image").map((asset) => ({
+              id: asset.id,
+              assetVersionId: (asset as typeof asset & { assetVersionId?: string }).assetVersionId ?? `${asset.id}-v1`,
+              name: asset.name,
+              kind: "image",
+              url: asset.url,
+            }))}
+            onInstalled={() => void reloadSavedWorkspace()}
+          />}
           <div className="preproduction-upload"><label>标记为<select value={uploadRole} onChange={(event) => setUploadRole(event.target.value as AssetRole)}>{Object.entries(roleLabels).map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label><button type="button" className="secondary-action" disabled={Boolean(busy) || dirty} onClick={() => uploadInputRef.current?.click()}><Upload size={16} aria-hidden="true" />{busy === "upload" ? "正在上传…" : "上传素材"}</button><input ref={uploadInputRef} aria-label="上传素材文件" hidden type="file" accept="image/*,video/*,audio/*" disabled={Boolean(busy) || dirty} onChange={upload} /></div>
+          <div className="preproduction-upload" aria-label="导入 YouTube 视频">
+            <label>YouTube 链接<input aria-label="YouTube 链接" value={youtubeUrl} placeholder="https://youtu.be/..." onChange={(event) => { setYoutubeUrl(event.target.value); setYoutubeProbe(null); }} /></label>
+            <p>读取链接会访问 YouTube 页面与播放器元数据 API；确认下载后还会访问 *.googlevideo.com。默认不读取或发送会话。</p>
+            <label><input type="checkbox" checked={youtubeDisclosureAccepted} onChange={(event) => setYoutubeDisclosureAccepted(event.target.checked)} />我已阅读并同意上述外发范围</label>
+            <label><input type="checkbox" checked={youtubeUseSession} onChange={(event) => setYoutubeUseSession(event.target.checked)} />仅在此链接需要时使用系统安全存储中的合法会话</label>
+            <button type="button" className="secondary-action" disabled={Boolean(busy) || dirty || !youtubeUrl.trim() || !youtubeDisclosureAccepted} onClick={() => void probeYoutube()}>{busy === "youtube-probe" ? "正在读取…" : "读取链接"}</button>
+            {youtubeProbe && <div role="status"><strong>{youtubeProbe.title}</strong><small>适配器：{youtubeProbe.adapter.id} {youtubeProbe.adapter.version} · 状态：{youtubeProbe.status} · 最近真实验证：{youtubeProbe.lastRealVerificationAt ?? "尚无真实验证（受控测试不计入）"}</small><p>{youtubeProbe.externalRequest.purpose}</p><button type="button" className="primary-action" disabled={Boolean(busy) || dirty} onClick={() => void importYoutube()}>{busy === "youtube-import" ? "正在创建导入…" : "确认权利并下载"}</button></div>}
+            {youtubeRun && <div role="status"><strong>导入运行：{youtubeRun.status}</strong><small>{youtubeRun.error ? `诊断：${youtubeRun.error}` : `运行标识：${youtubeRun.id}`}</small><button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void refreshYoutubeRun()}>刷新导入状态</button>{["queued", "running", "cancel_requested"].includes(youtubeRun.status) && <button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void changeYoutubeRun("cancel")}>取消导入</button>}{["failed", "cancelled"].includes(youtubeRun.status) && <button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void changeYoutubeRun("retry")}>重试导入</button>}</div>}
+          </div>
+          <div className="preproduction-upload" aria-label="导入 B站视频">
+            <label>B站链接<input aria-label="B站链接" value={bilibiliUrl} placeholder="https://www.bilibili.com/video/BV... 或 https://b23.tv/..." onChange={(event) => { setBilibiliUrl(event.target.value); setBilibiliProbe(null); setBilibiliPart(null); }} /></label>
+            <p>读取链接会访问 B站页面和元数据 API；b23.tv 仅做有限 HTTPS 跳转解析，最终必须为标准 BV 视频页。不会自动下载合集。</p>
+            <label><input type="checkbox" checked={bilibiliDisclosureAccepted} onChange={(event) => setBilibiliDisclosureAccepted(event.target.checked)} />我已阅读并同意上述外发范围</label>
+            <label><input type="checkbox" checked={bilibiliUseSession} onChange={(event) => setBilibiliUseSession(event.target.checked)} />仅在此链接需要时使用系统安全存储中的合法 B站会话</label>
+            <button type="button" className="secondary-action" disabled={Boolean(busy) || dirty || !bilibiliUrl.trim() || !bilibiliDisclosureAccepted} onClick={() => void probeBilibili()}>{busy === "bilibili-probe" ? "正在读取…" : "读取链接与分P"}</button>
+            {bilibiliProbe && <div role="status"><strong>{bilibiliProbe.title}</strong><small>适配器：{bilibiliProbe.adapter.id} {bilibiliProbe.adapter.version} · 状态：{bilibiliProbe.status} · 最近真实验证：{bilibiliProbe.lastRealVerificationAt ?? "尚无真实验证（受控测试不计入）"}</small><p>{bilibiliProbe.parts.length > 1 ? "该视频有多个分P，请明确选择一个后再下载。" : "单分P视频已可选择。"}</p><label>选择分P<select aria-label="选择 B站分P" value={bilibiliPart ?? ""} onChange={(event) => setBilibiliPart(Number(event.target.value) || null)}><option value="">请选择</option>{bilibiliProbe.parts.map(part => <option key={part.number} value={part.number}>P{part.number} · {part.title} · {part.durationSeconds ?? "未知"}秒</option>)}</select></label><button type="button" className="primary-action" disabled={Boolean(busy) || dirty || bilibiliPart === null} onClick={() => void importBilibili()}>{busy === "bilibili-import" ? "正在创建导入…" : "确认权利并下载所选分P"}</button></div>}
+            {bilibiliRun && <div role="status"><strong>导入运行：{bilibiliRun.status}</strong><small>{bilibiliRun.error ? `诊断：${bilibiliRun.error}` : `运行标识：${bilibiliRun.id}`}</small><button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void refreshBilibiliRun()}>刷新导入状态</button>{["queued", "running", "cancel_requested"].includes(bilibiliRun.status) && <button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void changeBilibiliRun("cancel")}>取消导入</button>}{["failed", "cancelled"].includes(bilibiliRun.status) && <button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void changeBilibiliRun("retry")}>重试导入</button>}</div>}
+          </div>
+          <div className="preproduction-upload" aria-label="导入抖音视频">
+            <label>抖音链接或分享文本<input aria-label="抖音链接或分享文本" value={douyinUrl} placeholder="https://www.douyin.com/video/... 或 https://v.douyin.com/..." onChange={(event) => { setDouyinUrl(event.target.value); setDouyinProbe(null); }} /></label>
+            <p>读取分享文本只接受唯一抖音链接；v.douyin.com 仅做有限、无代理且 DNS 固定的 HTTPS 跳转解析。系统不会绕过验证码、风控、地区或私密限制。</p>
+            <label><input type="checkbox" checked={douyinDisclosureAccepted} onChange={(event) => setDouyinDisclosureAccepted(event.target.checked)} />我已阅读并同意上述外发范围</label>
+            <label><input type="checkbox" checked={douyinUseSession} onChange={(event) => setDouyinUseSession(event.target.checked)} />仅在此链接需要时使用系统安全存储中的合法抖音会话</label>
+            <button type="button" className="secondary-action" disabled={Boolean(busy) || dirty || !douyinUrl.trim() || !douyinDisclosureAccepted} onClick={() => void probeDouyin()}>{busy === "douyin-probe" ? "正在读取…" : "读取链接"}</button>
+            {douyinProbe && <div role="status"><strong>{douyinProbe.title}</strong><small>适配器：{douyinProbe.adapter.id} {douyinProbe.adapter.version} · 状态：{douyinProbe.status} · 最近真实验证：{douyinProbe.lastRealVerificationAt ?? "尚无真实验证（受控测试不计入）"}</small><p>{douyinProbe.externalRequest.purpose}</p><button type="button" className="primary-action" disabled={Boolean(busy) || dirty} onClick={() => void importDouyin()}>{busy === "douyin-import" ? "正在创建导入…" : "确认权利并下载"}</button></div>}
+            {douyinRun && <div role="status"><strong>导入运行：{douyinRun.status}</strong><small>{douyinRun.error ? `诊断：${douyinRun.error}` : `运行标识：${douyinRun.id}`}</small><button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void refreshDouyinRun()}>刷新导入状态</button>{["queued", "running", "cancel_requested"].includes(douyinRun.status) && <button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void changeDouyinRun("cancel")}>取消导入</button>}{["failed", "cancelled"].includes(douyinRun.status) && <button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void changeDouyinRun("retry")}>重试导入</button>}</div>}
+          </div>
+          <XiaohongshuImportPanel projectId={project.id} role={uploadRole} disabled={dirty || Boolean(busy)} />
+          <KuaishouImportPanel projectId={project.id} role={uploadRole} disabled={dirty || Boolean(busy)} onInstalled={() => void reloadSavedWorkspace()} />
           <div className="preproduction-filters" role="group" aria-label="素材标签筛选"><button type="button" aria-pressed={roleFilter === "all"} className={roleFilter === "all" ? "is-active" : ""} onClick={() => setRoleFilter("all")}>全部</button>{(Object.entries(roleLabels) as Array<[AssetRole, string]>).map(([role, label]) => <button type="button" key={role} aria-pressed={roleFilter === role} className={roleFilter === role ? "is-active" : ""} onClick={() => setRoleFilter(role)}>{label}</button>)}</div>
-          {visibleAssets.length ? <ul className="preproduction-assets">{visibleAssets.map((asset) => <li key={asset.id}><span className="preproduction-asset-kind">{asset.kind}</span><div className="preproduction-asset-info"><strong>{asset.name}</strong>{asset.notes && <p>{asset.notes}</p>}<button type="button" className="secondary-action" aria-label={`管理素材 ${asset.name}`} onClick={() => setManagedAssetId(asset.id)}>管理素材</button><span className="preproduction-asset-role">{roleLabels[asset.role]}</span>{asset.width && asset.height ? <small>{asset.width}×{asset.height}</small> : null}<a className="preproduction-asset-download" href={asset.url} download>下载{asset.name}</a><details className={`preproduction-asset-preview ${studioMode ? "studio-asset-preview" : ""}`} open={studioMode || undefined}><summary>预览</summary>{asset.kind === "image" ? <img src={asset.url} alt={`${asset.name} 预览`} /> : asset.kind === "video" ? <video controls preload="metadata" aria-label={`${asset.name} 预览`} src={asset.url} /> : <audio controls preload="metadata" aria-label={`${asset.name} 预览`} src={asset.url} />}</details></div></li>)}</ul> : <p className="preproduction-empty">还没有匹配的素材。上传素材，或从已有参考和工具结果导入。</p>}
+          {visibleAssets.length ? <ul className="preproduction-assets">{visibleAssets.map((asset) => <li key={asset.id}><span className="preproduction-asset-kind">{asset.kind}</span><div className="preproduction-asset-info"><strong>{asset.name}</strong>{asset.notes && <p>{asset.notes}</p>}<button type="button" className="secondary-action" aria-label={`管理素材 ${asset.name}`} onClick={() => setManagedAssetId(asset.id)}>管理素材</button><span className="preproduction-asset-role">{roleLabels[asset.role]}</span>{asset.width && asset.height ? <small>{asset.width}×{asset.height}</small> : null}<a className="preproduction-asset-download" href={asset.url} download>下载{asset.name}</a><details className={`preproduction-asset-preview ${studioMode ? "studio-asset-preview" : ""}`} open={studioMode || undefined}><summary>预览</summary>{asset.kind === "image" ? <img src={asset.url} alt={`${asset.name} 预览`} /> : asset.kind === "video" ? <video controls preload="metadata" aria-label={`${asset.name} 预览`} src={asset.url} /> : asset.kind === "text" ? <TextAssetPreview url={asset.url} name={asset.name} /> : <audio controls preload="metadata" aria-label={`${asset.name} 预览`} src={asset.url} />}</details></div></li>)}</ul> : <p className="preproduction-empty">还没有匹配的素材。上传素材，或从已有参考和工具结果导入。</p>}
           {workspace.assets.find((asset) => asset.id === managedAssetId) && (() => {
             const asset = workspace.assets.find((item) => item.id === managedAssetId)!;
             return <AssetManager key={`${project.id}:${asset.id}`} projectId={project.id} asset={asset} revision={workspace.revision}

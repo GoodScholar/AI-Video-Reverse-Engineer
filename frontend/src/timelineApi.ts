@@ -4,7 +4,7 @@ import type { Packaging, Reframe, ReframeAnalysis } from "./ReframeControls";
 export type TimelineAssetKind = "image" | "video" | "audio";
 export type TimelineTrackKind = "video" | "audio";
 export type TimelineFormat = "preview" | "mp4" | "wav";
-export type TimelineRunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type TimelineRunStatus = "queued" | "running" | "cancel_requested" | "cancelled" | "failed" | "unknown" | "partial_success" | "completed";
 
 export type TimelineClip = { id: string; assetId: string; start: number; inPoint: number; duration: number; speed: number; volume: number; fadeIn: number; fadeOut: number; reframe?: Reframe };
 export type TimelineTrack = { id: string; name: string; kind: TimelineTrackKind; muted: boolean; hidden: boolean; clips: TimelineClip[] };
@@ -12,7 +12,7 @@ export type TimelineTransitionTemplate = "cut" | "dissolve" | "push" | "wipe" | 
 export type TimelineTransition = { id: string; leftClipId: string; rightClipId: string; template: TimelineTransitionTemplate;
   enabled: boolean; duration: number; overlap: number; audioCrossfade: boolean; reason: string };
 export type TimelineAsset = { id: string; name: string; kind: TimelineAssetKind; url: string; duration?: number; width?: number; height?: number };
-export type TimelineRun = { id: string; revision: number; format: TimelineFormat; status: TimelineRunStatus; error: string | null; url?: string };
+export type TimelineRun = { id: string; commonRunId?: string; domainKind?: string; revision: number; format: TimelineFormat; status: TimelineRunStatus; error: string | null; inputSnapshot?: unknown; inputFingerprint?: string | null; idempotencyKey?: string | null; retryOf?: string | null; attempt?: number; logs?: Array<{ event: string; attempt?: number; reason?: string }>; recovery?: { reason: string; attempt?: number }; url?: string };
 export type TimelineWorkspace = { revision: number; settings: { width: number; height: number; fps: 24 | 25 | 30 }; tracks: TimelineTrack[]; transitions?: TimelineTransition[]; assets: TimelineAsset[]; runs: TimelineRun[]; reframeAnalysis?: Record<string, ReframeAnalysis>; packaging?: Packaging };
 export type TimelineSave = Pick<TimelineWorkspace, "revision" | "settings" | "tracks" | "transitions" | "packaging">;
 
@@ -46,12 +46,16 @@ export function cancelTimelineReframe(projectId: string, clipId: string, revisio
   return request(`${timelineBase(projectId)}/reframes/${encodeURIComponent(clipId)}/cancel`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ revision }) }, "无法取消主体分析，请重试。");
 }
 
-export function startTimelineRun(projectId: string, revision: number, format: TimelineFormat): Promise<TimelineWorkspace> {
-  return request(`${timelineBase(projectId)}/runs`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ revision, format }) }, "无法提交渲染任务，请先保存当前时间线后重试。");
+export function startTimelineRun(projectId: string, revision: number, format: TimelineFormat, idempotencyKey?: string): Promise<TimelineWorkspace> {
+  return request(`${timelineBase(projectId)}/runs`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ revision, format, ...(idempotencyKey ? { idempotencyKey } : {}) }) }, "无法提交渲染任务，请先保存当前时间线后重试。");
 }
 
 export function cancelTimelineRun(projectId: string, runId: string): Promise<TimelineWorkspace> {
   return request(`${timelineBase(projectId)}/runs/${encodeURIComponent(runId)}/cancel`, { method: "POST", headers: jsonHeaders, body: "{}" }, "无法取消渲染任务，请重试。");
+}
+
+export function retryTimelineRun(projectId: string, runId: string, idempotencyKey: string): Promise<TimelineWorkspace> {
+  return request(`${timelineBase(projectId)}/runs/${encodeURIComponent(runId)}/retry`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ idempotencyKey }) }, "无法重试渲染任务，请重试。");
 }
 
 export function timelineOutputUrl(projectId: string, runId: string) {

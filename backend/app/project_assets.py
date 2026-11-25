@@ -4,16 +4,26 @@ from __future__ import annotations
 import os
 import shutil
 import stat
+import hashlib
+import json
+import tempfile
 from contextlib import ExitStack, contextmanager
+from copy import deepcopy
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator
+from threading import RLock
+from typing import Any, Callable, Iterable, Iterator, Mapping
 from uuid import uuid4
 
+from .durable_runs import freeze_run_input
 from .preproduction import PreproductionStore
 from .reference_video import validate_storage_id
+from .video_sources import local_video_source
+from .youtube_import import YoutubeProbe, youtube_video_source
 
 
 ReferenceFacts = Callable[[str, str], list[dict[str, str]]]
+_RESULT_INSTALL_LOCKS: dict[str, RLock] = {}
+_RESULT_INSTALL_LOCKS_GUARD = RLock()
 
 
 class AssetInUseError(Exception):
@@ -30,6 +40,34 @@ class AssetReferencesUnavailableError(Exception):
     pass
 
 
+class AssetStateConflict(Exception):
+    """The caller's workspace revision is no longer current."""
+
+
+class ResultInstallationConflict(ValueError):
+    """A run/result identity already names different immutable media."""
+
+
+class LocalVideoInstallationConflict(ValueError):
+    """The same local-video identity names inconsistent stored media."""
+
+
+def _write_local_video_marker(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        descriptor, raw = tempfile.mkstemp(dir=path.parent, prefix=".local-video-", suffix=".part")
+        temporary = Path(raw)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as target:
+            json.dump(value, target, separators=(",", ":"))
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 class ProjectAssets:
     """Hide the legacy workspace shape and asset directory behind one boundary."""
 
@@ -43,6 +81,14 @@ class ProjectAssets:
             return uuid4().hex
         validate_storage_id(prefix)
         return f"{prefix}-{uuid4().hex}"
+
+    @staticmethod
+    def version_id(asset: Mapping[str, Any]) -> str:
+        """Return the immutable first-version identity used by legacy and current assets."""
+        version_id = asset.get("assetVersionId")
+        if isinstance(version_id, str) and version_id:
+            return version_id
+        return validate_storage_id(asset.get("id")) + "-v1"
 
     def records(self, project_id: str) -> list[dict[str, Any]]:
         return self.records_from(self._store.load(project_id))
@@ -114,6 +160,8 @@ class ProjectAssets:
             validate_storage_id(filename)
             path = self._store.path(project_id, "assets", filename)
             _regular_file(path)
+            if "sha256" in record and _sha256(path) != record["sha256"]:
+                raise OSError("项目素材内容哈希不匹配")
             return path
         except (KeyError, TypeError, OSError, ValueError):
             raise AssetFileUnavailableError("项目素材文件不可用") from None
@@ -171,6 +219,7 @@ class ProjectAssets:
 
     def update_metadata(
         self,
+        project_id: str,
         state: dict[str, Any],
         asset_id: str,
         *,
@@ -178,36 +227,386 @@ class ProjectAssets:
         notes: str,
         save: Callable[[dict[str, Any]], None],
     ) -> dict[str, Any]:
-        asset = self.find_in(state, asset_id)
-        previous_name = asset.get("name")
-        previous_notes = asset.get("notes")
-        previous_revision = state["revision"]
-        try:
-            asset.update(name=name, notes=notes)
-            state["revision"] += 1
-            save(state)
-        except BaseException:
-            asset["name"] = previous_name
-            if previous_notes is None:
-                asset.pop("notes", None)
-            else:
-                asset["notes"] = previous_notes
-            state["revision"] = previous_revision
-            raise
-        return asset
+        with _result_install_lock(self._store.root):
+            latest = self._store.load(project_id)
+            if state.get("revision") != latest.get("revision"):
+                raise AssetStateConflict("项目素材已更新")
+            asset = self.find_in(latest, asset_id)
+            previous_name = asset.get("name")
+            previous_notes = asset.get("notes")
+            previous_revision = latest["revision"]
+            try:
+                asset.update(name=name, notes=notes)
+                latest["revision"] += 1
+                save(latest)
+            except BaseException:
+                asset["name"] = previous_name
+                if previous_notes is None:
+                    asset.pop("notes", None)
+                else:
+                    asset["notes"] = previous_notes
+                latest["revision"] = previous_revision
+                raise
+            _sync_state(state, latest)
+            return self.find_in(state, asset_id)
 
     def add_many(
         self,
         project_id: str,
         entries: Iterable[tuple[Path, dict[str, Any]]],
     ) -> dict[str, Any]:
+        with _result_install_lock(self._store.root):
+            state = self._store.load(project_id)
+            with ExitStack() as stack:
+                for source, record in entries:
+                    stack.enter_context(self.install(project_id, state, source, record))
+                state["revision"] += 1
+                self._store.save(project_id, state)
+            return state
+
+    def install_local_video(
+        self,
+        project_id: str,
+        *,
+        source: Path,
+        staging_root: Path,
+        original_name: str,
+        role: str,
+        metadata: Mapping[str, Any],
+        confirmed_at: str,
+        apply: Callable[[dict[str, Any], dict[str, Any]], None] | None = None,
+        deduplicate: bool = True,
+    ) -> dict[str, Any]:
+        """Install an authorized local video once, keyed by immutable content."""
+        source = Path(source)
+        try:
+            if source.parent.resolve(strict=True) != Path(staging_root).resolve(strict=True) or not source.name.startswith(".preproduction-"):
+                raise OSError("本地视频必须来自受管上传暂存区")
+        except OSError:
+            raise OSError("本地视频必须来自受管上传暂存区") from None
+        _regular_file(source)
+        content_hash = _sha256(source)
+        provenance = local_video_source(
+            original_name=original_name,
+            metadata=metadata,
+            content_hash=content_hash,
+            confirmed_at=confirmed_at,
+        )
+        with _result_install_lock(self._store.root):
+            state = self._store.load(project_id)
+            matches = [asset for asset in self.records_from(state)
+                       if isinstance(asset.get("videoSource"), dict)
+                       and asset["videoSource"].get("sourceType") == "local"
+                       and asset["videoSource"].get("contentHash") == content_hash]
+            if deduplicate and len(matches) > 1:
+                raise LocalVideoInstallationConflict("同一内容哈希对应多个本地视频素材")
+            if deduplicate and matches:
+                existing = matches[0]
+                try:
+                    stored_hash = _sha256(self.file(project_id, existing))
+                except (OSError, ValueError, KeyError):
+                    raise LocalVideoInstallationConflict("已导入的本地视频文件不可用") from None
+                if existing.get("sha256") != content_hash or stored_hash != content_hash:
+                    raise LocalVideoInstallationConflict("已导入的本地视频内容不一致")
+                if apply is not None:
+                    apply(state, existing)
+                    self._store.save(project_id, state)
+                return existing
+            asset_id = self.new_id("local-video")
+            suffix = Path(original_name).suffix.lower()
+            filename = asset_id + (suffix if suffix and suffix[1:].isalnum() else ".mp4")
+            record = {
+                "id": asset_id,
+                "assetVersionId": asset_id + "-v1",
+                "name": provenance["originalReference"],
+                "kind": "video",
+                "role": role,
+                "file": filename,
+                "sha256": content_hash,
+                "duration": metadata["duration"],
+                "width": metadata["width"],
+                "height": metadata["height"],
+                "videoSource": provenance,
+            }
+            marker = self._local_video_marker(project_id, asset_id)
+            _write_local_video_marker(marker, {"version": 1, "assetId": asset_id, "file": filename})
+            try:
+                with self.install(project_id, state, source, record, move=True):
+                    if _sha256(self._store.path(project_id, "assets", filename)) != content_hash:
+                        raise LocalVideoInstallationConflict("本地视频安装后内容校验失败")
+                    if apply is None:
+                        state["revision"] += 1
+                    else:
+                        apply(state, record)
+                    self._store.save(project_id, state)
+            finally:
+                marker.unlink(missing_ok=True)
+            return record
+
+    def recover_local_video_installations(self, project_id: str) -> None:
+        """Finish or discard an interrupted local-video installation before serving state."""
+        assets_dir = self._store.path(project_id, "assets")
+        if not assets_dir.exists():
+            return
+        if assets_dir.is_symlink() or not assets_dir.is_dir():
+            raise OSError("项目素材目录无效")
         state = self._store.load(project_id)
-        with ExitStack() as stack:
-            for source, record in entries:
-                stack.enter_context(self.install(project_id, state, source, record))
+        records = self.index_from(state)
+        for marker in assets_dir.glob("local-video-*.pending.json"):
+            if marker.is_symlink() or not marker.is_file():
+                raise OSError("本地视频安装记录无效")
+            try:
+                data = json.loads(marker.read_text(encoding="utf-8"))
+                if set(data) != {"version", "assetId", "file"} or data["version"] != 1:
+                    raise ValueError
+                asset_id = validate_storage_id(data["assetId"])
+                filename = validate_storage_id(data["file"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise OSError("本地视频安装记录无效") from error
+            target = self._store.path(project_id, "assets", filename)
+            asset = records.get(asset_id)
+            if asset is None or asset.get("file") != filename:
+                if target.exists():
+                    _regular_file(target)
+                    target.unlink()
+            marker.unlink()
+
+    def install_platform_video(
+        self,
+        project_id: str,
+        *,
+        source: Path,
+        staging_root: Path,
+        platform: str,
+        probe: Any,
+        role: str,
+        metadata: Mapping[str, Any],
+        confirmed_at: str,
+        provenance: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically install one checked platform download by its immutable identity."""
+        if platform not in {"youtube", "bilibili", "douyin", "xiaohongshu", "kuaishou"}:
+            raise ValueError("不支持的视频平台")
+        source = Path(source)
+        try:
+            if source.parent.resolve(strict=True) != Path(staging_root).resolve(strict=True) or not source.name.startswith(f".{platform}-"):
+                raise OSError("平台视频必须来自受管下载暂存区")
+        except OSError:
+            raise OSError("平台视频必须来自受管下载暂存区") from None
+        _regular_file(source)
+        content_hash = _sha256(source)
+        provenance = dict(provenance)
+        if provenance.get("contentHash") != content_hash:
+            raise LocalVideoInstallationConflict("平台视频内容哈希不一致")
+        with _result_install_lock(self._store.root):
+            state = self._store.load(project_id)
+            matches = [asset for asset in self.records_from(state)
+                       if isinstance(asset.get("videoSource"), dict)
+                       and asset["videoSource"].get("sourceId") == provenance["sourceId"]]
+            if len(matches) > 1:
+                raise LocalVideoInstallationConflict("同一平台视频对应多个项目素材")
+            if matches:
+                existing = matches[0]
+                try:
+                    stored_hash = _sha256(self.file(project_id, existing))
+                except (OSError, ValueError, KeyError):
+                    raise LocalVideoInstallationConflict("已导入的平台视频文件不可用") from None
+                if existing.get("sha256") != content_hash or stored_hash != content_hash:
+                    raise LocalVideoInstallationConflict("已导入的平台视频内容不一致")
+                return existing
+            asset_id = self.new_id(f"{platform}-video")
+            filename = asset_id + ".mp4"
+            record = {
+                "id": asset_id, "assetVersionId": asset_id + "-v1", "name": provenance["metadata"]["title"],
+                "kind": "video", "role": role, "file": filename, "sha256": content_hash,
+                "duration": metadata["duration"], "width": metadata["width"], "height": metadata["height"],
+                "videoSource": provenance,
+            }
+            marker = self._store.path(project_id, "assets", f"{platform}-video-{asset_id}.pending.json")
+            _write_local_video_marker(marker, {"version": 1, "assetId": asset_id, "file": filename})
+            try:
+                with self.install(project_id, state, source, record, move=True):
+                    if _sha256(self._store.path(project_id, "assets", filename)) != content_hash:
+                        raise LocalVideoInstallationConflict("平台视频安装后内容校验失败")
+                    state["revision"] += 1
+                    self._store.save(project_id, state)
+            finally:
+                marker.unlink(missing_ok=True)
+            return record
+
+    def install_youtube_video(
+        self, project_id: str, *, source: Path, staging_root: Path, probe: YoutubeProbe, role: str,
+        metadata: Mapping[str, Any], confirmed_at: str,
+    ) -> dict[str, Any]:
+        source = Path(source)
+        try:
+            if source.parent.resolve(strict=True) != Path(staging_root).resolve(strict=True) or not source.name.startswith(".youtube-"):
+                raise OSError("YouTube 视频必须来自受管下载暂存区")
+        except OSError:
+            raise OSError("YouTube 视频必须来自受管下载暂存区") from None
+        _regular_file(source)
+        content_hash = _sha256(source)
+        return self.install_platform_video(
+            project_id, source=source, staging_root=staging_root, platform="youtube", probe=probe, role=role,
+            metadata=metadata, confirmed_at=confirmed_at,
+            provenance=youtube_video_source(probe=probe, metadata=dict(metadata), content_hash=content_hash, confirmed_at=confirmed_at),
+        )
+
+    def recover_platform_video_installations(self, project_id: str, platform: str) -> None:
+        """Remove unregistered platform-download files after a process restart."""
+        if platform not in {"youtube", "bilibili", "douyin", "xiaohongshu", "kuaishou"}:
+            raise ValueError("不支持的视频平台")
+        assets_dir = self._store.path(project_id, "assets")
+        if not assets_dir.exists():
+            return
+        if assets_dir.is_symlink() or not assets_dir.is_dir():
+            raise OSError("项目素材目录无效")
+        records = self.index_from(self._store.load(project_id))
+        for marker in assets_dir.glob(f"{platform}-video-*.pending.json"):
+            if marker.is_symlink() or not marker.is_file():
+                raise OSError("平台视频安装记录无效")
+            try:
+                data = json.loads(marker.read_text(encoding="utf-8"))
+                if set(data) != {"version", "assetId", "file"} or data["version"] != 1:
+                    raise ValueError
+                asset_id, filename = validate_storage_id(data["assetId"]), validate_storage_id(data["file"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise OSError("平台视频安装记录无效") from error
+            target = self._store.path(project_id, "assets", filename)
+            asset = records.get(asset_id)
+            if asset is None or asset.get("file") != filename:
+                if target.exists():
+                    _regular_file(target)
+                    target.unlink()
+            marker.unlink()
+
+    def recover_youtube_video_installations(self, project_id: str) -> None:
+        self.recover_platform_video_installations(project_id, "youtube")
+
+    def recover_bilibili_video_installations(self, project_id: str) -> None:
+        self.recover_platform_video_installations(project_id, "bilibili")
+
+    def recover_douyin_video_installations(self, project_id: str) -> None:
+        self.recover_platform_video_installations(project_id, "douyin")
+
+    def recover_xiaohongshu_video_installations(self, project_id: str) -> None:
+        self.recover_platform_video_installations(project_id, "xiaohongshu")
+
+    def recover_kuaishou_video_installations(self, project_id: str) -> None:
+        self.recover_platform_video_installations(project_id, "kuaishou")
+
+    def _local_video_marker(self, project_id: str, asset_id: str) -> Path:
+        return self._store.path(project_id, "assets", f"local-video-{asset_id}.pending.json")
+
+    def install_run_result(
+        self,
+        project_id: str,
+        *,
+        source: Path,
+        run_id: str,
+        result_id: str,
+        kind: str,
+        name: str,
+        input_snapshot: Any,
+        provider: str | None = None,
+        processing_method: str | None = None,
+        common_run_id: str | None = None,
+        domain_kind: str | None = None,
+        domain_run_id: str | None = None,
+        media: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Install one controlled media result once, preserving its run identity."""
+        validate_storage_id(run_id)
+        validate_storage_id(result_id)
+        if common_run_id is None and (domain_kind is None or domain_run_id is None):
+            raise ValueError("运行结果必须指定公共运行或领域运行身份")
+        if domain_kind is not None:
+            validate_storage_id(domain_kind)
+        if domain_run_id is not None:
+            domain_run_id = validate_storage_id(domain_run_id)
+        if common_run_id is not None:
+            common_run_id = validate_storage_id(common_run_id)
+        if kind not in {"image", "video", "audio"}:
+            raise ValueError("运行结果媒体类型无效")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("运行结果名称无效")
+        _regular_file(Path(source))
+        content_hash = _sha256(Path(source))
+        frozen = freeze_run_input(input_snapshot)
+        media_metadata = _media_metadata(media)
+        with _result_install_lock(self._store.root):
+            return self._install_run_result_locked(
+                project_id, Path(source), run_id, result_id, kind, name.strip(), frozen, content_hash,
+                provider, processing_method, common_run_id, domain_kind, domain_run_id, media_metadata,
+            )
+
+    def _install_run_result_locked(
+        self, project_id: str, source: Path, run_id: str, result_id: str, kind: str, name: str,
+        frozen: Any, content_hash: str, provider: str | None, processing_method: str | None,
+        common_run_id: str | None, domain_kind: str | None, domain_run_id: str | None, media_metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        state = self._store.load(project_id)
+        if common_run_id is not None:
+            candidates = [asset for asset in self.records_from(state)
+                          if asset.get("sourceCommonRunId") == common_run_id and asset.get("sourceResultId") == result_id]
+        else:
+            candidates = [asset for asset in self.records_from(state)
+                          if asset.get("sourceResultId") == result_id
+                          and asset.get("sourceDomainKind", "legacy") == domain_kind
+                          and asset.get("sourceDomainRunId", asset.get("sourceRunId")) == domain_run_id]
+        if len(candidates) > 1:
+            raise ResultInstallationConflict("运行结果身份对应多个项目素材")
+        existing = candidates[0] if candidates else None
+        if existing is not None:
+            try:
+                installed_hash = _sha256(self.file(project_id, existing))
+            except (OSError, ValueError, KeyError):
+                raise ResultInstallationConflict("已安装的运行结果文件不可用") from None
+            expected_facts = {
+                "kind": kind, "provider": provider or None, "processingMethod": processing_method or None,
+                "sourceCommonRunId": common_run_id, "duration": media_metadata.get("duration"),
+                "width": media_metadata.get("width"), "height": media_metadata.get("height"),
+                "sourceDomainKind": domain_kind, "sourceDomainRunId": domain_run_id,
+            }
+            actual_facts = {key: existing.get(key) for key in expected_facts}
+            actual_facts["sourceDomainKind"] = existing.get("sourceDomainKind", "legacy")
+            actual_facts["sourceDomainRunId"] = existing.get("sourceDomainRunId", existing.get("sourceRunId"))
+            if (existing.get("sha256") != content_hash or installed_hash != existing.get("sha256")
+                    or existing.get("inputFingerprint") != frozen.fingerprint or actual_facts != expected_facts):
+                raise ResultInstallationConflict("同一运行结果的内容或输入已变化")
+            return existing
+        asset_id = self.new_id("result")
+        suffix = Path(source).suffix.lower()
+        filename = asset_id + (suffix if suffix and suffix[1:].isalnum() else ".bin")
+        record = {
+            "id": asset_id,
+            "assetVersionId": asset_id + "-v1",
+            "name": name,
+            "kind": kind,
+            "role": "reference",
+            "file": filename,
+            "sha256": content_hash,
+            "sourceRunId": run_id,
+            "sourceResultId": result_id,
+            "inputSnapshot": deepcopy(frozen.snapshot),
+            "inputFingerprint": frozen.fingerprint,
+            **media_metadata,
+        }
+        if domain_kind is not None:
+            record["sourceDomainKind"] = domain_kind
+            record["sourceDomainRunId"] = domain_run_id
+        if common_run_id is not None:
+            record["sourceCommonRunId"] = common_run_id
+        if isinstance(provider, str) and provider:
+            record["provider"] = provider
+        if isinstance(processing_method, str) and processing_method:
+            record["processingMethod"] = processing_method
+        with self.install(project_id, state, source, record):
+            if _sha256(self._store.path(project_id, "assets", filename)) != content_hash:
+                raise ResultInstallationConflict("运行结果安装后内容校验失败")
             state["revision"] += 1
             self._store.save(project_id, state)
-        return state
+        return record
 
     def delete(
         self,
@@ -217,26 +616,31 @@ class ProjectAssets:
         *,
         save: Callable[[dict[str, Any]], None],
     ) -> None:
-        asset = self.find_in(state, asset_id)
-        references = self.references(project_id, asset_id)
-        if references:
-            raise AssetInUseError(references)
-        path = self.file(project_id, asset)
-        staged = path.with_name(f".delete-{uuid4().hex}.part")
-        previous_assets = state["assets"]
-        previous_revision = state["revision"]
-        path.rename(staged)
-        try:
-            state["assets"] = [item for item in previous_assets if item is not asset]
-            state["revision"] += 1
-            save(state)
-        except BaseException:
-            state["assets"] = previous_assets
-            state["revision"] = previous_revision
-            if staged.exists():
-                staged.rename(path)
-            raise
-        staged.unlink()
+        with _result_install_lock(self._store.root):
+            latest = self._store.load(project_id)
+            if state.get("revision") != latest.get("revision"):
+                raise AssetStateConflict("项目素材已更新")
+            asset = self.find_in(latest, asset_id)
+            references = self.references(project_id, asset_id)
+            if references:
+                raise AssetInUseError(references)
+            path = self.file(project_id, asset)
+            staged = path.with_name(f".delete-{uuid4().hex}.part")
+            previous_assets = latest["assets"]
+            previous_revision = latest["revision"]
+            path.rename(staged)
+            try:
+                latest["assets"] = [item for item in previous_assets if item is not asset]
+                latest["revision"] += 1
+                save(latest)
+            except BaseException:
+                latest["assets"] = previous_assets
+                latest["revision"] = previous_revision
+                if staged.exists():
+                    staged.rename(path)
+                raise
+            staged.unlink()
+            _sync_state(state, latest)
 
     @staticmethod
     def find_in(state: dict[str, Any], asset_id: str) -> dict[str, Any]:
@@ -253,6 +657,17 @@ def _regular_file(path: Path) -> None:
         raise OSError("项目素材文件不可用")
 
 
+def _result_install_lock(root: Path) -> RLock:
+    key = str(Path(root).resolve())
+    with _RESULT_INSTALL_LOCKS_GUARD:
+        return _RESULT_INSTALL_LOCKS.setdefault(key, RLock())
+
+
+def _sync_state(destination: dict[str, Any], source: dict[str, Any]) -> None:
+    destination.clear()
+    destination.update(deepcopy(source))
+
+
 def _copy_regular(source: Path, target: Path) -> None:
     descriptor = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
@@ -265,3 +680,33 @@ def _copy_regular(source: Path, target: Path) -> None:
     finally:
         if descriptor != -1:
             os.close(descriptor)
+
+
+def _sha256(path: Path) -> str:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+            return digest.hexdigest()
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
+
+
+def _media_metadata(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping) or set(value) - {"duration", "width", "height"}:
+        raise ValueError("运行结果媒体信息无效")
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        if key == "duration":
+            if not isinstance(item, (int, float)) or isinstance(item, bool) or item <= 0:
+                raise ValueError("运行结果时长无效")
+        elif not isinstance(item, int) or isinstance(item, bool) or item <= 0:
+            raise ValueError("运行结果尺寸无效")
+        result[key] = item
+    return result

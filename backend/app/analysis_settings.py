@@ -170,6 +170,10 @@ class AnalysisProviderConfiguration(_StrictModel):
     verifiedAt: Optional[str] = None
     failedAt: Optional[str] = None
     errorCode: Optional[str] = None
+    # Read-only generation catalog evidence.  It is derived for every API
+    # response, never written with a connection test or provider setting.
+    textGenerationCapabilityState: Literal["verified", "unverified"] = "unverified"
+    textGenerationCapabilityVersion: Optional[str] = None
 
 
 class AnalysisSettings:
@@ -694,4 +698,10 @@ class AnalysisProviderConfigurations:
             verifiedAt=setting.verifiedAt if setting is not None else None,
             failedAt=setting.failedAt if setting is not None else None,
             errorCode=setting.errorCode if setting is not None else None,
+            textGenerationCapabilityState=(
+                "verified" if catalog.compatibilityAvailability == "verified" else "unverified"
+            ),
+            textGenerationCapabilityVersion=(
+                f"text-compatibility-{CATALOG_VERSION}" if catalog.compatibilityAvailability == "verified" else None
+            ),
         )

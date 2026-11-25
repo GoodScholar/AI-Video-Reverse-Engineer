@@ -1067,6 +1067,48 @@ def test_editing_proposal_does_not_convert_old_transition_handle_into_narration_
         assert current["segments"][0]["suggestionClip"]["duration"] == 2.35
 
 
+def test_script_remix_plan_uses_the_unified_remix_contract_and_canonical_storage(tmp_path):
+    with TestClient(create_app(tmp_path, segment_visual_vectorizer=MontageVectorizer())) as client:
+        project_id = client.post("/api/projects", json={"name": "统一脚本混剪"}).json()["id"]
+        install_montage_indexes(tmp_path, project_id)
+        search = client.post(f"/api/projects/{project_id}/segment-searches", json={
+            "query": "展示杯盖防泼溅", "limit": 2,
+        }, headers=INTENT).json()
+        base = f"/api/projects/{project_id}/batch-edits"
+        task = client.post(base, json={
+            "sellingPoint": "防泼溅", "script": "展示杯盖防泼溅。",
+        }, headers=INTENT).json()["task"]
+
+        created = client.post(f"{base}/{task['id']}/remix-plans", json={
+            "revision": 0, "searchIds": [search["id"]],
+            "narration": [{"durationSeconds": 2.0, "wordBoundariesSeconds": [1.0, 2.0]}],
+            "beatTimes": [2.05],
+        }, headers=INTENT)
+
+        assert created.status_code == 201, created.text
+        plan = created.json()["remixPlan"]
+        assert plan["schemaVersion"] == 2
+        assert plan["engine"] == "RemixEngine"
+        assert plan["entrypoint"] == "script"
+        assert plan["id"].startswith("remix-plan-")
+        assert plan["segments"][0]["input"]["searchId"] == search["id"]
+        state = json.loads((tmp_path / "project-files" / project_id / "batch-edits" / "state.json").read_text(encoding="utf-8"))
+        assert state["tasks"][0]["remixPlans"][0]["id"] == plan["id"]
+        assert "montageProposals" not in state["tasks"][0]
+
+        disabled = client.put(f"{base}/{task['id']}/remix-plans/{plan['id']}", json={
+            "revision": 0, "segments": [{"segmentId": "script-segment-1", "disabled": True}],
+        }, headers=INTENT)
+        assert disabled.status_code == 200, disabled.text
+        assert disabled.json()["remixPlan"]["segments"][0]["disabled"] is True
+        assert disabled.json()["remixPlan"]["segments"][0]["selectedClip"] is None
+        conflict = client.put(f"{base}/{task['id']}/remix-plans/{plan['id']}", json={
+            "revision": 0, "segments": [{"segmentId": "script-segment-1", "disabled": True}],
+        }, headers=INTENT)
+        assert conflict.status_code == 409
+        assert conflict.json()["detail"]["code"] == "montage_proposal_conflict"
+
+
 def test_montage_proposal_replacement_preserves_suggestion_and_stale_source_blocks_apply(tmp_path):
     with TestClient(create_app(tmp_path, segment_visual_vectorizer=MontageVectorizer())) as client:
         project_id = client.post("/api/projects", json={"name": "人工微调"}).json()["id"]
@@ -2459,7 +2501,8 @@ def test_apply_clears_stale_manual_before_reusing_matching_active_analysis(tmp_p
         project_id, base, task, proposal = _create_montage_proposal(client, tmp_path)
         state_path = tmp_path / "project-files" / project_id / "batch-edits" / "state.json"
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        selected = state["tasks"][0]["montageProposals"][0]["segments"][0]["selectedClip"]
+        plans = state["tasks"][0].get("remixPlans") or state["tasks"][0].get("montageProposals", [])
+        selected = plans[0]["segments"][0]["selectedClip"]
         stale = deepcopy(selected)
         stale["reframe"] = {
             "schemaVersion": 1,
