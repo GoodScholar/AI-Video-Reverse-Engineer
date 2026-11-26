@@ -23,3 +23,4 @@ backend/upscale_worker/vendor/
 backend/toolkit_worker/sam2-venv/
 backend/toolkit_worker/models/
 backend/toolkit_worker/vendor/
+artifacts/
